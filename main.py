@@ -1,4 +1,4 @@
-"""Driver Script for the ASPLOS OPTNKI Contest"""
+"""Driver script for NKI contests"""
 import argparse
 import ast
 import base64
@@ -44,9 +44,9 @@ def parse_args():
     parser.add_argument("--base-throughput", type=float, default=134.61)
 
     # Model path
-    parser.add_argument("--model-path", type=str, default="/home/ubuntu/qwen-30b-a3b/hf_model")
+    parser.add_argument("--model-path", type=str, default="/home/ubuntu/Qwen3-30B-A3B/hf_model")
     parser.add_argument("--compiled-model-path", type=str,
-                        default="/home/ubuntu/qwen-30b-a3b/traced_model")
+                        default="/home/ubuntu/Qwen3-30B-A3B/traced_model")
 
     # Evaluation
     parser.add_argument("--benchmark", action="store_true")
@@ -68,12 +68,12 @@ def parse_args():
     parser.add_argument("--torch-dtype", type=to_torch_dtype, default="bfloat16")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--padding-side", type=str)
-    parser.add_argument("--seq-len", type=int, default=128)
+    parser.add_argument("--seq-len", type=int, default=640)
     parser.add_argument("--n-active-tokens", type=int)
     parser.add_argument("--n-positions", type=int)
-    parser.add_argument("--max-context-length", type=int, default=128)
-    parser.add_argument("--max-new-tokens", type=int, default = 128)
-    parser.add_argument("--max-length", type=int, default=128)
+    parser.add_argument("--max-context-length", type=int)
+    parser.add_argument("--max-new-tokens", type=int)
+    parser.add_argument("--max-length", type=int)
     parser.add_argument("--rpl-reduce-dtype", type=to_torch_dtype)
     parser.add_argument("--output-logits", action="store_true")
     parser.add_argument("--vocab-parallel", action="store_true")
@@ -154,9 +154,6 @@ def prepare_inference(model_cls, args):
     # Load compiled model to Neuron.
     print("\nLoading model to Neuron...")
     model.load(args.compiled_model_path)
-    # loading_end_time = time.monotonic()
-    # model_loading_time = loading_end_time - compiling_end_time
-    # print(f"Total model loading time: {model_loading_time} seconds")
 
     # Load tokenizer.
     tokenizer = load_tokenizer(args.model_path, args.compiled_model_path, neuron_config)
@@ -571,7 +568,9 @@ def main():
         print(f"Validation {status}.")
 
     elif args.mode == "evaluate_single":
+        
         model, tokenizer, generation_config = prepare_inference(qwen.NeuronQwen3MoeForCausalLM, args)
+        
         base_model, _, base_generation_config = prepare_inference(baseline_qwen.NeuronQwen3MoeForCausalLM, args)
 
         accuracy = run_accuracy_check(
@@ -606,7 +605,9 @@ def main():
         )
         
     elif args.mode == "evaluate_all":
+        
         model, tokenizer, generation_config = prepare_inference(qwen.NeuronQwen3MoeForCausalLM, args)
+        
         base_model, _, base_generation_config = prepare_inference(baseline_qwen.NeuronQwen3MoeForCausalLM, args)
 
         prompts = parse_prompts("prompts.txt")
@@ -615,8 +616,10 @@ def main():
 
         total_score = 0
 
+        # to do - move both of these calls into batch mode 
         # Iterate through the prompts
         for i, prompt in enumerate(prompts):
+            
             data = prompt_data[i]
             base_latency = float(data[3])
             base_throughput = float(data[4])
@@ -633,7 +636,6 @@ def main():
                 num_tokens_to_check=args.num_tokens_to_check,
             )
 
-            _ = benchmark_sampling(base_model, tokenizer, base_generation_config, args.prompts)
             report = benchmark_sampling(model, tokenizer, generation_config, [prompt])
 
             latency = report["e2e_model"]["latency_ms_p99"]
