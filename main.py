@@ -554,9 +554,8 @@ def main():
 
     elif args.mode == "validate":
         model, tokenizer, generation_config = prepare_inference(qwen.NeuronQwen3MoeForCausalLM, args)
-
-        # use same logic as evaluate_single - first look for expected logits, if not there, get it 
-        # base_model, _, base_generation_config = prepare_inference(baseline_qwen.NeuronQwen3MoeForCausalLM, args)
+        
+        base_model, _, base_generation_config = prepare_inference(baseline_qwen.NeuronQwen3MoeForCausalLM, args)
 
         passed = run_accuracy_check(
             base_model,
@@ -577,10 +576,7 @@ def main():
         
         model, tokenizer, generation_config = prepare_inference(qwen.NeuronQwen3MoeForCausalLM, args)
 
-        # use this if the prompt is not in the file, otherwise pull the prompt ID and then read the expected logits file
         base_model, _, base_generation_config = prepare_inference(baseline_qwen.NeuronQwen3MoeForCausalLM, args)
-
-        # get expected logits
 
         accuracy = run_accuracy_check(
             base_model,
@@ -616,6 +612,8 @@ def main():
     elif args.mode == "evaluate_all":
         
         model, tokenizer, generation_config = prepare_inference(qwen.NeuronQwen3MoeForCausalLM, args)
+
+        base_model, _, base_generation_config = prepare_inference(baseline_qwen.NeuronQwen3MoeForCausalLM, args)
         
         prompts = parse_prompts("prompts.txt")
         prompt_data = parse_prompt_data("prompt_data.txt")
@@ -630,8 +628,6 @@ def main():
             data = prompt_data[i]
             base_latency = float(data[3])
             base_throughput = float(data[4])
-
-            # expected_logits = torch.load(f'expected_logits_prompt_{i}.pt', weights_only=True)
             
             accuracy = run_accuracy_check(
                 base_model,
