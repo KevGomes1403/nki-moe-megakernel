@@ -8,12 +8,7 @@ from neuronx_distributed_inference.utils.hf_adapter import HuggingFaceGeneration
 from neuronx_distributed_inference.models.config import MoENeuronConfig, OnDeviceSamplingConfig
 from neuronx_distributed_inference.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeInferenceConfig
 
-model_path = "/home/ubuntu/qwen-30b-a3b/hf_model"
-traced_model_path = "/home/ubuntu/qwen-30b-a3b/traced_model"
-
 torch.manual_seed(0)
-
-
 
 import gc
 import warnings
@@ -410,7 +405,6 @@ class NeuronQwen3MoeDecoderLayer(nn.Module):
         # We wrap input_layernorm/self_attn/post_attention_layernorm with module markers start/end
         # as a hint for compiler's modular-flow to avoid layer boundries in-between decoder layer components
         hidden_states = ModuleMarkerStartWrapper()(hidden_states)
-        print("ModuleMarkerStartWrapper set!!! ")
         if self.input_layernorm:
             if self.qkv_kernel_enabled and self.qkv_kernel_fused_rmsnorm:
                 qkv_fused_rmsnorm = self.input_layernorm
