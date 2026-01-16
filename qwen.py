@@ -1,598 +1,699 @@
-# coding=utf-8
-""" Qwen3 MOE model for NXD inference. This is a re-implementation of the NxDI source code for Qwen3 MOE, provided here for easy kernel development."""
-
+"""Driver script for NKI contests"""
+import argparse
+import ast
+import base64
+import copy
+import json
+import os
+import time
 import torch
 
+from torch_neuronx.pyhlo.hlo_pb2 import HloModuleProto
+from torch_neuronx.testing.validation import logit_validation
 from transformers import AutoTokenizer, GenerationConfig
-from neuronx_distributed_inference.utils.hf_adapter import HuggingFaceGenerationAdapter, load_pretrained_config
-from neuronx_distributed_inference.models.config import MoENeuronConfig, OnDeviceSamplingConfig
-from neuronx_distributed_inference.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeInferenceConfig
 
-torch.manual_seed(0)
+from neuronx_distributed_inference.models.config import OnDeviceSamplingConfig, to_torch_dtype
+from neuronx_distributed_inference.modules.generation.sampling import prepare_sampling_params
+from neuronx_distributed_inference.utils.accuracy import get_generate_outputs
+from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config, HuggingFaceGenerationAdapter
 
-import gc
-import warnings
-from typing import List, Optional, Tuple, Union, Dict, Any
+from neuronx_distributed_inference.utils.random import set_random_seed
 
-import torch
-import math
+from neuronx_distributed_inference.utils.benchmark import create_submodule_latency_collectors, register_latency_collectors, generate_report, Benchmark
 
-from neuronx_distributed_inference.models.model_base import NeuronBaseForCausalLM, NeuronBaseModel
-from neuronx_distributed_inference.modules.attention.gqa import GQA
-from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm
+# load the baseline model
+from neuronx_distributed_inference.models.qwen3_moe import modeling_qwen3_moe as baseline_qwen
 
-# Try except for the compatibility with older compiler version
-try:
-    from neuronxcc.nki._private_kernels.attention import attention_isa_kernel
-except ImportError:
-    from neuronxcc.nki.kernels.attention import attention_isa_kernel
+# use this to load the local qwen
+import importlib
 
-from neuronx_distributed.parallel_layers import parallel_state
-from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, ParallelEmbedding
-from neuronx_distributed.utils import cpu_mode
-from torch import nn
-from torch_neuronx.xla_impl.ops import nki_jit
-from transformers import Qwen3MoeForCausalLM
-from transformers.generation import SampleDecoderOnlyOutput, SampleEncoderDecoderOutput
-from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeRMSNorm
+from test import parse_prompts, parse_prompt_data
 
-from neuronx_distributed_inference.models.config import InferenceConfig, MoENeuronConfig, SHARD_ON_INTERMEDIATE_DIMENTION_PER_TP, MOE_TKG_MK_INTERMEDIATE_PER_TP
-from neuronx_distributed_inference.models.model_wrapper import CONTEXT_ENCODING_MODEL_TAG, TOKEN_GENERATION_MODEL_TAG
-from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
-from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
-from neuronx_distributed_inference.modules.moe_v2 import initialize_moe_module
-from neuronx_distributed_inference.models.layer_boundary_marker import (
-    ModuleMarkerEndWrapper,
-    ModuleMarkerStartWrapper,
-)
+BENCHMARK_REPORT_FILENAME = "benchmark_report.json"
 
-_flash_fwd_call = nki_jit()(attention_isa_kernel)
+set_random_seed(0)
 
-SampleOutput = Union[SampleEncoderDecoderOutput, SampleDecoderOnlyOutput]
+def parse_args():
+    parser = argparse.ArgumentParser()
 
-GQA_SHARDING_STRATEGY = GQA.REPLICATE_TO_TP_DEGREE
+    # contest specific
+    parser.add_argument("--mode", choices=["evaluate_single", "evaluate_all", "validate", "generate", "generate_accuracy_baselines"])
+    parser.add_argument("--qwen", type=str, default="qwen")
+    parser.add_argument("--enable-nki", action="store_true")
+    parser.add_argument("--base-latency", type=float, default=526.15)
+    parser.add_argument("--base-throughput", type=float, default=134.61)
+
+    # Model path
+    parser.add_argument("--model-path", type=str, default="/home/ubuntu/Qwen3-30B-A3B/hf_model")
+    parser.add_argument("--compiled-model-path", type=str,
+                        default="/home/ubuntu/Qwen3-30B-A3B/traced_model")
+
+    # Evaluation
+    parser.add_argument("--benchmark", action="store_true")
+    parser.add_argument("--divergence-difference-tol", type=float, default=0.001)
+    parser.add_argument("--tol-map", type=str)
+    parser.add_argument("--num-tokens-to-check", type=int)
+
+    # Generation
+    parser.add_argument("--prompt", dest="prompts", action="append")
+    parser.add_argument("--top-k", type=int, default=20)
+    parser.add_argument("--top-p", type=float, default=0.95)
+    parser.add_argument("--temperature", type=float, default=0.6)
+    parser.add_argument("--global-topk", type=int)
+    parser.add_argument("--do-sample", type=bool, default=True)
+    parser.add_argument("--dynamic", action="store_true")
+    parser.add_argument("--pad-token-id", type=int, default=2)
+
+    # Basic config
+    parser.add_argument("--torch-dtype", type=to_torch_dtype, default="bfloat16")
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--padding-side", type=str)
+    parser.add_argument("--seq-len", type=int, default=640)
+    parser.add_argument("--n-active-tokens", type=int)
+    parser.add_argument("--n-positions", type=int)
+    parser.add_argument("--max-context-length", type=int)
+    parser.add_argument("--max-new-tokens", type=int)
+    parser.add_argument("--max-length", type=int)
+    parser.add_argument("--rpl-reduce-dtype", type=to_torch_dtype)
+    parser.add_argument("--output-logits", action="store_true")
+    parser.add_argument("--vocab-parallel", action="store_true")
+    parser.add_argument("--skip-compile", type=bool, default=False)
+
+    # Attention
+    parser.add_argument("--fused-qkv", action="store_true")
+    parser.add_argument("--sequence-parallel-enabled", action="store_true")
+    parser.add_argument("--flash-decoding-enabled", action="store_true")
+
+    # On device sampling
+    parser.add_argument("--on-device-sampling", action="store_true")
+
+    # Bucketing
+    parser.add_argument("--enable-bucketing", type=bool, default=True)
+    parser.add_argument("--bucket-n-active-tokens", action="store_true")
+    parser.add_argument("--context-encoding-buckets", nargs="+", type=int)
+    parser.add_argument("--token-generation-buckets", nargs="+", type=int)
+
+    # Parallelism
+    parser.add_argument("--tp-degree", type=int, default=4)
+
+    # Kernels
+    parser.add_argument("--qkv-kernel-enabled", action="store_true")
+    parser.add_argument("--attn-kernel-enabled", action="store_true")
+    parser.add_argument("--mlp-kernel-enabled", action="store_true")
+    parser.add_argument("--quantized-mlp-kernel-enabled", action="store_true")
+    parser.add_argument("--rmsnorm-quantize-kernel-enabled", action="store_true")
+    parser.add_argument("--quantized-kernel-lower-bound", type=float, default=1200.0)
+    parser.add_argument("--mlp-kernel-fuse-residual-add", action="store_true")
+
+    return parser.parse_args()
 
 
-# Get the modules_to_not_convert from the neuron configs
-def get_modules_to_not_convert(neuron_config: MoENeuronConfig):
-    return getattr(neuron_config, "modules_to_not_convert", None)
+def validate_file_exists(path):
+    if not os.path.exists(path) or not os.path.isfile(path):
+        raise argparse.ArgumentError("Path must exist and be a file")
+    return path
 
 
-def _helper_concat_and_delete_qkv(qwen_state_dict: Dict[str, Any], layer_num: int, attr: str):
-    """
-    Helper function to concatenate and delete QKV attributes for fusedqkv (weight or scale).
-    Args:
-        qwen_state_dict: The state dictionary containing model weights
-        layer_num: The index of the layer to process
-        attr: The attribute to process ('weight' or 'scale')
-    """
-    qwen_state_dict[f"layers.{layer_num}.self_attn.Wqkv.{attr}"] = torch.cat(
-        [
-            qwen_state_dict[f"layers.{layer_num}.self_attn.q_proj.{attr}"],
-            qwen_state_dict[f"layers.{layer_num}.self_attn.k_proj.{attr}"],
-            qwen_state_dict[f"layers.{layer_num}.self_attn.v_proj.{attr}"],
-        ],
+def load_tokenizer(model_path, compiled_model_path, neuron_config):
+    tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side="right")
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.save_pretrained(compiled_model_path)
+    return tokenizer
+
+
+def prepare_inference(model_cls, args):
+    # Initialize configs.
+    print("Loading configs...")
+
+    # Skip values not specified in the args to avoid setting values to None in the config.
+    config_kwargs = copy.deepcopy(vars(args))
+    config_kwargs = {k: v for k, v in config_kwargs.items() if v is not None}
+
+    if args.on_device_sampling:
+        config_kwargs["on_device_sampling_config"] = OnDeviceSamplingConfig(**config_kwargs)
+
+    neuron_config = model_cls.get_neuron_config_cls()(**config_kwargs)
+
+    config = model_cls.get_config_cls()(
+        neuron_config, load_config=load_pretrained_config(args.model_path)
     )
-    del qwen_state_dict[f"layers.{layer_num}.self_attn.q_proj.{attr}"]
-    del qwen_state_dict[f"layers.{layer_num}.self_attn.k_proj.{attr}"]
-    del qwen_state_dict[f"layers.{layer_num}.self_attn.v_proj.{attr}"]
 
+    model = model_cls(args.model_path, config)
 
-def convert_state_dict_to_fused_qkv(qwen_state_dict: Dict[str, Any], cfg: InferenceConfig):
-    """
-    This function concats the qkv weights and scales to a Wqkv weight and scale for fusedqkv, and deletes the qkv weights.
-    """
-    mods_to_not_conv = get_modules_to_not_convert(cfg.neuron_config)
-    if mods_to_not_conv is None:
-        mods_to_not_conv = []
+    if not args.skip_compile:
 
-    for l in range(cfg.num_hidden_layers):  # noqa: E741
-        _helper_concat_and_delete_qkv(qwen_state_dict, l, "weight")
-        if (
-            cfg.neuron_config.quantized_mlp_kernel_enabled or cfg.neuron_config.quantized
-        ) and f"layers.{l}.self_attn" not in mods_to_not_conv:
-            _helper_concat_and_delete_qkv(qwen_state_dict, l, "scale")
-
-    gc.collect()
-
-    return qwen_state_dict
-
-
-def maybe_dequantize_layer(neuron_state_dict, config):
-    scale_layers = []
-    for layer_key in neuron_state_dict.keys():
-        if "_scale_inv" in layer_key:
-            scales = neuron_state_dict[layer_key]
-            scale_layers.append(layer_key)
-            fp8_layer_name = layer_key.replace("_scale_inv", "")
-            fp8_layer = neuron_state_dict[fp8_layer_name]
-            block_size = config.quantization_config["weight_block_size"]
-            scales_expanded = scales.repeat_interleave(block_size[0], dim=0).repeat_interleave(block_size[1], dim=1)
-            scaled_layer = fp8_layer.to(torch.float32) * scales_expanded.to(torch.float32)
-            neuron_state_dict[fp8_layer_name] = scaled_layer.to(config.neuron_config.torch_dtype)
-
-    # delete scale layers
-    for scale_layer in scale_layers:
-        del neuron_state_dict[scale_layer]
-
-
-def convert_qwen3_moe_hf_to_neuron_state_dict(neuron_state_dict, config):
-    """
-    Helper function which converts the huggingface checkpoints to state dictionary compatible with the stucture of the neuron MoE model.
-    """
-    assert config.neuron_config.glu_mlp is True, "Only GLU MLP is supported"
-
-    # dequantize layers if needed
-    maybe_dequantize_layer(neuron_state_dict, config)
-
-    # to facilitate rank usage in base model
-    neuron_state_dict["rank_util.rank"] = torch.arange(
-        0, config.neuron_config.tp_degree, dtype=torch.int32
-    )
-
-    for l in range(config.num_hidden_layers):  # noqa: E741
-        # To facilitate rank usage in attention
-        neuron_state_dict[f"layers.{l}.self_attn.rank_util.rank"] = torch.arange(
-            0, config.neuron_config.tp_degree, dtype=torch.int32
-        )
-
-        # Rename the q_norm, k_norm names
-        neuron_state_dict[f"layers.{l}.self_attn.k_layernorm.weight"] = (
-            neuron_state_dict[f"layers.{l}.self_attn.k_norm.weight"].detach().clone()
-        )
-        del neuron_state_dict[f"layers.{l}.self_attn.k_norm.weight"]
-
-        # Rename the q_norm, k_norm names
-        neuron_state_dict[f"layers.{l}.self_attn.q_layernorm.weight"] = (
-            neuron_state_dict[f"layers.{l}.self_attn.q_norm.weight"].detach().clone()
-        )
-        del neuron_state_dict[f"layers.{l}.self_attn.q_norm.weight"]
-
-        # Copy router weights
-        neuron_state_dict[f"layers.{l}.mlp.router.linear_router.weight"] = (
-            neuron_state_dict[f"layers.{l}.mlp.gate.weight"].detach().clone()
-        )
-        del neuron_state_dict[f"layers.{l}.mlp.gate.weight"]
-
-        intermediate_size, hidden_size = neuron_state_dict[
-            f"layers.{l}.mlp.experts.0.gate_proj.weight"
-        ].shape
-        device = neuron_state_dict[f"layers.{l}.mlp.experts.0.gate_proj.weight"].device
-        dtype = neuron_state_dict[f"layers.{l}.mlp.experts.0.gate_proj.weight"].dtype
-
-        # copy the MLP parameters
-        gate_up_proj = torch.empty(
-            config.num_experts,
-            hidden_size,
-            2 * intermediate_size,
-            dtype=dtype,
-            device=device,
-        )
-        for e in range(config.num_experts):
-            # Copy gate_proj and up_proj after concatenation
-            gate_proj_weights = (
-                neuron_state_dict[f"layers.{l}.mlp.experts.{e}.gate_proj.weight"]
-                .T.detach()
-                .clone()
-            )
-            up_proj_weights = (
-                neuron_state_dict[f"layers.{l}.mlp.experts.{e}.up_proj.weight"]
-                .T.detach()
-                .clone()
-            )
-
-            gate_up_proj_slice = torch.narrow(gate_up_proj, 0, e, 1)
-            gate_proj_slice = torch.narrow(gate_up_proj_slice, 2, 0, intermediate_size)
-            gate_proj_slice.copy_(gate_proj_weights)
-            up_proj_slice = torch.narrow(
-                gate_up_proj_slice, 2, intermediate_size, intermediate_size
-            )
-            up_proj_slice.copy_(up_proj_weights)
-
-            del neuron_state_dict[f"layers.{l}.mlp.experts.{e}.gate_proj.weight"]
-            del neuron_state_dict[f"layers.{l}.mlp.experts.{e}.up_proj.weight"]
-
-        # padding gate_up_proj on intermediate size
-        pad_size = getattr(config, "moe_intermediate_pad_size", 0)
-        if pad_size > 0:
-            gate_up_proj = gate_up_proj.reshape(config.num_experts, hidden_size, 2, -1)
-            # padding right on gate_up_proj: (num_experts, hidden_size, 2, intermediate_size)
-            gate_up_proj = torch.nn.functional.pad(gate_up_proj, (0, pad_size))
-            gate_up_proj = gate_up_proj.reshape(config.num_experts, hidden_size, -1)
-        neuron_state_dict[f"layers.{l}.mlp.expert_mlps.mlp_op.gate_up_proj.weight"] = gate_up_proj
-
-        down_proj = torch.empty(
-            config.num_experts,
-            intermediate_size,
-            hidden_size,
-            dtype=dtype,
-            device=device,
-        )
-        for e in range(config.num_experts):
-            # Copy down_proj
-            down_proj_weights = (
-                neuron_state_dict[f"layers.{l}.mlp.experts.{e}.down_proj.weight"]
-                .T.detach()
-                .clone()
-            )
-            down_proj_slice = torch.narrow(down_proj, 0, e, 1)
-            down_proj_slice.copy_(down_proj_weights)
-            del neuron_state_dict[f"layers.{l}.mlp.experts.{e}.down_proj.weight"]
-
-        # padding down_proj on intermediate size
-        if pad_size > 0:
-            # padding bottom on down_proj: (num_experts, intermediate_size, hidden_size)
-            down_proj = torch.nn.functional.pad(down_proj, (0, 0, 0, pad_size))
-        neuron_state_dict[f"layers.{l}.mlp.expert_mlps.mlp_op.down_proj.weight"] = down_proj
-
-        gc.collect()
-
-    if config.neuron_config.fused_qkv:
-        neuron_state_dict = convert_state_dict_to_fused_qkv(neuron_state_dict, config)
-
-    return neuron_state_dict
-
-
-def get_rmsnorm_cls():
-    # Initialize to the appropriate implementation of RMSNorm
-    # If infer on NXD -> CustomRMSNorm
-    # If infer on CPU -> HF_RMSNorm (CustomRMSNorm does not work on CPU)
-    return Qwen3MoeRMSNorm if cpu_mode() else CustomRMSNorm
-
-
-class Qwen3MoeInferenceConfig(InferenceConfig):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # Qwen3-MoE config has `num_experts` instead of `num_local_experts`
-        # We need to add `num_local_experts` as it is expected by `initialize_moe_module`
-        self.num_local_experts = self.num_experts
-        # Qwen3-MoE has no shared experts
-        self.n_shared_experts = 0
-        # ExpertMLPsV2 reads moe_intermediate from config.intermediate_size
-
-        # check whether need to pad intermediate size
-        self.maybe_pad_intermediate()
-
-        # enable moe_fused_nki_kernel
-        self.enable_moe_fused_nki_kernel()
-
-        self.intermediate_size = self.moe_intermediate_size
-        # We need router dtype to be FP32 for accuracy
-        self.neuron_config.router_config.dtype = torch.float32
-        # HF uses softmax (non-configurable) act for Qwen3-MoE
-        self.neuron_config.router_config.act_fn = "softmax"
-        # Set DISABLE_NUMERIC_CC_TOKEN=1 for Qwen3 MoE as a workaround
-        # for the extra add/multiple in all-gather/reduce-scatter CC ops
-        # https://github.com/pytorch/xla/pull/3825 (openxla PR https://github.com/openxla/xla/pull/7677 not accepted)
-        self.neuron_config.disable_numeric_cc_token = True
-        # Qwen3 normalizes top k affinities
-        self.neuron_config.normalize_top_k_affinities = True
-
-    def maybe_pad_intermediate(self):
-        moe_tp_degree = self.neuron_config.moe_tp_degree
-        I_TP = self.moe_intermediate_size // moe_tp_degree
-        if getattr(self.neuron_config.blockwise_matmul_config, "use_shard_on_intermediate_dynamic_while", False):
-            # If shard-on-I enabled, check the intermediate size per tp is divisible by SHARD_ON_INTERMEDIATE_DIMENTION_PER_TP
-            if I_TP % SHARD_ON_INTERMEDIATE_DIMENTION_PER_TP != 0:
-                padded_moe_intermediate_size = math.ceil(I_TP / SHARD_ON_INTERMEDIATE_DIMENTION_PER_TP) * SHARD_ON_INTERMEDIATE_DIMENTION_PER_TP * moe_tp_degree
-                self.moe_intermediate_pad_size = max(padded_moe_intermediate_size - self.moe_intermediate_size, 0)
-                # set moe_intermediate_size to padded size
-                self.moe_intermediate_size = padded_moe_intermediate_size
-
-    def enable_moe_fused_nki_kernel(self):
-        I_TP = self.moe_intermediate_size // self.neuron_config.moe_tp_degree
-        # if moe_fused_nki_kernel_enabled is enabled and the intermeidiate_size_per_tp is divisible by MOE_TKG_MK_INTERMEDIATE_PER_TP
-        if getattr(self.neuron_config, "moe_fused_nki_kernel_enabled", False) and I_TP % MOE_TKG_MK_INTERMEDIATE_PER_TP == 0:
-            self.moe_fused_nki_kernel_enabled = True
-
-    def get_required_attributes(self) -> List[str]:
-        return [
-            "head_dim",
-            "hidden_act",
-            "hidden_size",
-            "max_position_embeddings",
-            "moe_intermediate_size",
-            "norm_topk_prob",
-            "num_attention_heads",
-            "num_experts",
-            "num_experts_per_tok",
-            "num_hidden_layers",
-            "num_key_value_heads",
-            "rms_norm_eps",
-            "rope_scaling",
-            "rope_theta",
-            "tie_word_embeddings",
-            "vocab_size",
-        ]
-
-    @classmethod
-    def get_neuron_config_cls(cls):
-        return MoENeuronConfig
-
-
-class NeuronQwen3MoEAttention(NeuronAttentionBase):
-    def __init__(self, config: Qwen3MoeInferenceConfig):
-        rotary_emb = RotaryEmbedding(
-            config.head_dim,
-            max_position_embeddings=config.max_position_embeddings,
-            base=config.rope_theta,
-        )
-
-        super().__init__(
-            config=config,
-            hidden_size=config.hidden_size,
-            num_attention_heads=config.num_attention_heads,
-            num_key_value_heads=config.num_key_value_heads,
-            head_dim=config.head_dim,
-            rotary_emb=rotary_emb,
-            rms_norm_eps=config.rms_norm_eps,
-            # qk_norm in the base class is different from Qwen3RMSNorm
-            use_qk_norm=False,
-        )
-
-        # Override q_layernorm and k_layernorm with RMSNorm
-        self.q_layernorm = get_rmsnorm_cls()(self.head_dim, self.rms_norm_eps)
-        self.k_layernorm = get_rmsnorm_cls()(self.head_dim, self.rms_norm_eps)
-
-        if not parallel_state.model_parallel_is_initialized():
-            raise ValueError(
-                "NeuronQwen3MoEAttention has to be initialized in a distributed env. Please use neuronx_distributed"
-                " module to initialize a distributed env."
-            )
-
-
-class NeuronQwen3MoeDecoderLayer(nn.Module):
-    """
-    Just replace the attention with the NXD version, and MLP with the NXD version
-    """
-
-    def __init__(self, config: Qwen3MoeInferenceConfig, layer_idx: int):
-        super().__init__()
-        self.hidden_size = config.hidden_size
-        self.self_attn = NeuronQwen3MoEAttention(config=config)
-        self.moe_fused_nki_kernel_enabled = getattr(config, "moe_fused_nki_kernel_enabled", False)
-
-        self.input_layernorm = get_rmsnorm_cls()(
-            config.hidden_size,
-            eps=config.rms_norm_eps,
-        )
-        self.post_attention_layernorm = get_rmsnorm_cls()(
-            config.hidden_size,
-            eps=config.rms_norm_eps,
-        )
-
-        if self.moe_fused_nki_kernel_enabled:
-            self.mlp = initialize_moe_module(
-                config=config, rmsnorm=self.post_attention_layernorm, init_tkg_module=True
-            )
-        else:
-            self.mlp = initialize_moe_module(
-                config=config,
-            )
-
-        self.qkv_kernel_enabled = config.neuron_config.qkv_kernel_enabled
-        self.sequence_parallel_enabled = config.neuron_config.sequence_parallel_enabled
-        self.qkv_kernel_fused_rmsnorm = not self.sequence_parallel_enabled
-        self.moe_mask_padded_tokens = config.neuron_config.moe_mask_padded_tokens
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        padding_mask: Optional[torch.Tensor] = None,
-        **kwargs,
-    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
-        """
-        Args:
-            hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
-            attention_mask (`torch.FloatTensor`, *optional*):
-                attention mask of size `(batch_size, sequence_length)` if flash attention is used or `(batch_size, 1,
-                query_sequence_length, key_sequence_length)` if default attention is used.
-            position_ids (`torch.FloatTensor`, *optional*):
-                position ids of size `(batch_size, sequence_length)`.
-            past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
-        """
-        if "padding_mask" in kwargs:
-            warnings.warn(
-                "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
-            )
-
-        residual = hidden_states
-
-        qkv_fused_rmsnorm = None
-        # We wrap input_layernorm/self_attn/post_attention_layernorm with module markers start/end
-        # as a hint for compiler's modular-flow to avoid layer boundries in-between decoder layer components
-        hidden_states = ModuleMarkerStartWrapper()(hidden_states)
-        if self.input_layernorm:
-            if self.qkv_kernel_enabled and self.qkv_kernel_fused_rmsnorm:
-                qkv_fused_rmsnorm = self.input_layernorm
-            else:
-                hidden_states = self.input_layernorm(hidden_states)
-
-        # Self Attention
-        hidden_states, present_key_value, cos_cache, sin_cache = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            rmsnorm=qkv_fused_rmsnorm,
-            **kwargs,
-        )
-        hidden_states = residual + hidden_states
-
-        # MoE
-        residual = hidden_states
-        if not self.moe_fused_nki_kernel_enabled:
-            hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states, padding_mask)[0]
-        hidden_states = residual + hidden_states
-
-        # End module marker
-        hidden_states = ModuleMarkerEndWrapper()(hidden_states)
-        outputs = (hidden_states, present_key_value, cos_cache, sin_cache, None)
-
-        return outputs
-
-
-class NeuronQwen3MoeModel(NeuronBaseModel):
-    """
-    NeuronQwen3MoeModel extends the Qwen3MoeModel to be traceable.
-    The forward function of this class is traced.
-    """
-
-    def setup_attr_for_model(self, config: Qwen3MoeInferenceConfig):
-        self.on_device_sampling = config.neuron_config.on_device_sampling_config is not None
-        self.tp_degree = config.neuron_config.tp_degree
-        self.hidden_size = config.hidden_size
-        self.num_attention_heads = config.num_attention_heads
-        self.num_key_value_heads = config.num_key_value_heads
-        self.max_batch_size = config.neuron_config.max_batch_size
-        self.buckets = config.neuron_config.buckets
-
-    def init_model(self, config: Qwen3MoeInferenceConfig):
-        self.padding_idx = config.pad_token_id
-        self.vocab_size = config.vocab_size
-
-        self.embed_tokens = ParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            self.padding_idx,
-            dtype=config.neuron_config.torch_dtype,
-            shard_across_embedding=True,
-        )
-        self.layers = nn.ModuleList(
-            [
-                NeuronQwen3MoeDecoderLayer(config, layer_idx)
-                for layer_idx in range(config.num_hidden_layers)
-            ]
-        )
-        self.norm = get_rmsnorm_cls()(self.hidden_size, eps=config.rms_norm_eps)
-        self.lm_head = ColumnParallelLinear(
-            config.hidden_size,
-            config.vocab_size,
-            gather_output=False if self.on_device_sampling else True,
-            bias=False,
-        )
-
-
-class NeuronQwen3MoeForCausalLM(NeuronBaseForCausalLM):
-    """
-    This class can be used as Qwen3MoeForCausalLM
-    """
-
-    _model_cls = NeuronQwen3MoeModel
-
-    @staticmethod
-    def load_hf_model(model_path, **kwargs):
-        return Qwen3MoeForCausalLM.from_pretrained(model_path, **kwargs)
-
-    @classmethod
-    def get_config_cls(cls):
-        return Qwen3MoeInferenceConfig
-
-    @staticmethod
-    def convert_hf_to_neuron_state_dict(state_dict: dict, config: Qwen3MoeInferenceConfig) -> dict:
-        return convert_qwen3_moe_hf_to_neuron_state_dict(state_dict, config)
-
-    # Wraps NeuronBaseForCausalLM.enable_context_encoding() to add compile_tag.
-    def enable_context_encoding(self):
-        self.compile_tag = CONTEXT_ENCODING_MODEL_TAG
-        super().enable_context_encoding()
-
-    # Wraps NeuronBaseForCausalLM.enable_token_generation() to add compile_tag.
-    def enable_token_generation(self):
-        self.compile_tag = TOKEN_GENERATION_MODEL_TAG
-        super().enable_token_generation()
-
-    def get_compiler_args(self):
-        # Set compiler optimization level based on model tag
-        if self.compile_tag == CONTEXT_ENCODING_MODEL_TAG:
-            optimization_level = "-O1"
-        elif self.compile_tag == TOKEN_GENERATION_MODEL_TAG:
-            # Disable Modular flow for TKG graph with EP enabled as it causes perf degradation
-            optimization_level = "-O3" if self.neuron_config.moe_ep_degree > 1 else "-O1"
-        compiler_args = f"--enable-saturate-infinity --enable-mixed-precision-accumulation --model-type transformer {optimization_level}"
-        # Add flags for cc-overlap
-        compiler_args += (
-            " --tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2'"
-        )
-        compiler_args += " --auto-cast=none"
-        # Enable vector-offset DGE
-        compiler_args += " --internal-enable-dge-levels vector_dynamic_offsets"
-        compiler_args += " --internal-hlo2tensorizer-options='--verify-hlo=true'"
-        if self.neuron_config.scratchpad_page_size:
-            compiler_args += (
-                f" --hbm-scratchpad-page-size={self.neuron_config.scratchpad_page_size} "
-            )
-
-        if self.neuron_config.attn_block_tkg_nki_kernel_enabled:
-            assert (
-                self.neuron_config.attn_block_tkg_nki_kernel_cascaded_attention
-            ), "If using attn_block_tkg_nki_kernel_enabled for Qwen3MoE you must also use attn_block_tkg_nki_kernel_cascaded_attention"
-            # Enabled RMSNorm pre-RoPE in the Attn TKG MK
-            self.neuron_config.pre_rope_rmsnorm = True
-            # When enabling the Cascaded Attn TKG MK we will run over 5 million instructions on E2E
-            compiler_args += " --internal-max-instruction-limit=15000000"
-
-        return compiler_args
-
-
-def generate(skip_compile=False):
-    # Initialize configs and tokenizer.
-    generation_config = GenerationConfig.from_pretrained(model_path)
-
-    if not skip_compile:
-        neuron_config = MoENeuronConfig(
-            tp_degree=4,
-            batch_size=1,
-            max_context_length=128,
-            seq_len=1024,
-            on_device_sampling_config=OnDeviceSamplingConfig(do_sample=True, temperature=0.6, top_k=20, top_p=0.95),
-            enable_bucketing=False,
-            flash_decoding_enabled=False
-        )
-        config = Qwen3MoeInferenceConfig(
-            neuron_config,
-            load_config=load_pretrained_config(model_path),
-        )        
-        tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side="right")
-        tokenizer.pad_token = tokenizer.eos_token
         # Compile and save model.
+        # to do, add save sharded checkpoint here 
+        compiling_start_time = time.monotonic()
         print("\nCompiling and saving model...")
-        model = NeuronQwen3MoeForCausalLM(model_path, config)
-        model.compile(traced_model_path)
-        tokenizer.save_pretrained(traced_model_path)
+        model.compile(args.compiled_model_path, debug=False)
+    
+        compiling_end_time = time.monotonic()
+        total_compiling_time = compiling_end_time - compiling_start_time
+        print(f"Compiling and tracing time: {total_compiling_time} seconds")
 
-    # Load from compiled checkpoint.
-    print("\nLoading model from compiled checkpoint...")
-    model = NeuronQwen3MoeForCausalLM(traced_model_path)
-    model.load(traced_model_path)
-    tokenizer = AutoTokenizer.from_pretrained(traced_model_path)
+    # Load compiled model to Neuron.
+    print("\nLoading model to Neuron...")
+    model.load(args.compiled_model_path)
 
-    # Generate outputs.
-    print("\nGenerating outputs...")
-    prompt = "Give me a short introduction to large language models."
-    messages = [
-        {"role": "user", "content": prompt}
+    # Load tokenizer.
+    tokenizer = load_tokenizer(args.model_path, args.compiled_model_path, neuron_config)
+    neuron_config.pad_token_id = tokenizer.pad_token_id
+
+    # Configure generation config.
+    generation_config = GenerationConfig.from_pretrained(args.model_path)
+    generation_config_args = [
+        "do_sample",
+        "top_k",
+        "pad_token_id",
+        "dynamic",
+        "top_p",
+        "temperature",
     ]
-    text = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=True # Switches between thinking and non-thinking modes. Default is True.
+    generation_config_kwargs = {
+        k: getattr(args, k) for k in generation_config_args if getattr(args, k) is not None
+    }
+    generation_config.update(**generation_config_kwargs)
+
+    return model, tokenizer, generation_config
+
+
+def generate_submodule_reports(latency_collectors, neuron_config, num_runs):
+    reports = {}
+    for key, collector in latency_collectors.items():
+        tokens_len = neuron_config.max_length
+        if key == "context_encoding_model":
+            tokens_len = neuron_config.seq_len - neuron_config.max_new_tokens
+        elif key == "token_generation_model":
+            tokens_len = neuron_config.max_new_tokens
+        reports[key] = generate_report(
+            collector.latency_list, tokens_len, neuron_config.max_batch_size, num_runs
+        )
+    return reports
+
+
+def benchmark_sampling(model, tokenizer, generation_config, prompts):
+
+    print ('Beginning benchmark sampling')
+    
+    neuron_config = model.neuron_config
+
+    sampling_params = prepare_sampling_params(
+        batch_size=neuron_config.batch_size,
+        top_k=generation_config.top_k
+        if isinstance(generation_config.top_k, list)
+        else [generation_config.top_k],
+        top_p=generation_config.top_p
+        if isinstance(generation_config.top_p, list)
+        else [generation_config.top_p],
+        temperature=generation_config.temperature
+        if isinstance(generation_config.temperature, list)
+        else [generation_config.temperature],
     )
-    inputs = tokenizer([text], padding=True, return_tensors="pt")
+
+    report = {}
+
+    # on_device_sampling flow does not support min_new_tokens
+    # to override eos_tokens so we remove EOS tokens to ensure
+    # token generation happens.
+    modified_generation_config = copy.deepcopy(generation_config)
+    if model.on_device_sampling:
+        modified_generation_config.eos_token_id = []
+    
+    inputs = tokenizer(prompts, padding=True, return_tensors="pt")
+    input_ids = inputs.input_ids
+    attention_mask = inputs.attention_mask
+    neuron_config.max_new_tokens = neuron_config.seq_len - input_ids.shape[1]
+
+    input_param = {
+        "input_ids": input_ids,
+        "generation_config": modified_generation_config,
+        "attention_mask": attention_mask,
+        "min_new_tokens": neuron_config.max_new_tokens,
+        "max_new_tokens": neuron_config.max_new_tokens,
+        "top_k": 1,
+        "do_sample": not neuron_config.enable_fused_speculation,
+        "sampling_params": sampling_params,
+        "max_length": neuron_config.max_length
+        if neuron_config.max_new_tokens is None
+        else None,
+    }
+
+    latency_collectors = create_submodule_latency_collectors(model)
+
+    def post_warmup_func():
+        register_latency_collectors(latency_collectors, model)
+
+    # Register latency collectors after warm-up to avoid recording warm-up metrics.
     generation_model = HuggingFaceGenerationAdapter(model)
-    outputs = generation_model.generate(
-        inputs.input_ids,
-        generation_config=generation_config,
-        attention_mask=inputs.attention_mask,
-        max_length=model.config.neuron_config.max_length,
+    e2e_benchmark = Benchmark(
+        generation_model.generate,
+        input_param,
+        preprocess_func=model.reset,
+        post_warmup_func=post_warmup_func,
     )
-    output_tokens = tokenizer.batch_decode(outputs, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+    e2e_benchmark.run()
+    report["e2e_model"] = generate_report(
+        e2e_benchmark.latency_list,
+        neuron_config.max_length,
+        neuron_config.max_batch_size,
+        n_runs=e2e_benchmark.num_runs,
+    )
+        
+    report.update(
+        generate_submodule_reports(
+            latency_collectors, neuron_config, e2e_benchmark.num_runs
+        )
+    )
+    
+    model.reset()
+
+    print("Benchmark completed and its result is as following")
+    print(json.dumps(report, indent=4))
+    with open(BENCHMARK_REPORT_FILENAME, "w") as f:
+        json.dump(report, f)
+    print("Completed saving result to " + BENCHMARK_REPORT_FILENAME)
+
+    return report
+
+
+def check_accuracy_logits(base_model, base_generation_config, neuron_model, tokenizer, generation_config, prompts, divergence_difference_tol, tol_map, num_tokens_to_check):
+    assert (prompts is not None)
+
+    inputs = tokenizer(prompts, padding=True, return_tensors="pt")
+    initial_input_ids = inputs.input_ids
+    initial_attention_mask = inputs.attention_mask
+    seq_len = neuron_model.config.neuron_config.seq_len
+
+    neuron_model.config.neuron_config.max_new_tokens = seq_len - initial_input_ids.shape[1]
+
+    model = HuggingFaceGenerationAdapter(base_model)
+    new_tokens = neuron_model.config.neuron_config.max_new_tokens
+    with torch.inference_mode():
+        outputs = model.generate(
+            input_ids=initial_input_ids,
+            attention_mask=initial_attention_mask,
+            max_new_tokens=new_tokens,
+            min_new_tokens=new_tokens,
+            do_sample=False,
+            return_dict_in_generate=True,
+            output_scores=True,
+            generation_config=base_generation_config,
+        )
+    expected_logits = torch.stack(outputs.scores)
+
+    if num_tokens_to_check is not None:
+        print(f"Validating logits for first {num_tokens_to_check} tokens")
+        expected_logits = expected_logits[:num_tokens_to_check, :, :]
+
+    expected_token_ids = expected_logits.argmax(dim=2).T
+    expected_tokens = tokenizer.batch_decode(
+        expected_token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
+    )
+    print("Expected Output: ", expected_tokens, expected_token_ids)
+    print("Expected Logits Shape: ", expected_logits.shape)
+
+    model = HuggingFaceGenerationAdapter(neuron_model)
+    expected_attention_mask = torch.ones(
+        (
+            initial_attention_mask.shape[0],
+            expected_token_ids.shape[1],
+        ),
+        dtype=torch.int32,
+   )
+    extrapolated_attention_mask = torch.cat(
+        (initial_attention_mask, expected_attention_mask), dim=1
+    )
+
+    def generate_fn(input_ids):
+        input_length = input_ids.shape[1]
+        attention_mask = extrapolated_attention_mask[:, :input_length]
+        with torch.inference_mode():
+            model_outputs = model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=seq_len - input_length,
+                min_new_tokens=seq_len - input_length,
+                do_sample=False,
+                return_dict_in_generate=True,
+                output_scores=True,
+                generation_config=generation_config,
+            )
+
+        actual_logits = torch.stack(model_outputs.scores)
+        actual_token_ids = actual_logits.argmax(dim=2).T
+        actual_tokens = tokenizer.batch_decode(
+            actual_token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )
+        print("Actual Output: ", actual_tokens, actual_token_ids)
+        print("Actual Logits Shape: ", actual_logits.shape)
+        return torch.stack(model_outputs.scores)
+
+    passed, _, status_msg = logit_validation(
+        input_ids=initial_input_ids,
+        generate_fn=generate_fn,
+        expected_logits=expected_logits,
+        tol_map=tol_map,
+        divergence_difference_tol=divergence_difference_tol,
+    )
+    print("STATUS MSG", status_msg)
+    assert passed, status_msg
+
+    print("Passed logits validation")
+
+
+def run_generation(model, tokenizer, prompts, generation_config):
+    print("\nGenerating outputs...")
+    print(f"Prompts: {prompts}")
+
+    _, output_tokens = get_generate_outputs(
+        model,
+        prompts,
+        tokenizer,
+        is_hf=False,
+        generation_config=generation_config,
+        max_length=model.neuron_config.max_length,
+    )
+
     print("Generated outputs:")
     for i, output_token in enumerate(output_tokens):
         print(f"Output {i}: {output_token}")
 
+def run_accuracy_check(
+    base_model,
+    base_generation_config,
+    model,
+    tokenizer,
+    generation_config,
+    prompt,
+    divergence_difference_tol,
+    tol_map,
+    num_tokens_to_check=None,
+):
+    if tol_map:
+        tol_map = ast.literal_eval(tol_map)
+
+    try:
+        check_accuracy_logits(
+            base_model=base_model,
+            base_generation_config=base_generation_config,
+            neuron_model=model,
+            tokenizer=tokenizer,
+            generation_config=generation_config,
+            prompts=prompt,
+            divergence_difference_tol=divergence_difference_tol,
+            tol_map=tol_map,
+            num_tokens_to_check=num_tokens_to_check,
+        )
+    except AssertionError:
+        return False
+
+    return True
+
+
+def count_nki_flop_ratio(hlo_path_context_enc, hlo_path_token_gen):
+    hlo_macs = 0
+    nki_macs = 0
+
+    def parse_hlo_file(hlo_file_path):
+        with open(hlo_file_path, 'rb') as f:
+            hlo_data = f.read()
+
+        hlo_proto = HloModuleProto()
+        hlo_proto.ParseFromString(hlo_data)
+        return hlo_proto
+
+    def count_mac(hlo_proto):
+        nki_mac = 0
+        hlo_mac = 0
+
+        for computation in hlo_proto.computations:
+            instruction_map = {instr.id: instr for instr in computation.instructions}
+
+            for instruction in computation.instructions:
+                # Finding NKI ops
+                if instruction.opcode == "custom-call":
+                    if instruction.custom_call_target == 'AwsNeuronCustomNativeKernel':
+                        try:
+                            backend_config = instruction.backend_config
+                            config = json.loads(base64.b64decode(backend_config))
+                            mac_count = int(config['mac_count'])
+                        except Exception:
+                            mac_count = 0
+
+                        nki_mac += mac_count
+                        hlo_mac += mac_count
+                elif instruction.opcode == "dot":
+                    # Get dot dimension numbers
+                    dnums = instruction.dot_dimension_numbers
+
+                    # Get shapes of operands using operand_ids
+                    lhs_shape = instruction_map[instruction.operand_ids[0]].shape
+                    rhs_shape = instruction_map[instruction.operand_ids[1]].shape
+
+                    # Initialize counters
+                    lhs_batch = 1
+                    lhs_contracting_size = 1
+                    lhs_non_contracting_size = 1
+                    rhs_non_contracting_size = 1
+
+                    # Process LHS shape
+                    for i in range(len(lhs_shape.dimensions)):
+                        if i in dnums.lhs_contracting_dimensions:
+                            lhs_contracting_size *= lhs_shape.dimensions[i]
+                        elif i in dnums.lhs_batch_dimensions:
+                            lhs_batch *= lhs_shape.dimensions[i]
+                        else:
+                            lhs_non_contracting_size *= lhs_shape.dimensions[i]
+
+                    # Process RHS shape
+                    for i in range(len(rhs_shape.dimensions)):
+                        if i not in dnums.rhs_contracting_dimensions and \
+                           i not in dnums.rhs_batch_dimensions:
+                            rhs_non_contracting_size *= rhs_shape.dimensions[i]
+
+                    mac_count = (lhs_batch * lhs_non_contracting_size *
+                                 lhs_contracting_size * rhs_non_contracting_size)
+                    hlo_mac += mac_count
+
+        return hlo_mac, nki_mac
+
+    hlo_proto_context_enc = parse_hlo_file(hlo_path_context_enc)
+    hlo_proto_token_gen = parse_hlo_file(hlo_path_token_gen)
+    hlo_mac_context_enc, nki_mac_context_enc = count_mac(hlo_proto_context_enc)
+    hlo_mac_token_gen, nki_mac_token_gen = count_mac(hlo_proto_token_gen)
+
+    # FIXME: Need to consider token gen get executed more
+    hlo_macs = hlo_mac_context_enc + hlo_mac_token_gen
+    nki_macs = nki_mac_context_enc + nki_mac_token_gen
+
+    if hlo_macs == 0:
+        assert nki_macs == 0
+        nki_flop_ratio = 0
+    else:
+        nki_flop_ratio = nki_macs / hlo_macs
+
+    return nki_flop_ratio
+
+
+def calculate_score(base_latency, base_throughput, accuracy, latency, throughput, nki_flop_ratio):
+    
+
+    increased_throughput = throughput / base_throughput
+    reduced_latency = base_latency / latency
+
+    final_score = accuracy * reduced_latency * increased_throughput * (1 + nki_flop_ratio)
+
+    print ('In this final score of ', final_score, ' the contestant got a breakdown as follows.')
+    print ('accuracy: ', accuracy)
+    print ('reduced_latency: ', reduced_latency)
+    print ('increased throughput: ',  increased_throughput)
+    print ('nki flop ratio: ', nki_flop_ratio)
+    
+    return final_score
+
+def find_hlos():
+    
+    # this path is defined by default NxD, the string matching works with Neuron SDK 2.27
+    enc_dir = '/tmp/nxd_model/context_encoding_model/_tp0_bk0'
+    ctx_enc = [f for f in os.listdir(enc_dir) if 'hlo_module' in f.lower()]
+    assert len(ctx_enc) == 1
+    ctx_rt = os.path.join(enc_dir, ctx_enc[0])
+
+    tkg_dir = '/tmp/nxd_model/token_generation_model/_tp0_bk0'
+    tkg_gen = [f for f in os.listdir(tkg_dir) if 'hlo_module' in f.lower()]
+    assert len(tkg_gen) == 1
+    tkg_rt = os.path.join(tkg_dir, tkg_gen[0])
+
+    print ('Found your HLOs')
+
+    return ctx_rt, tkg_rt
+
+def main():
+    args = parse_args()
+    if not args.prompts:
+        args.prompts = ["I believe the meaning of life is"]
+    args.batch_size = len(args.prompts)
+    args.max_length = args.seq_len
+    args.tol_map = "{None: (1e-5, 0.05), 1000: (1e-5, 0.03), 50: (1e-5, 0.03), 5: (1e-5, 0.03)}"
+
+    # points to your local model definition from qwen.py
+    qwen = importlib.import_module(args.qwen)   
+
+    if args.mode == "generate":
+        model, tokenizer, generation_config = prepare_inference(qwen.NeuronQwen3MoeForCausalLM, args)
+        run_generation(
+            model,
+            tokenizer,
+            args.prompts,
+            generation_config
+        )
+
+    elif args.mode == "validate":
+        model, tokenizer, generation_config = prepare_inference(qwen.NeuronQwen3MoeForCausalLM, args)
+        base_model, _, base_generation_config = prepare_inference(baseline_qwen.NeuronQwen3MoeForCausalLM, args)
+
+        passed = run_accuracy_check(
+            base_model,
+            base_generation_config,
+            model,
+            tokenizer,
+            generation_config,
+            args.prompts,
+            args.divergence_difference_tol,
+            args.tol_map,
+            num_tokens_to_check=args.num_tokens_to_check,
+        )
+
+        status = "passed" if passed else "failed"
+        print(f"Validation {status}.")
+
+    elif args.mode == "evaluate_single":
+        
+        model, tokenizer, generation_config = prepare_inference(qwen.NeuronQwen3MoeForCausalLM, args)
+        
+        base_model, _, base_generation_config = prepare_inference(baseline_qwen.NeuronQwen3MoeForCausalLM, args)
+
+        accuracy = run_accuracy_check(
+            base_model,
+            base_generation_config,
+            model,
+            tokenizer,
+            generation_config,
+            args.prompts,
+            args.divergence_difference_tol,
+            args.tol_map,
+            num_tokens_to_check=args.num_tokens_to_check,
+        )
+
+        report = benchmark_sampling(model, tokenizer, generation_config, args.prompts)
+
+        latency = report["e2e_model"]["latency_ms_p99"]
+        throughput = report["e2e_model"]["throughput"]
+
+        ctx_enc_hlo_path, tkg_gen_hlo_path = find_hlos()
+
+        nki_flop_ratio = count_nki_flop_ratio(ctx_enc_hlo_path, tkg_gen_hlo_path)
+
+        score = calculate_score(args.base_latency, args.base_throughput, accuracy, latency, throughput, nki_flop_ratio)
+        print(
+            f"Prompt: {args.prompts[0]}\n"
+            f"Final Score: {score}\n"
+            f"\tAccuracy: {accuracy}\n"
+            f"\tLatency: {latency}\n"
+            f"\tThroughput: {throughput}\n"
+            f"\tNKI FLOPs Ratio: {nki_flop_ratio}"
+        )
+        
+    elif args.mode == "evaluate_all":
+        
+        model, tokenizer, generation_config = prepare_inference(qwen.NeuronQwen3MoeForCausalLM, args)
+        
+        base_model, _, base_generation_config = prepare_inference(baseline_qwen.NeuronQwen3MoeForCausalLM, args)
+
+        prompts = parse_prompts("prompts.txt")
+        prompt_data = parse_prompt_data("prompt_data.txt")
+        assert len(prompts) == len(prompt_data)
+
+        total_score = 0
+
+        # to do - move both of these calls into batch mode 
+        # Iterate through the prompts
+        for i, prompt in enumerate(prompts):
+            
+            data = prompt_data[i]
+            base_latency = float(data[3])
+            base_throughput = float(data[4])
+
+            accuracy = run_accuracy_check(
+                base_model,
+                base_generation_config,
+                model,
+                tokenizer,
+                generation_config,
+                [prompt],
+                args.divergence_difference_tol,
+                args.tol_map,
+                num_tokens_to_check=args.num_tokens_to_check,
+            )
+
+            report = benchmark_sampling(model, tokenizer, generation_config, [prompt])
+
+            latency = report["e2e_model"]["latency_ms_p99"]
+            throughput = report["e2e_model"]["throughput"]
+
+            ctx_enc_hlo_path, tkg_gen_hlo_path = find_hlos()
+    
+            nki_flop_ratio = count_nki_flop_ratio(ctx_enc_hlo_path, tkg_gen_hlo_path)
+
+            score = calculate_score(base_latency, base_throughput, accuracy, latency, throughput, nki_flop_ratio)
+            print(
+                f"Prompt: {prompt}\n"
+                f"Final Score: {score}\n"
+                f"\tAccuracy: {accuracy}\n"
+                f"\tLatency: {latency}\n"
+                f"\tThroughput: {throughput}\n"
+                f"\tNKI FLOPs Ratio: {nki_flop_ratio}"
+            )
+            total_score += score
+
+        print(f"\nTotal Score: {total_score}\n")
+
+    elif args.mode == "generate_accuracy_baselines":
+
+        base_model, tokenizer, base_generation_config = prepare_inference(baseline_qwen.NeuronQwen3MoeForCausalLM, args)
+        
+        inputs = tokenizer(args.prompts, padding=True, return_tensors="pt")
+        initial_input_ids = inputs.input_ids
+        initial_attention_mask = inputs.attention_mask
+        seq_len = base_model.config.neuron_config.seq_len
+        
+        base_model.config.neuron_config.max_new_tokens = seq_len - initial_input_ids.shape[1]
+        
+        base_model_generative = HuggingFaceGenerationAdapter(base_model)
+        
+        new_tokens = base_model.config.neuron_config.max_new_tokens # set to 633
+        
+        with torch.inference_mode():
+            outputs = base_model_generative.generate(
+                input_ids=initial_input_ids,
+                attention_mask=initial_attention_mask,
+                max_new_tokens=new_tokens,
+                min_new_tokens=new_tokens,
+                do_sample=False,
+                return_dict_in_generate=True,
+                output_scores=True,
+                generation_config=base_generation_config,
+            )
+            
+        expected_logits = torch.stack(outputs.scores)
+
+        # write logits to a file 
+        torch.save(expected_logits, 'expected_logits.pt')
+        
+    else:
+        assert False, "Undefined mode"
+
+
+if __name__ == "__main__":
+    main()
