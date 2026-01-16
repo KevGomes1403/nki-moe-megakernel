@@ -37,7 +37,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
 
     # contest specific
-    parser.add_argument("--mode", choices=["evaluate_single", "evaluate_all", "validate", "generate"])
+    parser.add_argument("--mode", choices=["evaluate_single", "evaluate_all", "validate", "generate", "generate_accuracy_baselines"])
     parser.add_argument("--qwen", type=str, default="qwen")
     parser.add_argument("--enable-nki", action="store_true")
     parser.add_argument("--base-latency", type=float, default=526.15)
@@ -78,6 +78,7 @@ def parse_args():
     parser.add_argument("--output-logits", action="store_true")
     parser.add_argument("--vocab-parallel", action="store_true")
     parser.add_argument("--skip-compile", type=bool, default=False)
+    parser.add_argument("--save_sharded_checkpoint", type=bool, default=True)
 
     # Attention
     parser.add_argument("--fused-qkv", action="store_true")
@@ -143,6 +144,7 @@ def prepare_inference(model_cls, args):
     if not args.skip_compile:
 
         # Compile and save model.
+        # to do, add save sharded checkpoint here 
         compiling_start_time = time.monotonic()
         print("\nCompiling and saving model...")
         model.compile(args.compiled_model_path, debug=False)
@@ -319,7 +321,7 @@ def check_accuracy_logits(base_model, base_generation_config, neuron_model, toke
             expected_token_ids.shape[1],
         ),
         dtype=torch.int32,
-    )
+   )
     extrapolated_attention_mask = torch.cat(
         (initial_attention_mask, expected_attention_mask), dim=1
     )
@@ -532,6 +534,7 @@ def main():
     args = parse_args()
     if not args.prompts:
         args.prompts = ["I believe the meaning of life is"]
+        
     args.batch_size = len(args.prompts)
     args.max_length = args.seq_len
     args.tol_map = "{None: (1e-5, 0.05), 1000: (1e-5, 0.03), 50: (1e-5, 0.03), 5: (1e-5, 0.03)}"
@@ -541,6 +544,7 @@ def main():
 
     if args.mode == "generate":
         model, tokenizer, generation_config = prepare_inference(qwen.NeuronQwen3MoeForCausalLM, args)
+        
         run_generation(
             model,
             tokenizer,
@@ -550,7 +554,9 @@ def main():
 
     elif args.mode == "validate":
         model, tokenizer, generation_config = prepare_inference(qwen.NeuronQwen3MoeForCausalLM, args)
-        base_model, _, base_generation_config = prepare_inference(baseline_qwen.NeuronQwen3MoeForCausalLM, args)
+
+        # use same logic as evaluate_single - first look for expected logits, if not there, get it 
+        # base_model, _, base_generation_config = prepare_inference(baseline_qwen.NeuronQwen3MoeForCausalLM, args)
 
         passed = run_accuracy_check(
             base_model,
@@ -570,8 +576,11 @@ def main():
     elif args.mode == "evaluate_single":
         
         model, tokenizer, generation_config = prepare_inference(qwen.NeuronQwen3MoeForCausalLM, args)
-        
+
+        # use this if the prompt is not in the file, otherwise pull the prompt ID and then read the expected logits file
         base_model, _, base_generation_config = prepare_inference(baseline_qwen.NeuronQwen3MoeForCausalLM, args)
+
+        # get expected logits
 
         accuracy = run_accuracy_check(
             base_model,
@@ -608,8 +617,6 @@ def main():
         
         model, tokenizer, generation_config = prepare_inference(qwen.NeuronQwen3MoeForCausalLM, args)
         
-        base_model, _, base_generation_config = prepare_inference(baseline_qwen.NeuronQwen3MoeForCausalLM, args)
-
         prompts = parse_prompts("prompts.txt")
         prompt_data = parse_prompt_data("prompt_data.txt")
         assert len(prompts) == len(prompt_data)
@@ -624,6 +631,8 @@ def main():
             base_latency = float(data[3])
             base_throughput = float(data[4])
 
+            # expected_logits = torch.load(f'expected_logits_prompt_{i}.pt', weights_only=True)
+            
             accuracy = run_accuracy_check(
                 base_model,
                 base_generation_config,
@@ -658,6 +667,43 @@ def main():
 
         print(f"\nTotal Score: {total_score}\n")
 
+    elif args.mode == "generate_accuracy_baselines":
+
+        base_model, tokenizer, base_generation_config = prepare_inference(baseline_qwen.NeuronQwen3MoeForCausalLM, args)
+
+        prompts = parse_prompts("prompts.txt")
+
+        # Iterate through the prompts
+        for i, prompt in enumerate(prompts):
+        
+            inputs = tokenizer(args.prompts, padding=True, return_tensors="pt")
+            initial_input_ids = inputs.input_ids
+            initial_attention_mask = inputs.attention_mask
+            seq_len = base_model.config.neuron_config.seq_len
+            
+            base_model.config.neuron_config.max_new_tokens = seq_len - initial_input_ids.shape[1]
+            
+            base_model_generative = HuggingFaceGenerationAdapter(base_model)
+            
+            new_tokens = base_model.config.neuron_config.max_new_tokens 
+            
+            with torch.inference_mode():
+                outputs = base_model_generative.generate(
+                    input_ids=initial_input_ids,
+                    attention_mask=initial_attention_mask,
+                    max_new_tokens=new_tokens,
+                    min_new_tokens=new_tokens,
+                    do_sample=False,
+                    return_dict_in_generate=True,
+                    output_scores=True,
+                    generation_config=base_generation_config,
+                )
+                
+            expected_logits = torch.stack(outputs.scores)
+    
+            # write logits to a file 
+            torch.save(expected_logits, f'expected_logits_{i}.pt')
+        
     else:
         assert False, "Undefined mode"
 
