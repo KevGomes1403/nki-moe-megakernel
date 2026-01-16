@@ -78,6 +78,7 @@ def parse_args():
     parser.add_argument("--output-logits", action="store_true")
     parser.add_argument("--vocab-parallel", action="store_true")
     parser.add_argument("--skip-compile", type=bool, default=False)
+    parser.add_argument("save_sharded_checkpoint", type=bool, default=True)
 
     # Attention
     parser.add_argument("--fused-qkv", action="store_true")
@@ -662,34 +663,39 @@ def main():
     elif args.mode == "generate_accuracy_baselines":
 
         base_model, tokenizer, base_generation_config = prepare_inference(baseline_qwen.NeuronQwen3MoeForCausalLM, args)
-        
-        inputs = tokenizer(args.prompts, padding=True, return_tensors="pt")
-        initial_input_ids = inputs.input_ids
-        initial_attention_mask = inputs.attention_mask
-        seq_len = base_model.config.neuron_config.seq_len
-        
-        base_model.config.neuron_config.max_new_tokens = seq_len - initial_input_ids.shape[1]
-        
-        base_model_generative = HuggingFaceGenerationAdapter(base_model)
-        
-        new_tokens = base_model.config.neuron_config.max_new_tokens # set to 633
-        
-        with torch.inference_mode():
-            outputs = base_model_generative.generate(
-                input_ids=initial_input_ids,
-                attention_mask=initial_attention_mask,
-                max_new_tokens=new_tokens,
-                min_new_tokens=new_tokens,
-                do_sample=False,
-                return_dict_in_generate=True,
-                output_scores=True,
-                generation_config=base_generation_config,
-            )
-            
-        expected_logits = torch.stack(outputs.scores)
 
-        # write logits to a file 
-        torch.save(expected_logits, 'expected_logits.pt')
+        prompts = parse_prompts("prompts.txt")
+
+        # Iterate through the prompts
+        for i, prompt in enumerate(prompts):
+        
+            inputs = tokenizer(args.prompts, padding=True, return_tensors="pt")
+            initial_input_ids = inputs.input_ids
+            initial_attention_mask = inputs.attention_mask
+            seq_len = base_model.config.neuron_config.seq_len
+            
+            base_model.config.neuron_config.max_new_tokens = seq_len - initial_input_ids.shape[1]
+            
+            base_model_generative = HuggingFaceGenerationAdapter(base_model)
+            
+            new_tokens = base_model.config.neuron_config.max_new_tokens 
+            
+            with torch.inference_mode():
+                outputs = base_model_generative.generate(
+                    input_ids=initial_input_ids,
+                    attention_mask=initial_attention_mask,
+                    max_new_tokens=new_tokens,
+                    min_new_tokens=new_tokens,
+                    do_sample=False,
+                    return_dict_in_generate=True,
+                    output_scores=True,
+                    generation_config=base_generation_config,
+                )
+                
+            expected_logits = torch.stack(outputs.scores)
+    
+            # write logits to a file 
+            torch.save(expected_logits, f'expected_logits_{i}.pt')
         
     else:
         assert False, "Undefined mode"
