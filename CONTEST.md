@@ -94,7 +94,7 @@ Write NKI kernels that improve upon the baseline implementation by optimizing th
 
 ### Software Stack
 
-- **SDK**: AWS Neuron SDK 2.28
+- **SDK**: AWS Neuron SDK 2.27
 - **Programming Interface**: Neuron Kernel Interface (NKI) with Python
   - Direct access to NeuronCore hardware primitives
   - Support for custom memory layouts and data movement
@@ -310,6 +310,8 @@ This competition will:
 - Aninda Manocha
 - Wei Tang
 - Armin Agha-Ebrahim
+- Sadaf Rasool
+- Paul Govereau
 
 **Previous Experience**: Successfully organized ASPLOS 2025/EuroSys 2025 Contest on NKI-based Llama 3.2 1B optimization ([aws-neuron/nki-llama](https://github.com/aws-neuron/nki-llama) on GitHub)
 
