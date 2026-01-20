@@ -79,6 +79,7 @@ def parse_args():
     parser.add_argument("--vocab-parallel", action="store_true")
     parser.add_argument("--skip-compile", type=bool, default=False)
     parser.add_argument("--save_sharded_checkpoint", type=bool, default=True)
+    parser.add_argument("--platform-target", type=str, default='trn2') 
 
     # Attention
     parser.add_argument("--fused-qkv", action="store_true")
@@ -553,6 +554,10 @@ def main():
         )
 
     elif args.mode == "validate":
+        if args.platform_target == 'trn2':
+            print ('Validation not supported for trn2, exiting.')
+            quit()
+            
         model, tokenizer, generation_config = prepare_inference(qwen.NeuronQwen3MoeForCausalLM, args)
         
         base_model, _, base_generation_config = prepare_inference(baseline_qwen.NeuronQwen3MoeForCausalLM, args)
@@ -573,22 +578,30 @@ def main():
         print(f"Validation {status}.")
 
     elif args.mode == "evaluate_single":
+
+        if args.platform_target == 'trn2':
+            
+            model, tokenizer, generation_config = prepare_inference(qwen.NeuronQwen3MoeForCausalLM, args)
+
+            accuracy = 1
+            
+        elif args.platform_target == 'trn3': 
         
-        model, tokenizer, generation_config = prepare_inference(qwen.NeuronQwen3MoeForCausalLM, args)
+            model, tokenizer, generation_config = prepare_inference(qwen.NeuronQwen3MoeForCausalLM, args)
 
-        base_model, _, base_generation_config = prepare_inference(baseline_qwen.NeuronQwen3MoeForCausalLM, args)
+            base_model, _, base_generation_config = prepare_inference(baseline_qwen.NeuronQwen3MoeForCausalLM, args)
 
-        accuracy = run_accuracy_check(
-            base_model,
-            base_generation_config,
-            model,
-            tokenizer,
-            generation_config,
-            args.prompts,
-            args.divergence_difference_tol,
-            args.tol_map,
-            num_tokens_to_check=args.num_tokens_to_check,
-        )
+            accuracy = run_accuracy_check(
+                base_model,
+                base_generation_config,
+                model,
+                tokenizer,
+                generation_config,
+                args.prompts,
+                args.divergence_difference_tol,
+                args.tol_map,
+                num_tokens_to_check=args.num_tokens_to_check,
+            )
 
         report = benchmark_sampling(model, tokenizer, generation_config, args.prompts)
 
@@ -608,20 +621,61 @@ def main():
             f"\tThroughput: {throughput}\n"
             f"\tNKI FLOPs Ratio: {nki_flop_ratio}"
         )
+
+    elif args.mode == 'evaluate_all' and args.platform_target == 'trn2':
         
-    elif args.mode == "evaluate_all":
+        model, tokenizer, generation_config = prepare_inference(qwen.NeuronQwen3MoeForCausalLM, args)
+
+        accuracy = 1
+        
+        prompts = parse_prompts("prompts.txt")
+        prompt_data = parse_prompt_data("prompt_data_trn2.txt")
+        assert len(prompts) == len(prompt_data)
+
+        total_score = 0
+
+        # to do - move both of these calls into batch mode 
+        # Iterate through the prompts
+        for i, prompt in enumerate(prompts):
+            
+            data = prompt_data[i]
+            base_latency = float(data[3])
+            base_throughput = float(data[4])
+
+            report = benchmark_sampling(model, tokenizer, generation_config, [prompt])
+
+            latency = report["e2e_model"]["latency_ms_p99"]
+            throughput = report["e2e_model"]["throughput"]
+
+            ctx_enc_hlo_path, tkg_gen_hlo_path = find_hlos()
+    
+            nki_flop_ratio = count_nki_flop_ratio(ctx_enc_hlo_path, tkg_gen_hlo_path)
+
+            score = calculate_score(base_latency, base_throughput, accuracy, latency, throughput, nki_flop_ratio)
+            print(
+                f"Prompt: {prompt}\n"
+                f"Final Score: {score}\n"
+                f"\tAccuracy: {accuracy}\n"
+                f"\tLatency: {latency}\n"
+                f"\tThroughput: {throughput}\n"
+                f"\tNKI FLOPs Ratio: {nki_flop_ratio}"
+            )
+            total_score += score
+
+        print(f"\nTotal Score: {total_score}\n")
+        
+    elif args.mode == "evaluate_all" and args.platform_target == 'trn3':
         
         model, tokenizer, generation_config = prepare_inference(qwen.NeuronQwen3MoeForCausalLM, args)
 
         base_model, _, base_generation_config = prepare_inference(baseline_qwen.NeuronQwen3MoeForCausalLM, args)
         
         prompts = parse_prompts("prompts.txt")
-        prompt_data = parse_prompt_data("prompt_data.txt")
+        prompt_data = parse_prompt_data("prompt_data_trn3.txt")
         assert len(prompts) == len(prompt_data)
 
         total_score = 0
 
-        # to do - move both of these calls into batch mode 
         # Iterate through the prompts
         for i, prompt in enumerate(prompts):
             
