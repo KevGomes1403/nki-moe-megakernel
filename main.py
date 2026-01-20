@@ -612,8 +612,6 @@ def main():
 
         nki_flop_ratio = count_nki_flop_ratio(ctx_enc_hlo_path, tkg_gen_hlo_path)
 
-        accuracy = 1
-
         score = calculate_score(args.base_latency, args.base_throughput, accuracy, latency, throughput, nki_flop_ratio)
         print(
             f"Prompt: {args.prompts[0]}\n"
@@ -631,7 +629,7 @@ def main():
         accuracy = 1
         
         prompts = parse_prompts("prompts.txt")
-        prompt_data = parse_prompt_data("prompt_data.txt")
+        prompt_data = parse_prompt_data("prompt_data_trn2.txt")
         assert len(prompts) == len(prompt_data)
 
         total_score = 0
@@ -673,7 +671,7 @@ def main():
         base_model, _, base_generation_config = prepare_inference(baseline_qwen.NeuronQwen3MoeForCausalLM, args)
         
         prompts = parse_prompts("prompts.txt")
-        prompt_data = parse_prompt_data("prompt_data.txt")
+        prompt_data = parse_prompt_data("prompt_data_trn3.txt")
         assert len(prompts) == len(prompt_data)
 
         total_score = 0
