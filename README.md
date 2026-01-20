@@ -1,5 +1,10 @@
-# NKI MoE Challenge
+# AWS Trainium2/3 MoE Kernel Challenge
 
+**MLSys 2026 Competition Track**
+
+Participants will write custom kernels with the Neuron Kernel Interface (NKI) for the Qwen3-30B-A3B Mixture of Experts model and optimize inference performance on AWS Trainium2/3 hardware.
+
+For full details on the competition, read [the competition guidelines](https://github.com/aws-neuron/nki-moe/blob/main/CONTEST.md).
 
 ## Getting Started
 

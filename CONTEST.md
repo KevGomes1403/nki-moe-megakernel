@@ -1,8 +1,8 @@
-# AWS Trainium3 MoE Kernel Challenge
+# AWS Trainium2/3 MoE Kernel Challenge
 
-**MLSys 2026 Competition Track Proposal**
+**MLSys 2026 Competition Track**
 
-> Participants will write custom kernels with the Neuron Kernel Interface (NKI) for the Qwen3-30B-A3B Mixture of Experts model and optimize inference performance on AWS Trainium3 hardware.
+Participants will write custom kernels with the Neuron Kernel Interface (NKI) for the Qwen3-30B-A3B Mixture of Experts model and optimize inference performance on AWS Trainium2/3 hardware.
 
 [![Conference](https://img.shields.io/badge/MLSys-2026-blue)](https://mlsys.org/)
 [![Location](https://img.shields.io/badge/Location-Bellevue%2C%20WA-green)]()
@@ -40,7 +40,7 @@
 
 ## Overview
 
-We propose an AWS Trainium competition track for MLSys 2026 (May 17-22, 2026, Bellevue, WA). Participants will develop custom kernels using the Neuron Kernel Interface (NKI) for the **Qwen3-30B-A3B Mixture of Experts** model and optimize inference performance on AWS Trainium3 hardware.
+We present an AWS Trainium competition track for MLSys 2026 (May 17-22, 2026, Bellevue, WA). Participants will develop custom kernels using the Neuron Kernel Interface (NKI) for the **Qwen3-30B-A3B Mixture of Experts** model and optimize inference performance on AWS Trainium3 hardware.
 
 This competition builds on the successful ASPLOS 2025/EuroSys 2025 contest while focusing on the unique challenges of sparse MoE architectures.
 
@@ -81,14 +81,7 @@ Write NKI kernels that improve upon the baseline implementation by optimizing th
 
 ## Technical Environment
 
-### Hardware: AWS Trainium3
-
-| Specification | Value |
-|---------------|-------|
-| Instance Type | `trn3.3xlarge` |
-| Logical NeuronCores | 4 per instance |
-| HBM Memory | 144GB |
-| Architecture | NeuronCore with tensor, vector, and scalar engines |
+### Hardware: AWS Trainium2/3
 
 ### Model: Qwen3-30B-A3B
 
@@ -101,8 +94,7 @@ Write NKI kernels that improve upon the baseline implementation by optimizing th
 
 ### Software Stack
 
-- **SDK**: AWS Neuron SDK 2.27 (released December 2025)
-  - *Extra points for upgrading to the latest SDK*
+- **SDK**: AWS Neuron SDK 2.28
 - **Programming Interface**: Neuron Kernel Interface (NKI) with Python
   - Direct access to NeuronCore hardware primitives
   - Support for custom memory layouts and data movement
