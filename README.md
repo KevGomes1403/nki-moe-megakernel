@@ -1,17 +1,33 @@
-## My Project
+# NKI MoE Challenge
 
-TODO: Fill this README out!
 
-Be sure to:
+## Getting Started
 
-* Change the title in this README
-* Edit your repository description on GitHub
+To learn NKI, follow [the official NKI guide](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/nki/index.html) and various example NKI kernels from the [nki-samples repository](https://github.com/aws-neuron/nki-samples). Another tool to help with optimizing NKI kernels is [NKI autotune](https://github.com/awslabs/nki-autotune).
 
-## Security
+## Setup Steps
 
-See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.
+1. Create a Trainium2 instance with AWS Neuron SDK v2.28 using EC2 based on the [setup guide](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/setup/neuron-setup/multiframework/multi-framework-ubuntu24-neuron-dlami.html#setup-ubuntu24-multi-framework-dlami).
+2. Activate the Neuron virtual environment to run inference by running the appropriate activation command for your SDK version. `source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate`
+3. Clone this repository and run `cd [PATH]/nki-moe` where `[PATH]` is the directory where you have performed the clone.
+4. Download the Qwen3-30B-A3B model to a `~/qwen-30b-a3b/hf_model` folder in your root directory. We recommend doing so using the [Hugging Face CLI](https://huggingface.co/docs/huggingface_hub/en/guides/cli). You can install this by running `pip3 install huggingface_hub[cli]`. You will also need to create an [access token](https://huggingface.co/docs/hub/en/security-tokens).
+5. To run inference, navigate to `[PATH]/nki-moe` and run `python3 main.py --mode generate`.
 
-## License
+## NKI Kernel Development
 
-This project is licensed under the Apache-2.0 License.
+The `qwen.py` file contains the model implementation where you can add your custom NKI kernels. Your task is to identify parts of the model (operators, fused operators, layers, or even the whole model) that can be implemented as NKI kernels and replace them in the original model to achieve better performance.
 
+Key areas to focus on:
+* MoE routing and expert selection logic
+* Expert computation (gate_proj, up_proj, down_proj)
+* Attention mechanisms with MoE-specific optimizations
+* Memory-efficient tensor operations for sparse expert execution
+
+## Additional Tools
+
+1. **Profiling:** If you would like to profile your implementation in order to get a better understanding of performance bottlenecks and opportunities for optimization, you can use the [Neuron Profiler](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/tools/neuron-sys-tools/neuron-profile-user-guide.html).
+2. **Benchmarking:** You can also leverage the [NKI benchmarking API](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/nki/api/generated/nki.benchmark.html) to retrieve execution latency statistics.
+
+## Contact
+
+**Email**: [nki-mlsys-2026@amazon.com](mailto:nki-mlsys-2026@amazon.com)
