@@ -1,4 +1,4 @@
-"""Driver Script for the ASPLOS OPTNKI Contest"""
+"""Driver script for NKI contests"""
 import argparse
 import ast
 import base64
@@ -37,16 +37,16 @@ def parse_args():
     parser = argparse.ArgumentParser()
 
     # contest specific
-    parser.add_argument("--mode", choices=["evaluate_single", "evaluate_all", "validate", "generate"])
+    parser.add_argument("--mode", choices=["evaluate_single", "evaluate_all", "validate", "generate", "generate_accuracy_baselines"])
     parser.add_argument("--qwen", type=str, default="qwen")
     parser.add_argument("--enable-nki", action="store_true")
     parser.add_argument("--base-latency", type=float, default=526.15)
     parser.add_argument("--base-throughput", type=float, default=134.61)
 
     # Model path
-    parser.add_argument("--model-path", type=str, default="/home/ubuntu/qwen-30b-a3b/hf_model")
+    parser.add_argument("--model-path", type=str, default="/home/ubuntu/Qwen3-30B-A3B/hf_model")
     parser.add_argument("--compiled-model-path", type=str,
-                        default="/home/ubuntu/qwen-30b-a3b/traced_model")
+                        default="/home/ubuntu/Qwen3-30B-A3B/traced_model")
 
     # Evaluation
     parser.add_argument("--benchmark", action="store_true")
@@ -68,16 +68,18 @@ def parse_args():
     parser.add_argument("--torch-dtype", type=to_torch_dtype, default="bfloat16")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--padding-side", type=str)
-    parser.add_argument("--seq-len", type=int, default=128)
+    parser.add_argument("--seq-len", type=int, default=640)
     parser.add_argument("--n-active-tokens", type=int)
     parser.add_argument("--n-positions", type=int)
-    parser.add_argument("--max-context-length", type=int, default=128)
-    parser.add_argument("--max-new-tokens", type=int, default = 128)
-    parser.add_argument("--max-length", type=int, default=128)
+    parser.add_argument("--max-context-length", type=int)
+    parser.add_argument("--max-new-tokens", type=int)
+    parser.add_argument("--max-length", type=int)
     parser.add_argument("--rpl-reduce-dtype", type=to_torch_dtype)
     parser.add_argument("--output-logits", action="store_true")
     parser.add_argument("--vocab-parallel", action="store_true")
     parser.add_argument("--skip-compile", type=bool, default=False)
+    parser.add_argument("--save_sharded_checkpoint", type=bool, default=True)
+    parser.add_argument("--platform-target", type=str, default='trn2') 
 
     # Attention
     parser.add_argument("--fused-qkv", action="store_true")
@@ -143,6 +145,7 @@ def prepare_inference(model_cls, args):
     if not args.skip_compile:
 
         # Compile and save model.
+        # to do, add save sharded checkpoint here 
         compiling_start_time = time.monotonic()
         print("\nCompiling and saving model...")
         model.compile(args.compiled_model_path, debug=False)
@@ -154,9 +157,6 @@ def prepare_inference(model_cls, args):
     # Load compiled model to Neuron.
     print("\nLoading model to Neuron...")
     model.load(args.compiled_model_path)
-    # loading_end_time = time.monotonic()
-    # model_loading_time = loading_end_time - compiling_end_time
-    # print(f"Total model loading time: {model_loading_time} seconds")
 
     # Load tokenizer.
     tokenizer = load_tokenizer(args.model_path, args.compiled_model_path, neuron_config)
@@ -322,7 +322,7 @@ def check_accuracy_logits(base_model, base_generation_config, neuron_model, toke
             expected_token_ids.shape[1],
         ),
         dtype=torch.int32,
-    )
+   )
     extrapolated_attention_mask = torch.cat(
         (initial_attention_mask, expected_attention_mask), dim=1
     )
@@ -535,6 +535,7 @@ def main():
     args = parse_args()
     if not args.prompts:
         args.prompts = ["I believe the meaning of life is"]
+        
     args.batch_size = len(args.prompts)
     args.max_length = args.seq_len
     args.tol_map = "{None: (1e-5, 0.05), 1000: (1e-5, 0.03), 50: (1e-5, 0.03), 5: (1e-5, 0.03)}"
@@ -544,6 +545,7 @@ def main():
 
     if args.mode == "generate":
         model, tokenizer, generation_config = prepare_inference(qwen.NeuronQwen3MoeForCausalLM, args)
+        
         run_generation(
             model,
             tokenizer,
@@ -552,7 +554,12 @@ def main():
         )
 
     elif args.mode == "validate":
+        if args.platform_target == 'trn2':
+            print ('Validation not supported for trn2, exiting.')
+            quit()
+            
         model, tokenizer, generation_config = prepare_inference(qwen.NeuronQwen3MoeForCausalLM, args)
+        
         base_model, _, base_generation_config = prepare_inference(baseline_qwen.NeuronQwen3MoeForCausalLM, args)
 
         passed = run_accuracy_check(
@@ -571,20 +578,30 @@ def main():
         print(f"Validation {status}.")
 
     elif args.mode == "evaluate_single":
-        model, tokenizer, generation_config = prepare_inference(qwen.NeuronQwen3MoeForCausalLM, args)
-        base_model, _, base_generation_config = prepare_inference(baseline_qwen.NeuronQwen3MoeForCausalLM, args)
 
-        accuracy = run_accuracy_check(
-            base_model,
-            base_generation_config,
-            model,
-            tokenizer,
-            generation_config,
-            args.prompts,
-            args.divergence_difference_tol,
-            args.tol_map,
-            num_tokens_to_check=args.num_tokens_to_check,
-        )
+        if args.platform_target == 'trn2':
+            
+            model, tokenizer, generation_config = prepare_inference(qwen.NeuronQwen3MoeForCausalLM, args)
+
+            accuracy = 1
+            
+        elif args.platform_target == 'trn3': 
+        
+            model, tokenizer, generation_config = prepare_inference(qwen.NeuronQwen3MoeForCausalLM, args)
+
+            base_model, _, base_generation_config = prepare_inference(baseline_qwen.NeuronQwen3MoeForCausalLM, args)
+
+            accuracy = run_accuracy_check(
+                base_model,
+                base_generation_config,
+                model,
+                tokenizer,
+                generation_config,
+                args.prompts,
+                args.divergence_difference_tol,
+                args.tol_map,
+                num_tokens_to_check=args.num_tokens_to_check,
+            )
 
         report = benchmark_sampling(model, tokenizer, generation_config, args.prompts)
 
@@ -604,23 +621,68 @@ def main():
             f"\tThroughput: {throughput}\n"
             f"\tNKI FLOPs Ratio: {nki_flop_ratio}"
         )
-        
-    elif args.mode == "evaluate_all":
-        model, tokenizer, generation_config = prepare_inference(qwen.NeuronQwen3MoeForCausalLM, args)
-        base_model, _, base_generation_config = prepare_inference(baseline_qwen.NeuronQwen3MoeForCausalLM, args)
 
+    elif args.mode == 'evaluate_all' and args.platform_target == 'trn2':
+        
+        model, tokenizer, generation_config = prepare_inference(qwen.NeuronQwen3MoeForCausalLM, args)
+
+        accuracy = 1
+        
         prompts = parse_prompts("prompts.txt")
-        prompt_data = parse_prompt_data("prompt_data.txt")
+        prompt_data = parse_prompt_data("prompt_data_trn2.txt")
+        assert len(prompts) == len(prompt_data)
+
+        total_score = 0
+
+        # to do - move both of these calls into batch mode 
+        # Iterate through the prompts
+        for i, prompt in enumerate(prompts):
+            
+            data = prompt_data[i]
+            base_latency = float(data[3])
+            base_throughput = float(data[4])
+
+            report = benchmark_sampling(model, tokenizer, generation_config, [prompt])
+
+            latency = report["e2e_model"]["latency_ms_p99"]
+            throughput = report["e2e_model"]["throughput"]
+
+            ctx_enc_hlo_path, tkg_gen_hlo_path = find_hlos()
+    
+            nki_flop_ratio = count_nki_flop_ratio(ctx_enc_hlo_path, tkg_gen_hlo_path)
+
+            score = calculate_score(base_latency, base_throughput, accuracy, latency, throughput, nki_flop_ratio)
+            print(
+                f"Prompt: {prompt}\n"
+                f"Final Score: {score}\n"
+                f"\tAccuracy: {accuracy}\n"
+                f"\tLatency: {latency}\n"
+                f"\tThroughput: {throughput}\n"
+                f"\tNKI FLOPs Ratio: {nki_flop_ratio}"
+            )
+            total_score += score
+
+        print(f"\nTotal Score: {total_score}\n")
+        
+    elif args.mode == "evaluate_all" and args.platform_target == 'trn3':
+        
+        model, tokenizer, generation_config = prepare_inference(qwen.NeuronQwen3MoeForCausalLM, args)
+
+        base_model, _, base_generation_config = prepare_inference(baseline_qwen.NeuronQwen3MoeForCausalLM, args)
+        
+        prompts = parse_prompts("prompts.txt")
+        prompt_data = parse_prompt_data("prompt_data_trn3.txt")
         assert len(prompts) == len(prompt_data)
 
         total_score = 0
 
         # Iterate through the prompts
         for i, prompt in enumerate(prompts):
+            
             data = prompt_data[i]
             base_latency = float(data[3])
             base_throughput = float(data[4])
-
+            
             accuracy = run_accuracy_check(
                 base_model,
                 base_generation_config,
@@ -633,7 +695,6 @@ def main():
                 num_tokens_to_check=args.num_tokens_to_check,
             )
 
-            _ = benchmark_sampling(base_model, tokenizer, base_generation_config, args.prompts)
             report = benchmark_sampling(model, tokenizer, generation_config, [prompt])
 
             latency = report["e2e_model"]["latency_ms_p99"]
@@ -656,6 +717,43 @@ def main():
 
         print(f"\nTotal Score: {total_score}\n")
 
+    elif args.mode == "generate_accuracy_baselines":
+
+        base_model, tokenizer, base_generation_config = prepare_inference(baseline_qwen.NeuronQwen3MoeForCausalLM, args)
+
+        prompts = parse_prompts("prompts.txt")
+
+        # Iterate through the prompts
+        for i, prompt in enumerate(prompts):
+        
+            inputs = tokenizer(args.prompts, padding=True, return_tensors="pt")
+            initial_input_ids = inputs.input_ids
+            initial_attention_mask = inputs.attention_mask
+            seq_len = base_model.config.neuron_config.seq_len
+            
+            base_model.config.neuron_config.max_new_tokens = seq_len - initial_input_ids.shape[1]
+            
+            base_model_generative = HuggingFaceGenerationAdapter(base_model)
+            
+            new_tokens = base_model.config.neuron_config.max_new_tokens 
+            
+            with torch.inference_mode():
+                outputs = base_model_generative.generate(
+                    input_ids=initial_input_ids,
+                    attention_mask=initial_attention_mask,
+                    max_new_tokens=new_tokens,
+                    min_new_tokens=new_tokens,
+                    do_sample=False,
+                    return_dict_in_generate=True,
+                    output_scores=True,
+                    generation_config=base_generation_config,
+                )
+                
+            expected_logits = torch.stack(outputs.scores)
+    
+            # write logits to a file 
+            torch.save(expected_logits, f'expected_logits_{i}.pt')
+        
     else:
         assert False, "Undefined mode"
 

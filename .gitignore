@@ -1,0 +1,5 @@
+*.safetensors
+*.log
+*.json
+*.ipynb_checkpoints/
+__pycache__/

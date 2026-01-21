@@ -17,6 +17,20 @@ def parse_prompt_data(filepath):
         blocks = blocks[0:-1]
     return [block.split(',') for block in blocks]
 
+def parse_prompts_as_dict(filepath):
+    '''
+    Builds a dictionary with the index number of the prompt as the value, the prompt as the key.
+    '''
+    with open(filepath, 'r') as file:
+        arr = file.read().split('\n\n')
+
+    arr = [prompt.strip() for prompt in arr if prompt.strip()]
+    rt = {}
+    for idx, prompt in enumerate(arr):
+        rt[prompt]=idx
+    
+    return rt
+
 
 def main():
     prompts = parse_prompts("prompts.txt")
