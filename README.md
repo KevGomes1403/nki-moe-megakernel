@@ -4,7 +4,7 @@
 
 Participants will write custom kernels with the Neuron Kernel Interface (NKI) for the Qwen3-30B-A3B Mixture of Experts model and optimize inference performance on AWS Trainium2/3 hardware.
 
-For full details on the competition, read [the competition guidelines](https://github.com/aws-neuron/nki-moe/blob/main/CONTEST.md).
+For full details on the competition, read [the competition guidelines](https://github.com/aws-neuron/nki-moe/blob/main/CONTEST.md). Register for the competition [here](https://docs.google.com/forms/d/e/1FAIpQLSeWuJ9h9F0-aC5OwhKcIKgzUB8Sc3DFdBNEgzxzHfM4QsajcA/viewform?resourcekey=0-VVlo6GUSizIcln6HhBFvKQ).
 
 ## Getting Started
 
