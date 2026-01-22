@@ -540,8 +540,12 @@ def main():
     args.max_length = args.seq_len
     args.tol_map = "{None: (1e-5, 0.05), 1000: (1e-5, 0.03), 50: (1e-5, 0.03), 5: (1e-5, 0.03)}"
 
-    # points to your local model definition from qwen.py
-    qwen = importlib.import_module(args.qwen)   
+    # points to your local model definition from qwen.py or qwen_with_nki.py
+    if args.enable_nki:
+        print("Loading qwen_with_nki module (NKI-accelerated RMSNorm enabled)")
+        qwen = importlib.import_module("qwen_with_nki")
+    else:
+        qwen = importlib.import_module(args.qwen)   
 
     if args.mode == "generate":
         model, tokenizer, generation_config = prepare_inference(qwen.NeuronQwen3MoeForCausalLM, args)

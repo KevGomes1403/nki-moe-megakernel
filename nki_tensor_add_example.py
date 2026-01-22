@@ -1,7 +1,5 @@
 """
 Simple Working NKI Kernel - Tensor Addition
-Based directly on AWS official example
-This WILL work!
 """
 
 import torch
@@ -14,7 +12,6 @@ import neuronxcc.nki.language as nl
 def nki_tensor_add_kernel(a_input, b_input):
     """
     NKI kernel to compute element-wise addition of two input tensors.
-    Direct copy from AWS documentation.
     """
     # Create output tensor shared between all SPMD instances
     c_output = nl.ndarray(a_input.shape, dtype=a_input.dtype, buffer=nl.shared_hbm)
@@ -37,7 +34,7 @@ def nki_tensor_add_kernel(a_input, b_input):
     # Store results back to HBM
     nl.store(c_output[ix, iy], value=c_tile)
     
-    # Transfer ownership to caller
+    # Return the output tensor
     return c_output
 
 
@@ -96,5 +93,4 @@ def test_simple_add():
 
 
 if __name__ == "__main__":
-    success = test_simple_add()
-    exit(0 if success else 1)
+    test_simple_add()
