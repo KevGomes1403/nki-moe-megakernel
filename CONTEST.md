@@ -149,7 +149,7 @@ All submissions must:
 | **Second Place** | $10,000 USD | Guaranteed internship interviews |
 | **Third Place** | $5,000 USD | Guaranteed internship interviews |
 
-> Members from the top three teams have **guaranteed interviews** for internships in the AWS Trainium team. Other participants will be considered based on strength of submission.
+> Eligible members from the top three teams have **guaranteed interviews** for internships in the AWS Trainium team. Other participants will be considered based on strength of submission. 
 
 Prizes will be distributed equally among team members.
 
