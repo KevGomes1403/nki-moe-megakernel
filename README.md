@@ -77,6 +77,26 @@ Key areas to focus on:
 * Attention mechanisms with MoE-specific optimizations
 * Memory-efficient tensor operations for sparse expert execution
 
+## Evaluation and Scoring
+
+The contest organizers will execute each team's submission across the twenty withheld benchmarks on a dedicated Trainium instance. The submissions will be evaluated on:
+
+1) Accuracy of generated output vs. our reference implementation. Accuracy evaluation will be a binary assessor: Any benchmark that fails an accuracy threshold will result in a score of 0\.   
+2) Latency (Time to first token (TTFT))  
+3) Throughput measured as output tokens / second  
+4) Amount of model written in NKI (measured as NKI FLOPS / total model FLOPS) (will be applied as a scaling factor for (b) and (c)). Note: NKI FLOPs measures the number of multiply-accumulate (MAC) operations.
+
+Rankings will be established by calculating the total normalized number of points per team, where points are normalized against the baseline.
+
+We define **points** as **Accuracy** (binary) **\* Reduced Latency \* Increased Throughput \* (1 + Normalized NKI FLOPS)**, where:
+
+* **Accuracy** = 1 if accuracy matches or exceeds a predetermined threshold, 0 otherwise  
+* **Reduced Latency** = Reference implementation TTFT divided by submission TTFT  
+* **Increased Throughput** = Submission tokens/sec divided by reference implementation tokens/sec  
+* **Normalized NKI FLOPS** = Submission NKI FLOPS divided by total model FLOPS
+
+For example, a submission that is sufficiently accurate, with 10x reduced latency, 2x increased throughput, and 0.85 normalized NKI FLOPS would obtain 1 \* 10 \* 2 \* 1.85 \= 37 points.
+
 ## Additional Tools
 
 1. **Profiling:** If you would like to profile your implementation in order to get a better understanding of performance bottlenecks and opportunities for optimization, you can use the [Neuron Explorer](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/tools/neuron-explorer/index.html).
