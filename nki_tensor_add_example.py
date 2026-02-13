@@ -4,45 +4,39 @@ Simple Working NKI Kernel - Tensor Addition
 
 import torch
 import torch_xla.core.xla_model as xm
-import neuronxcc.nki as nki
-import neuronxcc.nki.language as nl
+import nki
+import nki.language as nl
+import nki.isa as nisa
 
 
-@nki.jit
+@nki.jit(platform_target="trn2")
 def nki_tensor_add_kernel(a_input, b_input):
     """
     NKI kernel to compute element-wise addition of two input tensors.
     """
-    # Create output tensor shared between all SPMD instances
+    # Check both input tensor shapes are the same for element-wise operation
+    assert a_input.shape == b_input.shape
+
+    # Check the first dimension does not exceed on-chip memory tile size
+    assert a_input.shape[0] <= nl.tile_size.pmax
+
+    # Allocate SBUF tiles and copy input data from HBM via DMA
+    a_tile = nl.ndarray(a_input.shape, dtype=a_input.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=a_tile, src=a_input)
+
+    b_tile = nl.ndarray(b_input.shape, dtype=b_input.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=b_tile, src=b_input)
+
+    # Compute element-wise addition using tensor_tensor ISA
+    c_tile = nl.ndarray(a_input.shape, dtype=a_input.dtype, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=c_tile, data1=a_tile, data2=b_tile, op=nl.add)
+
+    # Create output in HBM and copy result back via DMA
     c_output = nl.ndarray(a_input.shape, dtype=a_input.dtype, buffer=nl.shared_hbm)
-    
-    # Calculate tile offsets based on current 'program'
-    offset_i_x = nl.program_id(0) * 128
-    offset_i_y = nl.program_id(1) * 512
-    
-    # Generate tensor indices
-    ix = offset_i_x + nl.arange(128)[:, None]
-    iy = offset_i_y + nl.arange(512)[None, :]
-    
-    # Load input data from HBM to SBUF
-    a_tile = nl.load(a_input[ix, iy])
-    b_tile = nl.load(b_input[ix, iy])
-    
-    # Compute a + b
-    c_tile = a_tile + b_tile
-    
-    # Store results back to HBM
-    nl.store(c_output[ix, iy], value=c_tile)
-    
+    nisa.dma_copy(dst=c_output, src=c_tile)
+
     # Return the output tensor
     return c_output
-
-
-def nki_tensor_add(a_input, b_input):
-    """Kernel caller with SPMD grid"""
-    grid_x = a_input.shape[0] // 128
-    grid_y = a_input.shape[1] // 512
-    return nki_tensor_add_kernel[grid_x, grid_y](a_input, b_input)
 
 
 def test_simple_add():
@@ -55,19 +49,18 @@ def test_simple_add():
     device = xm.xla_device()
     print(f"\nUsing device: {device}")
     
-    # Create test tensors (must be multiples of tile size)
-    shape = (256, 1024)  # 2*128 x 2*512
+    # Create test tensors (must fit in a single tile: shape[0] <= pmax)
+    shape = (4, 3)
     print(f"Tensor shape: {shape}")
-    
-    torch.manual_seed(42)
-    a = torch.randn(shape, device=device)
-    b = torch.randn(shape, device=device)
-    
+
+    a = torch.ones(shape, dtype=torch.float16, device=device)
+    b = torch.ones(shape, dtype=torch.float16, device=device)
+
     print("\n[1/3] Computing reference (PyTorch)...")
     ref_output = a + b
-    
+
     print("[2/3] Computing NKI kernel...")
-    nki_output = nki_tensor_add(a, b)
+    nki_output = nki_tensor_add_kernel(a, b)
     
     print("[3/3] Comparing...")
     max_diff = torch.abs(ref_output - nki_output).max().item()
