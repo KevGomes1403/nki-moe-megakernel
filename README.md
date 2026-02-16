@@ -6,7 +6,7 @@ Participants will write custom kernels with the Neuron Kernel Interface (NKI) fo
 
 For full details on the competition, read [the competition guidelines](https://github.com/aws-neuron/nki-moe/blob/main/CONTEST.md). 
 
-To register your team, [enter your information here](https://docs.google.com/forms/d/e/1FAIpQLSeWuJ9h9F0-aC5OwhKcIKgzUB8Sc3DFdBNEgzxzHfM4QsajcA/viewform?usp=sharing&ouid=108119140038382966223&resourcekey=0-VVlo6GUSizIcln6HhBFvKQ) (just one entry per team).
+To register your team, [enter your information here](https://docs.google.com/forms/d/e/1FAIpQLSeWuJ9h9F0-aC5OwhKcIKgzUB8Sc3DFdBNEgzxzHfM4QsajcA/viewform?usp=sharing&ouid=108119140038382966223&resourcekey=0-VVlo6GUSizIcln6HhBFvKQ) (just one entry per team). We will close this registration link when the event is at capacity, so if you're able to complete registration please assume it is confirmed.
 
 ## Getting Started
 
@@ -101,6 +101,10 @@ For example, a submission that is sufficiently accurate, with 10x reduced latenc
 
 1. **Profiling:** If you would like to profile your implementation in order to get a better understanding of performance bottlenecks and opportunities for optimization, you can use the [Neuron Explorer](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/tools/neuron-explorer/index.html).
 2. **Benchmarking:** You can also leverage the [NKI benchmarking API](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/nki/api/generated/nki.benchmark.html) to retrieve execution latency statistics.
+
+## FAQ's
+1. What batch size will be used in evalution? We will use a batch size of 1 in the final evaluation.
+2. Should I use NKI 1 or NKI 2? We will make both NKI 1 and NKI 2 available in the evaluation suite, but we will prefer solutions that use NKI 2.
 
 ## Contact
 
