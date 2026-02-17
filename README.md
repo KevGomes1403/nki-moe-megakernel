@@ -105,6 +105,7 @@ For example, a submission that is sufficiently accurate, with 10x reduced latenc
 ## FAQ's
 1. What batch size will be used in evalution? We will use a batch size of 1 in the final evaluation.
 2. Should I use NKI 1 or NKI 2? We will make both NKI 1 and NKI 2 available in the evaluation suite, but we will prefer solutions that use NKI 2.
+3. How can I access Trn2? Please follow the notes [here](https://github.com/aws-neuron/nki-moe/issues/9).
 
 ## Contact
 
