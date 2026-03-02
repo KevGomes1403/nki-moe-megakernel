@@ -1,4 +1,5 @@
 accelerate
+autoregressive-language-model-generate
 huggingface_hub[cli]
 safetensors-layer-grabber
 tinytrie

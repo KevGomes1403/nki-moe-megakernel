@@ -17,8 +17,8 @@ def silu_activation(input):
 
 
 def qwen3_moe_top_k_router(
-    hidden_states,
-    weight,
+    hidden_states,  # torch.Size([10, 2048])
+    weight,  # torch.Size([128, 2048])
 ):
     hidden_states_reshaped = hidden_states.reshape(-1, 2048)
     router_logits = torch.nn.functional.linear(hidden_states_reshaped, weight)  # (seq_len, num_experts)
@@ -97,19 +97,19 @@ def sdpa_attention_forward(
 
 
 def qwen3_moe_attention(
-    hidden_states,
-    cos,
-    sin,
-    attention_mask,
-    q_proj_weight,
-    k_proj_weight,
-    v_proj_weight,
-    o_proj_weight,
-    q_norm_weight,
-    k_norm_weight,
+    hidden_states,  # torch.Size([1, 10, 2048])
+    cos,  # torch.Size([1, 10, 128])
+    sin,  # torch.Size([1, 10, 128])
+    attention_mask,  # torch.Size([1, 1, 10, 10])
+    q_proj_weight,  # torch.Size([4096, 2048])
+    k_proj_weight,  # torch.Size([512, 2048])
+    v_proj_weight,  # torch.Size([512, 2048])
+    o_proj_weight,  # torch.Size([2048, 4096])
+    q_norm_weight,  # torch.Size([128])
+    k_norm_weight,  # torch.Size([128])
 ):
     input_shape = hidden_states.shape[:-1]
-    hidden_shape = (*input_shape, -1, 128)
+    hidden_shape = (*input_shape, -1, 128)  # (1, 10, -1, 128)
 
     query_states = qwen3_moe_rms_norm(
         torch.nn.functional.linear(
@@ -117,7 +117,7 @@ def qwen3_moe_attention(
             q_proj_weight,
         ).view(hidden_shape),
         q_norm_weight,
-    ).transpose(1, 2)
+    ).transpose(1, 2)  # torch.Size([1, 32, 10, 128])
     
     key_states = qwen3_moe_rms_norm(
         torch.nn.functional.linear(
@@ -125,40 +125,62 @@ def qwen3_moe_attention(
             k_proj_weight,
         ).view(hidden_shape),
         k_norm_weight,
-    ).transpose(1, 2)
+    ).transpose(1, 2)  # torch.Size([1, 4, 10, 128])
     
     value_states = torch.nn.functional.linear(
         hidden_states,
         v_proj_weight,
-    ).view(hidden_shape).transpose(1, 2)
+    ).view(hidden_shape).transpose(1, 2)  # torch.Size([1, 4, 10, 128])
 
     query_states, key_states = apply_rotary_pos_emb(
         query_states,
         key_states,
         cos,
         sin
-    )
+    )  # torch.Size([1, 32, 10, 128]), torch.Size([1, 4, 10, 128])
 
     attn_output = sdpa_attention_forward(
         query_states,
         key_states,
         value_states,
         attention_mask,
-    )
+    )  # torch.Size([1, 10, 32, 128])
 
-    attn_output_reshaped = attn_output.reshape(*input_shape, -1).contiguous()
+    attn_output_reshaped = attn_output.reshape(*input_shape, -1).contiguous()  # torch.Size([1, 10, 4096])
     attn_output_reshaped_projected = torch.nn.functional.linear(
         attn_output_reshaped,
         o_proj_weight,
-    )
+    )  # torch.Size([1, 10, 2048])
 
     return attn_output_reshaped_projected
 
 
 def qwen3_moe_experts(
-    hidden_states,
-    top_k_index,
-    top_k_weights,
+    hidden_states,  # torch.Size([10, 2048])
+    # (Pdb) p top_k_index
+    # tensor([[126,   2,  97,  21,  29,  75,  62,   3],
+    #         [ 62,  61,  13, 103,  50,   2,  32,  29],
+    #         [106,  27,  61,  50, 110, 114,  66,  47],
+    #         [ 17,  34,  28,  87,  62,  61, 124,  22],
+    #         [ 77, 116,  23,  12,  62, 112,  28, 125],
+    #         [ 11, 120,  81,  84,  93, 114,  61,  31],
+    #         [ 34,  67,  62,  17,  63,  30,  68,  14],
+    #         [112,  91, 125,  86,  28, 105,  23, 120],
+    #         [112,  83,  23, 122,  86,  28,  36, 125],
+    #         [ 65,  98, 114,  43,  73,  72, 100,  45]])
+    # (Pdb) p top_k_weights
+    # tensor([[0.2359, 0.1986, 0.1925, 0.0946, 0.0834, 0.0703, 0.0692, 0.0556],
+    #         [0.2419, 0.2382, 0.1826, 0.1422, 0.0540, 0.0515, 0.0455, 0.0441],
+    #         [0.3260, 0.1540, 0.1181, 0.1163, 0.0837, 0.0683, 0.0683, 0.0652],
+    #         [0.1806, 0.1751, 0.1474, 0.1363, 0.1363, 0.0880, 0.0707, 0.0654],
+    #         [0.2249, 0.1646, 0.1546, 0.1522, 0.0998, 0.0841, 0.0719, 0.0479],
+    #         [0.2448, 0.2229, 0.1485, 0.1231, 0.0782, 0.0680, 0.0591, 0.0555],
+    #         [0.2060, 0.1555, 0.1330, 0.1330, 0.1192, 0.0989, 0.0914, 0.0628],
+    #         [0.2251, 0.1431, 0.1243, 0.1168, 0.1150, 0.1031, 0.0984, 0.0742],
+    #         [0.2871, 0.1974, 0.1216, 0.1107, 0.0849, 0.0671, 0.0661, 0.0651],
+    #         [0.3200, 0.2098, 0.1387, 0.0910, 0.0665, 0.0615, 0.0606, 0.0518]])
+    top_k_index,  # torch.Size([10, 8])
+    top_k_weights,  # torch.Size([10, 8])
     # In the model code, there are two single parameters:
     # - gate_up_proj
     # - down_proj
@@ -172,15 +194,84 @@ def qwen3_moe_experts(
     down_proj_weight_list,
 ):
     with torch.no_grad():
-        expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=128)
+        expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=128)  # torch.Size([10, 8, 128])
         expert_mask_permuted = expert_mask.permute(2, 1, 0)
-        expert_hit = torch.greater(expert_mask_permuted.sum(dim=(-1, -2)), 0).nonzero()
+        # tensor([[  2],
+        # [  3],
+        # [ 11],
+        # [ 12],
+        # [ 13],
+        # [ 14],
+        # [ 17],
+        # [ 21],
+        # [ 22],
+        # [ 23],
+        # [ 27],
+        # [ 28],
+        # [ 29],
+        # [ 30],
+        # [ 31],
+        # [ 32],
+        # [ 34],
+        # [ 36],
+        # [ 43],
+        # [ 45],
+        # [ 47],
+        # [ 50],
+        # [ 61],
+        # [ 62],
+        # [ 63],
+        # [ 65],
+        # [ 66],
+        # [ 67],
+        # [ 68],
+        # [ 72],
+        # [ 73],
+        # [ 75],
+        # [ 77],
+        # [ 81],
+        # [ 83],
+        # [ 84],
+        # [ 86],
+        # [ 87],
+        # [ 91],
+        # [ 93],
+        # [ 97],
+        # [ 98],
+        # [100],
+        # [103],
+        # [105],
+        # [106],
+        # [110],
+        # [112],
+        # [114],
+        # [116],
+        # [120],
+        # [122],
+        # [124],
+        # [125],
+        # [126]])
+        expert_hit = torch.greater(expert_mask_permuted.sum(dim=(-1, -2)), 0).nonzero()  # torch.Size([55, 1])
 
     final_hidden_states = torch.zeros_like(hidden_states)
     for expert_idx_tensor in expert_hit:
         expert_idx = expert_idx_tensor[0]
         if expert_idx == 128:
             continue
+
+        # (Pdb) p expert_idx
+        # tensor(2)
+        # (Pdb) p top_k_pos
+        # tensor([1, 5])
+        # (Pdb) p token_idx
+        # tensor([0, 1])
+
+        # (Pdb) p expert_idx
+        # tensor(3)
+        # (Pdb) p top_k_pos
+        # tensor([7])
+        # (Pdb) p token_idx
+        # tensor([0])
 
         top_k_pos, token_idx = torch.where(expert_mask_permuted[expert_idx])
         
@@ -208,7 +299,7 @@ def qwen3_moe_experts(
 
 
 def qwen3_moe_sparse_moe_block(
-    hidden_states,
+    hidden_states,  # torch.Size([1, 10, 2048])
     # gate.weight
     gate_weight,
     # experts.*.gate_proj.weight
@@ -220,7 +311,7 @@ def qwen3_moe_sparse_moe_block(
 ):
     batch_size, sequence_length, hidden_dim = hidden_states.shape
     
-    hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
+    hidden_states_reshaped = hidden_states.view(-1, hidden_dim)  # torch.Size([10, 2048])
     
     _, routing_weights, selected_experts = qwen3_moe_top_k_router(
         hidden_states_reshaped,
@@ -240,7 +331,7 @@ def qwen3_moe_sparse_moe_block(
 
 
 def qwen3_moe_decoder_layer(
-    hidden_states,
+    hidden_states,  # torch.Size([1, 10, 2048])
     attention_mask,
     cos,
     sin,
@@ -275,7 +366,7 @@ def qwen3_moe_decoder_layer(
     normed_hidden_states = qwen3_moe_rms_norm(
         hidden_states,
         input_layernorm_weight,
-    )
+    )  # torch.Size([1, 10, 2048])
     
     self_attn_output = qwen3_moe_attention(
         normed_hidden_states,
@@ -314,13 +405,13 @@ def qwen3_moe_decoder_layer(
 
 
 def qwen3_moe_model(
-    input_ids,
-    attention_mask,
-    position_ids,
+    input_ids,  # torch.Size([1, 10])
+    attention_mask,  # torch.Size([1, 10])
+    position_ids,  # torch.Size([1, 10])
     # embed_tokens.weight
-    embed_tokens_weight,
+    embed_tokens_weight,  # torch.Size([151936, 2048])
     # rotary_emb.inv_freq
-    rotary_emb_inv_freq,
+    rotary_emb_inv_freq,  # torch.Size([64])
     # layers.*.input_layernorm.weight
     layers_input_layernorm_weight_list,
     # layers.*.self_attn.q_proj.weight
@@ -346,26 +437,26 @@ def qwen3_moe_model(
     # layers.*.mlp.experts.*.down_proj.weight
     layers_mlp_experts_down_proj_weight_list_list,
     # norm.weight
-    norm_weight,
+    norm_weight,  # torch.Size([2048])
 ):
     batch_size, length = input_ids.shape
     device = input_ids.device
 
     # 4D boolean mask (B, 1, L, L)
     causal_mask = torch.tril(torch.ones((length, length), dtype=torch.bool, device=device))[None,None,:,:].expand(batch_size, 1, length, length)
-    attention_mask_expanded = attention_mask[:,None,None,:].to(dtype=torch.bool)
-    final_mask = causal_mask & attention_mask_expanded
+    attention_mask_expanded = attention_mask[:,None,None,:].to(dtype=torch.bool)  # torch.Size([1, 1, 1, 10])
+    final_mask = causal_mask & attention_mask_expanded  # torch.Size([1, 1, 10, 10])
 
     hidden_states = torch.nn.functional.embedding(
         input_ids,
         embed_tokens_weight
-    )
+    )  # torch.Size([1, 10, 2048])
 
     cos, sin = qwen3_moe_rotary_embedding(
         x=hidden_states,
         position_ids=position_ids,
         inv_freq=rotary_emb_inv_freq
-    )
+    )  # torch.Size([1, 10, 128]), torch.Size([1, 10, 128])
 
     for (
         input_layernorm_weight,
@@ -399,15 +490,15 @@ def qwen3_moe_model(
             final_mask,
             cos,
             sin,
-            input_layernorm_weight,
-            self_attn_q_proj_weight,
-            self_attn_k_proj_weight,
-            self_attn_v_proj_weight,
-            self_attn_o_proj_weight,
-            self_attn_q_norm_weight,
-            self_attn_k_norm_weight,
-            post_attention_layernorm_weight,
-            mlp_gate_weight,
+            input_layernorm_weight,  # torch.Size([2048])
+            self_attn_q_proj_weight,  # torch.Size([4096, 2048])
+            self_attn_k_proj_weight,  # torch.Size([512, 2048])
+            self_attn_v_proj_weight,  # torch.Size([512, 2048])
+            self_attn_o_proj_weight,  # torch.Size([2048, 4096])
+            self_attn_q_norm_weight,  # torch.Size([128])
+            self_attn_k_norm_weight,  # torch.Size([128])
+            post_attention_layernorm_weight,  # torch.Size([2048])
+            mlp_gate_weight,  # torch.Size([128, 2048])
             mlp_experts_gate_proj_weight_list,
             mlp_experts_up_proj_weight_list,
             mlp_experts_down_proj_weight_list,
@@ -456,7 +547,7 @@ def qwen3_moe_for_causal_lm(
     # model.norm.weight
     model_norm_weight,
     # lm_head.weight
-    lm_head_weight,
+    lm_head_weight,  # torch.Size([151936, 2048])
 ):
     hidden_states = qwen3_moe_model(
         input_ids,

@@ -1,4 +1,6 @@
+Qwen/
 *.safetensors
+*.pt
 *.log
 *.json
 *.ipynb_checkpoints/
