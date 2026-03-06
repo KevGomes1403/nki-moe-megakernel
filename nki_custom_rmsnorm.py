@@ -3,6 +3,10 @@ import torch.nn as nn
 import nki
 import nki.isa as nisa
 import nki.language as nl
+from torch_neuronx.utils import get_platform_target
+
+
+PLATFORM_TARGET = get_platform_target()
 
 
 def stream_shuffle_broadcast(src, dst):
@@ -20,7 +24,7 @@ def stream_shuffle_broadcast(src, dst):
         )
 
 
-@nki.jit(platform_target="trn2")
+@nki.jit(platform_target=PLATFORM_TARGET)
 def nki_rmsnorm_kernel(input_tensor, weight, eps):
     """
     RMSNorm NKI kernel - migrated to NKI Beta 2 API.

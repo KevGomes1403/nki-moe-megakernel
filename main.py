@@ -9,6 +9,7 @@ import time
 import torch
 
 from torch_neuronx.pyhlo.hlo_pb2 import HloModuleProto
+from torch_neuronx.utils import get_platform_target
 from torch_neuronx.testing.validation import logit_validation
 from transformers import AutoTokenizer, GenerationConfig
 
@@ -79,7 +80,7 @@ def parse_args():
     parser.add_argument("--vocab-parallel", action="store_true")
     parser.add_argument("--skip-compile", type=bool, default=False)
     parser.add_argument("--save_sharded_checkpoint", type=bool, default=True)
-    parser.add_argument("--platform-target", type=str, default='trn2') 
+    parser.add_argument("--platform-target", type=str)
 
     # Attention
     parser.add_argument("--fused-qkv", action="store_true")
@@ -96,7 +97,7 @@ def parse_args():
     parser.add_argument("--token-generation-buckets", nargs="+", type=int)
 
     # Parallelism
-    parser.add_argument("--tp-degree", type=int, default=4)
+    parser.add_argument("--tp-degree", type=int)
 
     # Kernels
     parser.add_argument("--qkv-kernel-enabled", action="store_true")
@@ -121,6 +122,23 @@ def load_tokenizer(model_path, compiled_model_path, neuron_config):
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.save_pretrained(compiled_model_path)
     return tokenizer
+
+
+def detect_platform_target(args):
+    if args.platform_target:
+        return args.platform_target
+    return get_platform_target()
+
+
+def configure_runtime_env(args):
+    args.platform_target = detect_platform_target(args)
+
+    if args.tp_degree is None:
+        args.tp_degree = 8 if args.platform_target == "trn1" else 4
+
+    # NxD has a special TRN1 + TP=4 path that requires LOCAL_WORLD_SIZE.
+    if args.platform_target == "trn1" and args.tp_degree == 4 and "LOCAL_WORLD_SIZE" not in os.environ:
+        os.environ["LOCAL_WORLD_SIZE"] = str(args.tp_degree)
 
 
 def prepare_inference(model_cls, args):
@@ -533,6 +551,7 @@ def find_hlos():
 
 def main():
     args = parse_args()
+    configure_runtime_env(args)
     if not args.prompts:
         args.prompts = ["I believe the meaning of life is"]
         

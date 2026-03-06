@@ -7,9 +7,13 @@ import torch_xla.core.xla_model as xm
 import nki
 import nki.language as nl
 import nki.isa as nisa
+from torch_neuronx.utils import get_platform_target
 
 
-@nki.jit(platform_target="trn2")
+PLATFORM_TARGET = get_platform_target()
+
+
+@nki.jit(platform_target=PLATFORM_TARGET)
 def nki_tensor_add_kernel(a_input, b_input):
     """
     NKI kernel to compute element-wise addition of two input tensors.
