@@ -33,18 +33,39 @@ BENCHMARK_REPORT_FILENAME = "benchmark_report.json"
 
 set_random_seed(0)
 
+
+def _str2bool(value):
+    if isinstance(value, bool):
+        return value
+    value = value.strip().lower()
+    if value in {"true", "t", "1", "yes", "y"}:
+        return True
+    if value in {"false", "f", "0", "no", "n"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Expected boolean value, got: {value}")
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
 
     # contest specific
     parser.add_argument("--mode", choices=["evaluate_single", "evaluate_all", "validate", "generate", "generate_accuracy_baselines"])
-    parser.add_argument("--qwen", type=str, default="qwen")
+    parser.add_argument(
+        "--qwen",
+        type=str,
+        default="qwen",
+        help=(
+            "Qwen module or alias to load. Supported aliases: "
+            "qwen, qwen_with_nki (or qwen_nki), "
+            "qwen_with_attention_cte (or qwen_attention_cte/qwen_cte)."
+        ),
+    )
     parser.add_argument("--enable-nki", action="store_true")
     parser.add_argument("--base-latency", type=float, default=526.15)
     parser.add_argument("--base-throughput", type=float, default=134.61)
 
     # Model path
-    parser.add_argument("--model-path", type=str, default="/home/ubuntu/Qwen3-30B-A3B/hf_model")
+    parser.add_argument("--model-path", type=str, default="~/models/Qwen3-MoE/")
     parser.add_argument("--compiled-model-path", type=str,
                         default="/home/ubuntu/Qwen3-30B-A3B/traced_model")
 
@@ -60,7 +81,7 @@ def parse_args():
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--global-topk", type=int)
-    parser.add_argument("--do-sample", type=bool, default=True)
+    parser.add_argument("--do-sample", type=_str2bool, default=True)
     parser.add_argument("--dynamic", action="store_true")
     parser.add_argument("--pad-token-id", type=int, default=2)
 
@@ -77,9 +98,9 @@ def parse_args():
     parser.add_argument("--rpl-reduce-dtype", type=to_torch_dtype)
     parser.add_argument("--output-logits", action="store_true")
     parser.add_argument("--vocab-parallel", action="store_true")
-    parser.add_argument("--skip-compile", type=bool, default=False)
-    parser.add_argument("--save_sharded_checkpoint", type=bool, default=True)
-    parser.add_argument("--platform-target", type=str, default='trn2') 
+    parser.add_argument("--skip-compile", type=_str2bool, default=False)
+    parser.add_argument("--save_sharded_checkpoint", type=_str2bool, default=True)
+    parser.add_argument("--platform-target", type=str, default='trn1') 
 
     # Attention
     parser.add_argument("--fused-qkv", action="store_true")
@@ -90,7 +111,7 @@ def parse_args():
     parser.add_argument("--on-device-sampling", action="store_true")
 
     # Bucketing
-    parser.add_argument("--enable-bucketing", type=bool, default=True)
+    parser.add_argument("--enable-bucketing", type=_str2bool, default=True)
     parser.add_argument("--bucket-n-active-tokens", action="store_true")
     parser.add_argument("--context-encoding-buckets", nargs="+", type=int)
     parser.add_argument("--token-generation-buckets", nargs="+", type=int)
@@ -104,6 +125,71 @@ def parse_args():
     parser.add_argument("--mlp-kernel-enabled", action="store_true")
     parser.add_argument("--quantized-mlp-kernel-enabled", action="store_true")
     parser.add_argument("--rmsnorm-quantize-kernel-enabled", action="store_true")
+    parser.add_argument(
+        "--moe-fused-nki-kernel-enabled",
+        dest="moe_fused_nki_kernel_enabled",
+        action="store_true",
+        help="Enable fused MoE token-generation NKI kernel when compatible.",
+    )
+    parser.add_argument(
+        "--no-moe-fused-nki-kernel-enabled",
+        dest="moe_fused_nki_kernel_enabled",
+        action="store_false",
+        help="Disable fused MoE token-generation NKI kernel.",
+    )
+    parser.set_defaults(moe_fused_nki_kernel_enabled=None)
+    parser.add_argument(
+        "--attn-cte-kernel-enabled",
+        dest="attn_cte_kernel_enabled",
+        action="store_true",
+        help="Enable attention_cte kernel path in qwen_with_attention_cte.",
+    )
+    parser.add_argument(
+        "--no-attn-cte-kernel-enabled",
+        dest="attn_cte_kernel_enabled",
+        action="store_false",
+        help="Disable attention_cte kernel path in qwen_with_attention_cte.",
+    )
+    parser.set_defaults(attn_cte_kernel_enabled=None)
+    parser.add_argument(
+        "--attn-tkg-kernel-enabled",
+        dest="attn_tkg_kernel_enabled",
+        action="store_true",
+        help="Enable attention_tkg kernel path in qwen_with_attention_cte token generation.",
+    )
+    parser.add_argument(
+        "--no-attn-tkg-kernel-enabled",
+        dest="attn_tkg_kernel_enabled",
+        action="store_false",
+        help="Disable attention_tkg kernel path in qwen_with_attention_cte token generation.",
+    )
+    parser.set_defaults(attn_tkg_kernel_enabled=None)
+    parser.add_argument(
+        "--attn-tkg-use-pos-id",
+        dest="attn_tkg_use_pos_id",
+        action="store_true",
+        help="Use in-kernel mask generation via position IDs for attention_tkg.",
+    )
+    parser.add_argument(
+        "--no-attn-tkg-use-pos-id",
+        dest="attn_tkg_use_pos_id",
+        action="store_false",
+        help="Use explicit prior mask path for attention_tkg.",
+    )
+    parser.set_defaults(attn_tkg_use_pos_id=None)
+    parser.add_argument(
+        "--attn-tkg-allow-head-dim-128",
+        dest="attn_tkg_allow_head_dim_128",
+        action="store_true",
+        help="Allow attention_tkg when head_dim == 128 (disabled by default due observed instability).",
+    )
+    parser.add_argument(
+        "--no-attn-tkg-allow-head-dim-128",
+        dest="attn_tkg_allow_head_dim_128",
+        action="store_false",
+        help="Keep attention_tkg disabled for head_dim == 128.",
+    )
+    parser.set_defaults(attn_tkg_allow_head_dim_128=None)
     parser.add_argument("--quantized-kernel-lower-bound", type=float, default=1200.0)
     parser.add_argument("--mlp-kernel-fuse-residual-add", action="store_true")
 
@@ -531,8 +617,49 @@ def find_hlos():
 
     return ctx_rt, tkg_rt
 
+
+def resolve_qwen_module_name(qwen_name: str, enable_nki: bool) -> str:
+    alias_map = {
+        "qwen": "qwen",
+        "qwen_with_nki": "qwen_with_nki",
+        "qwen_nki": "qwen_with_nki",
+        "qwen_with_attention_cte": "qwen_with_attention_cte",
+        "qwen_attention_cte": "qwen_with_attention_cte",
+        "qwen_cte": "qwen_with_attention_cte",
+    }
+
+    normalized = qwen_name.strip()
+    module_name = alias_map.get(normalized, normalized)
+
+    # Backward-compatible default: --enable-nki with baseline qwen picks qwen_with_nki.
+    if enable_nki and module_name == "qwen":
+        module_name = "qwen_with_nki"
+
+    return module_name
+
+
+def configure_neuron_platform_target(platform_target: str) -> None:
+    target_aliases = {
+        "gen2": "trn1",
+        "gen3": "trn2",
+        "gen4": "trn3",
+    }
+    resolved_target = target_aliases.get(platform_target.strip().lower(), platform_target.strip().lower())
+
+    if "NEURON_PLATFORM_TARGET_OVERRIDE" not in os.environ:
+        os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = resolved_target
+        print(f"Set NEURON_PLATFORM_TARGET_OVERRIDE={resolved_target}")
+    else:
+        env_target = os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"]
+        if env_target != resolved_target:
+            print(
+                "NEURON_PLATFORM_TARGET_OVERRIDE is already set to "
+                f"{env_target}; leaving it unchanged (requested --platform-target={resolved_target})."
+            )
+
 def main():
     args = parse_args()
+    configure_neuron_platform_target(args.platform_target)
     if not args.prompts:
         args.prompts = ["I believe the meaning of life is"]
         
@@ -540,12 +667,10 @@ def main():
     args.max_length = args.seq_len
     args.tol_map = "{None: (1e-5, 0.05), 1000: (1e-5, 0.03), 50: (1e-5, 0.03), 5: (1e-5, 0.03)}"
 
-    # points to your local model definition from qwen.py or qwen_with_nki.py
-    if args.enable_nki:
-        print("Loading qwen_with_nki module (NKI-accelerated RMSNorm enabled)")
-        qwen = importlib.import_module("qwen_with_nki")
-    else:
-        qwen = importlib.import_module(args.qwen)   
+    # points to your local model definition (for example qwen.py, qwen_with_nki.py, qwen_with_attention_cte.py)
+    qwen_module_name = resolve_qwen_module_name(args.qwen, args.enable_nki)
+    print(f"Loading module: {qwen_module_name}")
+    qwen = importlib.import_module(qwen_module_name)
 
     if args.mode == "generate":
         model, tokenizer, generation_config = prepare_inference(qwen.NeuronQwen3MoeForCausalLM, args)
@@ -583,17 +708,14 @@ def main():
 
     elif args.mode == "evaluate_single":
 
+        model, tokenizer, generation_config = prepare_inference(qwen.NeuronQwen3MoeForCausalLM, args)
+
         if args.platform_target == 'trn2':
-            
-            model, tokenizer, generation_config = prepare_inference(qwen.NeuronQwen3MoeForCausalLM, args)
-
             accuracy = 1
-            
-        elif args.platform_target == 'trn3': 
-        
-            model, tokenizer, generation_config = prepare_inference(qwen.NeuronQwen3MoeForCausalLM, args)
-
-            base_model, _, base_generation_config = prepare_inference(baseline_qwen.NeuronQwen3MoeForCausalLM, args)
+        else:
+            base_model, _, base_generation_config = prepare_inference(
+                baseline_qwen.NeuronQwen3MoeForCausalLM, args
+            )
 
             accuracy = run_accuracy_check(
                 base_model,
@@ -626,7 +748,7 @@ def main():
             f"\tNKI FLOPs Ratio: {nki_flop_ratio}"
         )
 
-    elif args.mode == 'evaluate_all' and args.platform_target == 'trn2':
+    elif args.mode == 'evaluate_all':# and args.platform_target == 'trn2':
         
         model, tokenizer, generation_config = prepare_inference(qwen.NeuronQwen3MoeForCausalLM, args)
 
