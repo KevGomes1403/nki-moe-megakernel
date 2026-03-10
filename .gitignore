@@ -6,3 +6,4 @@ Qwen/
 *.ipynb_checkpoints/
 __pycache__/
 PostSPMDPassesExecutionDuration.txt
+parquet_files/

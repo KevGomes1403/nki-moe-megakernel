@@ -18,7 +18,7 @@ def test_attention_cte():
     print("=" * 70)
 
     # Ensure NKI tracing can identify the target on this host.
-    os.environ.setdefault("NEURON_PLATFORM_TARGET_OVERRIDE", "trn1")
+    os.environ.setdefault("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
 
     device = xm.xla_device()
     print(f"\nUsing device: {device}")
@@ -75,7 +75,7 @@ def test_attention_cte():
     tol = 2e-2
     if max_diff < tol:
         print("\n" + "=" * 70)
-        print("SUCCESS! attention_cte instantiates and executes on trn1.")
+        print("SUCCESS! attention_cte instantiates and executes on trn2.")
         print("=" * 70)
         return True
 

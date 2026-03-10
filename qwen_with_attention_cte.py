@@ -12,10 +12,12 @@ torch.manual_seed(0)
 
 import gc
 import logging
+import shlex
 import warnings
 from typing import List, Optional, Tuple, Union, Dict, Any
 
 import torch
+import torch.nn.functional as F
 import math
 import nki
 
@@ -29,7 +31,7 @@ try:
 except ImportError:
     from neuronxcc.nki.kernels.attention import attention_isa_kernel
 
-from neuronx_distributed.parallel_layers import parallel_state
+from neuronx_distributed.parallel_layers import mappings, parallel_state
 from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, ParallelEmbedding
 from neuronx_distributed.utils import cpu_mode
 from torch import nn
@@ -38,7 +40,7 @@ from transformers import Qwen3MoeForCausalLM
 from transformers.generation import SampleDecoderOnlyOutput, SampleEncoderDecoderOutput
 from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeRMSNorm
 
-from neuronx_distributed_inference.models.config import InferenceConfig, MoENeuronConfig, SHARD_ON_INTERMEDIATE_DIMENTION_PER_TP, MOE_TKG_MK_INTERMEDIATE_PER_TP
+from neuronx_distributed_inference.models.config import InferenceConfig, MoENeuronConfig, SHARD_ON_INTERMEDIATE_DIMENSION_PER_TP, MOE_TKG_MK_INTERMEDIATE_PER_TP
 from neuronx_distributed_inference.models.model_wrapper import CONTEXT_ENCODING_MODEL_TAG, TOKEN_GENERATION_MODEL_TAG
 from neuronx_distributed_inference.modules.attention.attention_base import (
     FlashAttentionStrategy,
@@ -51,10 +53,8 @@ from neuronx_distributed_inference.models.layer_boundary_marker import (
     ModuleMarkerStartWrapper,
 )
 
-try:
-    from nkilib.core.attention.attention_cte import attention_cte
-except ImportError:
-    attention_cte = None
+from nkilib.core.attention.attention_cte import attention_cte
+
 try:
     from nkilib.core.attention.attention_tkg import attention_tkg
     from nkilib.core.attention.attention_tkg_utils import AttnTKGConfig
@@ -67,6 +67,11 @@ except ImportError:
 _flash_fwd_call = nki_jit()(attention_isa_kernel)
 
 SampleOutput = Union[SampleEncoderDecoderOutput, SampleDecoderOnlyOutput]
+
+# nki_moe_fused kernel: one-time log flags
+_moe_fused_active_logged = False
+_moe_fused_skip_logged = False
+_moe_fused_error_logged = False
 
 GQA_SHARDING_STRATEGY = GQA.REPLICATE_TO_TP_DEGREE
 logger = logging.getLogger("Neuron")
@@ -286,6 +291,7 @@ class Qwen3MoeInferenceConfig(InferenceConfig):
         self.maybe_pad_intermediate()
 
         # enable moe_fused_nki_kernel
+        self.moe_fused_nki_kernel_enabled = True
         self.enable_moe_fused_nki_kernel()
 
         self.intermediate_size = self.moe_intermediate_size
@@ -299,6 +305,42 @@ class Qwen3MoeInferenceConfig(InferenceConfig):
         self.neuron_config.disable_numeric_cc_token = True
         # Qwen3 normalizes top k affinities
         self.neuron_config.normalize_top_k_affinities = True
+        
+        # self.neuron_config.attn_block_tkg_nki_kernel_enabled = True
+        # self.neuron_config.attn_block_tkg_nki_kernel_cascaded_attention = True
+        # self.neuron_config.fused_qkv = True
+        # self.neuron_config.qkv_kernel_enabled = True
+        self._snap_tkg_buckets_to_128()
+
+    def _snap_tkg_buckets_to_128(self):
+        """Cascaded TKG kernel requires s_prior % 128 == 0 for s_prior > 256.
+        Round up any non-compliant values to the next multiple of 128.
+
+        generate_buckets_for_tkg has two paths:
+          - enable_bucketing=False: uses max_length directly (ignores token_generation_buckets)
+          - enable_bucketing=True:  uses token_generation_buckets if set, else generate_buckets(128, max_length)
+        Both paths must be covered, so we snap max_length/seq_len AND token_generation_buckets.
+        """
+        nc = self.neuron_config
+
+        def snap128(n):
+            return n if n <= 256 or n % 128 == 0 else ((n + 127) // 128) * 128
+
+        # Snap explicit bucket list (enable_bucketing=True path when user passes --token-generation-buckets)
+        if nc.token_generation_buckets is not None:
+            nc.token_generation_buckets = sorted(set(snap128(b) for b in nc.token_generation_buckets))
+
+        # Snap max_length and seq_len — these drive the bucket ceiling in all paths
+        for attr in ("max_length", "seq_len"):
+            v = getattr(nc, attr, None)
+            if v and v > 256 and v % 128 != 0:
+                snapped = snap128(v)
+                setattr(nc, attr, snapped)
+                logger.warning(
+                    "attn_block_tkg: %s=%d is not a multiple of 128; snapping to %d "
+                    "(cascaded kernel requires s_prior %% 128 == 0)",
+                    attr, v, snapped,
+                )
 
     def _get_effective_moe_tp_degree(self):
         moe_tp_degree = self.neuron_config.moe_tp_degree
@@ -311,9 +353,9 @@ class Qwen3MoeInferenceConfig(InferenceConfig):
         moe_tp_degree = self._get_effective_moe_tp_degree()
         I_TP = self.moe_intermediate_size // moe_tp_degree
         if getattr(self.neuron_config.blockwise_matmul_config, "use_shard_on_intermediate_dynamic_while", False):
-            # If shard-on-I enabled, check the intermediate size per tp is divisible by SHARD_ON_INTERMEDIATE_DIMENTION_PER_TP
-            if I_TP % SHARD_ON_INTERMEDIATE_DIMENTION_PER_TP != 0:
-                padded_moe_intermediate_size = math.ceil(I_TP / SHARD_ON_INTERMEDIATE_DIMENTION_PER_TP) * SHARD_ON_INTERMEDIATE_DIMENTION_PER_TP * moe_tp_degree
+            # If shard-on-I enabled, check the intermediate size per tp is divisible by SHARD_ON_INTERMEDIATE_DIMENSION_PER_TP
+            if I_TP % SHARD_ON_INTERMEDIATE_DIMENSION_PER_TP != 0:
+                padded_moe_intermediate_size = math.ceil(I_TP / SHARD_ON_INTERMEDIATE_DIMENSION_PER_TP) * SHARD_ON_INTERMEDIATE_DIMENSION_PER_TP * moe_tp_degree
                 self.moe_intermediate_pad_size = max(padded_moe_intermediate_size - self.moe_intermediate_size, 0)
                 # set moe_intermediate_size to padded size
                 self.moe_intermediate_size = padded_moe_intermediate_size
@@ -930,15 +972,18 @@ class NeuronQwen3MoEAttention(NeuronAttentionBase):
 
 
 class NeuronQwen3MoeDecoderLayer(nn.Module):
-    """
-    Just replace the attention with the NXD version, and MLP with the NXD version
+    """Decoder layer with attention_cte for prefill and nki_moe_fused for token generation.
+
+    CTE (q_len > 1): Uses the standard NxD MoE module (initialize_moe_module).
+    TKG (q_len == 1): Calls nki_moe_fused kernel directly, bypassing the standard
+        MoE module for higher performance during token generation.
     """
 
     def __init__(self, config: Qwen3MoeInferenceConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = NeuronQwen3MoEAttention(config=config)
-        self.moe_fused_nki_kernel_enabled = getattr(config, "moe_fused_nki_kernel_enabled", False)
+        self.moe_fused_nki_kernel_enabled = getattr(config, "moe_fused_nki_kernel_enabled", True)
 
         self.input_layernorm = get_rmsnorm_cls()(
             config.hidden_size,
@@ -949,19 +994,111 @@ class NeuronQwen3MoeDecoderLayer(nn.Module):
             eps=config.rms_norm_eps,
         )
 
-        if self.moe_fused_nki_kernel_enabled:
-            self.mlp = initialize_moe_module(
-                config=config, rmsnorm=self.post_attention_layernorm, init_tkg_module=True
-            )
-        else:
-            self.mlp = initialize_moe_module(
-                config=config,
-            )
+        # Standard MoE module — used for CTE and as the weight store for TKG.
+        # rmsnorm is applied internally by self.mlp, so callers pass un-normed input.
+        # The nki_moe_fused path applies norm explicitly since it bypasses self.mlp.
+        self.mlp = initialize_moe_module(
+            config=config, rmsnorm=self.post_attention_layernorm,  init_tkg_module=True
+        )
 
         self.qkv_kernel_enabled = config.neuron_config.qkv_kernel_enabled
         self.sequence_parallel_enabled = config.neuron_config.sequence_parallel_enabled
         self.qkv_kernel_fused_rmsnorm = not self.sequence_parallel_enabled
         self.moe_mask_padded_tokens = config.neuron_config.moe_mask_padded_tokens
+
+        # nki_moe_fused configuration
+        self.normalize_top_k_affinities = config.neuron_config.normalize_top_k_affinities
+        self.num_experts = config.num_experts
+        self.num_experts_per_tok = config.num_experts_per_tok
+
+        # Check if nki_moe_fused can be used: I_tp must be padded to multiple of 128.
+        # moe_tp_degree = getattr(config.neuron_config, "moe_tp_degree", 1)
+        # if moe_tp_degree == 1 and config.neuron_config.tp_degree > 1:
+        #     moe_tp_degree = config.neuron_config.tp_degree
+        # I_tp = config.moe_intermediate_size // moe_tp_degree
+        # self._i_tp = I_tp
+        # self._i_tp_padded = ((I_tp + 127) // 128) * 128
+        # self._i_tp_needs_pad = (I_tp % 128 != 0)
+        # self.moe_fused_direct_enabled = getattr(
+        #     config.neuron_config, "moe_fused_direct_enabled", True
+        # )
+
+    # ------------------------------------------------------------------
+    # nki_moe_fused forward helper for token generation
+    # ------------------------------------------------------------------
+
+    # def _forward_moe_fused(self, hidden_states: torch.Tensor, bsz: int) -> torch.Tensor:
+    #     """Call nki_moe_fused for one decode step.
+
+    #     Args:
+    #         hidden_states: [bsz, 1, H] post-RMSNorm
+    #         bsz: batch size (= number of tokens T during decode)
+
+    #     Returns:
+    #         [bsz, 1, H] MoE output (after TP all-reduce)
+    #     """
+    #     global _moe_fused_active_logged
+    #     if not _moe_fused_active_logged:
+    #         logger.warning("nki_moe_fused NKI kernel ACTIVE for token generation")
+    #         _moe_fused_active_logged = True
+
+    #     T = bsz
+    #     H = hidden_states.shape[-1]
+    #     device = hidden_states.device
+    #     hidden_2d = hidden_states.reshape(T, H)  # [T, H]
+
+    #     # --- Router: get affinities and top-K indices ---
+    #     _, affinities_full, expert_index = self.mlp.router(hidden_2d)
+    #     # affinities_full: [T, E] (softmax over all experts)
+    #     # expert_index:     [T, K] int64
+
+    #     E = self.num_experts
+
+    #     # Build routing_weights [T, E]: sparse tensor with normalized top-K probs.
+    #     # Non-selected experts have weight 0, so the kernel skips their contribution.
+    #     if self.normalize_top_k_affinities:
+    #         topk_probs = affinities_full.gather(1, expert_index)           # [T, K]
+    #         topk_normalized = topk_probs / topk_probs.sum(dim=-1, keepdim=True)
+    #         routing_weights = torch.zeros(T, E, device=device, dtype=torch.float32)
+    #         routing_weights.scatter_(1, expert_index, topk_normalized.to(torch.float32))
+    #     else:
+    #         routing_weights = affinities_full.to(torch.float32)
+
+    #     # --- Weights (TP-sharded on intermediate dimension I) ---
+    #     gate_up_w = self.mlp.expert_mlps.mlp_op.gate_up_proj.weight  # [E, H, 2*I_tp]
+    #     down_w    = self.mlp.expert_mlps.mlp_op.down_proj.weight      # [E, I_tp, H]
+
+    #     # Pad intermediate dimension to multiple of 128 if needed.
+    #     if self._i_tp_needs_pad:
+    #         pad_size = self._i_tp_padded - self._i_tp
+    #         # gate_up_w: [E, H, 2*I_tp] → split into gate [E,H,I_tp] and up [E,H,I_tp],
+    #         # pad each, then concat back
+    #         gate_w = gate_up_w[:, :, :self._i_tp]
+    #         up_w = gate_up_w[:, :, self._i_tp:]
+    #         gate_w = F.pad(gate_w, (0, pad_size))
+    #         up_w = F.pad(up_w, (0, pad_size))
+    #         gate_up_w = torch.cat([gate_w, up_w], dim=2)  # [E, H, 2*I_tp_padded]
+    #         # down_w: [E, I_tp, H] → pad on dim=1
+    #         down_w = F.pad(down_w, (0, 0, 0, pad_size))   # [E, I_tp_padded, H]
+
+    #     # --- nki_moe_fused kernel call ---
+    #     output = _nki_moe_fused(
+    #         hidden_2d,         # [T, H] bf16
+    #         gate_up_w,         # [E, H, 2*I_tp_padded] bf16
+    #         down_w,            # [E, I_tp_padded, H] bf16
+    #         routing_weights,   # [T, E] float32
+    #     )  # [T, H]
+
+    #     # --- TP all-reduce ---
+    #     output = mappings.reduce_from_tensor_model_parallel_region(
+    #         output, process_group=parallel_state.get_world_group()
+    #     )
+
+    #     return output.reshape(bsz, 1, H)
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
 
     def forward(
         self,
@@ -972,26 +1109,17 @@ class NeuronQwen3MoeDecoderLayer(nn.Module):
         padding_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
-        """
-        Args:
-            hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
-            attention_mask (`torch.FloatTensor`, *optional*):
-                attention mask of size `(batch_size, sequence_length)` if flash attention is used or `(batch_size, 1,
-                query_sequence_length, key_sequence_length)` if default attention is used.
-            position_ids (`torch.FloatTensor`, *optional*):
-                position ids of size `(batch_size, sequence_length)`.
-            past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
-        """
+        global _moe_fused_skip_logged, _moe_fused_error_logged
+
         if "padding_mask" in kwargs:
             warnings.warn(
-                "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
+                "Passing `padding_mask` is deprecated and will be removed in v4.37. "
+                "Please make sure use `attention_mask` instead.`"
             )
 
         residual = hidden_states
 
         qkv_fused_rmsnorm = None
-        # We wrap input_layernorm/self_attn/post_attention_layernorm with module markers start/end
-        # as a hint for compiler's modular-flow to avoid layer boundries in-between decoder layer components
         hidden_states = ModuleMarkerStartWrapper()(hidden_states)
         if self.input_layernorm:
             if self.qkv_kernel_enabled and self.qkv_kernel_fused_rmsnorm:
@@ -1010,7 +1138,10 @@ class NeuronQwen3MoeDecoderLayer(nn.Module):
         )
         hidden_states = residual + hidden_states
 
-        # MoE
+        # ---- MoE block ----
+        # self.mlp applies post_attention_layernorm internally.
+        # The nki_moe_fused path needs explicit norm since it bypasses self.mlp.
+      
         residual = hidden_states
         if not self.moe_fused_nki_kernel_enabled:
             hidden_states = self.post_attention_layernorm(hidden_states)
@@ -1093,27 +1224,72 @@ class NeuronQwen3MoeForCausalLM(NeuronBaseForCausalLM):
     def enable_token_generation(self):
         self.compile_tag = TOKEN_GENERATION_MODEL_TAG
         super().enable_token_generation()
+        # Cascaded TKG kernel requires every bucket to be a multiple of 128
+        # (n_sprior_tile = ceil(s_prior/128) but accesses up to n_sprior_tile*128-1).
+        # Snap the bucket list that was just generated by generate_buckets_for_tkg.
+        tkg_nc = self.token_generation_model.config.neuron_config
+        def _snap128(b):
+            return b if b <= 256 or b % 128 == 0 else ((b + 127) // 128) * 128
+        if tkg_nc.buckets and not isinstance(tkg_nc.buckets[0], list):
+            snapped = sorted(set(_snap128(b) for b in tkg_nc.buckets))
+            if snapped != tkg_nc.buckets:
+                logger.warning(
+                    "attn_block_tkg: snapping TKG buckets %s → %s "
+                    "(cascaded kernel requires s_prior %% 128 == 0)",
+                    tkg_nc.buckets, snapped,
+                )
+                tkg_nc.buckets = snapped
 
     def get_compiler_args(self):
+        # Build args as a list so each element is a complete, unambiguous argument.
+        # shlex.join() quotes any values that contain spaces, and the base class
+        # calls shlex.split() before passing to the compiler, so the round-trip is safe.
+        args = [
+            "--enable-saturate-infinity",
+            "--enable-mixed-precision-accumulation",
+            "--model-type", "transformer",
+        ]
+
         # Set compiler optimization level based on model tag
         if self.compile_tag == CONTEXT_ENCODING_MODEL_TAG:
             optimization_level = "-O1"
+            tensorizer_opts = [
+                "--enable-ccop-compute-overlap",
+                "--cc-pipeline-tiling-factor=4",
+                "--vectorize-strided-dma",
+                "--enable-scalar-dge-vectorization",
+                "--enable-dmacopy-transpose",
+            ]
         elif self.compile_tag == TOKEN_GENERATION_MODEL_TAG:
-            # Disable Modular flow for TKG graph with EP enabled as it causes perf degradation
-            optimization_level = "-O3" if self.neuron_config.moe_ep_degree > 1 else "-O1"
-        compiler_args = f"--enable-saturate-infinity --enable-mixed-precision-accumulation --model-type transformer {optimization_level}"
-        # Add flags for cc-overlap
-        compiler_args += (
-            " --tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2'"
-        )
-        compiler_args += " --auto-cast=none"
-        # Enable vector-offset DGE
-        compiler_args += " --internal-enable-dge-levels vector_dynamic_offsets"
-        compiler_args += " --internal-hlo2tensorizer-options='--verify-hlo=true'"
+            optimization_level = "-O3"
+            tensorizer_opts = [
+                "--enable-ccop-compute-overlap",
+                "--cc-pipeline-tiling-factor=1",
+                "--vectorize-strided-dma",
+                "--enable-scalar-dge-vectorization",
+                "--enable-dmacopy-transpose",
+                "--eager-tkg-vectorize-dma",
+                "--enable-dge-on-indirect-dma",
+                "--enable-dge-on-vector-indirect-dma",
+            ]
+        else:
+            optimization_level = "-O1"
+            tensorizer_opts = []
+
+        if tensorizer_opts:
+            # Join sub-options into a single value; shlex.join quotes the resulting
+            # element so spaces inside the value survive the base class's shlex.split().
+            args.append(f"--tensorizer-options={' '.join(tensorizer_opts)}")
+
+        args.append(optimization_level)
+        args += ["--auto-cast=none", "--auto-cast-type=bf16"]
+        # Enable vector-offset DGE (two separate tokens)
+        args += ["--internal-enable-dge-levels", "vector_dynamic_offsets"]
+        # hlo2tensorizer sub-options (value contains spaces; shlex.join will quote it)
+        args.append("--internal-hlo2tensorizer-options=--verify-hlo=true")
+
         if self.neuron_config.scratchpad_page_size:
-            compiler_args += (
-                f" --hbm-scratchpad-page-size={self.neuron_config.scratchpad_page_size} "
-            )
+            args.append(f"--hbm-scratchpad-page-size={self.neuron_config.scratchpad_page_size}")
 
         if self.neuron_config.attn_block_tkg_nki_kernel_enabled:
             assert (
@@ -1122,9 +1298,9 @@ class NeuronQwen3MoeForCausalLM(NeuronBaseForCausalLM):
             # Enabled RMSNorm pre-RoPE in the Attn TKG MK
             self.neuron_config.pre_rope_rmsnorm = True
             # When enabling the Cascaded Attn TKG MK we will run over 5 million instructions on E2E
-            compiler_args += " --internal-max-instruction-limit=15000000"
+            args.append("--internal-max-instruction-limit=15000000")
 
-        return compiler_args
+        return shlex.join(args)
 
 
 def generate(skip_compile=False):

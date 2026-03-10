@@ -33,6 +33,10 @@ BENCHMARK_REPORT_FILENAME = "benchmark_report.json"
 
 set_random_seed(0)
 
+os.environ["NEURON_CC_FLAGS"] = " --disable-dge "
+os.environ["NEURON_FRAMEWORK_DEBUG"] = "1"
+os.environ["XLA_IR_DEBUG"] = "1"
+os.environ["XLA_HLO_DEBUG"] = "1"
 
 def _str2bool(value):
     if isinstance(value, bool):
@@ -57,7 +61,8 @@ def parse_args():
         help=(
             "Qwen module or alias to load. Supported aliases: "
             "qwen, qwen_with_nki (or qwen_nki), "
-            "qwen_with_attention_cte (or qwen_attention_cte/qwen_cte)."
+            "qwen_with_attention_cte (or qwen_attention_cte/qwen_cte), "
+            "qwen_with_moe_tkg (or qwen_moe_tkg/qwen_tkg)."
         ),
     )
     parser.add_argument("--enable-nki", action="store_true")
@@ -100,7 +105,7 @@ def parse_args():
     parser.add_argument("--vocab-parallel", action="store_true")
     parser.add_argument("--skip-compile", type=_str2bool, default=False)
     parser.add_argument("--save_sharded_checkpoint", type=_str2bool, default=True)
-    parser.add_argument("--platform-target", type=str, default='trn1') 
+    parser.add_argument("--platform-target", type=str, default='trn2') 
 
     # Attention
     parser.add_argument("--fused-qkv", action="store_true")
@@ -339,6 +344,7 @@ def benchmark_sampling(model, tokenizer, generation_config, prompts):
         input_param,
         preprocess_func=model.reset,
         post_warmup_func=post_warmup_func,
+        num_runs=2
     )
     e2e_benchmark.run()
     report["e2e_model"] = generate_report(
@@ -626,6 +632,10 @@ def resolve_qwen_module_name(qwen_name: str, enable_nki: bool) -> str:
         "qwen_with_attention_cte": "qwen_with_attention_cte",
         "qwen_attention_cte": "qwen_with_attention_cte",
         "qwen_cte": "qwen_with_attention_cte",
+        # Direct nkilib moe_tkg kernel for token generation + attention_cte for prefill.
+        "qwen_with_moe_tkg": "qwen_with_moe_tkg",
+        "qwen_moe_tkg": "qwen_with_moe_tkg",
+        "qwen_tkg": "qwen_with_moe_tkg",
     }
 
     normalized = qwen_name.strip()
