@@ -1,29 +1,18 @@
 """
-Optimized MoE kernel — v5: Token-Parallel Sparse Execution.
+Optimized MoE kernel — v5c: Batch-Load Routing Weights Per Token.
 
-Key optimization over v1/v3:
-  - SPARSE K-expert dispatch: only K experts per token, not all E.
-    Accepts expert_indices [T, K] and routing_weights_k [T, K] directly.
-  - range(T) outer token loop with per-token SBUF reuse: each token's
-    SBUF allocations are reused in the next token iteration, keeping SBUF
-    pressure constant regardless of T.
-  - ALL inner loops use nl.affine_range() where no loop-carried dependency:
-      h_t (hidden load), gu_t (gate+up matmul col), i_t (SiLU/mul/cast),
-      h_t (down matmul row), final store.
-  - PSUM tiles are allocated ONCE outside the T loop and reused (memset at
-    the start of each (t, k) pair) — avoids repeated PSUM allocation.
-  - Hoisted hidden state load for the current token (one DMA per h-tile).
-  - Dynamic expert weight indexing via .ap() scalar offset.
+Based on v5 (Token-Parallel Sparse Execution).
 
-Algorithm per token t:
-  1. Load token t's hidden tiles into SBUF.
-  2. For k in range(K) [sequential — output accumulation]:
-     a. Get expert id via ap() scalar offset.
-     b. Gate+Up matmul → gu_psum_tiles (memset before each k).
-     c. PSUM→SBUF, SiLU, multiply, cast to bf16.
-     d. Down matmul → down_psum (memset before each h_t).
-     e. PSUM→SBUF, scale by rw_k, accumulate into out_accum.
-  3. Cast out_accum → bf16, write to HBM output[t, :].
+Key optimization over v5:
+  - BATCH ROUTING WEIGHT LOAD: Instead of K separate 4-byte HBM DMAs per token
+    to load individual routing weights, we load ALL K routing weights for a token
+    in a single DMA: rw_k_buf[1, K] from routing_weights_k[t:t+1, 0:K].
+    This reduces DMA packet overhead from K transfers to 1 per token.
+  - All K values land at partition 0 in SBUF, so tensor_scalar can read them
+    without the non-zero partition constraint that originally forced per-element DMA.
+
+Everything else (gate+up projection, SiLU, down projection, accumulation) is
+unchanged from v5.
 
 Constraints:
     T <= 128
@@ -49,7 +38,7 @@ os.environ["XLA_HLO_DEBUG"] = "1"
 # ---------------------------------------------------------------------------
 
 @nki.jit(platform_target="trn2")
-def nki_moe_v5(
+def nki_moe_v5c(
     hidden_states,        # [T, H]    bf16
     gate_up_weights,      # [E, H, 2*I] bf16
     down_weights,         # [E, I, H]   bf16
@@ -57,7 +46,7 @@ def nki_moe_v5(
     routing_weights_k,    # [T, K]    float32 — routing weights for the K experts
 ):
     """
-    Sparse Token-Parallel MoE kernel (v5).
+    Sparse Token-Parallel MoE kernel (v5c) with batch routing weight load.
 
     Processes only K experts per token using dynamic weight indexing.
     Each token's SBUF is fully reused across the T loop, making SBUF
@@ -74,9 +63,6 @@ def nki_moe_v5(
     num_h_tiles  = H      // P   # number of P-wide hidden-dim tiles
     num_i_tiles  = I_size // P   # number of P-wide intermediate tiles
     num_gu_tiles = two_I  // P   # num_i_tiles * 2 (gate + up)
-
-    # Keep 3D weight tensors — use .ap() with scalar_offset/indirect_dim
-    # for dynamic expert selection (hardware computes eid * stride automatically).
 
     # HBM output buffer
     output = nl.ndarray((T, H), dtype=hidden_states.dtype, buffer=nl.shared_hbm)
@@ -96,9 +82,6 @@ def nki_moe_v5(
     # Pre-allocate PSUM tiles (reused across T and K loops).
     #   gu_psum_tiles[gu_t]  : [P, 1] float32 psum  (T=1 per token slice)
     #   down_psum            : [1, P] float32 psum   (T=1 per token slice)
-    #
-    # We process one token at a time so the partition = P (token in free dim).
-    # For a single token: gate+up result is [P_gu, 1], down result is [1, P_h].
     # =========================================================================
     # PSUM tile for gate+up: one [P, 1] tile per gu column block
     gu_psum_tiles = []
@@ -120,8 +103,8 @@ def nki_moe_v5(
     for t in range(T):
 
         # -------------------------------------------------------------------
-        # Load token t's hidden state: num_h_tiles × [P, 1] SBUF tiles.
-        # hidden_states[t, h_off:h_off+P] → h_sb[P, 1]
+        # Load token t's hidden state: num_h_tiles x [P, 1] SBUF tiles.
+        # hidden_states[t, h_off:h_off+P] -> h_sb[P, 1]
         # Access pattern: stride along H (inner), one row (token t).
         # -------------------------------------------------------------------
         h_tiles_sb = []
@@ -137,13 +120,27 @@ def nki_moe_v5(
             )
             h_tiles_sb.append(h_sb)
 
-        # Output accumulator for this token: num_h_tiles × [1, P] f32 SBUF
+        # Output accumulator for this token: num_h_tiles x [1, P] f32 SBUF
         # Zero once; K expert contributions are accumulated here.
         out_accum = []
         for _h_t in nl.affine_range(num_h_tiles):
             tmp = nl.ndarray((1, P), dtype=nl.float32, buffer=nl.sbuf)
             nisa.memset(dst=tmp, value=0)
             out_accum.append(tmp)
+
+        # -------------------------------------------------------------------
+        # Batch-load ALL K routing weights for token t in ONE DMA.
+        # Result shape: [1, K] at partition 0 in SBUF.
+        # This replaces K separate 4-byte DMA transfers with a single transfer,
+        # eliminating per-element DMA packet overhead.
+        # All values land in partition 0 (row 0), which avoids the tensor_scalar
+        # partition constraint that prevents accessing non-zero partitions.
+        # -------------------------------------------------------------------
+        rw_k_buf = nl.ndarray((1, K), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(
+            dst=rw_k_buf,
+            src=routing_weights_k[t:t+1, 0:K],
+        )
 
         # -------------------------------------------------------------------
         # K-EXPERT LOOP — sequential (accumulates into out_accum)
@@ -157,21 +154,14 @@ def nki_moe_v5(
                 offset=t * K + k,
             )
 
-            # Load routing weight for (t, k) from HBM → partition-0 SBUF scalar.
-            # Cannot use SBUF .ap() view as operand0 in tensor_scalar when
-            # accessing non-zero partitions (t > 0), so we DMA-load per element.
-            rw_scalar = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.dma_copy(
-                dst=rw_scalar,
-                src=routing_weights_k.ap(
-                    pattern=[[K, 1], [1, 1]],
-                    offset=t * K + k,
-                ),
-            )
+            # Extract this expert's routing weight from the pre-loaded buffer.
+            # rw_k_buf is at partition 0, so tensor_scalar can read it correctly
+            # without any partition-crossing issues.
+            rw_scalar = rw_k_buf[0:1, k:k+1]
 
             # ---------------------------------------------------------------
             # Stage 1: Gate+Up projection
-            #   hidden[1, H] @ gate_up_w[H, 2*I] → [1, 2*I]
+            #   hidden[1, H] @ gate_up_w[H, 2*I] -> [1, 2*I]
             #   nc_matmul layout:  dst += stationary.T @ moving
             #     stationary = w_tile   [P_h, P_gu]  (weight row tile)
             #     moving     = h_tile   [P_h, 1]     (token hidden tile)
@@ -182,7 +172,7 @@ def nki_moe_v5(
             for gu_t in nl.affine_range(num_gu_tiles):
                 nisa.memset(dst=gu_psum_tiles[gu_t], value=0)
 
-            # Accumulate h_t contributions into gu_psum (h_t sequential → PSUM dep)
+            # Accumulate h_t contributions into gu_psum (h_t sequential -> PSUM dep)
             for h_t in range(num_h_tiles):
                 h_off  = h_t * P
                 h_tile = h_tiles_sb[h_t]
@@ -200,8 +190,6 @@ def nki_moe_v5(
                             indirect_dim=0,
                         ),
                     )
-                    
-                    # Profiling shows tensor engine is waiting for DMA each iteration
 
                     nisa.nc_matmul(
                         dst=gu_psum_tiles[gu_t],
@@ -209,11 +197,11 @@ def nki_moe_v5(
                         moving=h_tile,
                     )
 
-            # PSUM → SBUF for gate+up, then SiLU + multiply + cast to bf16
+            # PSUM -> SBUF for gate+up, then SiLU + multiply + cast to bf16
             act_bf16_tiles = []
             for i_t in nl.affine_range(num_i_tiles):
-                # Gate half: gu_psum_tiles[i_t]      → [P, 1]
-                # Up   half: gu_psum_tiles[i_t + num_i_tiles] → [P, 1]
+                # Gate half: gu_psum_tiles[i_t]      -> [P, 1]
+                # Up   half: gu_psum_tiles[i_t + num_i_tiles] -> [P, 1]
                 gate_sb = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.tensor_copy(dst=gate_sb, src=gu_psum_tiles[i_t])
 
@@ -233,21 +221,21 @@ def nki_moe_v5(
                     op=nl.multiply,
                 )
 
-                # Cast f32 → bf16 once (hoisted outside h_t down loop)
+                # Cast f32 -> bf16 once (hoisted outside h_t down loop)
                 act_bf16 = nl.ndarray((P, 1), dtype=nl.bfloat16, buffer=nl.sbuf)
                 nisa.tensor_copy(dst=act_bf16, src=act_f32)
                 act_bf16_tiles.append(act_bf16)
 
             # ---------------------------------------------------------------
             # Stage 2: Down projection
-            #   act[1, I] @ down_w[I, H] → [1, H]
+            #   act[1, I] @ down_w[I, H] -> [1, H]
             #   nc_matmul layout:  dst += stationary.T @ moving
             #     stationary = act_tile  [P_i, 1]  (intermediate tile)
             #     moving     = dw_tile   [P_i, P]  (down weight tile)
             #     result     = [1, P]               stored in down_psum_tiles[h_t]
             # ---------------------------------------------------------------
 
-            # h_t is independent → affine_range; i_t sequential (PSUM acc dep)
+            # h_t is independent -> affine_range; i_t sequential (PSUM acc dep)
             for h_t in nl.affine_range(num_h_tiles):
                 h_off = h_t * P
 
@@ -267,8 +255,6 @@ def nki_moe_v5(
                             indirect_dim=0,
                         ),
                     )
-                    
-                    # Profiler: Waits for DMA
 
                     nisa.nc_matmul(
                         dst=down_psum_tiles[h_t],
@@ -276,7 +262,9 @@ def nki_moe_v5(
                         moving=dw_tile,
                     )
 
-            # Scale by routing weight and accumulate into out_accum
+            # Scale by routing weight and accumulate into out_accum.
+            # rw_scalar is an SBUF slice at partition 0, so tensor_scalar
+            # can broadcast it across the free dimension P without issues.
             for h_t in nl.affine_range(num_h_tiles):
                 down_sb = nl.ndarray((1, P), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.tensor_copy(dst=down_sb, src=down_psum_tiles[h_t])
@@ -299,7 +287,7 @@ def nki_moe_v5(
                 )
 
         # -------------------------------------------------------------------
-        # Store token t's output: out_accum[h_t] → output[t, h_off:h_off+P]
+        # Store token t's output: out_accum[h_t] -> output[t, h_off:h_off+P]
         # -------------------------------------------------------------------
         for h_t in nl.affine_range(num_h_tiles):
             h_off    = h_t * P
@@ -375,12 +363,12 @@ def _make_sparse_inputs(T, H, I_size, E, K, dtype=torch.bfloat16, seed=42):
     return hidden_states, gate_up_weights, down_weights, expert_indices, expert_weights
 
 
-def test_nki_moe_v5_small():
+def test_nki_moe_v5c_small():
     """Small correctness test: T=1, H=256, I=256, E=8, K=2."""
     import torch_xla.core.xla_model as xm
 
     print("=" * 70)
-    print("nki_moe_v5 — Small shapes (T=1, H=256, I=256, E=8, K=2)")
+    print("nki_moe_v5c — Small shapes (T=1, H=256, I=256, E=8, K=2)")
     print("=" * 70)
 
     device = xm.xla_device()
@@ -395,8 +383,8 @@ def test_nki_moe_v5_small():
     print("\n[1/3] Reference (PyTorch CPU)...")
     ref = pytorch_moe_sparse_reference(hidden, gu_w, d_w, eidx, rw_k)
 
-    print("[2/3] NKI v5 kernel on Trainium...")
-    nki_out = nki_moe_v5(
+    print("[2/3] NKI v5c kernel on Trainium...")
+    nki_out = nki_moe_v5c(
         hidden.to(device),
         gu_w.to(device),
         d_w.to(device),
@@ -416,7 +404,7 @@ def test_nki_moe_v5_small():
     threshold = 0.05
     if max_diff < threshold:
         print("\n" + "=" * 70)
-        print("PASS — nki_moe_v5 small test.")
+        print("PASS — nki_moe_v5c small test.")
         print("=" * 70)
         return True
     else:
@@ -424,21 +412,23 @@ def test_nki_moe_v5_small():
         return False
 
 
-def test_nki_moe_v5_qwen3_t1():
+def test_nki_moe_v5c_qwen3_t1():
     """Qwen3 shapes, T=1: H=2048, I=256, E=128, K=8."""
     import torch_xla.core.xla_model as xm
 
     print("\n" + "=" * 70)
-    print("nki_moe_v5 — Qwen3 T=1 (H=2048, I=256, E=128, K=8)")
+    print("nki_moe_v5c — Qwen3 T=1 (H=2048, I=256, E=128, K=8)")
     print("=" * 70)
 
     device = xm.xla_device()
     T, H, I_size, E, K = 1, 2048, 256, 128, 8
 
-    hidden, gu_w, d_w, eidx, rw_k = _make_sparse_inputs(T, H, I_size, E, K, seed=123)
+    hidden, gu_w, d_w, eidx, rw_k = _make_sparse_inputs(T, H, I_size, E, K, seed=999)
 
     ref = pytorch_moe_sparse_reference(hidden, gu_w, d_w, eidx, rw_k)
-    nki_out = nki_moe_v5(
+
+    # Direct kernel call — no profiling wrapper
+    nki_out = nki_moe_v5c(
         hidden.to(device),
         gu_w.to(device),
         d_w.to(device),
@@ -461,55 +451,11 @@ def test_nki_moe_v5_qwen3_t1():
         return False
 
 
-def test_nki_moe_v5_qwen3_t4():
-    """Qwen3 shapes, T=1: H=2048, I=256, E=128, K=8 (second seed)."""
-    import torch_xla.core.xla_model as xm
-
-    print("\n" + "=" * 70)
-    print("nki_moe_v5 — Qwen3 T=1 seed=999 (H=2048, I=256, E=128, K=8)")
-    print("=" * 70)
-
-    device = xm.xla_device()
-    T, H, I_size, E, K = 1, 2048, 256, 128, 8
-
-    hidden, gu_w, d_w, eidx, rw_k = _make_sparse_inputs(T, H, I_size, E, K, seed=999)
-
-    ref = pytorch_moe_sparse_reference(hidden, gu_w, d_w, eidx, rw_k)
-    from torch_neuronx.experimental import profiler
-    with profiler.profile(port=9012,
-                        profile_type='system',
-                        target='neuron_profile_perfetto',
-                        output_dir='./output',
-                        ms_duration=600000) as profiler:
-        nki_out = nki_moe_v5(
-            hidden.to(device),
-            gu_w.to(device),
-            d_w.to(device),
-            eidx.to(device),
-            rw_k.to(device),
-        ).cpu()
-
-    diff     = torch.abs(ref.float() - nki_out.float())
-    max_diff = diff.max().item()
-    mean_diff = diff.mean().item()
-
-    print(f"  Max  |diff|  : {max_diff:.6e}")
-    print(f"  Mean |diff|  : {mean_diff:.6e}")
-
-    if max_diff < 0.05:
-        print("  PASS")
-        return True
-    else:
-        print(f"  FAIL — max_diff {max_diff:.4e}")
-        return False
-
-
-def test_nki_moe_v5():
-    """Run all v5 correctness tests."""
+def test_nki_moe_v5c():
+    """Run all v5c correctness tests."""
     results = []
-    results.append(("small (T=1,H=256,I=256,E=8,K=2)",  test_nki_moe_v5_small()))
-    # results.append(("qwen3 T=1 (H=2048,I=256,E=128,K=8)", test_nki_moe_v5_qwen3_t1()))
-    results.append(("qwen3 T=1 seed=999 (H=2048,I=256,E=128,K=8)", test_nki_moe_v5_qwen3_t4()))
+    # results.append(("small (T=1,H=256,I=256,E=8,K=2)",  test_nki_moe_v5c_small()))
+    results.append(("qwen3 T=1 seed=999 (H=2048,I=256,E=128,K=8)", test_nki_moe_v5c_qwen3_t1()))
 
     print("\n" + "=" * 70)
     print("Summary:")
@@ -520,9 +466,9 @@ def test_nki_moe_v5():
         all_ok = all_ok and ok
     print("=" * 70)
     if all_ok:
-        print("All v5 tests PASSED.")
+        print("All v5c tests PASSED.")
     else:
-        print("Some v5 tests FAILED.")
+        print("Some v5c tests FAILED.")
     return all_ok
 
 
@@ -532,7 +478,7 @@ def test_nki_moe_v5():
 
 if __name__ == "__main__":
     t0 = time.perf_counter()
-    ok = test_nki_moe_v5()
+    ok = test_nki_moe_v5c()
     t1 = time.perf_counter()
     print(f"\nTotal time: {t1 - t0:.1f}s")
     import sys

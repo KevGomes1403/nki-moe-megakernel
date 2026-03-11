@@ -1,143 +1,218 @@
 ---
 name: nki-kernel-optimizer
-description: Generates, reviews, and optimizes AWS Neuron NKI kernels with correct nki.lang/nki.isa syntax and a performance-first approach. Use when the user asks to "write an NKI kernel", "optimize/improve an NKI kernel", "fix NKI syntax errors", "reduce latency on Trainium/Inferentia2", "choose tiling/scheduling for NKI", or "benchmark/profile an NKI kernel"
+description: |
+  Generates, reviews, and optimizes AWS Neuron NKI (Neuron Kernel Interface) kernels.
+  Trigger when the user asks to write, fix, optimize, benchmark, or profile an NKI kernel,
+  mentions Trainium/Inferentia, SBUF/PSUM/HBM, nki.lang, nki.isa, or neuron-profile.
 ---
 
-# NKI Kernel Optimizer
+# NKI Kernel Optimizer Skill
 
-## Purpose
-This skill helps you:
-1) Generate NKI kernels from a math spec / PyTorch block.
-2) Fix syntax/semantic issues in existing NKI kernels.
-3) Improve performance by choosing good tiling, memory placement, and loop scheduling.
-4) Benchmark and profile using `nki.benchmark` and traces (NEFF/NTFF).
+## Environment Setup (ALWAYS do this before running any kernel)
 
-## When to use (activation cues)
-Use this skill when the user:
-- Provides NKI kernel code and asks to fix errors or improve latency/throughput.
-- Asks for an NKI implementation of an op (attention pieces, layernorm/rmsnorm, softmax, GEMM variants, elementwise+reduction).
-- Mentions Trainium/Inferentia2/Trainium2/Trainium3, NeuronCores, SBUF/PSUM/HBM.
-- Wants a benchmarking harness with `nki.benchmark` or profiling traces.
+```bash
+source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
+export NEURON_PLATFORM_TARGET_OVERRIDE=trn2
+```
 
-## Operating principles
-- **Correctness first, then speed.** Produce a correctness-checkable kernel (separate from benchmark) before tuning.
-- **Make data movement explicit.** Prefer predictable allocations and explicit loads/stores; avoid hidden HBM roundtrips.
-- **Tile to fit on-chip.** Keep hot working sets in SBUF/PSUM; stream from HBM only when needed.
-- **Use the right engine.** Prefer tensor engine instructions for matmul, vector engine for reductions/elementwise, scalar engine for nonlinearities.
-- **Iterate with measurements.** Every optimization should be tied to a benchmark delta.
+**Hardware**: trn2 instance — 4 NeuronCores (NeuronCore-v3 / gen3).
+NeuronCores are exclusive: only one Python process can hold them at a time. Run kernels sequentially.
 
-## Standard workflow
+---
 
-### Step 0 — Intake (ask only what you need)
-Collect:
-- Target device generation: inf2 / trn1 (NeuronDevice v2), trn2, trn3.
-- Kernel category: elementwise, reduction, fused, matmul, attention primitive.
-- Shapes/dtypes/layout constraints; any alignment or tile-size requirements you already know.
-- Performance objective: latency p50, p99, or throughput; acceptable numerical error.
+## Reference Docs
 
-### Step 1 — Establish a minimal spec
-Write a compact, testable spec:
-- Inputs/outputs with shapes & dtype.
-- Exact math (including scaling, masking, eps, etc.).
-- Expected tolerances (rtol/atol).
-- Any fusion boundaries (what must be inside the kernel vs outside).
+| File | Contents |
+|------|----------|
+| `references/nki-overview.md` | Architecture, APIs, programming model |
+| `references/nki-syntax-quickref.md` | nki.lang / nki.isa cheatsheet, common patterns |
+| `references/performance-playbook.md` | Structured step-by-step optimization workflow |
+| `references/benchmarking-recipes.md` | Wall-clock timing, trace emission, profiling hooks |
+| `references/common-pitfalls.md` | Compiler errors, dtype gotchas, scheduling mistakes |
+| `references/templates.md` | Ready-to-use kernel scaffolding and harness templates |
 
-If the user provides PyTorch, derive the math spec and identify which parts can be fused safely.
+Read the relevant reference(s) before generating or modifying any kernel code.
 
-### Step 2 — Generate a baseline NKI kernel (clear + correct)
-Use this baseline structure unless the op demands otherwise:
-1) Allocate outputs explicitly using `nl.ndarray(..., buffer=...)`.
-2) Load inputs via `nl.load(...)`.
-3) Compute using `nl` ops where possible; drop to `nki.isa` for performance-critical primitives.
-4) Store outputs via `nl.store(...)`.
-5) Return the output tensor(s).
+---
 
-Baseline quality gates:
-- No missing stores.
-- Output buffers are correct (HBM vs SBUF vs PSUM where appropriate).
-- Shapes are consistent at every step.
-- Loops: default to `nl.sequential_range()` unless you’re sure iterations are independent.
+## Intake — Collect Before Starting
 
-### Step 3 — Correctness harness (separate from benchmarking)
-Produce a separate Python test that:
-- Generates deterministic inputs (seeded).
-- Runs a reference implementation in NumPy (or framework CPU) and compares.
-- Uses `np.testing.assert_allclose` with chosen rtol/atol and reports max error.
+Ask only what you need:
 
-Do NOT rely on `nki.benchmark` output for correctness, since the benchmark path does not use the actual runtime inputs for correctness checks.
+1. **Device generation**: trn1/inf2 (NeuronCore-v2), trn2, or trn3.
+   Default to **trn2** unless specified.
+2. **Op category**: elementwise, reduction, fused, matmul/GEMM, attention primitive, MoE, custom.
+3. **Shapes & dtypes**: all input/output tensor shapes, dtypes, any alignment constraints.
+4. **Profiling data**: neuron-profile trace metrics (engine utilization, spill bytes, DMA activity, etc.). These drive the optimization plans — do not proceed to planning without them.
+5. **Existing code**: the kernel to optimize (required).
 
-### Step 4 — Performance pass (structured optimization)
-Apply optimizations in this order, measuring after each:
-1) **HBM traffic reduction**
-   - Fuse pointwise ops around reductions/matmul when safe.
-   - Use SBUF tiles; keep intermediate results on-chip.
-2) **Tiling & layout**
-   - Choose partition dimension (SBUF first dimension) and tile sizes that maximize reuse.
-   - Avoid strided/irregular accesses in free dimension.
-3) **Loop scheduling**
-   - Switch eligible loops to `nl.affine_range()` to unlock unrolling/pipelining.
-   - Keep dependency-carrying loops sequential.
-4) **Instruction selection**
-   - Use `nki.isa.nc_matmul` / `nki.isa.tensor_tensor` when they match hardware-friendly tile shapes.
-   - Prefer combined ops if available (e.g., fused vector ops) to reduce instruction count.
-5) **Allocation & lifetime**
-   - Reuse SBUF regions where safe.
-   - Avoid large transient allocations; keep SKILL output readable.
+---
 
-Always explain:
-- What changed (diff-level summary).
-- Why it should help (bandwidth vs compute vs scheduling).
-- What to measure (which percentile / which shapes).
+## Standard Workflow
 
-### Step 5 — Benchmarking with `nki.benchmark`
-Provide a benchmark wrapper using the decorator:
-- Use `warmup` and `iters`.
-- Optionally emit NEFF and trace (NTFF) to enable profiling.
-- Record p50 and p99 and compare to baseline.
+### Step 1 — Math Spec
 
-See `references/benchmarking-recipes.md`.
+Write a compact, unambiguous spec:
+- Inputs/outputs: shape, dtype, memory location (HBM vs SBUF).
+- Exact math (scaling, masking, epsilon, etc.).
+- Fusion boundaries: what must be fused vs. what can be separate.
+- Tolerances: rtol/atol for correctness check.
 
-### Step 6 — Profiling & diagnosis
-When traces are available:
-- Attribute time to engines (tensor/vector/scalar/gpsimd) and DMA.
-- Identify whether you are compute-bound or memory-bound.
-- Recommend the next optimization step accordingly.
+If the user supplies PyTorch code, derive the spec and annotate which parts can be safely fused.
 
-## Output format expectations
-When producing code, always include:
-1) The kernel function.
-2) A correctness test snippet.
-3) A benchmark snippet (if requested), including how to read p50/p99.
-4) A short “tuning notes” section with what to try next.
+---
 
-## Common pitfalls (fix automatically)
-- Returning an SBUF tensor when caller expects HBM output.
-- Allocating outputs in HBM but doing all math on HBM (missing SBUF tiling).
-- Using `nl.affine_range` on dependency-carrying loops (causes incorrect results or compiler pessimization).
-- Incorrect dtype promotion or missing casts.
-- Misunderstanding compile-time vs runtime behavior (e.g., print statements).
+### Step 2 — Profiling Analysis
 
-See `references/common-pitfalls.md`.
+Before planning, analyze the provided profiling data and characterize the kernel's current bottleneck:
 
-## Examples (user prompts that should trigger this skill)
-- "Write an NKI kernel for RMSNorm on Trainium2."
-- "Here’s my NKI kernel; it compiles but is slow. Improve tiling and scheduling."
-- "Fix this NKI syntax error around nl.ndarray / nl.store."
-- "Create a microbenchmark with nki.benchmark and emit a trace."
+- **Compute-bound**: ≥90% engine utilization on bottleneck engine.
+- **Memory-bound**: high `dma_active_time_percent`, low engine utilization, significant HBM traffic.
+- **Spill-bound**: non-zero `spill_save_bytes` / `spill_reload_bytes` — SBUF overflow forcing eviction.
+- **Stall-bound**: low utilization on all engines with no DMA overlap — scheduling or dependency issue.
 
-## Troubleshooting
-If the kernel fails to compile:
-1) Reduce to baseline (no fusion, sequential loops).
-2) Validate shapes/dtypes at every intermediate.
-3) Move advanced details into `nki.isa` only where necessary.
-4) If a specific ISA op fails, check tile/layout constraints and adjust.
+Document which metrics from the trace support your characterization. This framing drives the three plans in Step 3.
 
-If the benchmark is noisy:
-- Increase `iters`, keep inputs stable, and record multiple runs.
+---
 
-## Reference docs bundled with this skill
-- `references/nki-syntax-quickref.md`
-- `references/performance-playbook.md`
-- `references/benchmarking-recipes.md`
-- `references/common-pitfalls.md`
-- `references/templates.md`
+### Step 3 — Optimization Planning (Three Distinct Plans)
+
+Generate **exactly three optimization plans**. Each plan must:
+
+- Be **independent** — implementable without relying on the other two plans.
+- Be **specific** — reference exact loop variables, tensor names, tile sizes, API calls, and profiling metrics that motivate the change. Vague guidance ("tile better") is not acceptable.
+- Target a **distinct bottleneck or axis of improvement** (e.g., one plan may address memory bandwidth, another engine selection, another loop structure).
+- State the **hypothesis**: which metric in the profiler should improve and in what direction.
+
+Present each plan in this format:
+
+```
+### Plan A — <Short Title>
+
+**Bottleneck targeted**: <specific metric from profiling data>
+**Root cause**: <why this metric is high / low>
+**Change**: <exact code-level change — loop restructure, tile size, API swap, fusion boundary, etc.>
+**Expected effect**: <which profiler metric improves, and why>
+**Correctness risk**: <any numerical or shape concern to watch for>
+**Verification**: assert_allclose(rtol=X, atol=Y) — explain what to compare against
+```
+
+Do not begin any implementation until all three plans are written and confirmed (implicitly or explicitly) by the user.
+
+---
+
+### Step 4 — Sequential Subagent Dispatch
+
+Dispatch three subagents **one at a time** (hardware allows only one process at a time).
+Each subagent operates under the following mandate:
+
+#### Subagent Charter
+
+> You are implementing **Plan [A/B/C]** exactly as specified. Your goals are:
+> 1. **Faithfulness**: implement the plan as written. Do not introduce unplanned changes, even if you think they would help.
+> 2. **Correctness**: the kernel must be numerically equivalent to the original before you finish. Do not mark the task complete until `assert_allclose` passes.
+> 3. **Documentation**: every non-obvious line must have an inline comment explaining *why*, not just *what*.
+
+Each subagent must follow this internal loop:
+
+```
+REPEAT:
+  1. Implement the plan change on the current kernel code.
+  2. Run the correctness harness (see Step 5).
+  3. IF assert_allclose fails:
+       - Diagnose the numerical discrepancy (shape mismatch, dtype cast, accumulation order, etc.)
+       - Fix only what is needed to restore correctness; do not expand scope.
+       - Return to step 1.
+  4. UNTIL assert_allclose passes.
+THEN: output the final kernel with documentation and a correctness confirmation line.
+```
+
+A subagent **may not exit** while `assert_allclose` is failing. Partial implementations are not acceptable outputs.
+
+Output from each subagent:
+- Complete, runnable kernel code (with inline comments).
+- Final correctness confirmation: `max_diff=X.XXe-XX  PASS`.
+- A one-paragraph implementation note: what was changed, any deviation from the plan (must be flagged and justified), and any residual risk.
+
+---
+
+### Step 5 — Correctness Harness
+
+This harness is used by every subagent. It must be run against the **original unmodified kernel** to establish the reference baseline first.
+
+```python
+import numpy as np
+import torch
+
+# Deterministic inputs — use the same seed for all three subagents
+rng = np.random.default_rng(42)
+x = rng.random(shape).astype(np.float32)  # replace `shape` with actual shape
+
+# Reference: run the PyTorch reference to get the expected outputs
+ref = pytorch_kernel(torch.tensor(x))
+
+# Optimized result
+result = optimized_kernel(torch.tensor(x).to("xla")).cpu().numpy()
+
+# Numerical equivalence check
+np.testing.assert_allclose(result, ref, rtol=1e-3, atol=1e-3)
+print(f"max_diff={np.abs(result - ref).max():.2e}  PASS")
+```
+
+**Important**: all three subagents compare against the same `ref` (the original kernel output), not against each other. This keeps correctness checks independent and reproducible.
+
+---
+
+### Step 6 — Final Summary
+
+After all three subagents have completed, produce a structured summary:
+
+```
+## Optimization Summary
+
+### Original Kernel
+- Brief description of what it did and its profiled bottleneck(s).
+
+### Plan A — <Title>
+- What changed (code-level).
+- Why it was expected to help (hardware rationale).
+- Correctness: PASS (max_diff=X.XXe-XX).
+- Implementation notes / any deviations from the plan.
+
+### Plan B — <Title>
+- (same structure)
+
+### Plan C — <Title>
+- (same structure)
+
+### Recommendations
+- Which plan(s) are most promising to profile next and why.
+- Any interactions between plans that could be combined in a follow-up.
+- Any remaining risks or open questions.
+```
+
+The user will profile the three optimized kernels themselves. Do not include any wall-clock timing, `nki.benchmark` calls, or synthetic latency estimates.
+
+---
+
+## Code Documentation Standards
+
+All kernel code produced by this skill (baseline or optimized) must meet these standards:
+
+- **Block comments** before each logical section (load, compute, store).
+- **Inline comments** on any non-obvious indexing, tile size choice, or API selection — explain the *hardware reason* (e.g., "nl.affine_range here because DMA iterations are independent, enabling pipelining").
+- **Named constants** for tile sizes and magic numbers — no bare literals without a comment.
+- **Dtype annotations** on all `nl.ndarray` allocations.
+
+---
+
+## Quick Rules (apply automatically)
+
+- Always `source` the venv and set `NEURON_PLATFORM_TARGET_OVERRIDE=trn2` before running.
+- `expert_affinities` and other accumulation-path tensors must be `float32` (not `bf16`) for POST_SCALE MoE patterns.
+- `nl.par_dim(128)` is the partition dimension size on trn2; tile your partition dimension accordingly.
+- Use `nl.affine_range` for DMA loads that are independent; keep accumulation loops sequential.
+- When debugging compiler errors: reduce to minimal baseline (no fusion, no affine_range), then re-add optimizations one at a time.
+- `PSUM` buffers must be copied to SBUF before storing to HBM.
+- Do not call `.ap()` on SBUF tensors — HBM-only attribute.
+- No benchmarking in this workflow — the user profiles externally.

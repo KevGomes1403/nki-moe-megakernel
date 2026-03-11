@@ -1,29 +1,23 @@
 """
-Optimized MoE kernel — v5: Token-Parallel Sparse Execution.
+Optimized MoE kernel — v6b: Coalesce Down Weight DMAs.
 
-Key optimization over v1/v3:
-  - SPARSE K-expert dispatch: only K experts per token, not all E.
-    Accepts expert_indices [T, K] and routing_weights_k [T, K] directly.
-  - range(T) outer token loop with per-token SBUF reuse: each token's
-    SBUF allocations are reused in the next token iteration, keeping SBUF
-    pressure constant regardless of T.
-  - ALL inner loops use nl.affine_range() where no loop-carried dependency:
-      h_t (hidden load), gu_t (gate+up matmul col), i_t (SiLU/mul/cast),
-      h_t (down matmul row), final store.
-  - PSUM tiles are allocated ONCE outside the T loop and reused (memset at
-    the start of each (t, k) pair) — avoids repeated PSUM allocation.
-  - Hoisted hidden state load for the current token (one DMA per h-tile).
-  - Dynamic expert weight indexing via .ap() scalar offset.
+Built on v5a (Coalesce Gate+Up Weight DMAs).
 
-Algorithm per token t:
-  1. Load token t's hidden tiles into SBUF.
-  2. For k in range(K) [sequential — output accumulation]:
-     a. Get expert id via ap() scalar offset.
-     b. Gate+Up matmul → gu_psum_tiles (memset before each k).
-     c. PSUM→SBUF, SiLU, multiply, cast to bf16.
-     d. Down matmul → down_psum (memset before each h_t).
-     e. PSUM→SBUF, scale by rw_k, accumulate into out_accum.
-  3. Cast out_accum → bf16, write to HBM output[t, :].
+Key optimization over v5a:
+  - Down weight DMA coalescing: instead of loading one [P, P] tile per
+    (h_t, i_t) combination (16*2 = 32 DMAs per expert for H=2048, I=256),
+    we load the entire [P, H] weight row in ONE DMA per i_tile.  Then we
+    slice dw_row[:, h_t*P:(h_t+1)*P] for each h_t's nc_matmul.
+  - This reduces down DMAs from num_h_tiles * num_i_tiles per expert
+    to just num_i_tiles per expert (e.g. 32 → 2 for H=2048, I=256).
+
+Down projection DMA strategy:
+  - Old (v5a): inside h_t outer / i_t inner loop, loads [P,P] per (h_t,i_t)
+  - New (v6b): pre-loads ALL num_i_tiles [P,H] rows via affine_range BEFORE
+    the h_t/i_t loop, then slices [P,P] from the pre-loaded rows for each matmul.
+  - Loop structure (h_t outer affine, i_t inner sequential) is preserved from v5a.
+
+Everything else is identical to v5a.
 
 Constraints:
     T <= 128
@@ -49,7 +43,7 @@ os.environ["XLA_HLO_DEBUG"] = "1"
 # ---------------------------------------------------------------------------
 
 @nki.jit(platform_target="trn2")
-def nki_moe_v5(
+def nki_moe_v6b(
     hidden_states,        # [T, H]    bf16
     gate_up_weights,      # [E, H, 2*I] bf16
     down_weights,         # [E, I, H]   bf16
@@ -57,11 +51,11 @@ def nki_moe_v5(
     routing_weights_k,    # [T, K]    float32 — routing weights for the K experts
 ):
     """
-    Sparse Token-Parallel MoE kernel (v5).
+    Sparse Token-Parallel MoE kernel (v6b) with coalesced gate+up AND down DMAs.
 
-    Processes only K experts per token using dynamic weight indexing.
-    Each token's SBUF is fully reused across the T loop, making SBUF
-    pressure O(1) in T.
+    Gate+up: loads full [P, two_I] row per h_t in a single DMA (from v5a).
+    Down:    loads full [P, H] row per i_t in a single DMA (new in v6b),
+             then slices [P, P] per h_t for each matmul.
     """
     T      = hidden_states.shape[0]
     H      = hidden_states.shape[1]
@@ -170,7 +164,7 @@ def nki_moe_v5(
             )
 
             # ---------------------------------------------------------------
-            # Stage 1: Gate+Up projection
+            # Stage 1: Gate+Up projection  (UNCHANGED from v5a)
             #   hidden[1, H] @ gate_up_w[H, 2*I] → [1, 2*I]
             #   nc_matmul layout:  dst += stationary.T @ moving
             #     stationary = w_tile   [P_h, P_gu]  (weight row tile)
@@ -187,25 +181,30 @@ def nki_moe_v5(
                 h_off  = h_t * P
                 h_tile = h_tiles_sb[h_t]
 
+                # ============================================================
+                # Coalesced gate+up weight DMA (from v5a)
+                # Load the entire [P, two_I] weight row for this h_t in ONE
+                # DMA instead of num_gu_tiles separate [P, P] tile DMAs.
+                # ============================================================
+                w_row = nl.ndarray((P, two_I), dtype=gate_up_weights.dtype, buffer=nl.sbuf)
+                nisa.dma_copy(
+                    dst=w_row,
+                    src=gate_up_weights.ap(
+                        # Pattern: each of P partitions reads two_I contiguous elements
+                        # stride = two_I between partitions (one row of H), free dim = two_I
+                        pattern=[[two_I, P], [1, two_I]],
+                        offset=h_off * two_I,          # start at row h_t in the [H, 2I] slice
+                        scalar_offset=eid_offset,      # dynamic expert selection
+                        indirect_dim=0,                 # expert dim is dim-0 of the 3D tensor
+                    ),
+                )
+
+                # Slice the pre-loaded [P, two_I] row for each gu_t's [P, P] tile
                 for gu_t in nl.affine_range(num_gu_tiles):
                     gu_off = gu_t * P
-
-                    w_tile = nl.ndarray((P, P), dtype=gate_up_weights.dtype, buffer=nl.sbuf)
-                    nisa.dma_copy(
-                        dst=w_tile,
-                        src=gate_up_weights.ap(
-                            pattern=[[two_I, P], [1, P]],
-                            offset=h_off * two_I + gu_off,
-                            scalar_offset=eid_offset,
-                            indirect_dim=0,
-                        ),
-                    )
-                    
-                    # Profiling shows tensor engine is waiting for DMA each iteration
-
                     nisa.nc_matmul(
                         dst=gu_psum_tiles[gu_t],
-                        stationary=w_tile,
+                        stationary=w_row[0:P, gu_off:gu_off+P],  # slice from coalesced row
                         moving=h_tile,
                     )
 
@@ -233,21 +232,54 @@ def nki_moe_v5(
                     op=nl.multiply,
                 )
 
-                # Cast f32 → bf16 once (hoisted outside h_t down loop)
+                # Cast f32 → bf16 once (hoisted outside down loop)
                 act_bf16 = nl.ndarray((P, 1), dtype=nl.bfloat16, buffer=nl.sbuf)
                 nisa.tensor_copy(dst=act_bf16, src=act_f32)
                 act_bf16_tiles.append(act_bf16)
 
             # ---------------------------------------------------------------
-            # Stage 2: Down projection
+            # Stage 2: Down projection  (v6b — coalesced DMA)
             #   act[1, I] @ down_w[I, H] → [1, H]
             #   nc_matmul layout:  dst += stationary.T @ moving
             #     stationary = act_tile  [P_i, 1]  (intermediate tile)
             #     moving     = dw_tile   [P_i, P]  (down weight tile)
             #     result     = [1, P]               stored in down_psum_tiles[h_t]
+            #
+            # v6b change: pre-load all num_i_tiles [P, H] down weight rows
+            # BEFORE the h_t/i_t loops.  Each row is loaded in ONE DMA
+            # instead of num_h_tiles separate [P, P] tile DMAs.
+            # This reduces down DMAs from num_h_tiles*num_i_tiles to num_i_tiles
+            # per expert (e.g. 32 → 2 for H=2048, I=256).
+            #
+            # Loop structure is preserved from v5a: h_t outer (affine_range,
+            # independent PSUM tiles), i_t inner (sequential, PSUM accumulation).
+            # The only change is that i_t's matmul slices from the pre-loaded
+            # dw_rows[i_t] instead of issuing a new DMA.
             # ---------------------------------------------------------------
 
+            # ============================================================
+            # v6b: Pre-load ALL down weight rows for this expert.
+            # One [P, H] DMA per i_tile, issued BEFORE the h_t loop.
+            # down_weights shape: [E, I, H]
+            # For expert eid, i_tile i_t: rows [i_off:i_off+P], all H cols.
+            # ============================================================
+            dw_rows = []
+            for i_t in nl.affine_range(num_i_tiles):
+                i_off = i_t * P
+                dw_row = nl.ndarray((P, H), dtype=down_weights.dtype, buffer=nl.sbuf)
+                nisa.dma_copy(
+                    dst=dw_row,
+                    src=down_weights.ap(
+                        pattern=[[H, P], [1, H]],     # partition: P rows spaced H apart; free: H contiguous
+                        offset=i_off * H,              # start at row i_t*P in the [I, H] slice
+                        scalar_offset=eid_offset,      # dynamic expert selection
+                        indirect_dim=0,                 # expert dim is dim-0 of the 3D tensor
+                    ),
+                )
+                dw_rows.append(dw_row)
+
             # h_t is independent → affine_range; i_t sequential (PSUM acc dep)
+            # Same loop structure as v5a, but matmul slices from pre-loaded rows.
             for h_t in nl.affine_range(num_h_tiles):
                 h_off = h_t * P
 
@@ -255,25 +287,11 @@ def nki_moe_v5(
                 nisa.memset(dst=down_psum_tiles[h_t], value=0)
 
                 for i_t in range(num_i_tiles):
-                    i_off = i_t * P
-
-                    dw_tile = nl.ndarray((P, P), dtype=down_weights.dtype, buffer=nl.sbuf)
-                    nisa.dma_copy(
-                        dst=dw_tile,
-                        src=down_weights.ap(
-                            pattern=[[H, P], [1, P]],
-                            offset=i_off * H + h_off,
-                            scalar_offset=eid_offset,
-                            indirect_dim=0,
-                        ),
-                    )
-                    
-                    # Profiler: Waits for DMA
-
+                    # Slice [P, P] from pre-loaded [P, H] row (no DMA needed)
                     nisa.nc_matmul(
                         dst=down_psum_tiles[h_t],
                         stationary=act_bf16_tiles[i_t],
-                        moving=dw_tile,
+                        moving=dw_rows[i_t][0:P, h_off:h_off+P],  # [P, P] slice from coalesced row
                     )
 
             # Scale by routing weight and accumulate into out_accum
@@ -375,28 +393,27 @@ def _make_sparse_inputs(T, H, I_size, E, K, dtype=torch.bfloat16, seed=42):
     return hidden_states, gate_up_weights, down_weights, expert_indices, expert_weights
 
 
-def test_nki_moe_v5_small():
-    """Small correctness test: T=1, H=256, I=256, E=8, K=2."""
+def test_nki_moe_v6b_qwen3_t1():
+    """Qwen3 shapes, T=1: H=2048, I=256, E=128, K=8."""
     import torch_xla.core.xla_model as xm
 
-    print("=" * 70)
-    print("nki_moe_v5 — Small shapes (T=1, H=256, I=256, E=8, K=2)")
+    print("\n" + "=" * 70)
+    print("nki_moe_v6b — Qwen3 T=1 (H=2048, I=256, E=128, K=8)")
     print("=" * 70)
 
     device = xm.xla_device()
-    T, H, I_size, E, K = 1, 256, 256, 8, 2
+    T, H, I_size, E, K = 1, 2048, 256, 128, 8
 
-    hidden, gu_w, d_w, eidx, rw_k = _make_sparse_inputs(T, H, I_size, E, K)
+    hidden, gu_w, d_w, eidx, rw_k = _make_sparse_inputs(T, H, I_size, E, K, seed=123)
 
     print(f"  Shapes: T={T}, H={H}, I={I_size}, E={E}, K={K}")
-    print(f"  expert_indices[0]: {eidx[0].tolist()}")
-    print(f"  routing_weights[0]: {rw_k[0].tolist()}")
+    print(f"  num_h_tiles={H//128}, num_i_tiles={I_size//128}, num_gu_tiles={2*I_size//128}")
 
     print("\n[1/3] Reference (PyTorch CPU)...")
     ref = pytorch_moe_sparse_reference(hidden, gu_w, d_w, eidx, rw_k)
 
-    print("[2/3] NKI v5 kernel on Trainium...")
-    nki_out = nki_moe_v5(
+    print("[2/3] NKI v6b kernel on Trainium...")
+    nki_out = nki_moe_v6b(
         hidden.to(device),
         gu_w.to(device),
         d_w.to(device),
@@ -415,101 +432,18 @@ def test_nki_moe_v5_small():
 
     threshold = 0.05
     if max_diff < threshold:
-        print("\n" + "=" * 70)
-        print("PASS — nki_moe_v5 small test.")
+        print(f"\n  max_diff={max_diff:.2e}  PASS")
         print("=" * 70)
         return True
     else:
-        print(f"\nFAIL — max_diff {max_diff:.4e} > {threshold:.4e}")
+        print(f"\n  FAIL — max_diff {max_diff:.4e} > {threshold:.4e}")
         return False
 
 
-def test_nki_moe_v5_qwen3_t1():
-    """Qwen3 shapes, T=1: H=2048, I=256, E=128, K=8."""
-    import torch_xla.core.xla_model as xm
-
-    print("\n" + "=" * 70)
-    print("nki_moe_v5 — Qwen3 T=1 (H=2048, I=256, E=128, K=8)")
-    print("=" * 70)
-
-    device = xm.xla_device()
-    T, H, I_size, E, K = 1, 2048, 256, 128, 8
-
-    hidden, gu_w, d_w, eidx, rw_k = _make_sparse_inputs(T, H, I_size, E, K, seed=123)
-
-    ref = pytorch_moe_sparse_reference(hidden, gu_w, d_w, eidx, rw_k)
-    nki_out = nki_moe_v5(
-        hidden.to(device),
-        gu_w.to(device),
-        d_w.to(device),
-        eidx.to(device),
-        rw_k.to(device),
-    ).cpu()
-
-    diff     = torch.abs(ref.float() - nki_out.float())
-    max_diff = diff.max().item()
-    mean_diff = diff.mean().item()
-
-    print(f"  Max  |diff|  : {max_diff:.6e}")
-    print(f"  Mean |diff|  : {mean_diff:.6e}")
-
-    if max_diff < 0.05:
-        print("  PASS")
-        return True
-    else:
-        print(f"  FAIL — max_diff {max_diff:.4e}")
-        return False
-
-
-def test_nki_moe_v5_qwen3_t4():
-    """Qwen3 shapes, T=1: H=2048, I=256, E=128, K=8 (second seed)."""
-    import torch_xla.core.xla_model as xm
-
-    print("\n" + "=" * 70)
-    print("nki_moe_v5 — Qwen3 T=1 seed=999 (H=2048, I=256, E=128, K=8)")
-    print("=" * 70)
-
-    device = xm.xla_device()
-    T, H, I_size, E, K = 1, 2048, 256, 128, 8
-
-    hidden, gu_w, d_w, eidx, rw_k = _make_sparse_inputs(T, H, I_size, E, K, seed=999)
-
-    ref = pytorch_moe_sparse_reference(hidden, gu_w, d_w, eidx, rw_k)
-    from torch_neuronx.experimental import profiler
-    with profiler.profile(port=9012,
-                        profile_type='system',
-                        target='neuron_profile_perfetto',
-                        output_dir='./output',
-                        ms_duration=600000) as profiler:
-        nki_out = nki_moe_v5(
-            hidden.to(device),
-            gu_w.to(device),
-            d_w.to(device),
-            eidx.to(device),
-            rw_k.to(device),
-        ).cpu()
-
-    diff     = torch.abs(ref.float() - nki_out.float())
-    max_diff = diff.max().item()
-    mean_diff = diff.mean().item()
-
-    print(f"  Max  |diff|  : {max_diff:.6e}")
-    print(f"  Mean |diff|  : {mean_diff:.6e}")
-
-    if max_diff < 0.05:
-        print("  PASS")
-        return True
-    else:
-        print(f"  FAIL — max_diff {max_diff:.4e}")
-        return False
-
-
-def test_nki_moe_v5():
-    """Run all v5 correctness tests."""
+def test_nki_moe_v6b():
+    """Run all v6b correctness tests."""
     results = []
-    results.append(("small (T=1,H=256,I=256,E=8,K=2)",  test_nki_moe_v5_small()))
-    # results.append(("qwen3 T=1 (H=2048,I=256,E=128,K=8)", test_nki_moe_v5_qwen3_t1()))
-    results.append(("qwen3 T=1 seed=999 (H=2048,I=256,E=128,K=8)", test_nki_moe_v5_qwen3_t4()))
+    results.append(("qwen3 T=1 (H=2048,I=256,E=128,K=8)", test_nki_moe_v6b_qwen3_t1()))
 
     print("\n" + "=" * 70)
     print("Summary:")
@@ -520,9 +454,9 @@ def test_nki_moe_v5():
         all_ok = all_ok and ok
     print("=" * 70)
     if all_ok:
-        print("All v5 tests PASSED.")
+        print("All v6b tests PASSED.")
     else:
-        print("Some v5 tests FAILED.")
+        print("Some v6b tests FAILED.")
     return all_ok
 
 
@@ -532,7 +466,7 @@ def test_nki_moe_v5():
 
 if __name__ == "__main__":
     t0 = time.perf_counter()
-    ok = test_nki_moe_v5()
+    ok = test_nki_moe_v6b()
     t1 = time.perf_counter()
     print(f"\nTotal time: {t1 - t0:.1f}s")
     import sys

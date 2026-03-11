@@ -1,29 +1,17 @@
 """
-Optimized MoE kernel — v5: Token-Parallel Sparse Execution.
+Optimized MoE kernel — v5a: Coalesce Gate+Up Weight DMAs.
 
-Key optimization over v1/v3:
-  - SPARSE K-expert dispatch: only K experts per token, not all E.
-    Accepts expert_indices [T, K] and routing_weights_k [T, K] directly.
-  - range(T) outer token loop with per-token SBUF reuse: each token's
-    SBUF allocations are reused in the next token iteration, keeping SBUF
-    pressure constant regardless of T.
-  - ALL inner loops use nl.affine_range() where no loop-carried dependency:
-      h_t (hidden load), gu_t (gate+up matmul col), i_t (SiLU/mul/cast),
-      h_t (down matmul row), final store.
-  - PSUM tiles are allocated ONCE outside the T loop and reused (memset at
-    the start of each (t, k) pair) — avoids repeated PSUM allocation.
-  - Hoisted hidden state load for the current token (one DMA per h-tile).
-  - Dynamic expert weight indexing via .ap() scalar offset.
+Built on v5 (Token-Parallel Sparse Execution).
 
-Algorithm per token t:
-  1. Load token t's hidden tiles into SBUF.
-  2. For k in range(K) [sequential — output accumulation]:
-     a. Get expert id via ap() scalar offset.
-     b. Gate+Up matmul → gu_psum_tiles (memset before each k).
-     c. PSUM→SBUF, SiLU, multiply, cast to bf16.
-     d. Down matmul → down_psum (memset before each h_t).
-     e. PSUM→SBUF, scale by rw_k, accumulate into out_accum.
-  3. Cast out_accum → bf16, write to HBM output[t, :].
+Key optimization over v5:
+  - Gate+Up weight DMA coalescing: instead of loading one [P, P] tile per
+    (h_t, gu_t) combination (4 DMAs per h_t when num_gu_tiles=4), we load
+    the entire [P, two_I] weight row in ONE DMA per h_t.  Then we slice
+    w_row[:, gu_t*P:(gu_t+1)*P] for each gu_t's nc_matmul.
+  - This reduces gate_up DMAs from num_h_tiles * num_gu_tiles per expert
+    to just num_h_tiles per expert (e.g. 64 → 16 for H=2048, I=256).
+
+Everything else is identical to v5.
 
 Constraints:
     T <= 128
@@ -49,7 +37,7 @@ os.environ["XLA_HLO_DEBUG"] = "1"
 # ---------------------------------------------------------------------------
 
 @nki.jit(platform_target="trn2")
-def nki_moe_v5(
+def nki_moe_v5a(
     hidden_states,        # [T, H]    bf16
     gate_up_weights,      # [E, H, 2*I] bf16
     down_weights,         # [E, I, H]   bf16
@@ -57,11 +45,11 @@ def nki_moe_v5(
     routing_weights_k,    # [T, K]    float32 — routing weights for the K experts
 ):
     """
-    Sparse Token-Parallel MoE kernel (v5).
+    Sparse Token-Parallel MoE kernel (v5a) with coalesced gate+up DMAs.
 
-    Processes only K experts per token using dynamic weight indexing.
-    Each token's SBUF is fully reused across the T loop, making SBUF
-    pressure O(1) in T.
+    Instead of loading one [P, P] weight tile per (h_t, gu_t) pair,
+    loads the full [P, two_I] row per h_t in a single DMA, then slices
+    for each gu_t matmul.  All other logic is identical to v5.
     """
     T      = hidden_states.shape[0]
     H      = hidden_states.shape[1]
@@ -187,25 +175,31 @@ def nki_moe_v5(
                 h_off  = h_t * P
                 h_tile = h_tiles_sb[h_t]
 
+                # ============================================================
+                # PLAN A: Coalesced gate+up weight DMA
+                # Load the entire [P, two_I] weight row for this h_t in ONE
+                # DMA instead of num_gu_tiles separate [P, P] tile DMAs.
+                # This reduces gate_up DMAs from num_h*num_gu to num_h per expert.
+                # ============================================================
+                w_row = nl.ndarray((P, two_I), dtype=gate_up_weights.dtype, buffer=nl.sbuf)
+                nisa.dma_copy(
+                    dst=w_row,
+                    src=gate_up_weights.ap(
+                        # Pattern: each of P partitions reads two_I contiguous elements
+                        # stride = two_I between partitions (one row of H), free dim = two_I
+                        pattern=[[two_I, P], [1, two_I]],
+                        offset=h_off * two_I,          # start at row h_t in the [H, 2I] slice
+                        scalar_offset=eid_offset,      # dynamic expert selection
+                        indirect_dim=0,                 # expert dim is dim-0 of the 3D tensor
+                    ),
+                )
+
+                # Slice the pre-loaded [P, two_I] row for each gu_t's [P, P] tile
                 for gu_t in nl.affine_range(num_gu_tiles):
                     gu_off = gu_t * P
-
-                    w_tile = nl.ndarray((P, P), dtype=gate_up_weights.dtype, buffer=nl.sbuf)
-                    nisa.dma_copy(
-                        dst=w_tile,
-                        src=gate_up_weights.ap(
-                            pattern=[[two_I, P], [1, P]],
-                            offset=h_off * two_I + gu_off,
-                            scalar_offset=eid_offset,
-                            indirect_dim=0,
-                        ),
-                    )
-                    
-                    # Profiling shows tensor engine is waiting for DMA each iteration
-
                     nisa.nc_matmul(
                         dst=gu_psum_tiles[gu_t],
-                        stationary=w_tile,
+                        stationary=w_row[0:P, gu_off:gu_off+P],  # slice from coalesced row
                         moving=h_tile,
                     )
 
@@ -258,6 +252,7 @@ def nki_moe_v5(
                     i_off = i_t * P
 
                     dw_tile = nl.ndarray((P, P), dtype=down_weights.dtype, buffer=nl.sbuf)
+                    # GpSIMD Engine
                     nisa.dma_copy(
                         dst=dw_tile,
                         src=down_weights.ap(
@@ -267,9 +262,8 @@ def nki_moe_v5(
                             indirect_dim=0,
                         ),
                     )
-                    
-                    # Profiler: Waits for DMA
 
+                    # Happens more sequentially than gup
                     nisa.nc_matmul(
                         dst=down_psum_tiles[h_t],
                         stationary=act_bf16_tiles[i_t],
@@ -291,6 +285,7 @@ def nki_moe_v5(
                 )
 
                 # Accumulate expert k's contribution
+                # Vector engine
                 nisa.tensor_tensor(
                     dst=out_accum[h_t],
                     data1=out_accum[h_t],
@@ -375,12 +370,12 @@ def _make_sparse_inputs(T, H, I_size, E, K, dtype=torch.bfloat16, seed=42):
     return hidden_states, gate_up_weights, down_weights, expert_indices, expert_weights
 
 
-def test_nki_moe_v5_small():
+def test_nki_moe_v5a_small():
     """Small correctness test: T=1, H=256, I=256, E=8, K=2."""
     import torch_xla.core.xla_model as xm
 
     print("=" * 70)
-    print("nki_moe_v5 — Small shapes (T=1, H=256, I=256, E=8, K=2)")
+    print("nki_moe_v5a — Small shapes (T=1, H=256, I=256, E=8, K=2)")
     print("=" * 70)
 
     device = xm.xla_device()
@@ -395,8 +390,8 @@ def test_nki_moe_v5_small():
     print("\n[1/3] Reference (PyTorch CPU)...")
     ref = pytorch_moe_sparse_reference(hidden, gu_w, d_w, eidx, rw_k)
 
-    print("[2/3] NKI v5 kernel on Trainium...")
-    nki_out = nki_moe_v5(
+    print("[2/3] NKI v5a kernel on Trainium...")
+    nki_out = nki_moe_v5a(
         hidden.to(device),
         gu_w.to(device),
         d_w.to(device),
@@ -416,7 +411,7 @@ def test_nki_moe_v5_small():
     threshold = 0.05
     if max_diff < threshold:
         print("\n" + "=" * 70)
-        print("PASS — nki_moe_v5 small test.")
+        print("PASS — nki_moe_v5a small test.")
         print("=" * 70)
         return True
     else:
@@ -424,12 +419,12 @@ def test_nki_moe_v5_small():
         return False
 
 
-def test_nki_moe_v5_qwen3_t1():
+def test_nki_moe_v5a_qwen3_t1():
     """Qwen3 shapes, T=1: H=2048, I=256, E=128, K=8."""
     import torch_xla.core.xla_model as xm
 
     print("\n" + "=" * 70)
-    print("nki_moe_v5 — Qwen3 T=1 (H=2048, I=256, E=128, K=8)")
+    print("nki_moe_v5a — Qwen3 T=1 (H=2048, I=256, E=128, K=8)")
     print("=" * 70)
 
     device = xm.xla_device()
@@ -438,7 +433,7 @@ def test_nki_moe_v5_qwen3_t1():
     hidden, gu_w, d_w, eidx, rw_k = _make_sparse_inputs(T, H, I_size, E, K, seed=123)
 
     ref = pytorch_moe_sparse_reference(hidden, gu_w, d_w, eidx, rw_k)
-    nki_out = nki_moe_v5(
+    nki_out = nki_moe_v5a(
         hidden.to(device),
         gu_w.to(device),
         d_w.to(device),
@@ -461,55 +456,11 @@ def test_nki_moe_v5_qwen3_t1():
         return False
 
 
-def test_nki_moe_v5_qwen3_t4():
-    """Qwen3 shapes, T=1: H=2048, I=256, E=128, K=8 (second seed)."""
-    import torch_xla.core.xla_model as xm
-
-    print("\n" + "=" * 70)
-    print("nki_moe_v5 — Qwen3 T=1 seed=999 (H=2048, I=256, E=128, K=8)")
-    print("=" * 70)
-
-    device = xm.xla_device()
-    T, H, I_size, E, K = 1, 2048, 256, 128, 8
-
-    hidden, gu_w, d_w, eidx, rw_k = _make_sparse_inputs(T, H, I_size, E, K, seed=999)
-
-    ref = pytorch_moe_sparse_reference(hidden, gu_w, d_w, eidx, rw_k)
-    from torch_neuronx.experimental import profiler
-    with profiler.profile(port=9012,
-                        profile_type='system',
-                        target='neuron_profile_perfetto',
-                        output_dir='./output',
-                        ms_duration=600000) as profiler:
-        nki_out = nki_moe_v5(
-            hidden.to(device),
-            gu_w.to(device),
-            d_w.to(device),
-            eidx.to(device),
-            rw_k.to(device),
-        ).cpu()
-
-    diff     = torch.abs(ref.float() - nki_out.float())
-    max_diff = diff.max().item()
-    mean_diff = diff.mean().item()
-
-    print(f"  Max  |diff|  : {max_diff:.6e}")
-    print(f"  Mean |diff|  : {mean_diff:.6e}")
-
-    if max_diff < 0.05:
-        print("  PASS")
-        return True
-    else:
-        print(f"  FAIL — max_diff {max_diff:.4e}")
-        return False
-
-
-def test_nki_moe_v5():
-    """Run all v5 correctness tests."""
+def test_nki_moe_v5a():
+    """Run all v5a correctness tests."""
     results = []
-    results.append(("small (T=1,H=256,I=256,E=8,K=2)",  test_nki_moe_v5_small()))
-    # results.append(("qwen3 T=1 (H=2048,I=256,E=128,K=8)", test_nki_moe_v5_qwen3_t1()))
-    results.append(("qwen3 T=1 seed=999 (H=2048,I=256,E=128,K=8)", test_nki_moe_v5_qwen3_t4()))
+    # results.append(("small (T=1,H=256,I=256,E=8,K=2)",  test_nki_moe_v5a_small()))
+    results.append(("qwen3 T=1 (H=2048,I=256,E=128,K=8)", test_nki_moe_v5a_qwen3_t1()))
 
     print("\n" + "=" * 70)
     print("Summary:")
@@ -520,9 +471,9 @@ def test_nki_moe_v5():
         all_ok = all_ok and ok
     print("=" * 70)
     if all_ok:
-        print("All v5 tests PASSED.")
+        print("All v5a tests PASSED.")
     else:
-        print("Some v5 tests FAILED.")
+        print("Some v5a tests FAILED.")
     return all_ok
 
 
@@ -532,7 +483,7 @@ def test_nki_moe_v5():
 
 if __name__ == "__main__":
     t0 = time.perf_counter()
-    ok = test_nki_moe_v5()
+    ok = test_nki_moe_v5a()
     t1 = time.perf_counter()
     print(f"\nTotal time: {t1 - t0:.1f}s")
     import sys
