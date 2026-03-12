@@ -4,17 +4,51 @@
 
 ## Compiler Errors
 
-### NCC_IBIR158 — `.ap()` on SBUF tensor
+### NCC_IBIR158 — illegal SBUF/PSUM access pattern
 **Error**: `NCC_IBIR158: ...`
-**Cause**: Called `.ap()` on an SBUF-allocated tensor. `.ap()` is only valid on HBM tensors.
-**Fix**: Use direct slice indexing for SBUF column/row access:
+**Cause**: SBUF/PSUM `.ap()` call violates the contiguous-partition constraint: the first tuple's step must equal the total free-dimension element count. Reading every-other partition or any non-contiguous partition stride triggers this error.
+**Fix**: Ensure the first tuple step matches the free-dim size, or use direct slice indexing instead:
 ```python
-# WRONG
-col = sbuf_tensor.ap()[...]
+# ILLEGAL — step=64 skips partitions on a (128, 32) tensor (free_dim=32, step must be 32)
+t.ap(pattern=[[64, 64], [1, 32]], offset=0)
 
-# RIGHT
+# LEGAL — step=32 matches free_dim
+t.ap(pattern=[[32, 128], [1, 32]], offset=0)
+
+# ALTERNATIVE — for simple column access, direct slice avoids .ap() entirely
 col = sbuf_tensor[0:T, expert_id:expert_id+1]
 ```
+
+### NCC_IBIR030 — `scalar_offset` without `.ap()` descriptor
+**Error**: `NCC_IBIR030: ...`
+**Cause**: Passing an SBUF tensor directly (or a 1×1 slice) as `scalar_offset` to a DGE instruction without an `.ap()` descriptor. The compiler requires `.ap()` to derive `IndirectDimMaxIndex`.
+**Fix**: Wrap the SBUF tensor in `.ap()` with a shape that encodes the max expert index:
+```python
+# WRONG — compiler can't derive IndirectDimMaxIndex
+nisa.dge_gather(..., scalar_offset=eid_scratch[0:1, 0:1])
+
+# RIGHT — (128,1) shape → IndirectDimMaxIndex=127=E-1
+eid_offset = eid_scratch.ap(pattern=[[1,1],[1,1]], offset=0)
+nisa.dge_gather(..., scalar_offset=eid_offset)
+```
+
+### DGE `scalar_offset` absolute SBUF address bug (silent wrong results in E2E)
+**Symptom**: Kernel passes standalone correctness tests but produces wrong outputs (e.g., expert indices ≥ E, garbage scatter/gather) when run inside a full model.
+**Cause**: Using a computed `offset` (e.g., `offset=t*K+k`) in `.ap()` on an SBUF tensor bakes in an *absolute* SBUF address at compile time. In standalone tests the tensor is at a predictable SBUF location, so it resolves correctly. In E2E model compilation, earlier model tensors shift the allocation, so the baked address points to residual activations instead of the intended data.
+**Fix**: Copy the single element of interest into a dedicated scratch tensor at its base (partition 0, element 0), then reference with `offset=0`:
+```python
+# WRONG — offset=t*K+k bakes wrong absolute address in E2E
+eid_offset = expert_idx_sb.ap(pattern=[[K,1],[1,1]], offset=t*K+k)
+
+# CORRECT — load element fresh from HBM, reference at offset=0
+eid_scratch = nl.ndarray((128, 1), dtype=expert_indices.dtype, buffer=nl.sbuf)
+nisa.dma_copy(
+    dst=eid_scratch[0:1, 0:1],
+    src=expert_indices.ap(pattern=[[K,1],[1,1]], offset=t*K+k),  # HBM .ap() is safe
+)
+eid_offset = eid_scratch.ap(pattern=[[1,1],[1,1]], offset=0)  # always offset=0
+```
+The `(128,1)` shape preserves `IndirectDimMaxIndex=127` for the compiler.
 
 ### "TensorScalarPtr arith immediate dtype must be fp32"
 **Cause**: Using `bfloat16` affinities/scalars in POST_SCALE mode (e.g., MoE with POST_SCALE).

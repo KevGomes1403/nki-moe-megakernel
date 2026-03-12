@@ -214,5 +214,5 @@ All kernel code produced by this skill (baseline or optimized) must meet these s
 - Use `nl.affine_range` for DMA loads that are independent; keep accumulation loops sequential.
 - When debugging compiler errors: reduce to minimal baseline (no fusion, no affine_range), then re-add optimizations one at a time.
 - `PSUM` buffers must be copied to SBUF before storing to HBM.
-- Do not call `.ap()` on SBUF tensors — HBM-only attribute.
+- `.ap()` works on HBM and SBUF/PSUM tensors; see `nki-syntax-quickref.md` for restrictions and the DGE `scalar_offset` address pitfall.
 - No benchmarking in this workflow — the user profiles externally.

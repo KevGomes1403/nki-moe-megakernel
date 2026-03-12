@@ -33,7 +33,7 @@ BENCHMARK_REPORT_FILENAME = "benchmark_report.json"
 
 set_random_seed(0)
 
-os.environ["NEURON_CC_FLAGS"] = " --disable-dge "
+# os.environ["NEURON_CC_FLAGS"] = " --disable-dge "
 os.environ["NEURON_FRAMEWORK_DEBUG"] = "1"
 os.environ["XLA_IR_DEBUG"] = "1"
 os.environ["XLA_HLO_DEBUG"] = "1"
@@ -636,6 +636,9 @@ def resolve_qwen_module_name(qwen_name: str, enable_nki: bool) -> str:
         "qwen_with_moe_tkg": "qwen_with_moe_tkg",
         "qwen_moe_tkg": "qwen_with_moe_tkg",
         "qwen_tkg": "qwen_with_moe_tkg",
+        # v6b coalesced-DMA NKI kernel for MoE TKG path.
+        "qwen_with_v6b": "qwen_with_v6b",
+        "qwen_v6b": "qwen_with_v6b",
     }
 
     normalized = qwen_name.strip()
