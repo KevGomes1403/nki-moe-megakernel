@@ -7,3 +7,7 @@ Qwen/
 __pycache__/
 PostSPMDPassesExecutionDuration.txt
 parquet_files/
+output/
+*.neff
+*.ntff
+*.pb

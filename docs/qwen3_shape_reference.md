@@ -88,8 +88,8 @@ Default run config (from `main.py`): `--seq-len 640 --batch-size 1 --tp-degree 4
 |--------|---------------------|-------|
 | `hidden_states` (input) | [B, S, H] = [B, S, 2048] | Full H pre-attention |
 | `Q` after q_proj + q_layernorm | [B, S, Hq_tp×d] = [B, S, 1024] | Sharded |
-| `K` after k_proj + k_layernorm | [B, S, Hkv×d] = [B, S, 512] | Replicated |
-| `V` after v_proj | [B, S, Hkv×d] = [B, S, 512] | Replicated |
+| `K` after k_proj + k_layernorm | [B, S, Hkv×d] = [B, S, 512] | Replicated (Hkv_tp=4) |
+| `V` after v_proj | [B, S, Hkv×d] = [B, S, 512] | Replicated (Hkv_tp=4) |
 | `Q` reshaped for attention | [B, Hq_tp, S, d] = [B, 8, S, 128] | |
 | `K` reshaped for attention | [B, Hkv_tp, S, d] = [B, 4, S, 128] | |
 | `V` reshaped for attention | [B, Hkv_tp, S, d] = [B, 4, S, 128] | |

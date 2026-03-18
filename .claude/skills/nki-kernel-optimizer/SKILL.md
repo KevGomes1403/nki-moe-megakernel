@@ -30,6 +30,7 @@ NeuronCores are exclusive: only one Python process can hold them at a time. Run 
 | `references/benchmarking-recipes.md` | Wall-clock timing, trace emission, profiling hooks |
 | `references/common-pitfalls.md` | Compiler errors, dtype gotchas, scheduling mistakes |
 | `references/templates.md` | Ready-to-use kernel scaffolding and harness templates |
+| `references/logical-neuron-cores.md` | Combining two physical NeuronCores into one logical NeuronCore |
 
 Read the relevant reference(s) before generating or modifying any kernel code.
 

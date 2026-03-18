@@ -166,3 +166,109 @@ All three optimized kernels pass correctness with max_diff well under 0.1:
 | **HBM Read Bytes** | 9.72 MB | 11.10 MB | 15.35 MB |
 | **DMA Transfer Total Bytes** | 9.73 MB | 11.10 MB | 15.36 MB |
 | **Sbuf Write Bytes** | — | 11.11 MB | 15.37 MB |
+
+# Round 2
+
+Optimization Summary
+
+Original Best Kernels
+
+- v1 (direct layout): 459.11 µs — column layout + hidden hoisting
+- v2 (KV dedup): 434.93 µs — GQA K/V projection dedup
+
+Plan A — v4_merged_layout_dedup.py
+
+- What changed: Combined v1's column layout + hidden hoisting with v2's GQA dedup + NEW flash decode KV
+tile reuse (moved s_t loop outside g loop)
+- Correctness: PASS (max_diff=8.51e-03)
+- Path: kernels/attn_tkg/agents/v4_merged_layout_dedup.py
+
+Plan B — v5_freedim_packing.py
+
+- What changed: Packed 2 GQA Q heads into free dimension [128,2] during flash decode. Single matmul
+scores both heads simultaneously. All online softmax/V contribution operates on packed tensors.
+- Correctness: PASS (max_diff=8.51e-03)
+- Path: kernels/attn_tkg/agents/v5_freedim_packing.py
+
+Plan C — v6_ultimate.py
+
+- What changed: All 5 optimizations combined — column layout, hidden hoisting, GQA K/V dedup, free-dim
+packing, KV tile reuse
+- Correctness: PASS (max_diff=8.51e-03)
+- Path: kernels/attn_tkg/agents/v6_ultimate.py
+
+---
+
+## Data (v6)
+
+---
+
+### **Overall Stats**
+
+| Metric | Value |
+| --- | --- |
+| Model FLOPs | 0.000 FLOPS |
+| Total Time | 359.87 µs |
+| MM Arithmetic Intensity | 1 |
+| Peak FLOPs Bandwidth Ratio | 109.837 FLOPS |
+| Event Count | 2,537 |
+| Trace Count | 18,748 |
+| Neuroncore Cycle Count | 431,848 |
+| Transpose FLOPs | 85.197 MFLOPS |
+| Hardware FLOPs | 98.173 MFLOPS |
+
+---
+
+### **Tensor Engine**
+
+| Metric | Value |
+| --- | --- |
+| Tensor Engine Active Time | 37.40 µs |
+| Tensor Engine Instruction Time | 112.96 µs |
+| MFU Estimated Percent | 0.02% |
+| HFU Estimated Percent | 0.17% |
+| MFU Max Achievable Estimated Percent | 0.61% |
+| Tensor Engine Active Time Percent | 10.39% |
+| Matmul Instruction Count | 372 |
+| Tensor Engine Instruction Count | 840 |
+
+---
+
+### **Data Movement**
+
+| Metric | Value |
+| --- | --- |
+| Spill Reload Bytes | 0.00 B |
+| Input Queue Bytes | 0.00 B |
+| Output Queue Bytes | 0.00 B |
+| DMA Active Time | 148.47 µs |
+| DMA Transfer Time | 178.56 µs |
+| DMA Packet Time | 717.14 µs |
+| MBU Min Read Util Percent | 3.77% |
+| MBU Estimated Percent | 3.78% |
+| DMA Active Time Percent | 41.25% |
+| Dynamic DMA Packet Percent | 97.50% |
+| Dynamic DMA Size Percent | 97.51% |
+| DMA Queue Count | 51 |
+| PSUM Read SBUF Write Count | 88 |
+| Spill Save Bytes | 160.00 B |
+| Weight Queue Bytes | 160.00 B |
+| Static DMA Packet Count | 340 |
+| DMA Transfer Count | 364 |
+| HBM Write Bytes | 2.21 KB |
+| Hardware Dynamic DMA Packet Count | 2,880 |
+| PSUM Read SBUF Write Bytes | 5.47 KB |
+| Software Dynamic DMA Packet Count | 10,368 |
+| PSUM Read Bytes | 15.63 KB |
+| PSUM Write Bytes | 16.15 KB |
+| Weight Size Bytes | 16.38 KB |
+| Hardware Dynamic DMA Size | 21.76 KB |
+| DMA Transfer Average Bytes | 26.72 KB |
+| SBUF Read Bytes | 109.17 KB |
+| DMA Active Cycles | 178,158 |
+| Static DMA Size | 249.26 KB |
+| Inputs and Weights Size Bytes | 9.72 MB |
+| HBM Read Bytes | 9.72 MB |
+| DMA Transfer Total Bytes | 9.73 MB |
+| Software Dynamic DMA Size | 9.73 MB |
+| SBUF Write Bytes | 9.73 MB |
