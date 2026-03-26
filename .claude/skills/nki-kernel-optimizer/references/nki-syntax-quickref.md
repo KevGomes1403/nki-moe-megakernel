@@ -25,7 +25,20 @@ result = my_kernel_jit(input_tensor)
 
 # Trace mode (for dispatch wrappers — returns 0, not the output tensor)
 status = nki.jit(wrapper_fn, mode="trace")(arg1=..., arg2=...)
+
+# Register as a PyTorch custom op (for model integration)
+from torch_neuronx import nki_op
+
+@nki_op("mylib::my_op", mutates_args={})
+def my_op(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    my_kernel(x, out)
+    return out
 ```
+
+**Compilation flow**: `@nki.jit` triggers MLIR-based NKI compiler during Python tracing → NKI IR → Neuron Graph Compiler → NEFF executable loaded onto device.
+
+**Compile-time vs. runtime**: `print()`, Python conditionals, loop bounds → evaluated at compile time. `nki.isa.*` calls → generate runtime hardware operations.
 
 ---
 
@@ -131,28 +144,122 @@ s = nl.softmax(a, axis=[1])
 # stationary: [par_dim, K], moving: [K, free_dim], dst: [par_dim, free_dim] in PSUM
 nisa.nc_matmul(dst=psum_out, stationary=weight_sbuf, moving=input_sbuf)
 
+# MXFP8/MXFP4 quantized matmul with integrated dequantization
+nisa.nc_matmul_mx(dst=psum_out, stationary=weight_sbuf, moving=input_sbuf, ...)
+
 # Elementwise tensor-tensor
 nisa.tensor_tensor(dst=out, data1=a, data2=b, op=nl.add)
 nisa.tensor_tensor(dst=out, data1=a, data2=b, op=nl.multiply)
 
-# Tensor-scalar
+# Tensor-tensor scan
+nisa.tensor_tensor_scan(dst=out, data1=a, data2=b, op=nl.add)
+
+# Tensor-scalar: (data <op0> operand0) <op1> operand1
 nisa.tensor_scalar(dst=out, data=a, scalar0=scale, op0=nl.multiply)
+nisa.tensor_scalar(dst=out, data=a, scalar0=s0, op0=nl.add, scalar1=s1, op1=nl.multiply)
+
+# tensor_scalar with reduction
+nisa.tensor_scalar_reduce(dst=out, data=a, scalar0=scale, op0=nl.multiply, reduce_op=nl.add)
+
+# tensor_scalar with cumulative reduction
+nisa.tensor_scalar_cumulative(dst=out, data=a, scalar0=s, op0=nl.add)
+
+# Two sequential ops: (data <op0> operand0) <op1> operand1
+nisa.scalar_tensor_tensor(dst=out, data=a, operand0=b, operand1=c, op0=nl.add, op1=nl.multiply)
 
 # Activation (Scalar Engine)
 nisa.activation(dst=out, data=a, op=nl.exp)
 nisa.activation(dst=out, data=a, op=nl.rsqrt)
 
-# Copy PSUM → SBUF
+# Activation + reduction in one instruction
+nisa.activation_reduce(dst=out, data=a, op=nl.exp, reduce_op=nl.add)
+
+# Reduction along free axes (Vector Engine)
+nisa.tensor_reduce(dst=out, data=a, op=nl.add, axis=[1])
+
+# Cross-partition reduction (GpSimd Engine)
+nisa.tensor_partition_reduce(dst=out, data=a, op=nl.add)
+
+# Copy PSUM → SBUF (or SBUF → SBUF)
 nisa.tensor_copy(dst=sbuf_out, src=psum_in)
 
-# Transpose
+# Conditional copy based on predicate
+nisa.tensor_copy_predicated(dst=out, src=a, predicate=pred)
+
+# Transpose (Tensor or Vector Engine)
 nisa.nc_transpose(dst=out, data=inp)
 
+# Exponential: exp(x - max_value)
+nisa.exponential(dst=out, data=a, max_value=max_val)
+
+# Reciprocal: 1.0/x
+nisa.reciprocal(dst=out, data=a)
+
+# Quantize FP16/BF16 to MXFP8
+nisa.quantize_mx(dst_data=out_data, dst_scale=out_scale, src=a)
+
+# Fill with compile-time constant
+nisa.iota(dst=out, value=0.0)  # also generates literal patterns
+nisa.memset(dst=out, value=0.0)
+
+# Dropout
+nisa.dropout(dst=out, data=a, prob=p)
+
+# Conditional select
+nisa.affine_select(dst=out, on_true_tile=a, on_false_value=0.0, predicate=pred)
+nisa.range_select(dst=out, on_true_tile=a, bounds=(lo, hi))
+nisa.select_reduce(dst=out, on_true=a, on_false=b, predicate=pred, reduce_op=nl.max)
+
+# Sequence bounds for segment IDs
+nisa.sequence_bounds(dst=out, segment_ids=ids)
+
+# BatchNorm stats/aggregation
+nisa.bn_stats(dst=out, data=a)
+nisa.bn_aggr(dst_mean=mean, dst_var=var, stats=stats)
+
+# Gather
+nisa.local_gather(dst=out, src_buffer=src, index=idx)
+nisa.nc_n_gather(dst=out, data=src, indices=idx)
+
+# Replace first occurrence of values
+nisa.nc_match_replace8(dst=out, data=src, vals=vals, imm=replacement)
+
+# Cross-partition shuffle within a quadrant
+nisa.nc_stream_shuffle(dst=out, src=a)
+
+# DMA operations
+nisa.dma_copy(dst=dst_tensor, src=src_tensor)  # with optional read-modify-write
+nisa.dma_transpose(dst=out, src=a)
+nisa.dma_compute(dst=out, src=a, ...)  # element-wise scaling/reduction in DMA
+
+# Top-8 values per partition
+nisa.max8(dst=out, src=a)
+nisa.nc_find_index8(dst=out, data=src, vals=vals)
+
+# Random number generation
+nisa.rng(dst=out)
+nisa.rand2(dst=out)
+nisa.rand_set_state(state=s)
+nisa.rand_get_state(dst=out)
+nisa.set_rng_seed(seed=s)
+
+# Nonzero indices + count
+nisa.nonzero_with_count(dst_indices=idx, dst_count=cnt, src=a)
+
 # Barrier (sync all NeuronCores)
-nisa.barrier()
+nisa.core_barrier()
 
 # Collective communication
-nisa.sendrecv()
+nisa.sendrecv(dst=recv_buf, src=send_buf)
+```
+
+### `nki.isa` Config Enums
+
+```python
+nisa.engine       # Neuron Device engines (e.g., Tensor, Vector, Scalar, GpSimd, DMA)
+nisa.reduce_cmd   # Engine Register Reduce commands
+nisa.dge_mode     # Descriptor Generation Engine mode
+nisa.oob_mode     # Out-of-bounds access mode
 ```
 
 ---

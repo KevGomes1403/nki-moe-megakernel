@@ -24,13 +24,13 @@ NeuronCores are exclusive: only one Python process can hold them at a time. Run 
 
 | File | Contents |
 |------|----------|
-| `references/nki-overview.md` | Architecture, APIs, programming model |
 | `references/nki-syntax-quickref.md` | nki.lang / nki.isa cheatsheet, common patterns |
 | `references/performance-playbook.md` | Structured step-by-step optimization workflow |
 | `references/benchmarking-recipes.md` | Wall-clock timing, trace emission, profiling hooks |
 | `references/common-pitfalls.md` | Compiler errors, dtype gotchas, scheduling mistakes |
 | `references/templates.md` | Ready-to-use kernel scaffolding and harness templates |
 | `references/logical-neuron-cores.md` | Combining two physical NeuronCores into one logical NeuronCore |
+| `references/trn2-architecture.md` | NeuronCore-v3 hardware specs: engines, memory, DMA transpose, DGE, FP8 double-perf mode |
 
 Read the relevant reference(s) before generating or modifying any kernel code.
 

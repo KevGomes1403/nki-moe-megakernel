@@ -1,19 +1,37 @@
 """
-v6_ultimate: Optimized fused attention + output projection kernel.
+v8_wo_transposed: Contiguous DMA for Wo via caller-side transpose.
 
-Optimizations combined:
-1. Column layout (hidden, cos/sin, output) — eliminates nc_transpose calls
-2. Hidden tile hoisting — pre-load all 16 tiles, reuse across Q/K/V
-3. Wide row-level weight loads — Wk/Wv/Wq loaded as full [128, 2048] rows
-4. Packed Q heads [128, 8] — single RMSNorm + RoPE pass on packed tensor
-5. Two-pass flash decode with score recompute and global scalar max
-6. Fused output projection (nkilib pattern) — Wo hoisted to SBUF
-7. Micro-opts: fused tensor_scalar for RMSNorm, SBUF-only neg_max broadcast
+Changes from v7_combined:
+  Wo DMA Fix — Contiguous WO Loading (Plan A, corrected):
+    Wo is now passed as [Hq_out=1024, H_wo=2048] (transposed by the caller).
+    Reshaped to [Hq_tp=8, d=128, H_wo=2048] so each head's slice is contiguous.
+    Uses nkilib-style ap() pattern [[H_wo, PMAX], [1, H_wo]] giving 128 large
+    contiguous chunks instead of 2048 tiny scatter chunks.
+
+    Old approach (v7_combined):
+      Wo [H_wo=2048, Hq_out=1024], ap([[1,PMAX],[Hq_out,H_wo]])
+      → 2048 chunks × 256 bytes each, stride 2048 bytes → 12.5% fill ratio
+      → scatter DMA → root cause of 2.34ms runtime
+
+    New approach (v8_wo_transposed):
+      Wo [Hq_out=1024, H_wo=2048] (transposed), reshaped to [8,128,2048]
+      ap([[H_wo, PMAX], [1, H_wo]]), offset=head*PMAX*H_wo
+      → 128 chunks × 4096 bytes each, stride 4096 bytes → 50% fill ratio
+      → 16× fewer DMA packets, 4× better fill ratio
+
+  All other optimizations (Plan B cached scores, SBUF hoisting, hidden tile
+  hoisting, packed Q RMSNorm+RoPE, packed K/V cache hoisting) preserved unchanged.
+
+Preserved unchanged from v7_combined:
+  Column layout reshapes, hidden tile hoisting, wk/wv/wq wide-row loads,
+  packed Q RMSNorm + RoPE, rms_ones, global_max_g1 compact scalar,
+  active-position score, normalization (rsqrt trick), Plan B saved_scores,
+  test harness (with Wo.T.contiguous() passed to kernel).
 
 Shape assumptions (Qwen3-30B-A3B, TP=4, Hkv_tp=1 per rank):
   Hq_tp=8, Hkv_tp=1, GQA=8, d=128, H=2048
   Wk: [128, 2048], Wv: [128, 2048], Wq: [1024, 2048]
-  Wo: [2048, 1024]  (row-parallel o_proj: each TP rank holds [H, Hq_tp*d])
+  Wo: [1024, 2048]  (transposed o_proj weight: caller passes Wo.T.contiguous())
   K_cache: [1, 1, S_prior, 128], V_cache: [1, 1, S_prior, 128]
   Output: [1, 1, 2048] bf16
 """
@@ -45,7 +63,7 @@ def qwen3_attn_tkg_fused_oproj(
     Wq,              # [Hq_tp*d, H]     bf16  [1024, 2048]
     Wk,              # [Hkv_tp*d, H]    bf16  [128, 2048]  (Hkv_tp=1)
     Wv,              # [Hkv_tp*d, H]    bf16  [128, 2048]
-    Wo,              # [H, Hq_tp*d]     bf16  [2048, 1024]  row-parallel o_proj
+    Wo,              # [Hq_tp*d, H]     bf16  [1024, 2048]  transposed o_proj weight
     q_norm_weight,   # [d]              bf16  [128]
     k_norm_weight,   # [d]              bf16  [128]
     K_cache,         # [B, 1, S_prior, d] bf16
@@ -57,6 +75,9 @@ def qwen3_attn_tkg_fused_oproj(
     """
     Fused QKV + RMSNorm + RoPE + flash decode + output projection.
     Returns [B, 1, H_out] where H_out = H = 2048 (no LNC sharding for now).
+
+    Wo is passed as [Hq_out=1024, H_wo=2048] (caller transposes the weight).
+    This enables contiguous DMA loading via nkilib-style ap() pattern.
     """
     # --- Dimensions ---
     B = hidden_states.shape[0]      # 1
@@ -72,7 +93,8 @@ def qwen3_attn_tkg_fused_oproj(
     half_d = d // 2                 # 64
 
     # Output H: since no LNC, each core writes all H=2048 of Wo output
-    H_wo = Wo.shape[0]              # 2048
+    # Wo is now [Hq_out=1024, H_wo=2048] (transposed), so H_wo is shape[1]
+    H_wo = Wo.shape[1]              # 2048
     num_h_blocks = H_wo // F_MAX   # 4
 
     # =========================================================================
@@ -81,11 +103,6 @@ def qwen3_attn_tkg_fused_oproj(
     # Output [B, 1, H_wo]: allocate in HBM
     output = nl.ndarray((B, 1, H_wo), dtype=nl.bfloat16, buffer=nl.shared_hbm)
     # Reshape to [1, H_wo] for o_proj DMA stores.
-    # nc_matmul semantics (nkilib pattern, B=S=1):
-    #   stationary [PMAX, 1]: partition=PMAX contracted, free=1 is B*S output dim
-    #   moving     [PMAX, F_MAX]: partition=PMAX contracted, free=F_MAX is H output dim
-    #   PSUM       [1, F_MAX]: only row 0 valid (B*S=1 output rows)
-    # row 0: out[f] = sum_{p} attn_packed[p, head] * wo_sbuf[head][p, f]  (accumulated over heads)
     output_2d = output.reshape((1, H_wo))
 
     # Hidden: [B, 1, H] -> [H, B] column layout
@@ -122,6 +139,14 @@ def qwen3_attn_tkg_fused_oproj(
     rms_ones = nl.ndarray((PMAX, PMAX), dtype=nl.bfloat16, buffer=nl.sbuf, name="rms_ones")
     nisa.memset(rms_ones, value=1.0)
 
+    # Plan C1 NOTE: The original plan specified using nc_matmul outer-products
+    # ([PMAX,1] @ [1,GQA]) for broadcasting.  However, the Trainium2 hardware
+    # requires both operands of nc_matmul to share the same partition dimension
+    # (par_dim must be equal).  [PMAX,1] has par=PMAX=128, [1,GQA] has par=1 —
+    # they differ, so the compiler rejects them ("Fmap and Weight partitions must
+    # match").  The original for-loop broadcasts from v6_ultimate are preserved
+    # at all 6 sites as they are the correct working approach.
+
     # =========================================================================
     # HIDDEN TILE HOISTING
     # Pre-load all 16 hidden tiles [PMAX, 1] outside all loops. Reused for
@@ -138,73 +163,29 @@ def qwen3_attn_tkg_fused_oproj(
     )
 
     # =========================================================================
-    # WO WEIGHT HOISTING INTO SBUF
-    # Wo: [H_wo=2048, Hq_out=1024] reshaped conceptually as [Hq_tp=8, d=128, H_wo=2048]
-    # For each head h and each h_block (4 blocks of F_MAX=512):
-    #   wo_sbuf[h_block][head] shape: [d=128, F_MAX=512]
+    # WO WEIGHT HOISTING — nkilib-style contiguous DMA
     #
-    # Wo layout in HBM: [H_wo, Hq_out] where rows are output-hidden dim and
-    # cols are [head0_d0..d127, head1_d0..d127, ...] (Hq_tp heads × d each).
-    # We need per-head slice: Wo[h_block_offset:h_block_offset+F_MAX, head*d:(head+1)*d]
-    # transposed to [d=128, F_MAX=512] for nc_matmul moving operand.
+    # Wo is now passed as [Hq_out=1024, H_wo=2048] = [N*D, H] (caller transposes).
+    # Reshape to [Hq_tp=8, d=128, H_wo=2048] so each head's slice is contiguous.
     #
-    # Using nkilib pattern: w_reshaped [Hq_tp, d, H_wo] laid out as
-    # [head, d_row, h_col]. The .ap() pattern loads [d, F_MAX] per (head, h_block).
-    # Wo HBM layout [H_wo, Hq_tp*d]: stride between rows = Hq_tp*d = 1024.
-    # For head h, d-row r: Wo[h_block_start + f, h*d + r] = element at
-    # flat offset (h_block_start + f) * Hq_out + h*d + r.
-    #
-    # To load [d=128 partition rows, F_MAX=512 free cols] we need:
-    #   partition row r maps to head-local dim r (0..127)
-    #   free col f maps to output-hidden f (0..511) at h_block
-    # So we want Wo[h_block_start + f, h*d + r] for r in [0,128), f in [0,512)
-    # which is Wo_T[h*d + r, h_block_start + f] = Wo.T[Hq_out, H_wo]
-    # Wo.T[h*d:(h+1)*d, h_block*F_MAX:(h_block+1)*F_MAX] = [128, 512]
-    # We load this as [PMAX=128, F_MAX=512].
-    #
-    # Wo.T shape: [Hq_out=1024, H_wo=2048]. Stride in HBM for Wo.T row = H_wo = 2048.
-    # .ap() pattern on Wo (not Wo.T): we transpose manually using the reshape trick.
-    # Simpler: reshape Wo as [H_wo, Hq_out] and use ap() to collect head slices.
+    # ap() pattern [[H_wo, PMAX], [1, H_wo]]:
+    #   partition stride = H_wo = 2048 (one full output row apart)
+    #   free stride = 1 (contiguous elements)
+    # → 128 chunks × H_wo×2 = 4096 bytes each, stride 4096 bytes → 50% fill ratio
+    # vs old [[1,128],[Hq_out,H_wo]]: 2048 chunks × 256 bytes, stride 2048 → 12.5%
+    # 16× fewer DMA packets, 4× better fill ratio.
     # =========================================================================
+    Wo_reshaped = Wo.reshape((Hq_tp, d, H_wo))  # logical [8, 128, 2048] view
 
-    # Hoist Wo: we use a Python list of lists wo_sbuf[h_block][head]
-    # Each entry is [PMAX, F_MAX] bf16 in SBUF.
-    # Wo is [H_wo=2048, Hq_out=1024]. For o_proj:
-    #   attn_packed [PMAX=128, GQA=8] stationary (each col = one head's output)
-    #   Wo_head_block [PMAX=128, F_MAX=512] moving
-    # Result: [PMAX, F_MAX] — the H_wo slice of output.
-    #
-    # Wo[h_f_start:h_f_start+F_MAX, head*d:(head+1)*d] is [F_MAX, d].
-    # We need [d, F_MAX] = transposed. Load as [PMAX=d=128, F_MAX=512].
-    # Using ap() on Wo shaped [H_wo, Hq_out]:
-    #   We want F_MAX consecutive rows (dim0) and d consecutive cols starting at head*d.
-    #   ap() pattern: [[stride_p, count_p], [stride_f, count_f]]
-    #   partition tiles are along Wo rows (stride=1, count=PMAX? No...)
-    #
-    # Actually in NKI, ap() pattern selects elements from a flat HBM buffer.
-    # The partition dim (dim0 of destination) is filled via stride along flat memory.
-    # For loading [PMAX=128, F_MAX=512] from Wo[H_wo, Hq_out]:
-    #   We want: dst[p, f] = Wo[h_block*F_MAX + f, head*d + p]
-    #   Flat offset of Wo[row, col] = row * Hq_out + col
-    #   = (h_block*F_MAX + f) * Hq_out + head*d + p
-    #   = h_block*F_MAX*Hq_out + head*d + f*Hq_out + p
-    # So partition index p steps by 1, free index f steps by Hq_out.
-    # ap() pattern: [[1, PMAX], [Hq_out, F_MAX]], offset = h_block*F_MAX*Hq_out + head*d
-    # =========================================================================
-
-    Wo_flat = Wo  # [H_wo=2048, Hq_out=1024]
-    Hq_out_val = Hq_out  # 1024
-
-    # Load one [PMAX, H_wo] tile per head — 8 wide DMAs instead of 32 narrow ones.
     wo_sbuf = []
     for head in nl.affine_range(Hq_tp):
         wo_tile = nl.ndarray((PMAX, H_wo), dtype=nl.bfloat16, buffer=nl.sbuf,
                              name=f"wo_tile_h{head}")
         nisa.dma_copy(
             dst=wo_tile,
-            src=Wo_flat.ap(
-                pattern=[[1, PMAX], [Hq_out_val, H_wo]],
-                offset=head * d,
+            src=Wo_reshaped.ap(
+                pattern=[[H_wo, PMAX], [1, H_wo]],   # partition: stride H_wo, free: contiguous
+                offset=head * PMAX * H_wo,             # skip head * [128 × 2048] elements
             ),
         )
         wo_sbuf.append(wo_tile)
@@ -213,10 +194,7 @@ def qwen3_attn_tkg_fused_oproj(
     # K PROJECTION (Hkv_tp=1, one KV head)
     # Wide row load: load entire Wk row [128, 2048] in 16 tiles of [128, 128],
     # then matmul each tile with corresponding hidden tile.
-    # Loads hoisted: all wk_tiles loaded in affine loop, matmul in separate loop.
     # =========================================================================
-    # Load entire Wk [PMAX, H] = [128, 2048] in one wide DMA.
-    # Wk is already shaped [128, 2048], so a direct copy works.
     wk_full = nl.ndarray((PMAX, H), dtype=nl.bfloat16, buffer=nl.sbuf, name="wk_full")
     nisa.dma_copy(dst=wk_full, src=Wk)
     k_psum = nl.zeros((PMAX, B), dtype=nl.float32, buffer=nl.psum, name="k_psum")
@@ -260,9 +238,7 @@ def qwen3_attn_tkg_fused_oproj(
 
     # =========================================================================
     # V PROJECTION (Hkv_tp=1)
-    # Loads hoisted: all wv_tiles loaded in affine loop, matmul in separate loop.
     # =========================================================================
-    # Load entire Wv [PMAX, H] = [128, 2048] in one wide DMA.
     wv_full = nl.ndarray((PMAX, H), dtype=nl.bfloat16, buffer=nl.sbuf, name="wv_full")
     nisa.dma_copy(dst=wv_full, src=Wv)
     v_psum = nl.zeros((PMAX, B), dtype=nl.float32, buffer=nl.psum, name="v_psum")
@@ -274,10 +250,7 @@ def qwen3_attn_tkg_fused_oproj(
 
     # =========================================================================
     # Q PROJECTIONS — all 8 heads, then pack into [PMAX, GQA=8]
-    # Loads hoisted: all wq_tiles loaded in affine+static loops, matmul in separate loops.
     # =========================================================================
-    # Load each Q head's weight row [PMAX, H] = [128, 2048] in one wide DMA.
-    # Wq is [Hq_tp*d, H] = [1024, 2048]; head q_h occupies rows q_h*PMAX:(q_h+1)*PMAX.
     wq_heads = []
     for q_h in nl.affine_range(Hq_tp):
         wq_head = nl.ndarray((PMAX, H), dtype=nl.bfloat16, buffer=nl.sbuf,
@@ -309,8 +282,6 @@ def qwen3_attn_tkg_fused_oproj(
 
     # =========================================================================
     # PACKED Q RMSNORM on [PMAX, GQA=8]
-    # sum-of-squares: q_packed^2 -> [PMAX, 8], then rms_ones@q_sq_bf16 -> [PMAX, 8]
-    # Each column normalizes independently.
     # =========================================================================
     q_sq = nl.ndarray((PMAX, GQA), dtype=nl.float32, buffer=nl.sbuf, name="q_sq")
     nisa.tensor_tensor(q_sq, q_packed_f32, q_packed_f32, op=nl.multiply)
@@ -328,17 +299,19 @@ def qwen3_attn_tkg_fused_oproj(
     q_normed = nl.ndarray((PMAX, GQA), dtype=nl.float32, buffer=nl.sbuf, name="q_normed")
     nisa.tensor_tensor(q_normed, q_packed_f32, q_rms_inv, op=nl.multiply)
 
-    # Apply norm weight: qnw_sb [PMAX, 1] — broadcast to [PMAX, GQA] before multiply
+    # Apply norm weight: qnw_sb [PMAX, 1] broadcast to [PMAX, GQA] before multiply.
+    # for-loop broadcast (8 tensor_copy calls) — same as v6_ultimate.
     qnw_gqa = nl.ndarray((PMAX, GQA), dtype=nl.float32, buffer=nl.sbuf, name="qnw_gqa")
     for g in nl.affine_range(GQA):
         nisa.tensor_copy(qnw_gqa[0:PMAX, g:g+1], qnw_sb)
+
     q_normed2 = nl.ndarray((PMAX, GQA), dtype=nl.float32, buffer=nl.sbuf, name="q_normed2")
     nisa.tensor_tensor(q_normed2, q_normed, qnw_gqa, op=nl.multiply)
 
     # =========================================================================
     # PACKED Q ROPE on [PMAX, GQA=8]
-    # cos/sin [PMAX, 1] — must be broadcast to [PMAX, GQA] before multiply.
     # =========================================================================
+    # cos/sin [PMAX,1] broadcast to [PMAX,GQA] — for-loop (same as v6_ultimate).
     cos_gqa = nl.ndarray((PMAX, GQA), dtype=nl.float32, buffer=nl.sbuf, name="cos_gqa")
     sin_gqa = nl.ndarray((PMAX, GQA), dtype=nl.float32, buffer=nl.sbuf, name="sin_gqa")
     for g in nl.affine_range(GQA):
@@ -364,19 +337,12 @@ def qwen3_attn_tkg_fused_oproj(
 
     # =========================================================================
     # TWO-PASS FLASH DECODE
-    #
-    # Pass 1: Stream K tiles, compute scores [PMAX, GQA], find global scalar max.
-    #         Also compute active-position score.
-    # Pass 2: Re-stream K+V tiles, recompute scores, exp(score-max), accumulate.
-    #
-    # K_cache: [1, 1, S_prior, 128] — reshape to [S_prior, 128]
-    # V_cache: [1, 1, S_prior, 128] — reshape to [S_prior, 128]
     # =========================================================================
     K_cache_2d = K_cache.reshape((S_prior, d))   # [S_prior, 128]
     V_cache_2d = V_cache.reshape((S_prior, d))   # [S_prior, 128]
 
     # --- Active position score: k_rope [PMAX,1] dot q_scaled [PMAX,GQA] ---
-    # Element-wise multiply then reduce via rms_ones
+    # k_rope [PMAX,1] broadcast to [PMAX,GQA] — for-loop (same as v6_ultimate).
     k_rope_packed = nl.ndarray((PMAX, GQA), dtype=nl.float32, buffer=nl.sbuf, name="k_rope_packed")
     for g in nl.affine_range(GQA):
         nisa.tensor_copy(k_rope_packed[0:PMAX, g:g+1], k_rope)
@@ -389,13 +355,8 @@ def qwen3_attn_tkg_fused_oproj(
     nisa.nc_matmul(score_active_psum, stationary=rms_ones, moving=kq_elem_bf16)
     score_active = nl.ndarray((PMAX, GQA), dtype=nl.float32, buffer=nl.sbuf, name="score_active")
     nisa.tensor_copy(score_active, score_active_psum)
-    # score_active is [PMAX, GQA] but only row 0 has meaningful values (all rows same)
-    # We'll use it as-is since all rows hold the per-head scalar via matmul reduction.
 
     # Hoist all K-cache tiles into SBUF before pass 1 — reused in both passes.
-    # K_cache_2d is [S_prior, d]; each tile is [PMAX, PMAX] transposed:
-    #   k_cache_tiles[s_t][p, f] = K_cache_2d[s_t*PMAX + f, p]
-    #   ap() pattern: [[1, PMAX], [d, PMAX]], offset = s_t * PMAX * d
     k_cache_tiles = []
     for s_t in nl.affine_range(num_s_tiles):
         k_ct = nl.ndarray((PMAX, PMAX), dtype=nl.bfloat16, buffer=nl.sbuf, name=f"k_ct_{s_t}")
@@ -406,9 +367,6 @@ def qwen3_attn_tkg_fused_oproj(
         k_cache_tiles.append(k_ct)
 
     # Hoist all V-cache tiles into SBUF before pass 2.
-    # V_cache_2d is [S_prior, d]; each tile is [PMAX, PMAX]:
-    #   v_cache_tiles[s_t][p, f] = V_cache_2d[s_t*PMAX + p, f]
-    #   ap() pattern: [[d, PMAX], [1, d]], offset = s_t * PMAX * d
     v_cache_tiles = []
     for s_t in nl.affine_range(num_s_tiles):
         v_ct = nl.ndarray((PMAX, PMAX), dtype=nl.bfloat16, buffer=nl.sbuf, name=f"v_ct_{s_t}")
@@ -419,8 +377,6 @@ def qwen3_attn_tkg_fused_oproj(
         v_cache_tiles.append(v_ct)
 
     # --- Pass 1: find global max scalar across all K tiles + active position ---
-    # Track global_max as [GQA, 1] (compact per-head scalar) — avoids broadcast in the loop.
-    # score_active is [PMAX, GQA] with all rows identical; extract per-head scalar via transpose+reduce.
     global_max_g1 = nl.ndarray((GQA, 1), dtype=nl.float32, buffer=nl.sbuf, name="global_max_g1")
     nisa.memset(global_max_g1, value=-1e9)
 
@@ -433,19 +389,22 @@ def qwen3_attn_tkg_fused_oproj(
     nisa.tensor_reduce(dst=score_active_g1, op=nl.maximum, data=score_act_T_sb, axis=1)
     nisa.tensor_tensor(global_max_g1, global_max_g1, score_active_g1, op=nl.maximum)
 
+    # ── Plan B: saved_scores list for Pass 2 reuse ─────────────────────────────
+    # Collect score_sb from Pass 1 to avoid recomputing K×Q matmul in Pass 2.
+    # Memory cost: GQA * PMAX * 4 bytes = 4 KB per tile, 20 KB for S_prior=640.
+    saved_scores = []
+
     for s_t in nl.affine_range(num_s_tiles):
         # score [PMAX, GQA]: K_tile[PMAX,PMAX] @ q_bf16[PMAX,GQA]
+        # name= suffixes use s_t to keep each iteration's tensor name unique —
+        # the NKI compiler requires unique names even inside affine_range loops.
         score_psum = nl.zeros((PMAX, GQA), dtype=nl.float32, buffer=nl.psum, name=f"score_psum_{s_t}")
         nisa.nc_matmul(score_psum, stationary=k_cache_tiles[s_t], moving=q_bf16)
         score_sb = nl.ndarray((PMAX, GQA), dtype=nl.float32, buffer=nl.sbuf, name=f"score_sb_{s_t}")
         nisa.tensor_copy(score_sb, score_psum)
+        saved_scores.append(score_sb)   # cache score — reused in Pass 2, no re-matmul
 
-        # Per-position max: reduce over partition dim to get [PMAX, GQA] where each row = max across positions in tile
-        # Actually we want per-head max across s_t positions. The score [PMAX, GQA]:
-        # row p = dot(K_cache[s_t*128+p, :], q[:, g]) for each g.
-        # We need max over p for each g -> per-head tile_max scalar.
-        # Then take max with global_max_g1 [GQA, 1] — compact per-head scalar.
-        # Transpose score [PMAX, GQA] -> [GQA, PMAX] and reduce max over axis=1 -> [GQA, 1]
+        # Per-tile max reduction: transpose [PMAX,GQA] → [GQA,PMAX], reduce max → [GQA,1]
         score_T_psum = nl.ndarray((GQA, PMAX), dtype=nl.float32, buffer=nl.psum, name=f"score_T_psum_{s_t}")
         nisa.nc_transpose(score_T_psum, score_sb)
         score_T_sb = nl.ndarray((GQA, PMAX), dtype=nl.float32, buffer=nl.sbuf, name=f"score_T_sb_{s_t}")
@@ -461,9 +420,11 @@ def qwen3_attn_tkg_fused_oproj(
     neg_max_g1 = nl.ndarray((GQA, 1), dtype=nl.float32, buffer=nl.sbuf, name="neg_max_g1")
     nisa.tensor_scalar(neg_max_g1, global_max_g1, op0=nl.multiply, operand0=-1.0)
 
-    # SBUF-only broadcast: replicate neg_max_g1 [GQA,1] across PMAX free columns to get
-    # neg_max_wide [GQA, PMAX], then nc_transpose -> PSUM [PMAX, GQA] -> SBUF neg_max [PMAX, GQA].
-    # All operations stay on SBUF/PSUM — no HBM at all.
+    # SBUF-only broadcast: replicate neg_max_g1 [GQA,1] across PMAX free columns
+    # to get neg_max_wide [GQA, PMAX], then nc_transpose → PSUM [PMAX, GQA] →
+    # SBUF neg_max [PMAX, GQA].  All operations stay on SBUF/PSUM — no HBM.
+    # (Same as v6_ultimate; nc_matmul outer-product cannot be used here due to
+    #  hardware constraint: both operands of nc_matmul must share par_dim=PMAX.)
     neg_max_wide = nl.ndarray((GQA, PMAX), dtype=nl.float32, buffer=nl.sbuf, name="neg_max_wide")
     for f in nl.affine_range(PMAX):
         nisa.tensor_copy(neg_max_wide[0:GQA, f:f+1], neg_max_g1)
@@ -472,36 +433,34 @@ def qwen3_attn_tkg_fused_oproj(
     neg_max = nl.ndarray((PMAX, GQA), dtype=nl.float32, buffer=nl.sbuf, name="neg_max")
     nisa.tensor_copy(neg_max, neg_max_psum)
 
-    # --- Pass 2: recompute scores, exp(score - global_max), accumulate V ---
+    # --- Pass 2: use saved scores (no K matmul), exp(score - global_max), accumulate V ---
     v_acc = nl.ndarray((PMAX, GQA), dtype=nl.float32, buffer=nl.sbuf, name="v_acc")
     nisa.memset(v_acc, value=0.0)
     sum_acc = nl.ndarray((PMAX, GQA), dtype=nl.float32, buffer=nl.sbuf, name="sum_acc")
     nisa.memset(sum_acc, value=0.0)
 
     for s_t in nl.affine_range(num_s_tiles):
-        # Recompute K score — use hoisted K cache tile
-        score2_psum = nl.zeros((PMAX, GQA), dtype=nl.float32, buffer=nl.psum, name=f"score2_psum_{s_t}")
-        nisa.nc_matmul(score2_psum, stationary=k_cache_tiles[s_t], moving=q_bf16)
-        score2_sb = nl.ndarray((PMAX, GQA), dtype=nl.float32, buffer=nl.sbuf, name=f"score2_sb_{s_t}")
-        nisa.tensor_copy(score2_sb, score2_psum)
-
-        # exp(score - global_max)
+        # ── Plan B: No K matmul — reuse score cached from Pass 1 ──────────────
+        # saved_scores[s_t] is SBUF→SBUF add only; the nc_matmul+tensor_copy
+        # from Pass 1 is gone — for S_prior=640 this removes 5 matmuls.
+        # Unique name= suffixes required by the NKI compiler across loop iterations.
         score2_shifted = nl.ndarray((PMAX, GQA), dtype=nl.float32, buffer=nl.sbuf, name=f"score2_shifted_{s_t}")
-        nisa.tensor_tensor(score2_shifted, score2_sb, neg_max, op=nl.add)
+        nisa.tensor_tensor(score2_shifted, saved_scores[s_t], neg_max, op=nl.add)
+
         score2_exp = nl.ndarray((PMAX, GQA), dtype=nl.float32, buffer=nl.sbuf, name=f"score2_exp_{s_t}")
         nisa.activation(score2_exp, op=nl.exp, data=score2_shifted)
 
-        # Accumulate sum: rms_ones @ score2_exp_bf16 -> [PMAX, GQA] (row-sum)
         score2_exp_bf16 = nl.ndarray((PMAX, GQA), dtype=nl.bfloat16, buffer=nl.sbuf, name=f"score2_exp_bf16_{s_t}")
         nisa.tensor_copy(score2_exp_bf16, score2_exp)
+
+        # Accumulate softmax denominator: rms_ones @ score2_exp_bf16 → [PMAX, GQA] row-sum
         tile_sum_psum = nl.zeros((PMAX, GQA), dtype=nl.float32, buffer=nl.psum, name=f"tile_sum_psum_{s_t}")
         nisa.nc_matmul(tile_sum_psum, stationary=rms_ones, moving=score2_exp_bf16)
         tile_sum = nl.ndarray((PMAX, GQA), dtype=nl.float32, buffer=nl.sbuf, name=f"tile_sum_{s_t}")
         nisa.tensor_copy(tile_sum, tile_sum_psum)
         nisa.tensor_tensor(sum_acc, sum_acc, tile_sum, op=nl.add)
 
-        # V-weighted: stationary=v_cache_tiles[s_t][seqpos, headdim], moving=score2_exp_bf16[seqpos, GQA]
-        # Contracts over seqpos -> result [headdim, GQA]
+        # V-weighted accumulation: stationary=v_cache_tiles[s_t], moving=score2_exp_bf16
         v_weighted_psum = nl.zeros((PMAX, GQA), dtype=nl.float32, buffer=nl.psum, name=f"v_weighted_psum_{s_t}")
         nisa.nc_matmul(v_weighted_psum, stationary=v_cache_tiles[s_t], moving=score2_exp_bf16)
         v_weighted = nl.ndarray((PMAX, GQA), dtype=nl.float32, buffer=nl.sbuf, name=f"v_weighted_{s_t}")
@@ -515,10 +474,11 @@ def qwen3_attn_tkg_fused_oproj(
     nisa.activation(score_act_exp, op=nl.exp, data=score_act_shifted)
     nisa.tensor_tensor(sum_acc, sum_acc, score_act_exp, op=nl.add)
 
-    # v_active [PMAX, 1] broadcast to [PMAX, GQA]: multiply and accumulate
+    # v_active [PMAX,1] broadcast to [PMAX,GQA] — for-loop (same as v6_ultimate).
     v_act_packed = nl.ndarray((PMAX, GQA), dtype=nl.float32, buffer=nl.sbuf, name="v_act_packed")
     for g in nl.affine_range(GQA):
         nisa.tensor_copy(v_act_packed[0:PMAX, g:g+1], v_active)
+
     v_act_weighted = nl.ndarray((PMAX, GQA), dtype=nl.float32, buffer=nl.sbuf, name="v_act_weighted")
     nisa.tensor_tensor(v_act_weighted, v_act_packed, score_act_exp, op=nl.multiply)
     nisa.tensor_tensor(v_acc, v_acc, v_act_weighted, op=nl.add)
@@ -526,31 +486,34 @@ def qwen3_attn_tkg_fused_oproj(
     # --- Normalize: attn_out = v_acc / sum_acc ---
     sum_safe = nl.ndarray((PMAX, GQA), dtype=nl.float32, buffer=nl.sbuf, name="sum_safe")
     nisa.tensor_scalar(sum_safe, sum_acc, op0=nl.add, operand0=1e-9)
-    # Use rsqrt trick: 1/x = rsqrt(x)^2
+    # Use rsqrt trick: 1/x = rsqrt(x)^2 (avoids a native divide instruction)
     rsqrt_sum = nl.ndarray((PMAX, GQA), dtype=nl.float32, buffer=nl.sbuf, name="rsqrt_sum")
     nisa.activation(rsqrt_sum, op=nl.rsqrt, data=sum_safe)
     inv_sum = nl.ndarray((PMAX, GQA), dtype=nl.float32, buffer=nl.sbuf, name="inv_sum")
     nisa.tensor_tensor(inv_sum, rsqrt_sum, rsqrt_sum, op=nl.multiply)
 
+    # Cast attention output to bf16 for the matmul stationary operand
     attn_out = nl.ndarray((PMAX, GQA), dtype=nl.bfloat16, buffer=nl.sbuf, name="attn_out")
     nisa.tensor_tensor(attn_out, v_acc, inv_sum, op=nl.multiply)
 
     # =========================================================================
-    # FUSED OUTPUT PROJECTION (nkilib pattern)
+    # FUSED OUTPUT PROJECTION (v8 nkilib contiguous DMA pattern)
     #
-    # attn_out [PMAX, GQA=8] is our attention result.
-    # Pack into attn_packed [PMAX, GQA] bf16 — stationary operand.
-    # Wo weights already hoisted as wo_sbuf[h_blk][head] = [PMAX, F_MAX] bf16.
+    # attn_out [PMAX, GQA=8] bf16 — stationary per head, [PMAX, 1] slice.
+    # wo_sbuf[head] = [PMAX=d, H_wo=2048] with wo_sbuf[head][p, f] = Wo_new[head*d+p, f].
+    # nc_matmul: result[0, f] = sum_p attn_out[p, head] * Wo_new[head*d+p, f].
+    # Accumulated over all 8 heads → output[f] = attn_out_flat @ Wo_new (= attn_out_flat @ Wo_old.T).
     #
-    # For each h_block (4 blocks of F_MAX=512):
-    #   res_psum [PMAX, F_MAX] = 0
-    #   for head in 8:
-    #     nc_matmul(res_psum, stationary=attn_packed[:,head:head+1], moving=wo_sbuf[h_blk][head])
+    # Correctness check:
+    #   old: wo_sbuf[h][p, f] = Wo_old[f, h*128+p]  → result = attn_out_flat @ Wo_old.T
+    #   new: wo_sbuf[h][p, f] = Wo_new[h*128+p, f]  → result = attn_out_flat @ Wo_new
+    #   Since Wo_new = Wo_old.T, both give the same result. ✓
+    #
+    # 4 output blocks of F_MAX=512 each — same as v6_ultimate.
     # =========================================================================
-
     for h_blk in nl.affine_range(num_h_blocks):
-        # stationary=[PMAX,1], moving=[PMAX,F_MAX] -> PSUM result=[1, F_MAX]
-        # All 8 heads inlined — nc_matmul accumulates into res_psum across calls.
+        # stationary=[PMAX,1], moving=[PMAX,F_MAX] → PSUM result=[1, F_MAX].
+        # All 8 heads statically unrolled — nc_matmul accumulates into res_psum.
         res_psum = nl.zeros((1, F_MAX), dtype=nl.float32, buffer=nl.psum, name=f"res_psum_{h_blk}")
         nisa.nc_matmul(res_psum, stationary=attn_out[0:PMAX, 0:1], moving=wo_sbuf[0][0:PMAX, h_blk*F_MAX:(h_blk+1)*F_MAX])
         nisa.nc_matmul(res_psum, stationary=attn_out[0:PMAX, 1:2], moving=wo_sbuf[1][0:PMAX, h_blk*F_MAX:(h_blk+1)*F_MAX])
@@ -560,10 +523,10 @@ def qwen3_attn_tkg_fused_oproj(
         nisa.nc_matmul(res_psum, stationary=attn_out[0:PMAX, 5:6], moving=wo_sbuf[5][0:PMAX, h_blk*F_MAX:(h_blk+1)*F_MAX])
         nisa.nc_matmul(res_psum, stationary=attn_out[0:PMAX, 6:7], moving=wo_sbuf[6][0:PMAX, h_blk*F_MAX:(h_blk+1)*F_MAX])
         nisa.nc_matmul(res_psum, stationary=attn_out[0:PMAX, 7:8], moving=wo_sbuf[7][0:PMAX, h_blk*F_MAX:(h_blk+1)*F_MAX])
-        # Cast PSUM -> bf16 via tensor_copy to SBUF
+        # Cast PSUM → bf16 via tensor_copy to SBUF
         out_sb = nl.ndarray((1, F_MAX), dtype=nl.bfloat16, buffer=nl.sbuf, name=f"out_sb_{h_blk}")
         nisa.tensor_copy(out_sb, res_psum)
-        # Store [1, F_MAX] -> output[0, 0, h_blk*F_MAX : (h_blk+1)*F_MAX]
+        # Store [1, F_MAX] → output_2d[0, h_blk*F_MAX:(h_blk+1)*F_MAX]
         nisa.dma_copy(
             dst=output_2d[0:1, h_blk * F_MAX:(h_blk + 1) * F_MAX],
             src=out_sb[0:1, 0:F_MAX],
@@ -573,7 +536,7 @@ def qwen3_attn_tkg_fused_oproj(
 
 
 # =============================================================================
-# Test harness
+# Test harness (v8: Wo passed as Wo.T.contiguous() to kernel)
 # =============================================================================
 if __name__ == "__main__":
     import sys
@@ -609,7 +572,7 @@ if __name__ == "__main__":
         Reference implementation including fused output projection.
         K_cache: [B, 1, S_prior, d]
         V_cache: [B, 1, S_prior, d]
-        Wo:      [H_out, Hq_tp*d] = [2048, 1024]  row-parallel o_proj
+        Wo:      [H_out, Hq_tp*d] = [2048, 1024]  row-parallel o_proj (original shape)
         """
         B, _, H = hidden_states.shape
         Hq_out = Wq.shape[0]          # 1024
@@ -671,13 +634,13 @@ if __name__ == "__main__":
         attn_output = attn_output_heads.reshape(B, 1, Hq_tp * d).to(torch.bfloat16)
 
         # Output projection: [B, 1, Hq_tp*d] @ Wo.T -> [B, 1, H_out]
-        # Wo: [H_out, Hq_tp*d] — row-parallel
+        # Wo: [H_out, Hq_tp*d] — row-parallel (original untransposed shape)
         output = attn_output.float() @ Wo.float().T  # [B, 1, H_out]
         return output.to(torch.bfloat16)
 
     def run_test(B=1, S_prior=640, H=2048, d=128, Hq_tp=8, Hkv_tp=1):
         print(f"\n{'='*70}")
-        print(f"v6_ultimate (fused o_proj) Test")
+        print(f"v8_wo_transposed Test")
         print(f"B={B}, S_prior={S_prior}, H={H}, d={d}, Hq_tp={Hq_tp}, Hkv_tp={Hkv_tp}")
         print(f"{'='*70}")
 
@@ -695,7 +658,7 @@ if __name__ == "__main__":
         Wq = (torch.randn(Hq_out, H) * scale).to(dtype)
         Wk = (torch.randn(Hkv_out, H) * scale).to(dtype)
         Wv = (torch.randn(Hkv_out, H) * scale).to(dtype)
-        Wo = (torch.randn(H_wo, Hq_out) * scale).to(dtype)
+        Wo = (torch.randn(H_wo, Hq_out) * scale).to(dtype)  # [2048, 1024] original shape
         q_norm_weight = torch.ones(d, dtype=dtype)
         k_norm_weight = torch.ones(d, dtype=dtype)
         K_cache = (torch.randn(B, Hkv_tp, S_prior, d) * scale).to(dtype)
@@ -726,11 +689,14 @@ if __name__ == "__main__":
         cos_nki = cos_at_pos.reshape(B, d)
         sin_nki = sin_at_pos.reshape(B, d)
 
+        # Transpose Wo for the kernel: kernel expects [Hq_out=1024, H_wo=2048]
+        Wo_kernel = Wo.T.contiguous()  # [1024, 2048]
+
         hidden_dev = hidden_states.to(device)
         Wq_dev = Wq.to(device)
         Wk_dev = Wk.to(device)
         Wv_dev = Wv.to(device)
-        Wo_dev = Wo.to(device)
+        Wo_dev = Wo_kernel.to(device)  # pass transposed Wo to kernel
         q_norm_dev = q_norm_weight.to(device)
         k_norm_dev = k_norm_weight.to(device)
         K_cache_dev = K_cache.to(device)
@@ -739,7 +705,7 @@ if __name__ == "__main__":
         sin_dev = sin_nki.to(device)
         pos_dev = position_ids.to(device)
 
-        print("\n[3/4] Running NKI kernel (v6_ultimate fused o_proj)...")
+        print("\n[3/4] Running NKI kernel (v8_wo_transposed)...")
         nki_out_dev = qwen3_attn_tkg_fused_oproj[2](
             hidden_dev, Wq_dev, Wk_dev, Wv_dev, Wo_dev,
             q_norm_dev, k_norm_dev,
