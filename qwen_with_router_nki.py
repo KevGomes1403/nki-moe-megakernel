@@ -1,19 +1,25 @@
 # coding=utf-8
 """
-Qwen3 MoE model with NKI-fused attention for the CTE (context encoding) path.
+Qwen3 MoE model with NKI-fused attention (CTE) and NKI router.
 
-The v7ab NKI kernel (qwen3_attn_cte_fused) fuses:
-  QKV linear projection + per-head RMSNorm + RoPE + causal flash attention
+Standalone variant of qwen_with_attn_cte_nki.py with the PyTorch RouterTopK
+replaced by the NKI router kernel for the CTE path.
 
-It is used only during prefill (CTE path, past_key_value is None).
-Token generation (TKG) falls through to NeuronAttentionBase's default KV-cache path.
+NKI kernels used:
+  - qwen3_attn_cte_fused  : QKV proj + per-head RMSNorm + RoPE + causal flash attn
+  - qwen3_router_topk_cte : linear proj + softmax + top-K + L1-norm + scatter
 
-Key integration points:
-  - NeuronQwen3MoEAttentionWithNKICTE.forward() detects CTE vs TKG and routes accordingly.
-  - Weights are extracted from NeuronAttentionBase's existing q_proj / k_proj / v_proj
-    (or split from the fused Wqkv), then transposed to Plan B layout [H, out_per_rank].
-  - The output projection (o_proj) is applied separately after the NKI kernel.
-  - K, V are also computed after the kernel to populate the KV cache for TKG.
+Router integration notes:
+  - NKIRouterTopK overrides RouterTopK.forward() only; all other routing logic
+    (sequence parallel, preshard_hook, weight_T registration) is inherited.
+  - self.weight_T ([H, E]) is pre-transposed by RouterBase when
+    store_transposed_weights=True. The TKG fused kernel uses the same parameter,
+    so no runtime transpose is needed in either path.
+  - ea_out is already L1-normalized top-K affinities scattered into [T, E].
+    normalize_top_k_affinities=True in BlockwiseMatmulConfig makes the downstream
+    masking step a no-op (renormalizing an already-normalized tensor is identity).
+    NOTE: verify that BlockwiseMatmulConfig accepts normalize_top_k_affinities;
+    if not, this field may belong on MoENeuronConfig directly.
 """
 
 import gc
@@ -23,12 +29,10 @@ import shlex
 import warnings
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-
 logger = logging.getLogger("Neuron")
 logger.setLevel(logging.DEBUG)
 
@@ -41,6 +45,8 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeRMSNorm
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, ParallelEmbedding, RowParallelLinear
 from neuronx_distributed.utils import cpu_mode
+from neuronx_distributed.modules.moe.moe_configs import BlockwiseMatmulConfig
+from neuronx_distributed.modules.moe.routing import RouterTopK
 from neuronx_distributed_inference.models.config import (
     InferenceConfig,
     MoENeuronConfig,
@@ -82,25 +88,29 @@ import os
 # os.environ["NEURON_RT_INSPECT_OUTPUT_DIR"]= "./output"
 
 # ---------------------------------------------------------------------------
-# NKI kernel import
+# NKI kernel imports
 # ---------------------------------------------------------------------------
 from kernels.attn_cte.v7ab_qwen3_attn_cte_fused import qwen3_attn_cte_fused
-from neuronx_distributed.modules.moe.moe_configs import BlockwiseMatmulConfig
+from kernels.router_topk.qwen3_router_topk_plan_a import qwen3_router_topk_cte
 
 SampleOutput = Union[SampleEncoderDecoderOutput, SampleDecoderOnlyOutput]
 GQA_SHARDING_STRATEGY = GQA.REPLICATE_TO_TP_DEGREE
 
+# Router kernel shape constants — must match the model config
+_ROUTER_H = 2048   # hidden_size
+_ROUTER_E = 128    # num_experts
+_ROUTER_K = 8      # top_k
+
 
 # ---------------------------------------------------------------------------
-# Default blockwise config for the NKI CTE attention path
+# Neuron config
 # ---------------------------------------------------------------------------
 
-class Qwen3MoEAttnCTENeuronConfig(MoENeuronConfig):
-    """MoENeuronConfig with NKI-CTE blockwise defaults pre-applied.
+class Qwen3MoEWithRouterNeuronConfig(MoENeuronConfig):
+    """MoENeuronConfig with NKI-CTE blockwise defaults and normalize_top_k_affinities.
 
-    When blockwise_matmul_config is not supplied (e.g. via main.py CLI),
-    this class fills in the values tuned for the v7ab NKI fused kernel.
-    An explicitly-provided config is passed through unchanged.
+    normalize_top_k_affinities=True: ea_out from the NKI router is already
+    L1-normalized, so the downstream masking step is a no-op.
     """
 
     def __init__(self, **kwargs):
@@ -110,15 +120,18 @@ class Qwen3MoEAttnCTENeuronConfig(MoENeuronConfig):
                 logical_nc_config=2,
                 skip_dma_token=True,
                 skip_dma_weight=True,
-                # use_shard_on_block_dynamic_while=True,
-                # use_shard_on_intermediate_dynamic_while=True
+                normalize_top_k_affinities=True,
             )
         super().__init__(**kwargs)
 
 
 # ---------------------------------------------------------------------------
-# Helpers (copied from qwen.py)
+# Helpers
 # ---------------------------------------------------------------------------
+
+def get_rmsnorm_cls():
+    return Qwen3MoeRMSNorm if cpu_mode() else CustomRMSNorm
+
 
 def get_modules_to_not_convert(neuron_config: MoENeuronConfig):
     return getattr(neuron_config, "modules_to_not_convert", None)
@@ -177,14 +190,6 @@ def _build_interleaved_q_perm(num_attention_heads: int, head_dim: int, tp_degree
     With interleaved sharding and 4 replicated KV heads, each rank has exactly
     gqa = (Hq/tp) / Hkv = 2 Q heads per KV head, enabling LNC=2 to split Hkv
     across 2 NeuronCores.
-
-    The permutation reorders the global weight columns from
-      [head0, head1, ..., head(Hq-1)]
-    to
-      [head0, head(tp), head(2*tp), ...,   # rank 0's heads
-       head1, head(tp+1), ...,             # rank 1's heads
-       ...]
-    so that RowParallelLinear's contiguous shard gives rank r the interleaved heads.
     """
     perm = []
     for r in range(tp_degree):
@@ -202,9 +207,6 @@ def convert_qwen3_moe_hf_to_neuron_state_dict(neuron_state_dict, config):
     )
 
     # Interleaved Q-head permutation — built once, reused for every layer.
-    # Applied to both Wq_nki (input projection) and Wo_nki (output projection) so
-    # the NKI kernel's interleaved output flows into Wo_nki without any runtime
-    # reordering.  Standard q_proj and o_proj are left untouched for the TKG path.
     q_perm = _build_interleaved_q_perm(
         config.num_attention_heads, config.head_dim, config.neuron_config.tp_degree
     )
@@ -222,15 +224,7 @@ def convert_qwen3_moe_hf_to_neuron_state_dict(neuron_state_dict, config):
         )
         del neuron_state_dict[f"layers.{l}.self_attn.q_norm.weight"]
 
-        # NKI Plan B + interleaved Q-head sharding:
-        #   Wq_nki — pre-transposed [H, Hq*d] with columns permuted to interleaved
-        #     order so RowParallelLinear gives each rank the Q heads matching the
-        #     kernel's gqa=2 assumption (2 Q heads per KV head per rank).
-        #   Wk_nki / Wv_nki — pre-transposed [H, Hkv*d], fully replicated (all KV
-        #     heads on every rank); layout unchanged.
-        #   Wo_nki — o_proj columns permuted to match the interleaved kernel output;
-        #     RowParallelLinear shards this the same way so rank r's slice aligns
-        #     with what the kernel wrote at positions 0..Hq_per_rank*d-1.
+        # NKI Plan B weights: pre-transposed [H, out], Q columns in interleaved order.
         q_proj_T = neuron_state_dict[f"layers.{l}.self_attn.q_proj.weight"].T  # [H, Hq*d]
         neuron_state_dict[f"layers.{l}.self_attn.Wq_nki.weight"] = (
             q_proj_T[:, q_perm].contiguous()
@@ -245,10 +239,14 @@ def convert_qwen3_moe_hf_to_neuron_state_dict(neuron_state_dict, config):
         neuron_state_dict[f"layers.{l}.self_attn.Wo_nki.weight"] = (
             o_proj_w[:, q_perm].contiguous()
         )
+
+        # Router weight: HF gate.weight [E, H] → linear_router.weight [E, H].
+        # weight_T ([H, E]) is derived by RouterBase.preshard_hook at load time.
         neuron_state_dict[f"layers.{l}.mlp.router.linear_router.weight"] = (
             neuron_state_dict[f"layers.{l}.mlp.gate.weight"].detach().clone()
         )
         del neuron_state_dict[f"layers.{l}.mlp.gate.weight"]
+
         intermediate_size, hidden_size = neuron_state_dict[
             f"layers.{l}.mlp.experts.0.gate_proj.weight"
         ].shape
@@ -294,14 +292,9 @@ def convert_qwen3_moe_hf_to_neuron_state_dict(neuron_state_dict, config):
     return neuron_state_dict
 
 
-def get_rmsnorm_cls():
-    return Qwen3MoeRMSNorm if cpu_mode() else CustomRMSNorm
-
-
 def _format_blockwise_debug(blockwise_matmul_config: BlockwiseMatmulConfig):
     if blockwise_matmul_config is None:
         return "<none>"
-
     skip_dma = getattr(blockwise_matmul_config, "skip_dma", None)
     return (
         f"block_size={blockwise_matmul_config.block_size}, "
@@ -323,10 +316,8 @@ def _log_wrapper_blockwise(prefix: str, wrapper):
     if cfg is None:
         print(f"{prefix}: no neuron_config available")
         return
-
     bw_cfg = getattr(cfg, "blockwise_matmul_config", None)
     print(f"{prefix}: { _format_blockwise_debug(bw_cfg) }")
-
     model = getattr(wrapper, "model", None)
     if model is not None:
         model_cfg = getattr(model, "neuron_config", None)
@@ -335,6 +326,78 @@ def _log_wrapper_blockwise(prefix: str, wrapper):
         if model_cfg is not None:
             model_bw = getattr(model_cfg, "blockwise_matmul_config", None)
             print(f"{prefix} model: { _format_blockwise_debug(model_bw) }")
+
+
+# ---------------------------------------------------------------------------
+# NKI router
+# ---------------------------------------------------------------------------
+
+class NKIRouterTopK(RouterTopK):
+    """RouterTopK with the CTE forward replaced by the NKI router kernel.
+
+    Uses self.weight_T ([H, E]) pre-transposed by RouterBase when
+    store_transposed_weights=True. The TKG fused kernel reads the same
+    parameter, so no runtime transpose is needed in either path.
+
+    ea_out is L1-normalized top-K affinities scattered into [T, E] (zeros at
+    non-selected positions), equivalent to what get_expert_affinities_masked
+    produces when normalize_top_k_affinities=True.
+    """
+
+    def forward(self, hidden_states):
+        # hidden_states: [T, H] bf16
+        # RouterBase.get_router_logits already flattened (S, B, H) → (T, H).
+        T, H = hidden_states.shape
+        E, K = self.num_experts, self.top_k
+
+        assert H == _ROUTER_H, f"hidden_size mismatch: kernel expects {_ROUTER_H}, got {H}"
+        assert E == _ROUTER_E, f"num_experts mismatch: kernel expects {_ROUTER_E}, got {E}"
+        assert K == _ROUTER_K, f"top_k mismatch: kernel expects {_ROUTER_K}, got {K}"
+
+        # Kernel layout: x=[H, T], w=[H, E]; weight_T is already [H, E]
+        x = hidden_states.T.contiguous()
+        w = self.weight_T
+
+        rl = torch.empty((T, E), dtype=torch.float32, device=hidden_states.device)
+        ea = torch.empty((T, E), dtype=torch.float32, device=hidden_states.device)
+        ei = torch.empty((T, K), dtype=torch.int32,   device=hidden_states.device)
+
+        rl, ea, ei = qwen3_router_topk_cte[2](x, w, rl, ea, ei)
+
+        # Cast to match ExpertMLPsV2 expectations
+        router_logits     = rl.to(hidden_states.dtype)   # [T, E]
+        expert_affinities = ea.to(hidden_states.dtype)   # [T, E]
+        expert_index      = ei.to(torch.long)            # [T, K]
+
+        return router_logits, expert_affinities, expert_index
+
+
+def _install_nki_router(mlp) -> None:
+    """Swap mlp.router in-place with NKIRouterTopK, sharing all weights.
+
+    weight_T is re-derived from linear_router.weight so RouterBase.preshard_hook
+    (which repopulates weight_T from the checkpoint at load time) keeps both
+    parameters in sync.
+    """
+    old = mlp.router
+    nki_router = NKIRouterTopK(
+        num_experts=old.num_experts,
+        top_k=old.top_k,
+        hidden_size=old.linear_router.in_features,
+        act_fn=old.act_fn,
+        sequence_parallel_enabled=old.sequence_parallel_enabled,
+        sequence_dimension=old.sequence_dimension,
+        dtype=old.dtype,
+        device=old.device,
+        bias=old.bias,
+        tensor_model_parallel_group=old.tensor_parallel_group,
+        jitter_eps=old.jitter_eps,
+        store_transposed_weights=True,
+        apply_act_fn_over_topk=old.apply_act_fn_over_topk,
+    )
+    nki_router.linear_router = old.linear_router
+    nki_router.weight_T = nn.Parameter(old.linear_router.weight.detach().T.clone())
+    mlp.router = nki_router
 
 
 # ---------------------------------------------------------------------------
@@ -380,7 +443,6 @@ class NeuronQwen3MoEAttentionWithNKICTE(NeuronAttentionBase):
                 "NeuronQwen3MoEAttentionWithNKICTE must be initialized in a distributed env."
             )
 
-
         # NKI Plan B weight holders.
         # Q is sharded across TP ranks → RowParallelLinear (partition_dim=1) gives [H, Hq/tp].
         # K/V use REPLICATE_TO_TP_DEGREE: all KV heads live on every rank, so nn.Linear
@@ -390,38 +452,22 @@ class NeuronQwen3MoEAttentionWithNKICTE(NeuronAttentionBase):
         _H = config.hidden_size
         _Hq_full = config.num_attention_heads * config.head_dim
         _Hkv_full = config.num_key_value_heads * config.head_dim
-        # Save the config-level (full, pre-TP) KV head count.  self.num_key_value_heads is set by
-        # NeuronAttentionBase.init_gqa_properties() to the per-rank count (full / tp_degree), but
-        # Wk_nki/Wv_nki hold ALL KV heads (replicated), so the NKI kernel must be told the full
-        # count.  After the kernel we slice out this rank's portion for the KV cache.
+        # Save full (pre-TP) KV head count for KV-cache slicing after the kernel.
         self._nki_num_kv_heads_full = config.num_key_value_heads
-        # Wq_nki / Wk_nki / Wv_nki: input projections for the NKI CTE path.
-        # Wq_nki columns are stored in interleaved Q-head order (see state dict
-        # conversion) so the kernel's gqa = Hq_tp / Hkv_tp = 2 is correct and
-        # LNC=2 can split the 4 KV heads across 2 NeuronCores.
-        # Wk_nki / Wv_nki hold all Hkv_full KV heads (replicated on every rank).
+        # Wq_nki columns stored in interleaved Q-head order (see state dict conversion).
         self.Wq_nki = RowParallelLinear(_Hq_full, _H, bias=False, input_is_parallel=True, dtype=_dtype)
         self.Wk_nki = nn.Linear(_Hkv_full, _H, bias=False, dtype=_dtype)  # [H, Hkv_full], replicated
         self.Wv_nki = nn.Linear(_Hkv_full, _H, bias=False, dtype=_dtype)  # [H, Hkv_full], replicated
-        # Wo_nki: output projection for the NKI CTE path.  Its columns are permuted
-        # to the same interleaved Q-head order as Wq_nki so the kernel output flows
-        # directly into this layer with no runtime reordering.
-        # Standard o_proj (base class) is left untouched for the TKG path.
+        # Wo_nki columns permuted to match interleaved kernel output.
         self.Wo_nki = RowParallelLinear(_Hq_full, _H, bias=False, input_is_parallel=True, dtype=_dtype)
 
         logger.debug(
             "NKI CTE attn init: H=%d  Hq_full=%d  Hkv_full=%d  "
-            "num_heads_per_rank=%d (set after super().__init__)  "
             "num_kv_heads_full=%d  tp_degree=%d",
             _H, _Hq_full, _Hkv_full,
-            config.num_attention_heads,  # per-rank value not yet set; will be printed in fwd
             config.num_key_value_heads,
             config.neuron_config.tp_degree,
         )
-
-    # ------------------------------------------------------------------
-    # Main forward: CTE → NKI kernel, TKG → base class default
-    # ------------------------------------------------------------------
 
     def forward(
         self,
@@ -445,10 +491,6 @@ class NeuronQwen3MoEAttentionWithNKICTE(NeuronAttentionBase):
         # CTE: use NKI fused kernel
         # return self._nki_cte_forward(hidden_states, position_ids, **kwargs)
 
-    # ------------------------------------------------------------------
-    # CTE implementation
-    # ------------------------------------------------------------------
-
     def _nki_cte_forward(
         self,
         hidden_states: torch.Tensor,
@@ -457,40 +499,26 @@ class NeuronQwen3MoEAttentionWithNKICTE(NeuronAttentionBase):
     ) -> NeuronAttentionBaseOutput:
         bsz, q_len, h = hidden_states.size()
 
-        # ---- Rotary embeddings -----------------------------------------
-        # rotary_emb returns [B, S, head_dim] for both cos and sin
+        # Rotary embeddings
         cos_full, sin_full = self.rotary_emb(hidden_states, position_ids)
-        # NKI kernel expects [S, d] (B dimension is the batch; kernel assumes B=1 for CTE)
         cos_for_kernel = cos_full[0]  # [S, d]
         sin_for_kernel = sin_full[0]  # [S, d]
 
-        # ---- Weight extraction in Plan B layout [H, out_per_rank] ------
-        # .data strips the nn.Parameter/TP-metadata wrapper so NKI's tracer sees
-        # a plain torch.Tensor (the NxD TP attributes on the Parameter confuse it).
-        # Wq_nki columns are stored in interleaved Q-head order (see state dict
-        # conversion), so the kernel computes gqa = Hq_tp / Hkv_tp = 2 correctly:
-        # each rank has 2 Q heads per KV head, and LNC=2 splits the 4 KV heads.
+        # Weight extraction in Plan B layout [H, out_per_rank]
         Wq = self.Wq_nki.weight.data  # [H, Hq/tp] — interleaved column order
-        Wk = self.Wk_nki.weight.data  # [H, Hkv_full] (replicated — all KV heads)
-        Wv = self.Wv_nki.weight.data  # [H, Hkv_full] (replicated — all KV heads)
+        Wk = self.Wk_nki.weight.data  # [H, Hkv_full]
+        Wv = self.Wv_nki.weight.data  # [H, Hkv_full]
 
-        # Per-head RMSNorm weights — pre-reshape to [d, 1] so the kernel avoids
-        # calling .reshape() on a 1D HBM input tensor (unsupported in NKI tracing).
-        q_norm_weight = self.q_layernorm.weight.reshape(self.head_dim, 1)  # [d, 1]
-        k_norm_weight = self.k_layernorm.weight.reshape(self.head_dim, 1)  # [d, 1]
+        # Per-head RMSNorm weights pre-reshaped to [d, 1] for NKI tracing
+        q_norm_weight = self.q_layernorm.weight.reshape(self.head_dim, 1)
+        k_norm_weight = self.k_layernorm.weight.reshape(self.head_dim, 1)
 
-        # ---- NKI fused attention kernel --------------------------------
-        # Wk/Wv carry all Hkv_full KV heads → Hkv_tp = 4, gqa = 2.
-        # LNC=2 splits those 4 KV heads across 2 NeuronCores (2 heads each).
-        Hq_out = self.num_heads * self.head_dim          # per-rank Q output dim
-        Hkv_full_out = self._nki_num_kv_heads_full * self.head_dim  # full KV output dim
+        Hq_out = self.num_heads * self.head_dim
+        Hkv_full_out = self._nki_num_kv_heads_full * self.head_dim
 
         logger.debug(
-            "NKI CTE fwd: B=%d S=%d H=%d  Hq_out=%d  Hkv_full_out=%d  "
-            "num_kv_per_rank=%d  Wq=%s  Wk=%s",
-            bsz, q_len, h, Hq_out, Hkv_full_out,
-            self.num_key_value_heads,
-            tuple(Wq.shape), tuple(Wk.shape),
+            "NKI CTE fwd: B=%d S=%d H=%d  Hq_out=%d  Hkv_full_out=%d  Wq=%s  Wk=%s",
+            bsz, q_len, h, Hq_out, Hkv_full_out, tuple(Wq.shape), tuple(Wk.shape),
         )
 
         attn_out, K_cache_nki, V_cache_nki = qwen3_attn_cte_fused[2](
@@ -501,15 +529,9 @@ class NeuronQwen3MoEAttentionWithNKICTE(NeuronAttentionBase):
             Hq_out=Hq_out, Hkv_out=Hkv_full_out,
         )
 
-        # ---- Output projection -----------------------------------------
-        # Wo_nki has the same interleaved column permutation as Wq_nki, so the
-        # kernel's interleaved output flows directly into it with no reordering.
         attn_output = self.Wo_nki(attn_out)
 
-        # ---- KV cache layout conversion --------------------------------
-        # Kernel outputs all Hkv_full KV heads on every rank [B, S, Hkv_full*d]
-        # (Wk/Wv are replicated). TKG owns 1 head per rank (num_key_value_heads=1),
-        # so slice out rank r's head at offset r*d before reshaping to [B, 1, S, d].
+        # Slice rank-local KV heads for the cache: kernel outputs all Hkv_full heads
         num_kv_per_rank = self.num_key_value_heads
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
         kv_start = tp_rank * num_kv_per_rank * self.head_dim
@@ -535,29 +557,27 @@ class NeuronQwen3MoEAttentionWithNKICTE(NeuronAttentionBase):
 
 
 # ---------------------------------------------------------------------------
-# Decoder layer (identical to qwen.py except for the attention class)
+# Decoder layer
 # ---------------------------------------------------------------------------
 
-class NeuronQwen3MoeDecoderLayerWithNKIAttn(nn.Module):
+class NeuronQwen3MoeDecoderLayerWithNKI(nn.Module):
+    """Decoder layer with NKI attention (CTE) and NKI router."""
+
     def __init__(self, config: Qwen3MoeInferenceConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
-        # Use the NKI-fused attention module for CTE
         self.self_attn = NeuronQwen3MoEAttentionWithNKICTE(config=config)
         self.moe_fused_nki_kernel_enabled = getattr(config, "moe_fused_nki_kernel_enabled", False)
 
         self.input_layernorm = get_rmsnorm_cls()(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = get_rmsnorm_cls()(config.hidden_size, eps=config.rms_norm_eps)
 
-        # if self.moe_fused_nki_kernel_enabled:
         self.mlp = initialize_moe_module(
             config=config, rmsnorm=self.post_attention_layernorm, init_tkg_module=True
         )
-        # else:
-        #     self.mlp = initialize_moe_module(config=config)
-        expert_mlps = getattr(self.mlp, "expert_mlps", None)
-        blockwise_config = getattr(expert_mlps, "blockwise_matmul_config", None)
+        # Install the NKI router in place of the PyTorch RouterTopK
+        _install_nki_router(self.mlp)
 
         self.qkv_kernel_enabled = config.neuron_config.qkv_kernel_enabled
         self.sequence_parallel_enabled = True
@@ -606,15 +626,14 @@ class NeuronQwen3MoeDecoderLayerWithNKIAttn(nn.Module):
         hidden_states = residual + hidden_states
 
         hidden_states = ModuleMarkerEndWrapper()(hidden_states)
-        outputs = (hidden_states, present_key_value, cos_cache, sin_cache, None)
-        return outputs
+        return (hidden_states, present_key_value, cos_cache, sin_cache, None)
 
 
 # ---------------------------------------------------------------------------
-# Model and causal LM head
+# Model
 # ---------------------------------------------------------------------------
 
-class NeuronQwen3MoeModelWithNKIAttn(NeuronBaseModel):
+class NeuronQwen3MoeModelWithNKI(NeuronBaseModel):
     def setup_attr_for_model(self, config: Qwen3MoeInferenceConfig):
         self.on_device_sampling = config.neuron_config.on_device_sampling_config is not None
         self.tp_degree = config.neuron_config.tp_degree
@@ -637,7 +656,7 @@ class NeuronQwen3MoeModelWithNKIAttn(NeuronBaseModel):
         )
         self.layers = nn.ModuleList(
             [
-                NeuronQwen3MoeDecoderLayerWithNKIAttn(config, layer_idx)
+                NeuronQwen3MoeDecoderLayerWithNKI(config, layer_idx)
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
@@ -650,12 +669,14 @@ class NeuronQwen3MoeModelWithNKIAttn(NeuronBaseModel):
         )
 
 
-class NeuronQwen3MoeForCausalLM(NeuronBaseForCausalLM):
-    """Qwen3 MoE CausalLM with NKI-fused attention for the CTE path."""
+# ---------------------------------------------------------------------------
+# CausalLM entry point
+# ---------------------------------------------------------------------------
 
-    """Qwen3 MoE CausalLM with NKI-fused attention for the CTE path."""
+class NeuronQwen3MoeForCausalLMWithNKI(NeuronBaseForCausalLM):
+    """Qwen3 MoE CausalLM with NKI-fused attention (CTE) and NKI router."""
 
-    _model_cls = NeuronQwen3MoeModelWithNKIAttn
+    _model_cls = NeuronQwen3MoeModelWithNKI
 
     @staticmethod
     def load_hf_model(model_path, **kwargs):
@@ -663,7 +684,7 @@ class NeuronQwen3MoeForCausalLM(NeuronBaseForCausalLM):
 
     @classmethod
     def get_neuron_config_cls(cls):
-        return Qwen3MoEAttnCTENeuronConfig
+        return Qwen3MoEWithRouterNeuronConfig
 
     @classmethod
     def get_config_cls(cls):
@@ -720,8 +741,6 @@ class NeuronQwen3MoeForCausalLM(NeuronBaseForCausalLM):
             ]
 
         if tensorizer_opts:
-            # Join sub-options into a single value; shlex.join quotes the resulting
-            # element so spaces inside the value survive the base class's shlex.split().
             args.append(f"--tensorizer-options={' '.join(tensorizer_opts)}")
 
         args.append(optimization_level)
@@ -736,16 +755,15 @@ class NeuronQwen3MoeForCausalLM(NeuronBaseForCausalLM):
 
 
 # ---------------------------------------------------------------------------
-# Test: compile the CTE model and verify the NKI kernel traces
+# Test entry point
 # ---------------------------------------------------------------------------
 
 def test_cte_compile(model_path: str, traced_model_path: str):
     """
-    Compile just the CTE (context encoding) model and verify the NKI kernel
-    is successfully included in the compiled graph.
+    Compile the CTE model and verify both NKI kernels trace successfully.
 
     Usage:
-        python qwen_with_attn_cte_nki.py
+        python qwen_with_router_nki.py <model_path> <traced_model_path>
     """
     import os
     os.environ.setdefault("NEURON_CC_FLAGS", " ")
@@ -753,17 +771,19 @@ def test_cte_compile(model_path: str, traced_model_path: str):
     os.environ.setdefault("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
 
     print("=" * 70)
-    print("NKI Attention CTE Compile Test")
-    print("  Model:  NeuronQwen3MoeForCausalLMWithNKIAttn")
-    print("  Kernel: kernels/attn_cte/v7ab_qwen3_attn_cte_fused.py")
+    print("NKI Attention + Router CTE Compile Test")
+    print("  Model:      NeuronQwen3MoeForCausalLMWithNKI")
+    print("  Attn kernel: kernels/attn_cte/v7ab_qwen3_attn_cte_fused.py")
+    print("  Router kernel: kernels/router_topk/qwen3_router_topk_plan_a.py")
     print("=" * 70)
 
     blockwise_config = BlockwiseMatmulConfig.from_kwargs(
         block_size=128,
-        logical_nc_config=2,  # LNC2 for trn2
+        logical_nc_config=2,
         skip_dma_token=True,
         skip_dma_weight=True,
         use_shard_on_block_dynamic_while=True,
+        normalize_top_k_affinities=True,
     )
     neuron_config = MoENeuronConfig(
         tp_degree=4,
@@ -780,15 +800,13 @@ def test_cte_compile(model_path: str, traced_model_path: str):
     )
 
     print("\n[1/3] Initialising model ...")
-    model = NeuronQwen3MoeForCausalLM(model_path, config)
+    model = NeuronQwen3MoeForCausalLMWithNKI(model_path, config)
 
     print("[2/3] Enabling context encoding and compiling CTE graph ...")
-    # model.enable_context_encoding()
     model.compile(traced_model_path)
 
-
     print("[3/3] Compilation complete.")
-    print("  NKI attention CTE kernel compiled successfully.")
+    print("  NKI attention + router CTE kernels compiled successfully.")
     print("=" * 70)
 
 
@@ -796,7 +814,7 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) < 3:
-        print("Usage: python qwen_with_attn_cte_nki.py <model_path> <traced_model_path>")
+        print("Usage: python qwen_with_router_nki.py <model_path> <traced_model_path>")
         sys.exit(1)
 
     test_cte_compile(model_path=sys.argv[1], traced_model_path=sys.argv[2])

@@ -1,16 +1,16 @@
 """
 Router Top-K kernel for Qwen3-30B-A3B CTE, single TP rank (TP=4), LNC=2.
-Plan A: Single whole-x DMA + T_TILE=128.
+Plan A: Single burst-DMA x load using [H, T] layout + T_TILE=128.
 
 Math:
-    logits[t, e]     = sum_h(x[t, h] * w[h, e])          # bf16 matmul, fp32 accum
+    logits[t, e]     = sum_h(x[h, t] * w[h, e])          # bf16 matmul, fp32 accum
     affinities[t, :] = softmax(logits[t, :])              # fp32, numerically stable
     topK_idx[t, :]   = argtop8(affinities[t, :])[:K]      # hardware max8+find_index8
     sum_topK[t]      = sum(affinities[t, topK_idx[t, :]]) # fp32 reduction
     out_affi[t, e]   = affinities[t, e] / sum_topK[t]     # if e in topK_idx, else 0
 
 Shapes (CTE, B=1, S=128, TP=4):
-    x:               [T, H]    = [T, 2048]    bf16   (T_local tiled in T_TILE=128 chunks)
+    x:               [H, T]    = [2048, T]    bf16   (NEW: H-major so T is contiguous)
     w:               [H, E]    = [2048, 128]  bf16   (caller transposes router.weight [E,H])
     router_logits:   [T, E]    = [T, 128]     float32
     expert_affinities:[T, E]   = [T, 128]     float32 (scattered + normalized)
@@ -22,32 +22,37 @@ LNC=2 sharding:
     core_barrier synchronizes before caller reads the full output.
 
 Plan A changes vs original:
-    1. T_TILE increased from 64 → 128 to fully fill the PSUM partition dimension (P=128).
-    2. x DMA reorganized: instead of 80 per-(T-tile, H-tile) small DMAs (16 KB each),
-       we do 16 per-H-tile DMAs of [P, T_local] = 80 KB each (outside the T-tile loop),
-       then extract per-T-tile slices via tensor_copy (SBUF→SBUF, no HBM traffic).
-       16 × 80 KB >> 80 × 16 KB in terms of DMA efficiency.
-    3. Ceiling division for num_t_tiles so the last partial tile is handled correctly.
-    4. T_TILE_actual handles the last tile which may have fewer than 128 tokens.
+    1. x layout changed from [T, H] to [H, T] so T_local tokens per (partition, H-tile)
+       are contiguous in HBM — enabling true burst DMA instead of gather.
+    2. x DMA: single nisa.dma_copy loads all of x into x_sb [(P, NUM_H_TILES, T_local)]
+       using .ap() strides that map (p, ht, t) → x[ht*P + p, T_offset + t].
+       Each (p, ht) row reads T_local contiguous HBM bytes — burst, not gather.
+    3. w DMA: single nisa.dma_copy loads all of w into w_sb [(P, NUM_H_TILES, E)]
+       using .ap() strides that map (p, ht, e) → w[ht*P + p, e].
+       E=128 contiguous bytes per (p, ht) row.
+    4. Inner matmul loop uses direct SBUF slices x_sb[:, ht, nl.ds(...)] —
+       no tensor_copy needed since nc_matmul can address SBUF slices directly.
+    5. T_TILE increased from 64 → 128 to fully fill the PSUM partition dimension (P=128).
+    6. Ceiling division for num_t_tiles so the last partial tile is handled correctly.
+    7. T_TILE_actual handles the last tile which may have fewer than 128 tokens.
 
 SBUF budget:
-    x_full_tiles: 16 × [128, 320] × 2 B = 1.31 MB
-    w_sb:          [128, 2048] × 2 B     = 524 KB
-    w_tiles:      16 × [128, 128] × 2 B = 524 KB
-    expert_iota:   [128, 128] × 4 B     = 65 KB
+    x_sb: [128, 16, 320] × 2 B = 1.31 MB  (P × NUM_H_TILES × T_local)
+    w_sb: [128, 16, 128] × 2 B = 524 KB   (P × NUM_H_TILES × E)
+    expert_iota: [128, 128] × 4 B = 65 KB
     Per-tile working set ≈ 300 KB
-    Total ≈ 2.8 MB — well within 24 MB SBUF
+    Total ≈ 2.2 MB — well within 24 MB SBUF
 
 Key optimizations preserved:
-    1. w hoisted to SBUF once as [P, num_h_tiles, E] — reused across T tiles
-    2. nc_matmul (TensorEngine) for [T_TILE, H] @ [H, E] contraction
-    3. Numerically stable softmax: negate-max, fused exp+reduce, reciprocal
-    4. Hardware max8 + nc_find_index8 for top-K in one pass (K <= 8)
-    5. One-hot scatter via nisa.iota + K compare-accumulate passes
-    6. LNC token sharding: T splits across 2 cores, independent HBM stores
-    7. nisa.dma_copy for all bulk data movement
-    8. expert_iota hoisted outside T-tile loop
-    9. w loaded outside T-tile loop
+    1. w hoisted to SBUF once — reused across T tiles
+    2. x hoisted to SBUF once — reused across T tiles (burst DMA)
+    3. nc_matmul (TensorEngine) for [T_TILE, H] @ [H, E] contraction
+    4. Numerically stable softmax: negate-max, fused exp+reduce, reciprocal
+    5. Hardware max8 + nc_find_index8 for top-K in one pass (K <= 8)
+    6. One-hot scatter via nisa.iota + K compare-accumulate passes
+    7. LNC token sharding: T splits across 2 cores, independent HBM stores
+    8. nisa.dma_copy for all bulk data movement
+    9. expert_iota hoisted outside T-tile loop
    10. core_barrier outside T-tile loop
 
 Constraints:
@@ -70,10 +75,14 @@ NUM_H_TILES = H // P   # = 16
 # The original T_TILE=64 left the upper half of PSUM empty; 128 doubles utilization.
 T_TILE = 128      # was 64
 
+# Module-level constant so the test harness can detect which HBM layout x uses.
+# Plan A (and B) use [H, T] layout for burst-DMA efficiency; original uses [T, H].
+X_HBM_LAYOUT = "HT"
+
 
 @nki.jit(platform_target="trn2")
 def qwen3_router_topk_cte(
-    x,                  # [T, H]    bf16  — hidden states after post_attn_layernorm
+    x,                  # [H, T]    bf16  — hidden states, H-major for burst DMA (Plan A)
     w,                  # [H, E]    bf16  — router weight (transposed from [E, H])
     router_logits,      # [T, E]    float32  — output: raw logits before softmax
     expert_affinities,  # [T, E]    float32  — output: scattered, L1-normalized affinities
@@ -84,12 +93,16 @@ def qwen3_router_topk_cte(
 
     Launched as: qwen3_router_topk_cte[2](x, w, router_logits, expert_affinities, expert_index)
 
+    x is expected in [H, T] layout (H-major). This enables a single burst DMA
+    that loads T_local contiguous tokens per (partition, H-tile) row without
+    stride-gather penalties.
+
     Note: output parameters (router_logits, expert_affinities, expert_index) are
     accepted for interface compatibility but the kernel writes to nl.shared_hbm
     buffers internally and returns those.  The caller should use the returned
     tensors, not the passed-in output buffers.
     """
-    T = x.shape[0]   # total tokens (dynamic)
+    T = x.shape[1]   # total tokens (dynamic); x is [H, T] so dim 1 is T
 
     # ----------------------------------------------------------------
     # LNC sharding: each core processes T_local = T/2 tokens
@@ -117,12 +130,27 @@ def qwen3_router_topk_cte(
     ei_out  = nl.ndarray((T, K), dtype=nl.uint32,  buffer=nl.shared_hbm)
 
     # ----------------------------------------------------------------
-    # Plan A: load entire w into SBUF in one 524 KB DMA.
+    # Plan A: load entire w into SBUF via single burst DMA.
+    # w[H, E] is reorganized as w_sb[P, NUM_H_TILES, E].
+    # .ap strides: partition stride = NUM_H_TILES*E (skip one full P-row worth),
+    #              h-tile stride    = E              (skip one E-block within a P-row),
+    #              element stride   = 1              (E contiguous elements).
+    # Mapping: w_sb[p, ht, e] = w[ht*P + p, e]
+    # Each (p, ht) row reads E=128 contiguous HBM bytes — burst, not gather.
     # w stays OUTSIDE the T-tile loop — same weights for all tiles.
     # ----------------------------------------------------------------
-    w_sb = nl.ndarray((P, NUM_H_TILES * E), dtype=nl.bfloat16, buffer=nl.sbuf,
-                      name="w_sb")
-    nisa.dma_copy(dst=w_sb, src=w.reshape((P, NUM_H_TILES * E)))
+    T_full = x.shape[1]  # full T dimension of x [H, T] = 640
+    w_sb = nl.ndarray((P, NUM_H_TILES, E), dtype=nl.bfloat16, buffer=nl.sbuf, name="w_sb")
+    # w.ap strides map w_sb[p, ht, e] → w[ht*P + p, e]:
+    # w[H, E] flat layout: element (h, e) is at offset h*E + e.
+    # We want h = ht*P + p, so offset = (ht*P + p)*E + e.
+    #   partition dim (p): stride = E   (advancing p by 1: (ht*P+p)*E → (ht*P+p+1)*E, delta=E)
+    #   h-tile dim  (ht):  stride = P*E (advancing ht by 1: delta = P*E)
+    #   element dim (e):   stride = 1,  size = E (E contiguous elements per row of w)
+    nisa.dma_copy(
+        dst=w_sb,
+        src=w.ap([[E, P], [P * E, NUM_H_TILES], [1, E]]),
+    )
 
     # expert_iota is constant — compute outside the T-tile loop
     expert_iota = nl.ndarray((P, E), dtype=nl.uint32, buffer=nl.sbuf,
@@ -130,39 +158,31 @@ def qwen3_router_topk_cte(
     nisa.iota(dst=expert_iota, pattern=[[1, E]], offset=0, channel_multiplier=0)
 
     # ----------------------------------------------------------------
-    # Load w_tiles (unchanged from original — correct 2-step pattern).
-    # w_sb is re-arranged into per-H-tile [P, E] tiles for nc_matmul.
+    # Plan A: load x into SBUF via single burst DMA.
+    # x[H, T] is reorganized as x_sb[P, NUM_H_TILES, T_local].
+    # .ap strides map x_sb[p, ht, t] → x[ht*P + p, T_offset + t]:
+    #   partition dim (p): stride = NUM_H_TILES*T_full (one full row of x[H,T] = T_full
+    #                               elements, repeated NUM_H_TILES times per partition)
+    #   h-tile dim (ht):   stride = P*T_full (each H-tile spans P rows of x)
+    #   element dim (t):   stride = 1, size = T_local (T_local contiguous tokens)
+    # offset = T_offset positions into the T dimension of x.
+    # Within each (p, ht) row: T_local contiguous HBM reads — true burst DMA.
+    # x stays OUTSIDE the T-tile loop — reused across T tiles.
     # ----------------------------------------------------------------
-    w_tiles = []
-    for ht in nl.affine_range(NUM_H_TILES):
-        w_tile = nl.ndarray((P, E), dtype=nl.bfloat16, buffer=nl.sbuf,
-                                name=f"w_tile_{ht}")
-        nisa.dma_copy(
-            dst=w_tile,
-            src=w_sb.ap(
-                [[NUM_H_TILES * E, P], [1, E]], offset=ht * E
-            ),
-        )
-        w_tiles.append(w_tile)
-
-    # ----------------------------------------------------------------
-    # Plan A — Change 2: Pre-load all T_local tokens per H-tile in one DMA.
-    # Instead of 80 small per-(T-tile, H-tile) x DMAs (16 KB each), we do
-    # 16 per-H-tile DMAs of [P, T_local] = 80 KB each.
-    # .ap([[NUM_H_TILES, P], [H, T_local]], offset=T_offset*H+ht) yields
-    # element [p, t] = x[T_offset + t, ht + p * NUM_H_TILES], which is
-    # exactly the H-tile slice for hidden dimension index ht + p*NUM_H_TILES.
-    # These 16 DMAs stay OUTSIDE the T-tile loop.
-    # ----------------------------------------------------------------
-    x_full_tiles = []
-    for ht in nl.affine_range(NUM_H_TILES):
-        x_full = nl.ndarray((P, T_local), dtype=nl.bfloat16, buffer=nl.sbuf,
-                            name=f"x_full_{ht}")
-        nisa.dma_copy(
-            dst=x_full,
-            src=x.ap([[NUM_H_TILES, P], [H, T_local]], offset=T_offset * H + ht),
-        )
-        x_full_tiles.append(x_full)
+    x_sb = nl.ndarray((P, NUM_H_TILES, T_local), dtype=nl.bfloat16, buffer=nl.sbuf,
+                      name="x_sb")
+    # x[H, T_full] viewed as x_sb[P, NUM_H_TILES, T_local]:
+    #   partition stride = T_full        (x row p=0 starts at 0, p=1 starts at T_full,
+    #                                     but each partition covers NUM_H_TILES H-indices
+    #                                     interleaved: h=p, h=p+P, h=p+2P, ...)
+    #   Actually the mapping ht*P + p means h-tile is the slow index, partition is fast.
+    #   So stride for ht (slow dim in x):  P * T_full  (skip P rows of x to advance ht)
+    #   Stride for p  (fast dim in x):     T_full      (skip one row of x to advance p)
+    #   Stride for t  (innermost):         1            (contiguous T elements)
+    nisa.dma_copy(
+        dst=x_sb,
+        src=x.ap([[T_full, P], [P * T_full, NUM_H_TILES], [1, T_local]], offset=T_offset),
+    )
 
     # ----------------------------------------------------------------
     # T-tile loop: process T_local tokens in T_TILE-sized chunks.
@@ -170,7 +190,7 @@ def qwen3_router_topk_cte(
     # varies per iteration — each tile gets independently-named buffers.
     # ----------------------------------------------------------------
     for t_tile in range(num_t_tiles):
-        # Absolute token offset in the full [T, H] tensor
+        # Absolute token offset in the full [T] output dimension
         t_off = T_offset + t_tile * T_TILE
 
         # Handle the last (potentially partial) tile.
@@ -180,21 +200,21 @@ def qwen3_router_topk_cte(
         # ----------------------------------------------------------------
         # Matmul: [T_TILE_actual, H] @ [H, E] → [T_TILE_actual, E]
         # PSUM dimension is [T_TILE_actual, E]; T_TILE_actual <= P=128 ✓
+        # nc_matmul args: stationary=[P, T_TILE_actual], moving=[P, E]
+        # stationary=x_sb[:, ht, nl.ds(t_tile*T_TILE, T_TILE_actual)] gives
+        # a [P, T_TILE_actual] slice directly from SBUF — no tensor_copy needed.
+        # The ht loop uses plain Python range (not nl.affine_range) so ht is a
+        # compile-time integer, enabling direct index into the x_sb/w_sb arrays.
         # ----------------------------------------------------------------
         router_logits_psum = nl.zeros((T_TILE_actual, E), dtype=nl.float32,
                                       buffer=nl.psum, name=f"rl_psum_{t_tile}")
 
-        for ht in nl.affine_range(NUM_H_TILES):
-            # Plan A — Change 3: extract T-tile slice from pre-loaded SBUF.
-            # tensor_copy is SBUF→SBUF (no HBM traffic), much cheaper than DMA.
-            # Slice: x_full_tiles[ht][:, t_tile*T_TILE : t_tile*T_TILE + T_TILE_actual]
-            x_tile = nl.ndarray((P, T_TILE_actual), dtype=nl.bfloat16, buffer=nl.sbuf,
-                                name=f"x_tile_{t_tile}_{ht}")
-            nisa.tensor_copy(
-                dst=x_tile,
-                src=x_full_tiles[ht][:, nl.ds(t_tile * T_TILE, T_TILE_actual)],
+        for ht in range(NUM_H_TILES):  # Python range: ht is compile-time int for direct SBUF slice
+            nisa.nc_matmul(
+                dst=router_logits_psum,
+                stationary=x_sb[:, ht, nl.ds(t_tile * T_TILE, T_TILE_actual)],  # [P, T_TILE_actual]
+                moving=w_sb[:, ht, :],                                           # [P, E]
             )
-            nisa.nc_matmul(dst=router_logits_psum, stationary=x_tile, moving=w_tiles[ht])
 
         # ----------------------------------------------------------------
         # Copy PSUM → SBUF and store router_logits slice to HBM

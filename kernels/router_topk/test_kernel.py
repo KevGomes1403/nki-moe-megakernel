@@ -32,6 +32,7 @@ import os
 os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = "trn2"
 os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2"
 
+# PROFILING: Don't remove
 os.environ["NEURON_CC_FLAGS"] = " "
 os.environ["NEURON_FRAMEWORK_DEBUG"] = "1"
 os.environ["XLA_IR_DEBUG"]= "1"
@@ -112,7 +113,16 @@ def main():
     print(f"Reference : PyTorch (CPU)")
     print(f"Under test: {args.module}")
 
-    kernel = load_kernel(args.module)
+    mod = importlib.import_module(args.module)
+    kernel = getattr(mod, KERNEL_FN)
+
+    # Detect x HBM layout: Plan A/B use [H, T] for burst-DMA efficiency;
+    # original kernel uses [T, H]. Transpose x before passing to the kernel
+    # when the module declares X_HBM_LAYOUT = "HT".
+    x_layout = getattr(mod, "X_HBM_LAYOUT", "TH")
+    if x_layout == "HT":
+        # Kernel expects x as [H, T]: transpose the [T, H] tensor.
+        x_t = x_t.t().contiguous()
     rl_t, ea_t, ei_t = kernel[LNC](x_t, w_t, rl_d, ea_d, ei_d)
     xm.mark_step()
     rl_t_np = rl_t.cpu().numpy()
@@ -121,11 +131,28 @@ def main():
 
     np.testing.assert_allclose(rl_t_np, rl_ref_np, rtol=1e-2, atol=1e-2)
     np.testing.assert_allclose(ea_t_np, ea_ref_np, rtol=1e-2, atol=1e-2)
-    np.testing.assert_array_equal(ei_t_np, ei_ref_np)
+
+    # Expert index check: allow tie-breaking differences.
+    # Hardware max8 and PyTorch topk can select different indices when affinity values are equal.
+    # For each token, verify the kernel selected valid top-K indices by checking that
+    # the set of selected affinity values matches the reference (up to ties).
+    ei_mismatch = (ei_t_np != ei_ref_np).any(axis=1)
+    if ei_mismatch.any():
+        bad_tokens = np.where(ei_mismatch)[0]
+        for tok in bad_tokens:
+            ref_vals = np.sort(ea_ref_np[tok, ei_ref_np[tok]])
+            # Use ea_ref_np (ground truth affinities) evaluated at kernel-selected indices
+            ker_vals = np.sort(ea_ref_np[tok, ei_t_np[tok]])
+            np.testing.assert_allclose(
+                ker_vals, ref_vals, rtol=1e-5, atol=1e-5,
+                err_msg=f"Token {tok}: kernel selected non-equivalent indices (not a tie)"
+            )
+        print(f"expert_index   {ei_mismatch.sum()} tokens differ by tie-breaking only  PASS")
+    else:
+        print(f"expert_index   exact_match  PASS")
 
     print(f"router_logits  max_diff={np.abs(rl_t_np - rl_ref_np).max():.2e}  PASS")
     print(f"expert_affi    max_diff={np.abs(ea_t_np - ea_ref_np).max():.2e}  PASS")
-    print(f"expert_index   exact_match  PASS")
 
 
 if __name__ == "__main__":
