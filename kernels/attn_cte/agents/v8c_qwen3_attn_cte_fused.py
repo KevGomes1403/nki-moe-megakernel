@@ -175,11 +175,23 @@ import nki
 import nki.language as nl
 import nki.isa as nisa
 
+
+import os
+os.environ["NEURON_FRAMEWORK_DEBUG"] = "1"
+os.environ["XLA_IR_DEBUG"]= "1"
+os.environ["XLA_HLO_DEBUG"]= "1"
+os.environ["NEURON_RT_INSPECT_ENABLE"]= "1"
+os.environ["NEURON_RT_INSPECT_DEVICE_PROFILE"]= "1"
+os.environ["NEURON_RT_INSPECT_OUTPUT_DIR"]= "./output"
+
+os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = "trn2"
+os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2"
+
 PMAX = 128
 EPS = 1e-6
 
 
-@nki.jit
+@nki.jit(platform_target="trn2")
 def qwen3_attn_cte_fused(
     hidden_states,   # [B, S, H] bf16, B=1 typical
     Wq,              # [H, Hq_tp*d] = [2048, 1024] bf16 — pre-transposed (Plan B)

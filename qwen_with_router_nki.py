@@ -342,11 +342,14 @@ class NKIRouterTopK(RouterTopK):
     ea_out is L1-normalized top-K affinities scattered into [T, E] (zeros at
     non-selected positions), equivalent to what get_expert_affinities_masked
     produces when normalize_top_k_affinities=True.
+
+    Input hidden_states may have leading dims (S, B, H); they are flattened to
+    (T, H) before the kernel call, matching RouterBase.get_router_logits behaviour.
     """
 
     def forward(self, hidden_states):
-        # hidden_states: [T, H] bf16
-        # RouterBase.get_router_logits already flattened (S, B, H) → (T, H).
+        # Flatten (S, B, H) or any leading dims → (T, H), matching RouterBase.get_router_logits
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         T, H = hidden_states.shape
         E, K = self.num_experts, self.top_k
 
@@ -362,7 +365,7 @@ class NKIRouterTopK(RouterTopK):
         ea = torch.empty((T, E), dtype=torch.float32, device=hidden_states.device)
         ei = torch.empty((T, K), dtype=torch.int32,   device=hidden_states.device)
 
-        rl, ea, ei = qwen3_router_topk_cte[2](x, w, rl, ea, ei)
+        rl, ea, ei = qwen3_router_topk_cte[2](x.data, w.data, rl, ea, ei)
 
         # Cast to match ExpertMLPsV2 expectations
         router_logits     = rl.to(hidden_states.dtype)   # [T, E]
@@ -378,8 +381,62 @@ def _install_nki_router(mlp) -> None:
     weight_T is re-derived from linear_router.weight so RouterBase.preshard_hook
     (which repopulates weight_T from the checkpoint at load time) keeps both
     parameters in sync.
+
+    The TKG fused kernel casts hidden states to float32 internally before the
+    router matmul (MoEFusedTKGConfig.router_mm_dtype defaults to torch.float32).
+    weight_T on the TKG router (moe_fused_tkg.router, which is the old router)
+    must also be float32 to satisfy the kernel's x.dtype == w.dtype assertion.
+    This is done here before the swap so moe_fused_tkg.router.weight_T is float32
+    at both compile time and runtime (preshard_hook is also patched to preserve this).
     """
     old = mlp.router
+
+    # Cast the TKG router's weight_T to float32 to match router_mm_dtype=float32.
+    # moe_fused_tkg.router IS old, so this fixes the TKG path without touching our router.
+    if hasattr(old, 'weight_T'):
+        old.weight_T = nn.Parameter(old.weight_T.data.to(torch.float32))
+
+    # Override _apply on old so that model.to(bfloat16) (called in model_wrapper.py
+    # after construction) does not cast weight_T back to bfloat16.
+    _orig_apply = old._apply
+    def _apply_protect_weight_T(fn):
+        _orig_apply(fn)
+        if 'weight_T' in old._parameters and old._parameters['weight_T'].dtype != torch.float32:
+            old._parameters['weight_T'] = nn.Parameter(
+                old._parameters['weight_T'].data.to(torch.float32),
+                requires_grad=False,
+            )
+        return old
+    old._apply = _apply_protect_weight_T
+
+    # Patch moe_fused_tkg.preshard_hook to derive weight_T at load time.
+    #
+    # invoke_preshard_hook (trace.py) walks the module tree and, when it finds a
+    # module with preshard_hook, calls it and *returns immediately* without
+    # recursing into children. MoEFusedTKG.preshard_hook is a no-op pass, so the
+    # framework calls that and stops — it never reaches old.preshard_hook on the
+    # child router. We must therefore patch moe_fused_tkg directly.
+    #
+    # The framework calls moe_fused_tkg.preshard_hook(state_dict, prefix) where
+    # prefix = "…mlp.moe_fused_tkg.weight". From that we can reconstruct:
+    #   checkpoint key : "…mlp.router.linear_router.weight"
+    #   target key     : "…mlp.moe_fused_tkg.router.weight_T"
+    def _tkg_preshard_hook(model_state_dict, prefix):
+        # prefix = "…mlp.moe_fused_tkg.weight"
+        mlp_prefix = prefix.removesuffix("moe_fused_tkg.weight")   # "…mlp."
+        tkg_prefix  = mlp_prefix + "moe_fused_tkg."                 # "…mlp.moe_fused_tkg."
+        original_key  = mlp_prefix + "router.linear_router.weight"  # checkpoint key
+        transposed_key = tkg_prefix + "router.weight_T"             # target key
+        if original_key in model_state_dict:
+            model_state_dict[transposed_key] = (
+                model_state_dict[original_key]
+                .detach().transpose(0, 1).clone().to(torch.float32)
+            )
+        elif transposed_key in model_state_dict:
+            # Compiled checkpoint already has weight_T — just ensure float32.
+            model_state_dict[transposed_key] = model_state_dict[transposed_key].to(torch.float32)
+    mlp.moe_fused_tkg.preshard_hook = _tkg_preshard_hook
+
     nki_router = NKIRouterTopK(
         num_experts=old.num_experts,
         top_k=old.top_k,
@@ -491,71 +548,6 @@ class NeuronQwen3MoEAttentionWithNKICTE(NeuronAttentionBase):
         # CTE: use NKI fused kernel
         # return self._nki_cte_forward(hidden_states, position_ids, **kwargs)
 
-    def _nki_cte_forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_ids: Optional[torch.LongTensor],
-        **kwargs,
-    ) -> NeuronAttentionBaseOutput:
-        bsz, q_len, h = hidden_states.size()
-
-        # Rotary embeddings
-        cos_full, sin_full = self.rotary_emb(hidden_states, position_ids)
-        cos_for_kernel = cos_full[0]  # [S, d]
-        sin_for_kernel = sin_full[0]  # [S, d]
-
-        # Weight extraction in Plan B layout [H, out_per_rank]
-        Wq = self.Wq_nki.weight.data  # [H, Hq/tp] — interleaved column order
-        Wk = self.Wk_nki.weight.data  # [H, Hkv_full]
-        Wv = self.Wv_nki.weight.data  # [H, Hkv_full]
-
-        # Per-head RMSNorm weights pre-reshaped to [d, 1] for NKI tracing
-        q_norm_weight = self.q_layernorm.weight.reshape(self.head_dim, 1)
-        k_norm_weight = self.k_layernorm.weight.reshape(self.head_dim, 1)
-
-        Hq_out = self.num_heads * self.head_dim
-        Hkv_full_out = self._nki_num_kv_heads_full * self.head_dim
-
-        logger.debug(
-            "NKI CTE fwd: B=%d S=%d H=%d  Hq_out=%d  Hkv_full_out=%d  Wq=%s  Wk=%s",
-            bsz, q_len, h, Hq_out, Hkv_full_out, tuple(Wq.shape), tuple(Wk.shape),
-        )
-
-        attn_out, K_cache_nki, V_cache_nki = qwen3_attn_cte_fused[2](
-            hidden_states,
-            Wq, Wk, Wv,
-            q_norm_weight, k_norm_weight,
-            cos_for_kernel, sin_for_kernel,
-            Hq_out=Hq_out, Hkv_out=Hkv_full_out,
-        )
-
-        attn_output = self.Wo_nki(attn_out)
-
-        # Slice rank-local KV heads for the cache: kernel outputs all Hkv_full heads
-        num_kv_per_rank = self.num_key_value_heads
-        tp_rank = parallel_state.get_tensor_model_parallel_rank()
-        kv_start = tp_rank * num_kv_per_rank * self.head_dim
-        kv_end   = kv_start + num_kv_per_rank * self.head_dim
-
-        K_cache = (
-            K_cache_nki[:, :, kv_start:kv_end]
-            .reshape(bsz, q_len, num_kv_per_rank, self.head_dim)
-            .transpose(1, 2)
-        )
-        V_cache = (
-            V_cache_nki[:, :, kv_start:kv_end]
-            .reshape(bsz, q_len, num_kv_per_rank, self.head_dim)
-            .transpose(1, 2)
-        )
-
-        return NeuronAttentionBaseOutput(
-            hidden_states=attn_output,
-            present_key_value=(K_cache, V_cache),
-            cos_cache=cos_full,
-            sin_cache=sin_full,
-        )
-
-
 # ---------------------------------------------------------------------------
 # Decoder layer
 # ---------------------------------------------------------------------------
@@ -570,8 +562,13 @@ class NeuronQwen3MoeDecoderLayerWithNKI(nn.Module):
         self.self_attn = NeuronQwen3MoEAttentionWithNKICTE(config=config)
         self.moe_fused_nki_kernel_enabled = getattr(config, "moe_fused_nki_kernel_enabled", False)
 
-        self.input_layernorm = get_rmsnorm_cls()(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = get_rmsnorm_cls()(config.hidden_size, eps=config.rms_norm_eps)
+        _dtype = config.neuron_config.torch_dtype
+        # Cast to target dtype at construction so XLA traces with bfloat16 from the start.
+        # Without this, Qwen3MoeRMSNorm initializes its weight as float32 (torch.ones default),
+        # which propagates float32 hidden states into the TKG fused kernel and triggers
+        # an x.dtype != w.dtype assertion against the bfloat16 weight_T.
+        self.input_layernorm = get_rmsnorm_cls()(config.hidden_size, eps=config.rms_norm_eps).to(_dtype)
+        self.post_attention_layernorm = get_rmsnorm_cls()(config.hidden_size, eps=config.rms_norm_eps).to(_dtype)
 
         self.mlp = initialize_moe_module(
             config=config, rmsnorm=self.post_attention_layernorm, init_tkg_module=True
@@ -580,7 +577,7 @@ class NeuronQwen3MoeDecoderLayerWithNKI(nn.Module):
         _install_nki_router(self.mlp)
 
         self.qkv_kernel_enabled = config.neuron_config.qkv_kernel_enabled
-        self.sequence_parallel_enabled = True
+        self.sequence_parallel_enabled = False
         self.qkv_kernel_fused_rmsnorm = not self.sequence_parallel_enabled
         self.moe_mask_padded_tokens = config.neuron_config.moe_mask_padded_tokens
 
@@ -620,8 +617,8 @@ class NeuronQwen3MoeDecoderLayerWithNKI(nn.Module):
         hidden_states = residual + hidden_states
 
         residual = hidden_states
-        if not self.moe_fused_nki_kernel_enabled:
-            hidden_states = self.post_attention_layernorm(hidden_states)
+        # if not self.moe_fused_nki_kernel_enabled:
+        #     hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states, padding_mask)[0]
         hidden_states = residual + hidden_states
 
@@ -673,7 +670,7 @@ class NeuronQwen3MoeModelWithNKI(NeuronBaseModel):
 # CausalLM entry point
 # ---------------------------------------------------------------------------
 
-class NeuronQwen3MoeForCausalLMWithNKI(NeuronBaseForCausalLM):
+class NeuronQwen3MoeForCausalLM(NeuronBaseForCausalLM):
     """Qwen3 MoE CausalLM with NKI-fused attention (CTE) and NKI router."""
 
     _model_cls = NeuronQwen3MoeModelWithNKI
@@ -800,7 +797,7 @@ def test_cte_compile(model_path: str, traced_model_path: str):
     )
 
     print("\n[1/3] Initialising model ...")
-    model = NeuronQwen3MoeForCausalLMWithNKI(model_path, config)
+    model = NeuronQwen3MoeForCausalLM(model_path, config)
 
     print("[2/3] Enabling context encoding and compiling CTE graph ...")
     model.compile(traced_model_path)

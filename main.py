@@ -33,6 +33,17 @@ BENCHMARK_REPORT_FILENAME = "benchmark_report.json"
 
 set_random_seed(0)
 
+# Profiling
+import os
+os.environ["NEURON_FRAMEWORK_DEBUG"] = "1"
+os.environ["XLA_IR_DEBUG"]= "1"
+os.environ["XLA_HLO_DEBUG"]= "1"
+os.environ["NEURON_RT_INSPECT_ENABLE"]= "1"
+os.environ["NEURON_RT_INSPECT_DEVICE_PROFILE"]= "1"
+os.environ["NEURON_RT_INSPECT_OUTPUT_DIR"]= "./output"
+
+os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = "trn2"
+os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2"
 
 def _str2bool(value):
     if isinstance(value, bool):
@@ -59,7 +70,8 @@ def parse_args():
             "qwen, qwen_with_nki (or qwen_nki), "
             "qwen_with_attention_cte (or qwen_attention_cte/qwen_cte), "
             "qwen_with_moe_tkg (or qwen_moe_tkg/qwen_tkg), "
-            "qwen_with_attn_cte_nki (or qwen_attn_cte_nki/qwen_nki_attn_cte)."
+            "qwen_with_attn_cte_nki (or qwen_attn_cte_nki/qwen_nki_attn_cte), "
+            "qwen_with_router_nki (or qwen_router_nki/qwen_nki_router)."
         ),
     )
     parser.add_argument("--enable-nki", action="store_true")
@@ -641,6 +653,10 @@ def resolve_qwen_module_name(qwen_name: str, enable_nki: bool) -> str:
         "qwen_with_attn_cte_nki": "qwen_with_attn_cte_nki",
         "qwen_attn_cte_nki": "qwen_with_attn_cte_nki",
         "qwen_nki_attn_cte": "qwen_with_attn_cte_nki",
+        # NKI fused attention (CTE) + NKI router.
+        "qwen_with_router_nki": "qwen_with_router_nki",
+        "qwen_router_nki": "qwen_with_router_nki",
+        "qwen_nki_router": "qwen_with_router_nki",
     }
 
     normalized = qwen_name.strip()
