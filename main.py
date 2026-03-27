@@ -667,6 +667,10 @@ def resolve_qwen_module_name(qwen_name: str, enable_nki: bool) -> str:
         "qwen_with_nkilib_moe_tkg": "qwen_with_nkilib_moe_tkg",
         "qwen_nkilib_moe_tkg": "qwen_with_nkilib_moe_tkg",
         "qwen_nkilib": "qwen_with_nkilib_moe_tkg",
+        # NKI router (CTE) + kernel_v8a fused MoE kernel (TKG).
+        "qwen_fused_moe_tkg": "qwen_fused_moe_tkg",
+        "qwen_v8a_moe_tkg": "qwen_fused_moe_tkg",
+        "qwen_v8a": "qwen_fused_moe_tkg",
     }
 
     normalized = qwen_name.strip()
