@@ -347,6 +347,9 @@ def run_correctness(kernel_fn, kernel_path: str, variant: str,
         print("Running NKI kernel on device...")
         nki_out = kernel_fn(*_kernel_args(inputs, device, variant))
         xm.mark_step()
+        # v10b and similar kernels return (output, k_rope_out, v_out); take first
+        if isinstance(nki_out, (tuple, list)):
+            nki_out = nki_out[0]
         nki_out_cpu = nki_out.cpu()
         print(f"  nki shape={nki_out_cpu.shape}  norm={nki_out_cpu.float().norm():.4f}")
 
@@ -388,12 +391,12 @@ def run_correctness(kernel_fn, kernel_path: str, variant: str,
 # ---------------------------------------------------------------------------
 
 def run_benchmark(kernel_fn, kernel_path: str, variant: str,
-                  warmup: int, iters: int, B: int):
+                  warmup: int, iters: int, B: int, s_prior: int = 640):
     print(f"Benchmarking kernel: {kernel_path}  (variant={variant})")
     print(f"  warmup={warmup}  iters={iters}")
 
     Hkv_tp  = _hkv_for_variant(variant)
-    S_prior = 2048
+    S_prior = s_prior
     print(f"  B={B}  S_prior={S_prior}  H=2048  d=128  Hq_tp=8  Hkv_tp={Hkv_tp}")
 
     inputs = make_inputs(B=B, S_prior=S_prior, Hkv_tp=Hkv_tp, variant=variant)
@@ -419,7 +422,8 @@ if __name__ == "__main__":
 
     if args.benchmark:
         run_benchmark(kernel_fn, kernel_path, variant,
-                      warmup=args.warmup, iters=args.iters, B=args.batch)
+                      warmup=args.warmup, iters=args.iters, B=args.batch,
+                      s_prior=args.s_prior[0])
     else:
         run_correctness(kernel_fn, kernel_path, variant,
                         s_prior_list=args.s_prior, B=args.batch)
