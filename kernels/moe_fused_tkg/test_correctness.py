@@ -192,12 +192,44 @@ def run_benchmark(run_kernel, kernel_path: str, warmup: int, iters: int):
     gate_up_xla = gate_up_w.to(device)
     down_xla    = down_w.to(device)
 
-    nki_benchmark(
+    result = nki_benchmark(
         run_kernel,
         inp_xla, gamma_xla, router_xla, gate_up_xla, down_xla,
         warmup=warmup,
         iters=iters,
     )
+
+    if result is not None and result.prof:
+        _print_full_profile(result.prof)
+
+
+def _print_full_profile(prof: dict) -> None:
+    """Print all profile keys not already shown by _print_profile_results."""
+    # Keys already printed by _print_profile_results in benchmark.py
+    _shown = {
+        "total_time", "total_active_time",
+        "tensor_engine_active_time", "vector_engine_active_time",
+        "scalar_engine_active_time", "dma_active_time",
+        "mfu_estimated_percent", "mbu_estimated_percent",
+        "mm_arithmetic_intensity",
+        "hbm_read_bytes", "hbm_write_bytes",
+        "spill_save_bytes", "spill_reload_bytes",
+    }
+    extra = {k: v for k, v in sorted(prof.items()) if k not in _shown}
+    if not extra:
+        return
+    sep = "=" * 60
+    print(f"\n{sep}")
+    print("  Additional profile fields")
+    print(sep)
+    for k, v in extra.items():
+        if isinstance(v, float) and "time" in k:
+            print(f"  {k:<45} = {v * 1e6:.2f} μs")
+        elif isinstance(v, float) and "bytes" in k:
+            print(f"  {k:<45} = {v / 1024:.1f} KiB")
+        else:
+            print(f"  {k:<45} = {v}")
+    print(sep + "\n")
 
 
 # ---------------------------------------------------------------------------

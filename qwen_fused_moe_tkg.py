@@ -1,15 +1,18 @@
 # coding=utf-8
 """
-Qwen3 MoE model with kernel_v8a fused MoE TKG kernel.
+Qwen3 MoE model with kernel_v9a fused MoE TKG kernel.
 
 Standalone variant of qwen_with_router_nki.py with the TKG MoE path replaced
-by a direct call to kernels.moe_fused_tkg.kernel_v8a.qwen3_moe_fused_tkg.
+by a direct call to kernels.moe_fused_tkg.kernel_v9a.qwen3_moe_fused_tkg.
 
 Changes vs qwen_with_router_nki.py:
-  - TKG path: self.mlp(...) replaced by kernel_v8a.qwen3_moe_fused_tkg[2](...)
+  - TKG path: self.mlp(...) replaced by kernel_v9a.qwen3_moe_fused_tkg[2](...)
   - CTE path: unchanged (self.mlp as before)
   - Weight layout: reuses initialize_moe_module weights exactly as loaded;
     gate_up_proj.weight is reshaped [E, H, 2*I] -> [E, H, 2, I] inline
+
+kernel_v9a uses I-dimension sharding + shared-HBM all-reduce instead of sendrecv,
+which compiles correctly in multi-layer model graphs.
 
 All tensor inputs to the kernel have .data appended for XLA tracing compatibility.
 """
@@ -30,7 +33,7 @@ from neuronx_distributed_inference.models.layer_boundary_marker import (
     ModuleMarkerStartWrapper,
 )
 
-from kernels.moe_fused_tkg import kernel_v8a
+from kernels.moe_fused_tkg import kernel_v9b
 
 
 # ---------------------------------------------------------------------------
@@ -38,7 +41,7 @@ from kernels.moe_fused_tkg import kernel_v8a
 # ---------------------------------------------------------------------------
 
 class NeuronQwen3MoeDecoderLayerFusedTKG(NeuronQwen3MoeDecoderLayerWithNKI):
-    """Decoder layer that calls kernel_v8a.qwen3_moe_fused_tkg for TKG, CTE unchanged."""
+    """Decoder layer that calls kernel_v9a.qwen3_moe_fused_tkg for TKG, CTE unchanged."""
 
     def forward(
         self,
@@ -86,16 +89,18 @@ class NeuronQwen3MoeDecoderLayerFusedTKG(NeuronQwen3MoeDecoderLayerWithNKI):
             # gate_up_w: [E, H, 2, I]  (reshaped from stored [E, H, 2*I])
             # down_w: [E, I, H]
             tkg = self.mlp.moe_fused_tkg
-            gate_up_w_fused = tkg.expert_mlps.mlp_op.gate_up_proj.weight  # [E, H, 2*I]
+            gate_up_w_fused = tkg.expert_mlps.mlp_op.gate_up_proj.weight.data  # [E, H, 2*I]
             E, H, two_I = gate_up_w_fused.shape
-            gate_up_w = gate_up_w_fused.view(E, H, 2, two_I // 2)         # [E, H, 2, I]
+            gate_up_w = gate_up_w_fused.view(E, H, 2, two_I // 2)             # [E, H, 2, I]
 
-            moe_out = kernel_v8a.qwen3_moe_fused_tkg[2](
+            down_w = tkg.expert_mlps.mlp_op.down_proj.weight.data              # [E, I, H]
+
+            moe_out = kernel_v9b.qwen3_moe_fused_tkg[2](
                 hidden_states.data,
-                self.post_attention_layernorm.weight.unsqueeze(0).data,    # [1, H]
-                tkg.router.weight_T.data,                                  # [H, E] float32
-                gate_up_w.data,                                            # [E, H, 2, I]
-                tkg.expert_mlps.mlp_op.down_proj.weight.data,             # [E, I, H]
+                self.post_attention_layernorm.weight.unsqueeze(0).data,        # [1, H]
+                tkg.router.weight_T.data,                                      # [H, E] float32
+                gate_up_w,                                                     # [E, H, 2, I]
+                down_w,                                                        # [E, I, H]
             )
             # kernel returns [B, H]; restore seq dim to match residual [B, 1, H]
             hidden_states = moe_out.unsqueeze(1)
@@ -127,6 +132,6 @@ class NeuronQwen3MoeModelFusedTKG(NeuronQwen3MoeModelWithNKI):
 # ---------------------------------------------------------------------------
 
 class NeuronQwen3MoeForCausalLM(_NeuronQwen3MoeForCausalLMBase):
-    """Qwen3 MoE CausalLM with kernel_v8a fused MoE TKG kernel."""
+    """Qwen3 MoE CausalLM with kernel_v9a fused MoE TKG kernel."""
 
     _model_cls = NeuronQwen3MoeModelFusedTKG
