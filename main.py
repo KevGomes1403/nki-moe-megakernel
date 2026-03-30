@@ -362,7 +362,7 @@ def benchmark_sampling(model, tokenizer, generation_config, prompts):
         e2e_benchmark.latency_list,
         neuron_config.max_length,
         neuron_config.max_batch_size,
-        n_runs=2,
+        n_runs=e2e_benchmark.num_runs,
     )
         
     report.update(

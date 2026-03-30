@@ -81,7 +81,7 @@ torch.manual_seed(0)
 import os
 
 from kernels.router_topk.qwen3_router_topk_plan_a import qwen3_router_topk_cte
-from kernels.moe_fused_tkg import kernel_v15
+from kernels.moe_fused_tkg import kernel_v19b as custom_moe_fused_kernel
 
 SampleOutput = Union[SampleEncoderDecoderOutput, SampleDecoderOnlyOutput]
 GQA_SHARDING_STRATEGY = GQA.REPLICATE_TO_TP_DEGREE
@@ -670,7 +670,7 @@ class NeuronQwen3MoeDecoderLayerFusedTKG(NeuronQwen3MoeDecoderLayerWithNKI):
             # gate_up:  [E, H, 2*I=384]  — native layout (gate cols 0:I, up cols I:2I)
             # down_w:   [E, I=192, H]    — native layout, no shard pre-split
             tkg = self.mlp.moe_fused_tkg
-            moe_out = kernel_v15.qwen3_moe_fused_tkg[2](
+            moe_out = custom_moe_fused_kernel.qwen3_moe_fused_tkg[2](
                 hidden_states.data,
                 self.post_attention_layernorm.weight.unsqueeze(0).data,        # [1, H]
                 tkg.router.weight_T.data,                                      # [H, E] bf16
