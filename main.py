@@ -73,7 +73,8 @@ def parse_args():
             "qwen_with_attn_cte_nki (or qwen_attn_cte_nki/qwen_nki_attn_cte), "
             "qwen_with_router_nki (or qwen_router_nki/qwen_nki_router), "
             "qwen_with_router_attn_tkg (or qwen_router_attn_tkg/qwen_attn_tkg), "
-            "qwen_with_nkilib_moe_tkg (or qwen_nkilib_moe_tkg/qwen_nkilib)."
+            "qwen_with_nkilib_moe_tkg (or qwen_nkilib_moe_tkg/qwen_nkilib), "
+            "qwen_complete (or qwen_fused_moe_attn_tkg/qwen_full_tkg)."
         ),
     )
     parser.add_argument("--enable-nki", action="store_true")
@@ -671,6 +672,10 @@ def resolve_qwen_module_name(qwen_name: str, enable_nki: bool) -> str:
         "qwen_fused_moe_tkg": "qwen_fused_moe_tkg",
         "qwen_v8a_moe_tkg": "qwen_fused_moe_tkg",
         "qwen_v8a": "qwen_fused_moe_tkg",
+        # v10e fused attention TKG + kernel_v19b fused MoE TKG (both kernels active).
+        "qwen_complete": "qwen_complete",
+        "qwen_fused_moe_attn_tkg": "qwen_complete",
+        "qwen_full_tkg": "qwen_complete",
     }
 
     normalized = qwen_name.strip()

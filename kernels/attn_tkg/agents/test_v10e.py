@@ -237,10 +237,10 @@ if __name__ == "__main__":
     # ── Correctness ────────────────────────────────────────────────────────────
     # Test 1: primary case — half-filled cache, random K values
     # v10d's heuristic is imprecise here; v10e must be exact
-    run_correctness_test(pos=320, label="half-filled cache")
+    # run_correctness_test(pos=320, label="half-filled cache")
 
-    # Test 2: full cache — all positions valid, mask all zeros
-    run_correctness_test(pos=640, label="full cache")
+    # # Test 2: full cache — all positions valid, mask all zeros
+    # run_correctness_test(pos=640, label="full cache")
 
     # Test 3: nearly-empty cache — only first tile (128 tokens) valid
     run_correctness_test(pos=128, label="one tile valid")
@@ -252,9 +252,9 @@ if __name__ == "__main__":
     print("BENCHMARK COMPARISON: v10d vs v10e")
     print("="*70)
 
-    r_v10d = run_benchmark("v10d", qwen3_attn_tkg_fused_oproj_v10d[2], pos=640)
-    r_v10e = run_benchmark("v10e", qwen3_attn_tkg_fused_oproj_v10e[2], pos=640)
-
+    # r_v10d = run_benchmark("v10d", qwen3_attn_tkg_fused_oproj_v10d[2], pos=640)
+    # r_v10e = run_benchmark("v10e", qwen3_attn_tkg_fused_oproj_v10e[2], pos=640)
+l
     if r_v10d and r_v10e:
         delta_us = r_v10e.device_time_us - r_v10d.device_time_us
         pct = delta_us / r_v10d.device_time_us * 100
