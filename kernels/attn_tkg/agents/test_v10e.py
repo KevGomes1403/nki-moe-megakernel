@@ -252,9 +252,9 @@ if __name__ == "__main__":
     print("BENCHMARK COMPARISON: v10d vs v10e")
     print("="*70)
 
-    # r_v10d = run_benchmark("v10d", qwen3_attn_tkg_fused_oproj_v10d[2], pos=640)
-    # r_v10e = run_benchmark("v10e", qwen3_attn_tkg_fused_oproj_v10e[2], pos=640)
-l
+    r_v10d = run_benchmark("v10d", qwen3_attn_tkg_fused_oproj_v10d[2], pos=640)
+    r_v10e = run_benchmark("v10e", qwen3_attn_tkg_fused_oproj_v10e[2], pos=640)
+
     if r_v10d and r_v10e:
         delta_us = r_v10e.device_time_us - r_v10d.device_time_us
         pct = delta_us / r_v10d.device_time_us * 100

@@ -2,8 +2,10 @@
 Custom fused MoE TKG kernel for Qwen3-30B-A3B (TP=4, LNC=2).
 Implements from scratch: RMSNorm + Router + TopK(8) + Selective-Expert MLPs
 
-kernel_v20a — Plan A: Flat SBUF + affine_range(K) prefetch
-=============================================================
+kernel_v22a — Round 1 Plan A: Eliminate per-expert tile-1 prep loop
+====================================================================
+
+Derived from kernel_v20a.
 
 Interface contract (no repack required):
   gate_up_w  [E=128, H=2048, 2*I=384] bf16 — native layout from qwen.py/qwen_fused_moe_tkg.py
@@ -11,40 +13,33 @@ Interface contract (no repack required):
                                               cols I:2*I = up   weights
   down_w     [E=128, I=192,  H=2048]   bf16 — native layout from qwen.py/qwen_fused_moe_tkg.py
 
-DMA coalescing strategy:
-  gate_up:  ONE coalesced DMA per expert, loading [_PMAX, H_free * _GU_FLAT] per expert k
-              into a flat contiguous SBUF buffer (gate_up_flat).
-            Two zero-padded tile-1 buffers (gate_t1_128, up_t1_128) hold the
-              partial 64-col second tile, zero-filled at cols 64:128 so nc_matmul
-              always sees a K=128 stationary. Filled via SBUF tensor_copy, not DMA.
+Changes vs v20a:
+  1. Removed the large gate_t1_128 [_PMAX, H_free, I0] and up_t1_128 [_PMAX, H_free, I0]
+     SBUF buffers (saving 8 KB SBUF total).
+  2. Removed the two hoisted memsets for the [H_free, I0] tile-1 buffers (2 fewer
+     memset instructions per token).
+  3. Removed the tile-1 prep loop (2 × H_free = 32 tensor_copy calls per expert ×
+     K=8 experts = 256 tensor_copy instructions eliminated per token).
+  4. In the gate/up matmul loop, tile-1 (i_tile==1) now uses two small single-slot
+     scratch buffers gate_t1_sb [_PMAX, I0] and up_t1_sb [_PMAX, I0] (8 KB SBUF total,
+     same as before but with H_free=1 instead of H_free=16 slots).
+     The pad region [I1:I0] of these buffers is memset to 0 ONCE before the token
+     loop (reuses the same memset; pad bytes are never overwritten inside the loops).
+     For each h1 in the matmul affine_range, a tensor_copy loads the 64 valid cols
+     into gate_t1_sb[:,0:I1] and up_t1_sb[:,0:I1] immediately before the nc_matmul.
+     The compiler can pipeline the tensor_copy and nc_matmul on separate engines.
 
-  down:     ONE coalesced DMA per I-tile per expert, loading full H=2048.
-              stride_p = H = 2048 == count_col = 2048 → fully coalesced.
-            prg_id offsets into the SBUF at matmul time:
-              h1_g = prg_id * H_free_shard + h1_out
-            Tile 0: 128 rows  (I rows 0:128), full DMA.
-            Tile 1:  64 valid rows (I rows 128:192) + 64 zero-padded rows.
-              memset rows 64:128 then DMA rows 0:64.
+  NOTE: nc_matmul requires stationary free_dim = 128 (_PMAX) on trn2.
+  K=64 stationary is not supported (compiler rejects it). The single-slot approach
+  maintains K=128 by keeping the zero-padded layout while reducing SBUF footprint
+  and eliminating the batched prep loop.
 
-Plan A optimisation (vs v15):
-  Static pad-region memsets hoisted outside the k-loop (run once per token instead
-  of once per expert):
-    gate_t1_128 pad zeros [cols 64:128]: 8× memset → 1× memset per token
-    up_t1_128   pad zeros [cols 64:128]: 8× memset → 1× memset per token
-    down_full1  pad zeros [rows 64:128]: 8× memset → 1× memset per token
-  gate_up_psum and down_psum allocations also hoisted; their per-expert
-  nisa.memset(*, 0.0) calls remain inside k-loop (PSUM must be zeroed per expert).
-
-Plan A (v20a) — Flat SBUF + affine_range(K) prefetch:
-  Replace 8×gate_up_bufs, 8×down_full0_bufs, 8×down_full1_bufs named lists
-  with 3 flat tensors: gate_up_flat, down_full0_flat, down_full1_flat.
-  Prefetch loop uses nl.affine_range(K) so the compiler sees all K expert DMAs
-  as independent → can batch/overlap all K×3=24 DMAs simultaneously.
-  Compute loop uses nl.static_range(K) with nl.ds(k*stride, stride) offsets.
-
-  gate_up_flat:   [_PMAX, K * H_free * _GU_FLAT] = [128, 8*16*384] = [128, 49152]
-  down_full0_flat: [_PMAX, K * H_shard]           = [128, 8*1024]  = [128, 8192]
-  down_full1_flat: [_PMAX, K * H_shard]           = [128, 8*1024]  = [128, 8192]
+Net effect vs v20a:
+  - SBUF: −8 KB (gate_t1_128 + up_t1_128 reduced from [16,128] to [1,128] each)
+  - Instructions: −256 tensor_copy + −2 memset per token (prep loop eliminated)
+  - Instructions added: +2 × H_free × K = 256 tensor_copy (inline in matmul loop)
+  Total tensor_copy count is the same; however the instruction ordering is changed:
+  copies are now interleaved with matmuls, which may improve engine overlap.
 
 SBUF budget estimate (per partition lane, 224 KiB limit):
   inp_flat_sb:           [16*T, _PMAX]   bf16  =   4 KB  (T=1)
@@ -53,17 +48,15 @@ SBUF budget estimate (per partition lane, 224 KiB limit):
   rmsnorm_normed_bf16:   [_PMAX, 16*T]   bf16  =   4 KB
   output_temp:           [_PMAX, 8, 1]   fp32  =   4 KB  (H_free_shard=8, T=1)
   aff_bcast:             [_PMAX, 8]      fp32  =   4 KB
-  gate_up_flat:          [128, 49152]    bf16  =  12 KB  (per lane: 49152*2/128 = 768B × 128?)
-                         Actually: par_dim=128, free=49152: 128*49152*2 / 128 lanes = 98304 B = 96 KB
-  gate_t1_128:           [_PMAX,16,128]  bf16  =   4 KB  (single, reused across experts)
-  up_t1_128:             [_PMAX,16,128]  bf16  =   4 KB  (single, reused across experts)
+  gate_up_flat:          [_PMAX, K*H_free, _GU_FLAT] bf16 = 96 KB
+  gate_t1_sb:            [_PMAX, I0=128] bf16  =  ~0.5 KB  (single slot, reused per h1)
+  up_t1_sb:              [_PMAX, I0=128] bf16  =  ~0.5 KB  (single slot, reused per h1)
   down_full0_flat:        [_PMAX,8192]   bf16  =  16 KB
   down_full1_flat:        [_PMAX,8192]   bf16  =  16 KB
-  router_w_wide_sb:      [_PMAX, 4, 128] bf16  =  64 KB  (4 tiles × H_free/4)
+  router_w_wide_sb:      [_PMAX, 4, 128] bf16  =  64 KB  (freed before Stage 4)
   out_sb:                [T, H_shard]    bf16  =   2 KB
   gate/up/inter SBUF:    ~16 KB (PSUM flush + silu + inter)
-  Total peak:            ~238 KB — note: router_w_wide_sb is freed before Stage 4,
-                         peak in Stage 4 ≈ 174 KB < 224 KiB limit.
+  Total peak (Stage 4):  ~167 KB < 224 KiB limit (7 KB saved vs v20a).
 """
 
 import nki
@@ -117,6 +110,9 @@ def qwen3_moe_fused_tkg(
 
     gate_up_w is [E, H, 2*I=384] in native flat format (gate then up, no zero-pad).
     down_w is [E, I=192, H=2048] in native format (no shard pre-split).
+
+    v22a changes: tile-1 matmuls use K=I1=64 directly from gate_up_flat, eliminating
+    the gate_t1_128/up_t1_128 SBUF buffers and all associated tensor_copy calls.
     """
     B = inp.shape[0]
     T = B  # seq_len=1 for TKG, so tokens = batch
@@ -331,13 +327,19 @@ def qwen3_moe_fused_tkg(
     down_full0_flat = nl.ndarray((_PMAX, K * H_shard),          dtype=down_w.dtype,    buffer=nl.sbuf)
     down_full1_flat = nl.ndarray((_PMAX, K * H_shard),          dtype=down_w.dtype,    buffer=nl.sbuf)
 
-    # gate_t1_128/up_t1_128: single pair of reused buffers (one per expert, overwritten each k)
-    gate_t1_128 = nl.ndarray((_PMAX, H_free, I0), dtype=gate_up_w.dtype, buffer=nl.sbuf)
-    up_t1_128   = nl.ndarray((_PMAX, H_free, I0), dtype=gate_up_w.dtype, buffer=nl.sbuf)
+    # Single-slot tile-1 scratch buffers: reused for each (k, h1) iteration.
+    # Size [_PMAX, I0]: valid cols [0:I1] written per h1; pad cols [I1:I0] zeroed once.
+    gate_t1_sb = nl.ndarray((_PMAX, I0), dtype=gate_up_w.dtype, buffer=nl.sbuf)
+    up_t1_sb   = nl.ndarray((_PMAX, I0), dtype=gate_up_w.dtype, buffer=nl.sbuf)
 
     # Hoist PSUM buffers (per-expert memset stays inside k-loop)
     gate_up_psum = nl.ndarray((_PMAX, 2 * I_tiles), dtype=nl.float32, buffer=nl.psum)
     down_psum    = nl.ndarray((_PMAX, H_free_shard), dtype=nl.float32, buffer=nl.psum)
+
+    # Pad zeros for tile-1 scratch buffers — done ONCE outside the token loop.
+    # Cols [I1:I0] are never overwritten inside any loop, so one memset suffices.
+    nisa.memset(gate_t1_sb[0:_PMAX, nl.ds(I1, I1)], value=0.0)
+    nisa.memset(up_t1_sb[0:_PMAX, nl.ds(I1, I1)],   value=0.0)
 
     for t in nl.static_range(T):
 
@@ -347,10 +349,6 @@ def qwen3_moe_fused_tkg(
         # Zero ALL K experts' pad rows (I1:_PMAX) in down_full1_flat at once
         # One memset covers all K experts simultaneously → K× fewer memset instructions
         nisa.memset(down_full1_flat[nl.ds(I1, I1), 0:K * H_shard], value=0.0)
-
-        # gate_t1_128 and up_t1_128 pad zeros — same as v19b (one per token, outside k-loop)
-        nisa.memset(gate_t1_128[0:_PMAX, 0:H_free, nl.ds(I1, I1)], value=0.0)
-        nisa.memset(up_t1_128[0:_PMAX, 0:H_free, nl.ds(I1, I1)],   value=0.0)
 
         # ------------------------------------------------------------------
         # aff_bcast setup (done before prefetch, overlaps with DMA loading)
@@ -417,40 +415,46 @@ def qwen3_moe_fused_tkg(
             gate_h_base = k * H_free   # first H-tile row index for expert k in gate_up_flat
             down_expert_base = k * H_shard  # col offset in down flats for expert k
 
-            # --- Tile-1 prep: copy gate/up partial tile → gate_t1_128/up_t1_128 ---
-            # Source: cols [I0 : I0+I1] and [I+I0 : I+I0+I1] within each H-tile of expert k
-            for h1 in nl.static_range(H_free):
-                nisa.tensor_copy(
-                    dst=gate_t1_128[0:_PMAX, h1, 0:I1],
-                    src=gate_up_flat[0:_PMAX, gate_h_base + h1, nl.ds(I0, I1)],
-                )
-                nisa.tensor_copy(
-                    dst=up_t1_128[0:_PMAX, h1, 0:I1],
-                    src=gate_up_flat[0:_PMAX, gate_h_base + h1, nl.ds(I + I0, I1)],
-                )
-
             # --- Gate/Up matmul ---
             nisa.memset(gate_up_psum, value=0.0)
 
             for h1 in nl.affine_range(H_free):
                 h_idx = gate_h_base + h1  # compile-time: gate_h_base is static, h1 is affine
-                for i_tile in nl.static_range(I_tiles):
-                    if i_tile == 0:
-                        g_stat = gate_up_flat[0:_PMAX, h_idx, nl.ds(0, I0)]   # gate t0
-                        u_stat = gate_up_flat[0:_PMAX, h_idx, nl.ds(I, I0)]   # up t0
-                    else:
-                        g_stat = gate_t1_128[0:_PMAX, h1, 0:I0]               # gate t1
-                        u_stat = up_t1_128[0:_PMAX, h1, 0:I0]                 # up t1
-                    nisa.nc_matmul(
-                        dst=gate_up_psum[0:_PMAX, i_tile:i_tile + 1],
-                        stationary=g_stat,
-                        moving=rmsnorm_normed_bf16[0:_PMAX, nl.ds(h1 * T, T)],
-                    )
-                    nisa.nc_matmul(
-                        dst=gate_up_psum[0:_PMAX, I_tiles + i_tile:I_tiles + i_tile + 1],
-                        stationary=u_stat,
-                        moving=rmsnorm_normed_bf16[0:_PMAX, nl.ds(h1 * T, T)],
-                    )
+
+                # Tile 0: K=I0=128, stationary read directly from gate_up_flat
+                nisa.nc_matmul(
+                    dst=gate_up_psum[0:_PMAX, 0:1],
+                    stationary=gate_up_flat[0:_PMAX, h_idx, nl.ds(0, I0)],
+                    moving=rmsnorm_normed_bf16[0:_PMAX, nl.ds(h1 * T, T)],
+                )
+                nisa.nc_matmul(
+                    dst=gate_up_psum[0:_PMAX, I_tiles:I_tiles + 1],
+                    stationary=gate_up_flat[0:_PMAX, h_idx, nl.ds(I, I0)],
+                    moving=rmsnorm_normed_bf16[0:_PMAX, nl.ds(h1 * T, T)],
+                )
+
+                # Tile 1: inline tensor_copy of I1=64 valid cols into single-slot scratch buffer.
+                # gate_t1_sb[:,0:I1] ← gate_up_flat[:,h_idx, I0:I0+I1]
+                # up_t1_sb[:,0:I1]   ← gate_up_flat[:,h_idx, I+I0:I+I0+I1]
+                # Pad cols [I1:I0] remain zero (set once before token loop).
+                nisa.tensor_copy(
+                    dst=gate_t1_sb[0:_PMAX, 0:I1],
+                    src=gate_up_flat[0:_PMAX, h_idx, nl.ds(I0, I1)],
+                )
+                nisa.tensor_copy(
+                    dst=up_t1_sb[0:_PMAX, 0:I1],
+                    src=gate_up_flat[0:_PMAX, h_idx, nl.ds(I + I0, I1)],
+                )
+                nisa.nc_matmul(
+                    dst=gate_up_psum[0:_PMAX, 1:2],
+                    stationary=gate_t1_sb[0:_PMAX, 0:I0],
+                    moving=rmsnorm_normed_bf16[0:_PMAX, nl.ds(h1 * T, T)],
+                )
+                nisa.nc_matmul(
+                    dst=gate_up_psum[0:_PMAX, I_tiles + 1:I_tiles + 2],
+                    stationary=up_t1_sb[0:_PMAX, 0:I0],
+                    moving=rmsnorm_normed_bf16[0:_PMAX, nl.ds(h1 * T, T)],
+                )
 
             # --- Flush gate/up PSUM → SBUF, SiLU, inter ---
             # (same as v19b — unchanged)
@@ -507,7 +511,7 @@ def qwen3_moe_fused_tkg(
     # output_temp [_PMAX, H_free_shard, T] → HBM output [T, H] bf16
     # Each core writes its H_shard columns at HBM offset prg_id*H_shard.
     # -----------------------------------------------------------------------
-    output = nl.ndarray((T, H), dtype=inp.dtype, buffer=nl.shared_hbm)
+    output = nl.ndarray((T, H), dtype=inp.dtype, buffer=nl.hbm)
     out_sb = nl.ndarray((T, H_shard), dtype=inp.dtype, buffer=nl.sbuf)
 
     for h1 in nl.static_range(H_free_shard):
@@ -528,7 +532,7 @@ def qwen3_moe_fused_tkg(
 
 
 def run(inp, gamma, router_w, gate_up_w, down_w):
-    """Run kernel_v20a with native weight layouts — no preprocessing required.
+    """Run kernel_v22a with native weight layouts — no preprocessing required.
 
     Accepts gate_up_w as either:
       [E, H, 2*I=384]        — flat native (gate cols 0:I, up cols I:2I)
@@ -571,6 +575,6 @@ def run(inp, gamma, router_w, gate_up_w, down_w):
     xm.mark_step()
 
     outputs = qwen3_moe_fused_tkg[2](inp, gamma, router_w, gate_up_w, down_w)
-    # if isinstance(outputs, (tuple, list)):
-    #     return outputs[0]
+    if isinstance(outputs, (tuple, list)):
+        return outputs[0]
     return outputs

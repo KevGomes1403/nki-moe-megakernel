@@ -1,38 +1,30 @@
 """
-v10e: Extends v10d by replacing the K-norm zero-detection mask with an exact
-      position_ids-based threshold mask.
+v12a: Extends v10e by replacing the 3-step K-cache load+nc_transpose+tensor_copy
+      sequence with a single nisa.dma_transpose call per K-cache tile.
 
-Changes from v10d:
-  - position_ids [B, 1] int32 is now USED (was previously accepted but ignored).
-  - Before the K-cache hoisting loop, loads position_ids[0, 0] → pos_f32 [1, 1].
-  - Before the K-cache hoisting loop, builds par_index_f32 [PMAX, 1] with values
-    0.0, 1.0, ..., 127.0 via nisa.iota (partition-index sequence).
-  - Inside the hoisting loop, replaces the 6-op norm-based mask:
-        k_sq_raw, k_sq_f32, k_norm_sq, k_neg_scaled, mask_from_k, mask_tile_f32
-    with a 5-op threshold mask:
-        threshold_local = pos_f32 - tile_start          [1, 1] f32
-        delta = par_index_f32 - threshold_local         [PMAX, 1] f32
-        relu_delta = relu(delta)                        [PMAX, 1] f32
-        clamped = min(relu_delta, 1.0)                  [PMAX, 1] f32
-        mask_tile_f32 = clamped * (-1e9)                [PMAX, 1] f32
+Changes from v10e:
+  - In the K-cache hoisting loop (Plan B), each of the 5 K-cache tiles previously
+    used a 3-step sequence:
+        k_raw  = nl.ndarray(...)  + nisa.dma_copy(...)      [DMA load]
+        k_ct_psum = nl.ndarray(...) + nisa.nc_transpose(...) [TensorE transpose]
+        k_ct = nl.ndarray(...) + nisa.tensor_copy(...)       [VectorE copy]
+    Replaced with a single dma_transpose call:
+        k_ct = nl.ndarray((PMAX, PMAX), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.dma_transpose(dst=k_ct, src=K_cache_2d[s_t*PMAX:(s_t+1)*PMAX, :])
 
-  Exact masking math:
-    row_global = tile_start + p   (p = partition index 0..127)
-    mask[p] = 0      if row_global < pos   (valid token in K/V cache)
-    mask[p] = -1e9   if row_global >= pos  (future or padding)
+  dma_transpose reads [128, 128] BF16 contiguously from HBM and writes it
+  transposed to SBUF in a single DMA operation. The resulting layout
+  k_ct[d_head, seq_pos] = K_cache[s_t*128+seq_pos, d_head] is identical to
+  what the 3-step sequence produced.
 
-  Performance improvement over v10d:
-    - Removes tensor_tensor (k²), tensor_copy (cast), tensor_reduce (sum 128→1),
-      tensor_scalar (scale), activation (exp) per tile — 5 ops × 5 tiles = 25 ops.
-    - Adds: 1 DMA (2 bytes pos), 1 tensor_copy (cast), 1 iota (outside loop),
-      plus per tile: tensor_scalar (subtract), tensor_tensor (delta), activation (relu),
-      tensor_scalar (min), tensor_scalar (multiply) = 5 ops × 5 tiles = 25 ops.
-    - Net: removes expensive tensor_reduce and transcendental exp; replaces with
-      cheap elementwise ops. Expected equal or better device_time_us.
+  Instruction savings:
+    - Removes 5 × nc_transpose (TensorE) + 5 × tensor_copy (VectorE) = 10 instructions.
+    - The 5 dma_copy instructions become 5 dma_transpose instructions (no net change
+      in DMA count, but eliminates the intermediate k_raw SBUF allocation).
 
-All other optimizations from v10d are preserved unchanged:
-  Plan A static shape constants, Plan B K-cache contiguous load + PE transpose,
-  Q-proj one-head-at-a-time, O-proj head-outer/h_blk-inner, all tp_broadcast
+All other optimizations from v10e are preserved unchanged:
+  Plan A static shape constants, position_ids threshold masking, Q-proj
+  one-head-at-a-time, O-proj head-outer/h_blk-inner, all tp_broadcast
   patterns, Plan B saved scores, hidden tile hoisting, Wo contiguous DMA.
 """
 
@@ -58,7 +50,7 @@ os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = "trn2"
 os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2"
 
 @nki.jit
-def qwen3_attn_tkg_fused_oproj_v10e(
+def qwen3_attn_tkg_fused_oproj_v12a(
     hidden_states,   # [B, 1, H]        bf16  (B=1)
     Wq,              # [Hq_tp*d, H]     bf16  [1024, 2048]
     Wk,              # [Hkv_tp*d, H]    bf16  [128, 2048]  (Hkv_tp=1)
@@ -406,6 +398,10 @@ def qwen3_attn_tkg_fused_oproj_v10e(
     # =========================================================================
     K_cache_2d = K_cache.reshape((S_prior, d))   # [S_prior, 128]
     V_cache_2d = V_cache.reshape((S_prior, d))   # [S_prior, 128]
+    # v12a: reshape K_cache to [S_prior, 1, 1, d] for dma_transpose.
+    # dma_transpose 4D permutation [3,1,2,0]: dst[d,0,0,s] = src[s,0,0,d].
+    # Output dim 2 step = PMAX elements = 256 bytes (32-byte aligned, avoids xbar error).
+    K_cache_4d = K_cache.reshape((S_prior, 1, 1, d))
 
     # --- Active position score: k_rope [PMAX,1] dot q_scaled [PMAX,GQA] ---
     # tp_broadcast: k_rope[PMAX=128, 1] → k_rope_packed[PMAX=128, GQA=8]
@@ -461,19 +457,16 @@ def qwen3_attn_tkg_fused_oproj_v10e(
     k_cache_tiles = []
     mask_tiles = []   # [PMAX, 1] f32 per tile: -1e9 for future/padding, 0 for valid
     for s_t in nl.affine_range(NUM_S_TILES):
-        # Step 1: Load K tile as natural [S_tile, d] row-major — 1 contiguous 32KB packet per tile
-        # k_raw[p, f] = K_cache_2d[s_t*128 + p, f]  (no stride, no scatter)
-        k_raw = nl.ndarray((PMAX, PMAX), dtype=nl.bfloat16, buffer=nl.sbuf, name=f"k_raw_{s_t}")
-        nisa.dma_copy(dst=k_raw, src=K_cache_2d[s_t * PMAX:(s_t + 1) * PMAX, :])
-
-        # Step 2: PE transpose to get k_ct[p, f] = K_cache_2d[s_t*128 + f, p]
-        # nc_transpose maps [P, F] → [F, P]: k_ct_psum[p_out, f_out] = k_raw[f_out, p_out]
-        #   = K_cache_2d[s_t*128 + f_out, p_out]  — identical to original ap() result
-        # CoreV3+ requires matching dtype for nc_transpose: use bf16 psum.
-        k_ct_psum = nl.ndarray((PMAX, PMAX), dtype=nl.bfloat16, buffer=nl.psum, name=f"k_ct_psum_{s_t}")
-        nisa.nc_transpose(k_ct_psum, k_raw)
-        k_ct = nl.ndarray((PMAX, PMAX), dtype=nl.bfloat16, buffer=nl.sbuf, name=f"k_ct_{s_t}")
-        nisa.tensor_copy(k_ct, k_ct_psum)
+        # Plan A (v12a): Single dma_transpose replaces the 3-step load+nc_transpose+tensor_copy.
+        # dma_transpose requires 4D src on this hardware. We use:
+        #   src = K_cache_4d[s_t*PMAX:(s_t+1)*PMAX, 0:1, 0:1, :] → shape [PMAX, 1, 1, PMAX]
+        # Permutation [3,1,2,0]: dst[d, 0, 0, s] = src[s, 0, 0, d] = K_orig[s_t*128+s, d]
+        # dst = [PMAX, 1, 1, PMAX] — output dim 2 step = PMAX = 256 bytes (32-byte aligned ✓)
+        # dst.reshape([PMAX, PMAX]) gives k_ct[d, s] = K_orig[s_t*128+s, d] — correct layout.
+        # Removes 1 nc_transpose (TensorE) + 1 tensor_copy (VectorE) per tile = 10 total instr saved.
+        k_ct_4d = nl.ndarray((PMAX, 1, 1, PMAX), dtype=nl.bfloat16, buffer=nl.sbuf, name=f"k_ct_4d_{s_t}")
+        nisa.dma_transpose(dst=k_ct_4d, src=K_cache_4d[s_t * PMAX:(s_t + 1) * PMAX, 0:1, 0:1, :])
+        k_ct = k_ct_4d.reshape((PMAX, PMAX))
 
         k_cache_tiles.append(k_ct)
 

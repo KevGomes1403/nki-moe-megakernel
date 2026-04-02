@@ -81,7 +81,7 @@ torch.manual_seed(0)
 import os
 
 from kernels.router_topk.qwen3_router_topk_plan_a import qwen3_router_topk_cte
-from kernels.moe_fused_tkg import kernel_v19b as custom_moe_fused_kernel
+from kernels.moe_fused_tkg import kernel_v20a as custom_moe_fused_kernel
 
 SampleOutput = Union[SampleEncoderDecoderOutput, SampleDecoderOnlyOutput]
 GQA_SHARDING_STRATEGY = GQA.REPLICATE_TO_TP_DEGREE
@@ -677,8 +677,8 @@ class NeuronQwen3MoeDecoderLayerFusedTKG(NeuronQwen3MoeDecoderLayerWithNKI):
                 tkg.expert_mlps.mlp_op.gate_up_proj.weight.data,               # [E, H, 2*I=384]
                 tkg.expert_mlps.mlp_op.down_proj.weight.data,                  # [E, I=192, H]
             )                                                                  # returns [T, H] bf16
-            if isinstance(moe_out, (tuple, list)):
-                moe_out = moe_out[0]
+            # if isinstance(moe_out, (tuple, list)):
+            #     moe_out = moe_out[0]
             # TP all-reduce: each rank produced a partial sum over its I shard;
             # sum across TP ranks to get the full output.
             moe_out = mappings.reduce_from_tensor_model_parallel_region(

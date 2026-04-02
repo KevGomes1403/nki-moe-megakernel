@@ -2,8 +2,12 @@
 Custom fused MoE TKG kernel for Qwen3-30B-A3B (TP=4, LNC=2).
 Implements from scratch: RMSNorm + Router + TopK(8) + Selective-Expert MLPs
 
-kernel_v20a — Plan A: Flat SBUF + affine_range(K) prefetch
+kernel_v25d — Plan D: Merge Phase 1+2 into single expert loop
 =============================================================
+Based on v19b. Instead of issuing ALL 24 DMAs first (Phase 1) then ALL compute
+(Phase 2), we merge into a single loop: for each expert k, issue its 3 DMAs
+then immediately compute. The compiler unrolls static_range(8) and can overlap
+expert k+1's DMAs with expert k's compute (separate SBUF buffers, no hazard).
 
 Interface contract (no repack required):
   gate_up_w  [E=128, H=2048, 2*I=384] bf16 — native layout from qwen.py/qwen_fused_moe_tkg.py
@@ -12,8 +16,8 @@ Interface contract (no repack required):
   down_w     [E=128, I=192,  H=2048]   bf16 — native layout from qwen.py/qwen_fused_moe_tkg.py
 
 DMA coalescing strategy:
-  gate_up:  ONE coalesced DMA per expert, loading [_PMAX, H_free * _GU_FLAT] per expert k
-              into a flat contiguous SBUF buffer (gate_up_flat).
+  gate_up:  ONE coalesced DMA per expert, loading [_PMAX, H_free, 2*I=384].
+              stride_p = 2*I = 384 == count_col = 384 → fully coalesced.
             Two zero-padded tile-1 buffers (gate_t1_128, up_t1_128) hold the
               partial 64-col second tile, zero-filled at cols 64:128 so nc_matmul
               always sees a K=128 stationary. Filled via SBUF tensor_copy, not DMA.
@@ -35,16 +39,23 @@ Plan A optimisation (vs v15):
   gate_up_psum and down_psum allocations also hoisted; their per-expert
   nisa.memset(*, 0.0) calls remain inside k-loop (PSUM must be zeroed per expert).
 
-Plan A (v20a) — Flat SBUF + affine_range(K) prefetch:
-  Replace 8×gate_up_bufs, 8×down_full0_bufs, 8×down_full1_bufs named lists
-  with 3 flat tensors: gate_up_flat, down_full0_flat, down_full1_flat.
-  Prefetch loop uses nl.affine_range(K) so the compiler sees all K expert DMAs
-  as independent → can batch/overlap all K×3=24 DMAs simultaneously.
-  Compute loop uses nl.static_range(K) with nl.ds(k*stride, stride) offsets.
+Plan C optimisation (vs v16a):
+  Within each k-loop iteration, issue the down_full0 and down_full1 DMAs immediately
+  after the gate_up DMA, before the tensor_copy tile-1 prep and before the gate/up
+  matmul. The down DMAs have no data dependency on gate_up_tile (they only require
+  expert_id, already known). By moving them earlier, the DMA engine can pipeline
+  gate_up + down0 + down1 together, allowing the down DMAs to complete during the
+  tile-1 tensor_copy prep (~small) and/or the gate/up matmul (~48 μs TensorE window),
+  rather than executing serially after the gate/up matmul is done.
 
-  gate_up_flat:   [_PMAX, K * H_free * _GU_FLAT] = [128, 8*16*384] = [128, 49152]
-  down_full0_flat: [_PMAX, K * H_shard]           = [128, 8*1024]  = [128, 8192]
-  down_full1_flat: [_PMAX, K * H_shard]           = [128, 8*1024]  = [128, 8192]
+Plan F optimisation (vs v18a):
+  Issue ALL 24 DMAs (8 gate_up + 8 down_full0 + 8 down_full1) in a single prefetch
+  loop BEFORE any compute, so the DMA engine pipelines all 24 packets simultaneously.
+  Uses K=8 separate named SBUF buffers (Python lists) for gate_up_bufs,
+  down_full0_bufs, down_full1_bufs — each [_PMAX, H_free/H_shard, _GU_FLAT/H_shard].
+  First dim is always par_dim=_PMAX=128 (NKI requirement).
+  Prefetch loop uses nl.static_range(K) to guarantee compile-time list indexing.
+  Compute loop also uses nl.static_range(K) reading from the pre-loaded buffers.
 
 SBUF budget estimate (per partition lane, 224 KiB limit):
   inp_flat_sb:           [16*T, _PMAX]   bf16  =   4 KB  (T=1)
@@ -53,12 +64,11 @@ SBUF budget estimate (per partition lane, 224 KiB limit):
   rmsnorm_normed_bf16:   [_PMAX, 16*T]   bf16  =   4 KB
   output_temp:           [_PMAX, 8, 1]   fp32  =   4 KB  (H_free_shard=8, T=1)
   aff_bcast:             [_PMAX, 8]      fp32  =   4 KB
-  gate_up_flat:          [128, 49152]    bf16  =  12 KB  (per lane: 49152*2/128 = 768B × 128?)
-                         Actually: par_dim=128, free=49152: 128*49152*2 / 128 lanes = 98304 B = 96 KB
+  gate_up_bufs (8×):     8×[_PMAX,16,384] bf16 =  96 KB
   gate_t1_128:           [_PMAX,16,128]  bf16  =   4 KB  (single, reused across experts)
   up_t1_128:             [_PMAX,16,128]  bf16  =   4 KB  (single, reused across experts)
-  down_full0_flat:        [_PMAX,8192]   bf16  =  16 KB
-  down_full1_flat:        [_PMAX,8192]   bf16  =  16 KB
+  down_full0_bufs (8×):  8×[_PMAX,1024]  bf16  =  16 KB
+  down_full1_bufs (8×):  8×[_PMAX,1024]  bf16  =  16 KB
   router_w_wide_sb:      [_PMAX, 4, 128] bf16  =  64 KB  (4 tiles × H_free/4)
   out_sb:                [T, H_shard]    bf16  =   2 KB
   gate/up/inter SBUF:    ~16 KB (PSUM flush + silu + inter)
@@ -96,9 +106,6 @@ _H_SHARD = _H_FREE_SHARD * _PMAX     # = 1024
 
 # Router DMA batching: 4 tiles per DMA → 4×32KB = 128KB per packet
 _ROUTER_BATCH = 4  # H_FREE must be divisible by this
-
-# Flat SBUF stride per expert for gate_up_flat
-_GU_STRIDE = _H_FREE * _GU_FLAT  # = 16 * 384 = 6144 cols per expert in flat buf
 
 
 @nki.jit
@@ -296,15 +303,11 @@ def qwen3_moe_fused_tkg(
     )
 
     # -----------------------------------------------------------------------
-    # Stage 4: Selective-Expert MLP — Plan A: Flat SBUF + affine_range(K) prefetch
+    # Stage 4: Selective-Expert MLP — Plan D: Merged DMA+compute per expert
     #
-    # Phase 1: Issue ALL 24 DMAs (8×gate_up + 8×down_full0 + 8×down_full1)
-    #          in a single affine_range(K) prefetch loop before any compute.
-    #          Uses 3 flat SBUF tensors: gate_up_flat, down_full0_flat, down_full1_flat.
-    #          affine_range signals independence → compiler can batch/overlap all K DMAs.
-    #
-    # Phase 2: Serial expert compute reads from flat pre-loaded buffers (no DMAs).
-    #          nl.static_range(K) with nl.ds(k*stride, stride) for flat buffer access.
+    # Single merged loop: for each expert k, issue its 3 DMAs then compute.
+    # Uses K=8 separate named SBUF buffers; the compiler can overlap expert
+    # k+1's DMAs (into bufs[k+1]) with expert k's compute (from bufs[k]).
     #
     # gate_up_w [E, H, 2*I=384] — NATIVE layout (gate cols 0:192, up cols 192:384)
     #   DMA: ONE coalesced load per expert, stride_p=384=count=384.
@@ -321,36 +324,62 @@ def qwen3_moe_fused_tkg(
     # -----------------------------------------------------------------------
     output_temp = nl.ndarray((_PMAX, H_free_shard, T), dtype=nl.float32, buffer=nl.sbuf)
 
-    # Flat SBUF buffers — one contiguous block for all K experts
-    # Enables nl.affine_range so compiler can issue all K DMAs independently
-    _GU_STRIDE_LOCAL = H_free * _GU_FLAT  # = 16 * 384 = 6144 cols per expert in flat buf
-    # gate_up_flat: 3D [_PMAX, K*H_free, _GU_FLAT] — required because the DMA src pattern
-    # is 3-level (3D), so dst must also be 3D. Middle dim K*H_free = 8*16 = 128 is the
-    # combined H-tile index across all experts; expert k uses rows [k*H_free : (k+1)*H_free].
-    gate_up_flat    = nl.ndarray((_PMAX, K * H_free, _GU_FLAT), dtype=gate_up_w.dtype, buffer=nl.sbuf)
-    down_full0_flat = nl.ndarray((_PMAX, K * H_shard),          dtype=down_w.dtype,    buffer=nl.sbuf)
-    down_full1_flat = nl.ndarray((_PMAX, K * H_shard),          dtype=down_w.dtype,    buffer=nl.sbuf)
-
-    # gate_t1_128/up_t1_128: single pair of reused buffers (one per expert, overwritten each k)
-    gate_t1_128 = nl.ndarray((_PMAX, H_free, I0), dtype=gate_up_w.dtype, buffer=nl.sbuf)
-    up_t1_128   = nl.ndarray((_PMAX, H_free, I0), dtype=gate_up_w.dtype, buffer=nl.sbuf)
-
-    # Hoist PSUM buffers (per-expert memset stays inside k-loop)
-    gate_up_psum = nl.ndarray((_PMAX, 2 * I_tiles), dtype=nl.float32, buffer=nl.psum)
-    down_psum    = nl.ndarray((_PMAX, H_free_shard), dtype=nl.float32, buffer=nl.psum)
-
     for t in nl.static_range(T):
+
+        # ------------------------------------------------------------------
+        # Allocate K=8 named SBUF buffers (par_dim=128 required as first dim)
+        # Use explicit named allocations — list comprehensions are not supported
+        # inside NKI kernel trace context. Access via Python list of named vars.
+        # ------------------------------------------------------------------
+        gate_up_buf0 = nl.ndarray((_PMAX, H_free, _GU_FLAT), dtype=gate_up_w.dtype, buffer=nl.sbuf)
+        gate_up_buf1 = nl.ndarray((_PMAX, H_free, _GU_FLAT), dtype=gate_up_w.dtype, buffer=nl.sbuf)
+        gate_up_buf2 = nl.ndarray((_PMAX, H_free, _GU_FLAT), dtype=gate_up_w.dtype, buffer=nl.sbuf)
+        gate_up_buf3 = nl.ndarray((_PMAX, H_free, _GU_FLAT), dtype=gate_up_w.dtype, buffer=nl.sbuf)
+        gate_up_buf4 = nl.ndarray((_PMAX, H_free, _GU_FLAT), dtype=gate_up_w.dtype, buffer=nl.sbuf)
+        gate_up_buf5 = nl.ndarray((_PMAX, H_free, _GU_FLAT), dtype=gate_up_w.dtype, buffer=nl.sbuf)
+        gate_up_buf6 = nl.ndarray((_PMAX, H_free, _GU_FLAT), dtype=gate_up_w.dtype, buffer=nl.sbuf)
+        gate_up_buf7 = nl.ndarray((_PMAX, H_free, _GU_FLAT), dtype=gate_up_w.dtype, buffer=nl.sbuf)
+        gate_up_bufs = [gate_up_buf0, gate_up_buf1, gate_up_buf2, gate_up_buf3,
+                        gate_up_buf4, gate_up_buf5, gate_up_buf6, gate_up_buf7]
+
+        down_full0_buf0 = nl.ndarray((_PMAX, H_shard), dtype=down_w.dtype, buffer=nl.sbuf)
+        down_full0_buf1 = nl.ndarray((_PMAX, H_shard), dtype=down_w.dtype, buffer=nl.sbuf)
+        down_full0_buf2 = nl.ndarray((_PMAX, H_shard), dtype=down_w.dtype, buffer=nl.sbuf)
+        down_full0_buf3 = nl.ndarray((_PMAX, H_shard), dtype=down_w.dtype, buffer=nl.sbuf)
+        down_full0_buf4 = nl.ndarray((_PMAX, H_shard), dtype=down_w.dtype, buffer=nl.sbuf)
+        down_full0_buf5 = nl.ndarray((_PMAX, H_shard), dtype=down_w.dtype, buffer=nl.sbuf)
+        down_full0_buf6 = nl.ndarray((_PMAX, H_shard), dtype=down_w.dtype, buffer=nl.sbuf)
+        down_full0_buf7 = nl.ndarray((_PMAX, H_shard), dtype=down_w.dtype, buffer=nl.sbuf)
+        down_full0_bufs = [down_full0_buf0, down_full0_buf1, down_full0_buf2, down_full0_buf3,
+                           down_full0_buf4, down_full0_buf5, down_full0_buf6, down_full0_buf7]
+
+        down_full1_buf0 = nl.ndarray((_PMAX, H_shard), dtype=down_w.dtype, buffer=nl.sbuf)
+        down_full1_buf1 = nl.ndarray((_PMAX, H_shard), dtype=down_w.dtype, buffer=nl.sbuf)
+        down_full1_buf2 = nl.ndarray((_PMAX, H_shard), dtype=down_w.dtype, buffer=nl.sbuf)
+        down_full1_buf3 = nl.ndarray((_PMAX, H_shard), dtype=down_w.dtype, buffer=nl.sbuf)
+        down_full1_buf4 = nl.ndarray((_PMAX, H_shard), dtype=down_w.dtype, buffer=nl.sbuf)
+        down_full1_buf5 = nl.ndarray((_PMAX, H_shard), dtype=down_w.dtype, buffer=nl.sbuf)
+        down_full1_buf6 = nl.ndarray((_PMAX, H_shard), dtype=down_w.dtype, buffer=nl.sbuf)
+        down_full1_buf7 = nl.ndarray((_PMAX, H_shard), dtype=down_w.dtype, buffer=nl.sbuf)
+        down_full1_bufs = [down_full1_buf0, down_full1_buf1, down_full1_buf2, down_full1_buf3,
+                           down_full1_buf4, down_full1_buf5, down_full1_buf6, down_full1_buf7]
 
         # ------------------------------------------------------------------
         # Hoist ALL pad memsets before the prefetch loop
         # ------------------------------------------------------------------
-        # Zero ALL K experts' pad rows (I1:_PMAX) in down_full1_flat at once
-        # One memset covers all K experts simultaneously → K× fewer memset instructions
-        nisa.memset(down_full1_flat[nl.ds(I1, I1), 0:K * H_shard], value=0.0)
+        # Zero pad region (rows I1:I0 = 64:128) for all K down_full1 buffers
+        for k_pad in range(K):  # static Python range — compile-time unroll
+            nisa.memset(down_full1_bufs[k_pad][nl.ds(I1, I1), 0:H_shard], value=0.0)
 
-        # gate_t1_128 and up_t1_128 pad zeros — same as v19b (one per token, outside k-loop)
+        # gate_t1_128/up_t1_128: single pair of reused buffers (one per expert, overwritten each k)
+        gate_t1_128 = nl.ndarray((_PMAX, H_free, I0), dtype=gate_up_w.dtype, buffer=nl.sbuf)
+        up_t1_128   = nl.ndarray((_PMAX, H_free, I0), dtype=gate_up_w.dtype, buffer=nl.sbuf)
         nisa.memset(gate_t1_128[0:_PMAX, 0:H_free, nl.ds(I1, I1)], value=0.0)
         nisa.memset(up_t1_128[0:_PMAX, 0:H_free, nl.ds(I1, I1)],   value=0.0)
+
+        # Hoist PSUM buffers (per-expert memset stays inside k-loop)
+        gate_up_psum = nl.ndarray((_PMAX, 2 * I_tiles), dtype=nl.float32, buffer=nl.psum)
+        down_psum    = nl.ndarray((_PMAX, H_free_shard), dtype=nl.float32, buffer=nl.psum)
 
         # ------------------------------------------------------------------
         # aff_bcast setup (done before prefetch, overlaps with DMA loading)
@@ -366,16 +395,16 @@ def qwen3_moe_fused_tkg(
             )
 
         # ------------------------------------------------------------------
-        # Phase 1: Issue ALL K×3 = 24 DMAs as independent operations
-        # nl.affine_range signals independence → compiler can batch/overlap all K expert DMAs
+        # Merged loop: DMA + compute per expert (Plan D)
+        # Expert k+1's DMAs write to bufs[k+1], expert k's compute reads
+        # from bufs[k] — no data hazard, compiler can overlap them.
         # ------------------------------------------------------------------
-        for k in nl.affine_range(K):
+        for k in nl.static_range(K):
             expert_id = top8_idx.ap(pattern=[[K, 1], [1, 1]], offset=t * K + k)
 
-            # DMA 1: gate_up — coalesced load [_PMAX, H_free, _GU_FLAT] per expert k
-            # dst is 3D slice [0:_PMAX, k*H_free:(k+1)*H_free, 0:_GU_FLAT] to match 3D src pattern
+            # DMA 1: gate_up — ONE coalesced load per expert [_PMAX, H_free, _GU_FLAT]
             nisa.dma_copy(
-                dst=gate_up_flat[0:_PMAX, nl.ds(k * H_free, H_free), 0:_GU_FLAT],
+                dst=gate_up_bufs[k],
                 src=gate_up_w.ap(
                     pattern=[[_GU_FLAT, _PMAX], [_PMAX * _GU_FLAT, H_free], [1, _GU_FLAT]],
                     offset=0,
@@ -385,9 +414,9 @@ def qwen3_moe_fused_tkg(
                 dge_mode=0,
             )
 
-            # DMA 2a: down tile 0 — I0 rows, H_shard cols (same HBM pattern as v19b, flat dst)
+            # DMA 2a: down tile 0 — I rows 0:128, H_shard=1024 cols
             nisa.dma_copy(
-                dst=down_full0_flat[0:_PMAX, nl.ds(k * H_shard, H_shard)],
+                dst=down_full0_bufs[k],
                 src=down_w.ap(
                     pattern=[[H, I0], [1, H_shard]],
                     offset=prg_id * H_shard,
@@ -397,9 +426,9 @@ def qwen3_moe_fused_tkg(
                 dge_mode=0,
             )
 
-            # DMA 2b: down tile 1 — I1 valid rows (pad rows I1:_PMAX already zeroed above)
+            # DMA 2b: down tile 1 — I rows 128:192 (64 valid), H_shard=1024 cols
             nisa.dma_copy(
-                dst=down_full1_flat[0:I1, nl.ds(k * H_shard, H_shard)],
+                dst=down_full1_bufs[k][0:I1, 0:H_shard],
                 src=down_w.ap(
                     pattern=[[H, I1], [1, H_shard]],
                     offset=I0 * H + prg_id * H_shard,
@@ -408,39 +437,34 @@ def qwen3_moe_fused_tkg(
                 ),
                 dge_mode=0,
             )
+            # Tile-1 tensor_copy using pre-loaded gate_up_bufs[k]
+            # gate cols 128:192 (I1=64 valid) → gate_t1_128 cols 0:64 valid, 64:128 zero.
+            # up   cols 320:384 (I1=64 valid) → up_t1_128   cols 0:64 valid, 64:128 zero.
+            nisa.tensor_copy(
+                dst=gate_t1_128[0:_PMAX, 0:H_free, 0:I1],
+                src=gate_up_bufs[k][0:_PMAX, 0:H_free, nl.ds(I0, I1)],
+            )
+            nisa.tensor_copy(
+                dst=up_t1_128[0:_PMAX, 0:H_free, 0:I1],
+                src=gate_up_bufs[k][0:_PMAX, 0:H_free, nl.ds(I + I0, I1)],
+            )
 
-        # ------------------------------------------------------------------
-        # Phase 2: Serial expert compute — reads from flat pre-loaded buffers
-        # ------------------------------------------------------------------
-        for k in nl.static_range(K):
-            # gate_up_flat middle index for expert k: rows [k*H_free : (k+1)*H_free]
-            gate_h_base = k * H_free   # first H-tile row index for expert k in gate_up_flat
-            down_expert_base = k * H_shard  # col offset in down flats for expert k
-
-            # --- Tile-1 prep: copy gate/up partial tile → gate_t1_128/up_t1_128 ---
-            # Source: cols [I0 : I0+I1] and [I+I0 : I+I0+I1] within each H-tile of expert k
-            for h1 in nl.static_range(H_free):
-                nisa.tensor_copy(
-                    dst=gate_t1_128[0:_PMAX, h1, 0:I1],
-                    src=gate_up_flat[0:_PMAX, gate_h_base + h1, nl.ds(I0, I1)],
-                )
-                nisa.tensor_copy(
-                    dst=up_t1_128[0:_PMAX, h1, 0:I1],
-                    src=gate_up_flat[0:_PMAX, gate_h_base + h1, nl.ds(I + I0, I1)],
-                )
-
-            # --- Gate/Up matmul ---
+            # ----------------------------------------------------------------
+            # Gate/Up matmul: [H, I] @ [H, T=1] → [I, T] in PSUM
+            # PSUM layout: [_PMAX, 4] — cols 0,1 = gate tiles 0,1; cols 2,3 = up tiles 0,1
+            # ----------------------------------------------------------------
             nisa.memset(gate_up_psum, value=0.0)
 
             for h1 in nl.affine_range(H_free):
-                h_idx = gate_h_base + h1  # compile-time: gate_h_base is static, h1 is affine
                 for i_tile in nl.static_range(I_tiles):
                     if i_tile == 0:
-                        g_stat = gate_up_flat[0:_PMAX, h_idx, nl.ds(0, I0)]   # gate t0
-                        u_stat = gate_up_flat[0:_PMAX, h_idx, nl.ds(I, I0)]   # up t0
+                        # Tile 0: K=128 cols taken directly from the combined buffer
+                        g_stat = gate_up_bufs[k][0:_PMAX, h1, nl.ds(0, I0)]   # gate cols 0:128
+                        u_stat = gate_up_bufs[k][0:_PMAX, h1, nl.ds(I, I0)]   # up   cols 192:320
                     else:
-                        g_stat = gate_t1_128[0:_PMAX, h1, 0:I0]               # gate t1
-                        u_stat = up_t1_128[0:_PMAX, h1, 0:I0]                 # up t1
+                        # Tile 1: K=128 zero-padded (64 valid + 64 zeros)
+                        g_stat = gate_t1_128[0:_PMAX, h1, 0:I0]               # gate tile 1
+                        u_stat = up_t1_128[0:_PMAX, h1, 0:I0]                 # up   tile 1
                     nisa.nc_matmul(
                         dst=gate_up_psum[0:_PMAX, i_tile:i_tile + 1],
                         stationary=g_stat,
@@ -452,43 +476,59 @@ def qwen3_moe_fused_tkg(
                         moving=rmsnorm_normed_bf16[0:_PMAX, nl.ds(h1 * T, T)],
                     )
 
-            # --- Flush gate/up PSUM → SBUF, SiLU, inter ---
-            # (same as v19b — unchanged)
+            # Flush gate/up PSUM → SBUF
             gate_sb = nl.ndarray((_PMAX, I_tiles), dtype=nl.float32, buffer=nl.sbuf)
             up_sb   = nl.ndarray((_PMAX, I_tiles), dtype=nl.float32, buffer=nl.sbuf)
             nisa.activation(gate_sb, op=nl.copy, data=gate_up_psum[0:_PMAX, 0:I_tiles])
             nisa.activation(up_sb,   op=nl.copy, data=gate_up_psum[0:_PMAX, I_tiles:2 * I_tiles])
+
+            # SiLU(gate) * up → inter_f32 [_PMAX, I_tiles]
+            # Rows 64:128 of I_tiles col 1 are zero (from tile-1 zero-padding) — correct.
             silu_res  = nl.ndarray((_PMAX, I_tiles), dtype=nl.float32, buffer=nl.sbuf)
             inter_f32 = nl.ndarray((_PMAX, I_tiles), dtype=nl.float32, buffer=nl.sbuf)
             nisa.activation(silu_res, op=nl.silu, data=gate_sb)
             nisa.tensor_tensor(inter_f32, silu_res, up_sb, nl.multiply)
+
+            # Cast inter to bf16 for the down matmul
             inter_bf16 = nl.ndarray((_PMAX, I_tiles), dtype=inp.dtype, buffer=nl.sbuf)
             nisa.activation(inter_bf16, op=nl.copy, data=inter_f32)
 
-            # --- Down matmul — reads from flat down buffers ---
+            # ----------------------------------------------------------------
+            # Down matmul: [I, H] @ [I, T=1] → [H_shard, T] partial sum
+            # Uses pre-loaded down_full0_bufs[k]/down_full1_bufs[k].
+            # ----------------------------------------------------------------
             nisa.memset(down_psum, value=0.0)
 
             for h1_out in nl.affine_range(H_free_shard):
-                # Stationary: [_PMAX, _PMAX] block from expert k's H-shard at output tile h1_out
+                # Tile 0: I rows 0:128 (all 128 valid)
                 nisa.nc_matmul(
                     dst=down_psum[0:_PMAX, h1_out:h1_out + 1],
-                    stationary=down_full0_flat[0:_PMAX, nl.ds(down_expert_base + h1_out * _PMAX, _PMAX)],
+                    stationary=down_full0_bufs[k][0:_PMAX, nl.ds(h1_out * _PMAX, _PMAX)],
                     moving=inter_bf16[0:_PMAX, 0:1],
                 )
+                # Tile 1: I rows 128:192 (64 valid, rows 64:128 zero from pre-k-loop memset)
                 nisa.nc_matmul(
                     dst=down_psum[0:_PMAX, h1_out:h1_out + 1],
-                    stationary=down_full1_flat[0:_PMAX, nl.ds(down_expert_base + h1_out * _PMAX, _PMAX)],
+                    stationary=down_full1_bufs[k][0:_PMAX, nl.ds(h1_out * _PMAX, _PMAX)],
                     moving=inter_bf16[0:_PMAX, 1:2],
                 )
 
-            # --- Flush down PSUM, scale by affinity, accumulate (same as v19b) ---
+            # Flush down PSUM → SBUF, scale by expert affinity
             down_result_sb = nl.ndarray((_PMAX, H_free_shard), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.activation(down_result_sb, op=nl.copy, data=down_psum[0:_PMAX, 0:H_free_shard])
+            nisa.activation(
+                down_result_sb[0:_PMAX, 0:H_free_shard],
+                op=nl.copy,
+                data=down_psum[0:_PMAX, 0:H_free_shard],
+            )
             down_result_scaled = nl.ndarray((_PMAX, H_free_shard), dtype=nl.float32, buffer=nl.sbuf)
             nisa.tensor_scalar(
-                down_result_scaled, data=down_result_sb,
-                op0=nl.multiply, operand0=aff_bcast[0:_PMAX, k:k + 1],
+                down_result_scaled,
+                data=down_result_sb,
+                op0=nl.multiply,
+                operand0=aff_bcast[0:_PMAX, k:k + 1],
             )
+
+            # Accumulate into output_temp (k==0: copy to initialise; k>0: add)
             if k == 0:
                 nisa.tensor_copy(
                     dst=output_temp[0:_PMAX, 0:H_free_shard, t:t + 1],
@@ -507,7 +547,7 @@ def qwen3_moe_fused_tkg(
     # output_temp [_PMAX, H_free_shard, T] → HBM output [T, H] bf16
     # Each core writes its H_shard columns at HBM offset prg_id*H_shard.
     # -----------------------------------------------------------------------
-    output = nl.ndarray((T, H), dtype=inp.dtype, buffer=nl.shared_hbm)
+    output = nl.ndarray((T, H), dtype=inp.dtype, buffer=nl.hbm)
     out_sb = nl.ndarray((T, H_shard), dtype=inp.dtype, buffer=nl.sbuf)
 
     for h1 in nl.static_range(H_free_shard):
@@ -528,7 +568,7 @@ def qwen3_moe_fused_tkg(
 
 
 def run(inp, gamma, router_w, gate_up_w, down_w):
-    """Run kernel_v20a with native weight layouts — no preprocessing required.
+    """Run kernel_v25d with native weight layouts — no preprocessing required.
 
     Accepts gate_up_w as either:
       [E, H, 2*I=384]        — flat native (gate cols 0:I, up cols I:2I)
@@ -571,6 +611,6 @@ def run(inp, gamma, router_w, gate_up_w, down_w):
     xm.mark_step()
 
     outputs = qwen3_moe_fused_tkg[2](inp, gamma, router_w, gate_up_w, down_w)
-    # if isinstance(outputs, (tuple, list)):
-    #     return outputs[0]
+    if isinstance(outputs, (tuple, list)):
+        return outputs[0]
     return outputs

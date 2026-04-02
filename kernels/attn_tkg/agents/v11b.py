@@ -1,39 +1,18 @@
 """
-v10e: Extends v10d by replacing the K-norm zero-detection mask with an exact
-      position_ids-based threshold mask.
+v11b: Plan B — Deferred Wo Loading with DMA-Compute Pipeline in O-Projection.
 
-Changes from v10d:
-  - position_ids [B, 1] int32 is now USED (was previously accepted but ignored).
-  - Before the K-cache hoisting loop, loads position_ids[0, 0] → pos_f32 [1, 1].
-  - Before the K-cache hoisting loop, builds par_index_f32 [PMAX, 1] with values
-    0.0, 1.0, ..., 127.0 via nisa.iota (partition-index sequence).
-  - Inside the hoisting loop, replaces the 6-op norm-based mask:
-        k_sq_raw, k_sq_f32, k_norm_sq, k_neg_scaled, mask_from_k, mask_tile_f32
-    with a 5-op threshold mask:
-        threshold_local = pos_f32 - tile_start          [1, 1] f32
-        delta = par_index_f32 - threshold_local         [PMAX, 1] f32
-        relu_delta = relu(delta)                        [PMAX, 1] f32
-        clamped = min(relu_delta, 1.0)                  [PMAX, 1] f32
-        mask_tile_f32 = clamped * (-1e9)                [PMAX, 1] f32
+Changes from v10e:
+  - Removes the upfront Wo weight hoisting loop (the 8-head DMA block before
+    flash decode). Instead, each head's Wo tile is loaded on demand inside the
+    O-projection loop body.
+  - Wo_reshaped = Wo.reshape(...) is kept (needed for the ap() pattern).
+  - The wo_sbuf list and the for-loop that pre-loads all 8 tiles are removed.
+  - Inside the O-projection loop, a single wo_tile ndarray is allocated and
+    loaded via dma_copy before the 4 nc_matmul calls for that head.
+  - With affine_range, the compiler can start DMA for head+1 while TensorE
+    processes head's matmuls (DMA-compute pipeline overlap).
 
-  Exact masking math:
-    row_global = tile_start + p   (p = partition index 0..127)
-    mask[p] = 0      if row_global < pos   (valid token in K/V cache)
-    mask[p] = -1e9   if row_global >= pos  (future or padding)
-
-  Performance improvement over v10d:
-    - Removes tensor_tensor (k²), tensor_copy (cast), tensor_reduce (sum 128→1),
-      tensor_scalar (scale), activation (exp) per tile — 5 ops × 5 tiles = 25 ops.
-    - Adds: 1 DMA (2 bytes pos), 1 tensor_copy (cast), 1 iota (outside loop),
-      plus per tile: tensor_scalar (subtract), tensor_tensor (delta), activation (relu),
-      tensor_scalar (min), tensor_scalar (multiply) = 5 ops × 5 tiles = 25 ops.
-    - Net: removes expensive tensor_reduce and transcendental exp; replaces with
-      cheap elementwise ops. Expected equal or better device_time_us.
-
-All other optimizations from v10d are preserved unchanged:
-  Plan A static shape constants, Plan B K-cache contiguous load + PE transpose,
-  Q-proj one-head-at-a-time, O-proj head-outer/h_blk-inner, all tp_broadcast
-  patterns, Plan B saved scores, hidden tile hoisting, Wo contiguous DMA.
+Everything else is IDENTICAL to v10e.
 """
 
 import math
@@ -58,7 +37,7 @@ os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = "trn2"
 os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2"
 
 @nki.jit
-def qwen3_attn_tkg_fused_oproj_v10e(
+def qwen3_attn_tkg_fused_oproj_v11b(
     hidden_states,   # [B, 1, H]        bf16  (B=1)
     Wq,              # [Hq_tp*d, H]     bf16  [1024, 2048]
     Wk,              # [Hkv_tp*d, H]    bf16  [128, 2048]  (Hkv_tp=1)
@@ -90,6 +69,9 @@ def qwen3_attn_tkg_fused_oproj_v10e(
       mask[p] = 0     if row_global < pos   (valid: token already in cache)
       mask[p] = -1e9  if row_global >= pos  (future/padding)
     Uses relu + clamp idiom: relu(p - (pos - tile_start)) clamped to [0,1] * -1e9.
+
+    v11b change: Wo tiles are NOT pre-hoisted. Each wo_tile is loaded on demand
+    inside the O-projection loop, enabling DMA-compute pipelining via affine_range.
     """
     # --- Dimensions ---
     B = hidden_states.shape[0]      # 1
@@ -194,32 +176,15 @@ def qwen3_attn_tkg_fused_oproj_v10e(
     )
 
     # =========================================================================
-    # WO WEIGHT HOISTING — nkilib-style contiguous DMA
+    # WO WEIGHT RESHAPE — kept for the ap() pattern used in O-projection loop.
     #
     # Wo is now passed as [Hq_out=1024, H_wo=2048] = [N*D, H] (caller transposes).
     # Reshape to [Hq_tp=8, d=128, H_wo=2048] so each head's slice is contiguous.
     #
-    # ap() pattern [[H_wo, PMAX], [1, H_wo]]:
-    #   partition stride = H_wo = 2048 (one full output row apart)
-    #   free stride = 1 (contiguous elements)
-    # → 128 chunks × H_wo×2 = 4096 bytes each, stride 4096 bytes → 50% fill ratio
-    # vs old [[1,128],[Hq_out,H_wo]]: 2048 chunks × 256 bytes, stride 2048 → 12.5%
-    # 16× fewer DMA packets, 4× better fill ratio.
+    # v11b: No upfront hoisting loop. The wo_tile for each head is loaded
+    # on demand inside the O-projection loop (see below).
     # =========================================================================
     Wo_reshaped = Wo.reshape((Hq_tp, d, H_wo))  # logical [8, 128, 2048] view
-
-    wo_sbuf = []
-    for head in nl.affine_range(HQ_TP_CONST):
-        wo_tile = nl.ndarray((PMAX, H_wo), dtype=nl.bfloat16, buffer=nl.sbuf,
-                             name=f"wo_tile_h{head}")
-        nisa.dma_copy(
-            dst=wo_tile,
-            src=Wo_reshaped.ap(
-                pattern=[[H_wo, PMAX], [1, H_wo]],   # partition: stride H_wo, free: contiguous
-                offset=head * PMAX * H_wo,             # skip head * [128 × 2048] elements
-            ),
-        )
-        wo_sbuf.append(wo_tile)
 
     # =========================================================================
     # K PROJECTION (Hkv_tp=1, one KV head)
@@ -685,22 +650,36 @@ def qwen3_attn_tkg_fused_oproj_v10e(
     nisa.tensor_tensor(attn_out, v_acc, inv_sum, op=nl.multiply)
 
     # =========================================================================
-    # FUSED OUTPUT PROJECTION — Change 2: head-outer, h_blk-inner loop order.
+    # FUSED OUTPUT PROJECTION — v11b: Deferred Wo Loading (Plan B)
     #
-    # Pre-allocate all 4 output PSUMs upfront so all h_blk blocks accumulate
-    # simultaneously across the head loop. Each head's wo_sbuf is fully consumed
-    # (all 4 blocks) before moving to the next head — better SBUF access locality.
+    # v10e pre-hoisted all 8 heads' Wo tiles upfront (before flash decode).
+    # v11b loads each head's wo_tile on demand inside the O-projection loop.
+    # With affine_range, the compiler can pipeline DMA for head+1 while TensorE
+    # processes head's 4 matmuls (DMA-compute overlap).
+    #
+    # Same ap() pattern and DMA efficiency as v10e — only scheduling changes.
     # =========================================================================
     res_psum_0 = nl.zeros((1, F_MAX), dtype=nl.float32, buffer=nl.psum, name="res_psum_0")
     res_psum_1 = nl.zeros((1, F_MAX), dtype=nl.float32, buffer=nl.psum, name="res_psum_1")
     res_psum_2 = nl.zeros((1, F_MAX), dtype=nl.float32, buffer=nl.psum, name="res_psum_2")
     res_psum_3 = nl.zeros((1, F_MAX), dtype=nl.float32, buffer=nl.psum, name="res_psum_3")
     for head in nl.affine_range(HQ_TP_CONST):
-        # All 4 output blocks for this head — fully consumes wo_sbuf[head] before next head
-        nisa.nc_matmul(res_psum_0, stationary=attn_out[0:PMAX, head:head+1], moving=wo_sbuf[head][0:PMAX, 0*F_MAX:1*F_MAX])
-        nisa.nc_matmul(res_psum_1, stationary=attn_out[0:PMAX, head:head+1], moving=wo_sbuf[head][0:PMAX, 1*F_MAX:2*F_MAX])
-        nisa.nc_matmul(res_psum_2, stationary=attn_out[0:PMAX, head:head+1], moving=wo_sbuf[head][0:PMAX, 2*F_MAX:3*F_MAX])
-        nisa.nc_matmul(res_psum_3, stationary=attn_out[0:PMAX, head:head+1], moving=wo_sbuf[head][0:PMAX, 3*F_MAX:4*F_MAX])
+        # Load this head's Wo tile on demand — same ap() pattern, same DMA efficiency.
+        # With affine_range, the compiler can start DMA for head+1 while TensorE
+        # processes head's matmuls (DMA-compute pipeline).
+        wo_tile = nl.ndarray((PMAX, H_wo), dtype=nl.bfloat16, buffer=nl.sbuf,
+                             name=f"wo_tile_{head}")
+        nisa.dma_copy(
+            dst=wo_tile,
+            src=Wo_reshaped.ap(
+                pattern=[[H_wo, PMAX], [1, H_wo]],
+                offset=head * PMAX * H_wo,
+            ),
+        )
+        nisa.nc_matmul(res_psum_0, stationary=attn_out[0:PMAX, head:head+1], moving=wo_tile[0:PMAX, 0*F_MAX:1*F_MAX])
+        nisa.nc_matmul(res_psum_1, stationary=attn_out[0:PMAX, head:head+1], moving=wo_tile[0:PMAX, 1*F_MAX:2*F_MAX])
+        nisa.nc_matmul(res_psum_2, stationary=attn_out[0:PMAX, head:head+1], moving=wo_tile[0:PMAX, 2*F_MAX:3*F_MAX])
+        nisa.nc_matmul(res_psum_3, stationary=attn_out[0:PMAX, head:head+1], moving=wo_tile[0:PMAX, 3*F_MAX:4*F_MAX])
     # Store all 4 output blocks after the head loop completes
     out_sb_0 = nl.ndarray((1, F_MAX), dtype=nl.bfloat16, buffer=nl.sbuf, name="out_sb_0")
     nisa.tensor_copy(out_sb_0, res_psum_0)

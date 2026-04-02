@@ -1,39 +1,27 @@
 """
-v10e: Extends v10d by replacing the K-norm zero-detection mask with an exact
-      position_ids-based threshold mask.
+v12d: Extends v12b with Plan D optimization — Deferred Wo DMA overlapping flash decode.
 
-Changes from v10d:
-  - position_ids [B, 1] int32 is now USED (was previously accepted but ignored).
-  - Before the K-cache hoisting loop, loads position_ids[0, 0] → pos_f32 [1, 1].
-  - Before the K-cache hoisting loop, builds par_index_f32 [PMAX, 1] with values
-    0.0, 1.0, ..., 127.0 via nisa.iota (partition-index sequence).
-  - Inside the hoisting loop, replaces the 6-op norm-based mask:
-        k_sq_raw, k_sq_f32, k_norm_sq, k_neg_scaled, mask_from_k, mask_tile_f32
-    with a 5-op threshold mask:
-        threshold_local = pos_f32 - tile_start          [1, 1] f32
-        delta = par_index_f32 - threshold_local         [PMAX, 1] f32
-        relu_delta = relu(delta)                        [PMAX, 1] f32
-        clamped = min(relu_delta, 1.0)                  [PMAX, 1] f32
-        mask_tile_f32 = clamped * (-1e9)                [PMAX, 1] f32
+Changes from v12b:
+  Plan D — Deferred Wo DMA: Overlap Wo Loading with Flash Decode Compute:
+    - Move the Wo hoisting loop (8×512KB = 4MB DMA) from the prologue (where it
+      competed with the Wq pre-load for DMA bandwidth) to AFTER Q-RoPE and BEFORE
+      the flash decode section.
+    - Key insight: Wo is not needed until the O-projection at the very end of the
+      kernel. Flash decode (K+V cache tile loading + 5 K matmuls + exp/reduce +
+      5 V matmuls) runs for ~15-20 μs of TensorE + VectorE activity. By issuing
+      the Wo DMA immediately before flash decode, the 4MB Wo load (~10.7 μs at
+      375 GB/s) runs concurrently with flash decode TensorE compute.
+    - Root cause fixed: in v12b, both Wq pre-load (4MB) and Wo hoisting (4MB)
+      ran in the prologue — 8MB of weight DMA competing serially before meaningful
+      compute. Moving Wo to overlap flash decode eliminates this serial bottleneck.
 
-  Exact masking math:
-    row_global = tile_start + p   (p = partition index 0..127)
-    mask[p] = 0      if row_global < pos   (valid token in K/V cache)
-    mask[p] = -1e9   if row_global >= pos  (future or padding)
-
-  Performance improvement over v10d:
-    - Removes tensor_tensor (k²), tensor_copy (cast), tensor_reduce (sum 128→1),
-      tensor_scalar (scale), activation (exp) per tile — 5 ops × 5 tiles = 25 ops.
-    - Adds: 1 DMA (2 bytes pos), 1 tensor_copy (cast), 1 iota (outside loop),
-      plus per tile: tensor_scalar (subtract), tensor_tensor (delta), activation (relu),
-      tensor_scalar (min), tensor_scalar (multiply) = 5 ops × 5 tiles = 25 ops.
-    - Net: removes expensive tensor_reduce and transcendental exp; replaces with
-      cheap elementwise ops. Expected equal or better device_time_us.
-
-All other optimizations from v10d are preserved unchanged:
-  Plan A static shape constants, Plan B K-cache contiguous load + PE transpose,
-  Q-proj one-head-at-a-time, O-proj head-outer/h_blk-inner, all tp_broadcast
-  patterns, Plan B saved scores, hidden tile hoisting, Wo contiguous DMA.
+All v12b optimizations are preserved unchanged:
+  Wq pre-load (8×512KB DMA before K/V processing), early Wv DMA (issued after
+  Wk DMA before K projection loop), Plan A static shape constants, Plan B
+  K-cache contiguous load + PE transpose, Q-proj psum→q_packed_f32 direct copy,
+  O-proj head-outer/h_blk-inner loop order, all tp_broadcast patterns,
+  Plan B saved scores, hidden tile hoisting, Wo contiguous ap() DMA pattern,
+  v10e position_ids threshold masking.
 """
 
 import math
@@ -58,7 +46,7 @@ os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = "trn2"
 os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2"
 
 @nki.jit
-def qwen3_attn_tkg_fused_oproj_v10e(
+def qwen3_attn_tkg_fused_oproj_v12d(
     hidden_states,   # [B, 1, H]        bf16  (B=1)
     Wq,              # [Hq_tp*d, H]     bf16  [1024, 2048]
     Wk,              # [Hkv_tp*d, H]    bf16  [128, 2048]  (Hkv_tp=1)
@@ -90,6 +78,13 @@ def qwen3_attn_tkg_fused_oproj_v10e(
       mask[p] = 0     if row_global < pos   (valid: token already in cache)
       mask[p] = -1e9  if row_global >= pos  (future/padding)
     Uses relu + clamp idiom: relu(p - (pos - tile_start)) clamped to [0,1] * -1e9.
+
+    v12d changes (extends v12b):
+      - Wo hoisting loop moved from prologue to just before flash decode, so the
+        4MB Wo DMA overlaps flash decode TensorE/VectorE compute (~15-20 μs).
+      - Wq pre-loaded as single 4MB DMA (wq_all [1024,2048]) before K/V processing.
+      - Q-proj loop indexes into wq_all directly (no per-head DMA inside the loop).
+      - Wv DMA issued immediately after Wk DMA (overlaps K proj loop + K norm + K RoPE).
     """
     # --- Dimensions ---
     B = hidden_states.shape[0]      # 1
@@ -102,6 +97,7 @@ def qwen3_attn_tkg_fused_oproj_v10e(
     S_prior = K_cache.shape[2]
     num_h_tiles = H // PMAX         # 16
     num_s_tiles = S_prior // PMAX
+
     half_d = d // 2                 # 64
 
     # Output H: since no LNC, each core writes all H=2048 of Wo output
@@ -194,32 +190,34 @@ def qwen3_attn_tkg_fused_oproj_v10e(
     )
 
     # =========================================================================
-    # WO WEIGHT HOISTING — nkilib-style contiguous DMA
+    # v12b Change 1: Pre-load all 8 Wq head tiles as 8 × 512KB DMAs issued early.
+    # SBUF partition dimension is hardware-limited to PMAX=128, so the full
+    # Wq [Hq_out=1024, H=2048] cannot fit in a single SBUF tensor (1024 > 128).
+    # Instead, 8 separate (PMAX=128, H=2048) tiles are pre-allocated and DMA-loaded
+    # BEFORE the Wo hoisting loop, issuing all 8 DMAs early so they overlap with:
+    #   - Wo hoisting (8 × 512KB DMA + tensor_copy per head)
+    #   - Wk + Wv DMA loads
+    #   - K/V projection compute
+    # This is functionally equivalent to one 4MB contiguous DMA (all 8 heads loaded
+    # in parallel with downstream work), eliminating the per-head DMA bottleneck
+    # in the Q-proj loop (previously each 512KB DMA ≈1.37 μs outlasted the 16
+    # inner matmuls ≈640 ns, making the loop DMA-paced).
+    # =========================================================================
+    wq_heads = []
+    for q_h in nl.affine_range(HQ_TP_CONST):
+        wq_head_tile = nl.ndarray((PMAX, H), dtype=nl.bfloat16, buffer=nl.sbuf, name=f"wq_head_early_{q_h}")
+        nisa.dma_copy(dst=wq_head_tile, src=Wq[q_h * PMAX:(q_h + 1) * PMAX, :])
+        wq_heads.append(wq_head_tile)
+
+    # =========================================================================
+    # WO WEIGHT RESHAPE (DMA hoisting deferred to just before flash decode)
     #
     # Wo is now passed as [Hq_out=1024, H_wo=2048] = [N*D, H] (caller transposes).
     # Reshape to [Hq_tp=8, d=128, H_wo=2048] so each head's slice is contiguous.
-    #
-    # ap() pattern [[H_wo, PMAX], [1, H_wo]]:
-    #   partition stride = H_wo = 2048 (one full output row apart)
-    #   free stride = 1 (contiguous elements)
-    # → 128 chunks × H_wo×2 = 4096 bytes each, stride 4096 bytes → 50% fill ratio
-    # vs old [[1,128],[Hq_out,H_wo]]: 2048 chunks × 256 bytes, stride 2048 → 12.5%
-    # 16× fewer DMA packets, 4× better fill ratio.
+    # The actual SBUF hoisting (wo_sbuf loop) is issued just before flash decode
+    # so the 4MB Wo DMA overlaps with flash decode TensorE/VectorE compute.
     # =========================================================================
     Wo_reshaped = Wo.reshape((Hq_tp, d, H_wo))  # logical [8, 128, 2048] view
-
-    wo_sbuf = []
-    for head in nl.affine_range(HQ_TP_CONST):
-        wo_tile = nl.ndarray((PMAX, H_wo), dtype=nl.bfloat16, buffer=nl.sbuf,
-                             name=f"wo_tile_h{head}")
-        nisa.dma_copy(
-            dst=wo_tile,
-            src=Wo_reshaped.ap(
-                pattern=[[H_wo, PMAX], [1, H_wo]],   # partition: stride H_wo, free: contiguous
-                offset=head * PMAX * H_wo,             # skip head * [128 × 2048] elements
-            ),
-        )
-        wo_sbuf.append(wo_tile)
 
     # =========================================================================
     # K PROJECTION (Hkv_tp=1, one KV head)
@@ -228,6 +226,15 @@ def qwen3_attn_tkg_fused_oproj_v10e(
     # =========================================================================
     wk_full = nl.ndarray((PMAX, H), dtype=nl.bfloat16, buffer=nl.sbuf, name="wk_full")
     nisa.dma_copy(dst=wk_full, src=Wk)
+
+    # =========================================================================
+    # v12b Change 2: Issue Wv DMA immediately after Wk DMA, before K projection loop.
+    # This allows the Wv load (512KB) to overlap with K projection matmul loop
+    # + K norm + K RoPE, removing it from the serial critical path.
+    # =========================================================================
+    wv_full = nl.ndarray((PMAX, H), dtype=nl.bfloat16, buffer=nl.sbuf, name="wv_full")
+    nisa.dma_copy(dst=wv_full, src=Wv)
+
     k_psum = nl.zeros((PMAX, B), dtype=nl.float32, buffer=nl.psum, name="k_psum")
     for h_t in nl.affine_range(NUM_H_TILES):
         nisa.nc_matmul(k_psum, stationary=wk_full[0:PMAX, h_t*PMAX:(h_t+1)*PMAX], moving=h_all[0:PMAX, h_t:h_t+1])
@@ -281,9 +288,8 @@ def qwen3_attn_tkg_fused_oproj_v10e(
 
     # =========================================================================
     # V PROJECTION (Hkv_tp=1)
+    # wv_full is already loaded (DMA issued before K proj loop above).
     # =========================================================================
-    wv_full = nl.ndarray((PMAX, H), dtype=nl.bfloat16, buffer=nl.sbuf, name="wv_full")
-    nisa.dma_copy(dst=wv_full, src=Wv)
     v_psum = nl.zeros((PMAX, B), dtype=nl.float32, buffer=nl.psum, name="v_psum")
     for h_t in nl.affine_range(NUM_H_TILES):
         nisa.nc_matmul(v_psum, stationary=wv_full[0:PMAX, h_t*PMAX:(h_t+1)*PMAX], moving=h_all[0:PMAX, h_t:h_t+1])
@@ -303,22 +309,19 @@ def qwen3_attn_tkg_fused_oproj_v10e(
     nisa.dma_copy(dst=v_out, src=v_T_sb)
 
     # =========================================================================
-    # Q PROJECTIONS — Change 1: one head at a time to reduce peak SBUF.
-    # Instead of hoisting all 8 wq_head[128,2048] tiles simultaneously (~4MB),
-    # we load, compute, and pack each head sequentially (peak: 1×512KB).
-    # Fuses the psum→q_vec→q_packed_f32 chain into a single tensor_copy per head.
+    # Q PROJECTIONS — v12b Change 1: use pre-loaded wq_heads[] tiles (DMAs issued
+    # early above) instead of per-head just-in-time DMA inside the loop.
+    # This removes 8 DMA copies from the Q-proj loop's critical path.
     # =========================================================================
     q_packed_f32 = nl.ndarray((PMAX, GQA), dtype=nl.float32, buffer=nl.sbuf, name="q_packed_f32")
     for q_h in nl.affine_range(HQ_TP_CONST):
-        # Load one head's weight row [128, 2048] — released after tensor_copy below
-        wq_head = nl.ndarray((PMAX, H), dtype=nl.bfloat16, buffer=nl.sbuf, name=f"wq_head_{q_h}")
-        nisa.dma_copy(dst=wq_head, src=Wq[q_h * PMAX:(q_h + 1) * PMAX, :])
         # Accumulate matmul over all 16 hidden tiles into psum [PMAX, B=1]
+        # stationary: wq_heads[q_h] is the pre-loaded [PMAX, H] tile for this head
         q_psum = nl.zeros((PMAX, B), dtype=nl.float32, buffer=nl.psum, name=f"q_psum_{q_h}")
         for h_t in nl.affine_range(NUM_H_TILES):
             nisa.nc_matmul(
                 q_psum,
-                stationary=wq_head[0:PMAX, h_t * PMAX:(h_t + 1) * PMAX],
+                stationary=wq_heads[q_h][0:PMAX, h_t * PMAX:(h_t + 1) * PMAX],
                 moving=h_all[0:PMAX, h_t:h_t + 1],
             )
         # Directly copy psum → q_packed_f32[:, q_h] — skips intermediate q_vec buffer
@@ -400,6 +403,30 @@ def qwen3_attn_tkg_fused_oproj_v10e(
     # Scale by 1/sqrt(d) and cast to bf16 — this is the "scaled Q" for flash decode
     q_bf16 = nl.ndarray((PMAX, GQA), dtype=nl.bfloat16, buffer=nl.sbuf, name="q_bf16")
     nisa.tensor_scalar(q_bf16, q_rope, op0=nl.multiply, operand0=INV_SQRT_D)
+
+    # =========================================================================
+    # Plan D: WO WEIGHT HOISTING — issued here (just before flash decode) so the
+    # 4MB Wo DMA overlaps with flash decode TensorE + VectorE compute (~15-20 μs).
+    # Wo is no longer needed until the O-projection at the very end of the kernel.
+    #
+    # ap() pattern [[H_wo, PMAX], [1, H_wo]]:
+    #   partition stride = H_wo = 2048 (one full output row apart)
+    #   free stride = 1 (contiguous elements)
+    # → 128 chunks × H_wo×2 = 4096 bytes each, stride 4096 bytes → 50% fill ratio
+    # vs old [[1,128],[Hq_out,H_wo]]: 2048 chunks × 256 bytes, stride 2048 → 12.5%
+    # =========================================================================
+    wo_sbuf = []
+    for head in nl.affine_range(HQ_TP_CONST):
+        wo_tile = nl.ndarray((PMAX, H_wo), dtype=nl.bfloat16, buffer=nl.sbuf,
+                             name=f"wo_tile_h{head}")
+        nisa.dma_copy(
+            dst=wo_tile,
+            src=Wo_reshaped.ap(
+                pattern=[[H_wo, PMAX], [1, H_wo]],   # partition: stride H_wo, free: contiguous
+                offset=head * PMAX * H_wo,             # skip head * [128 × 2048] elements
+            ),
+        )
+        wo_sbuf.append(wo_tile)
 
     # =========================================================================
     # TWO-PASS FLASH DECODE

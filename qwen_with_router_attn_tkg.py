@@ -92,7 +92,7 @@ import os
 # os.environ["NEURON_RT_INSPECT_DEVICE_PROFILE"]= "1"
 # os.environ["NEURON_RT_INSPECT_OUTPUT_DIR"]= "./output"
 
-from kernels.attn_tkg.agents.v10e import qwen3_attn_tkg_fused_oproj_v10e
+from kernels.attn_tkg.agents.v12e import qwen3_attn_tkg_fused_oproj_v12e
 from kernels.router_topk.qwen3_router_topk_plan_a import qwen3_router_topk_cte
 
 SampleOutput = Union[SampleEncoderDecoderOutput, SampleDecoderOnlyOutput]
@@ -537,7 +537,7 @@ class NeuronQwen3MoEAttentionWithNKITKG(NeuronAttentionBase):
 
         # Fused QKV + RMSNorm + RoPE + flash decode + o_proj (row-parallel).
         # Mask is generated on-chip from K-cache zero-detection (v10d).
-        output, k_rope_out, v_out = qwen3_attn_tkg_fused_oproj_v10e[2](
+        output, k_rope_out, v_out = qwen3_attn_tkg_fused_oproj_v12e[2](
             hidden_states.data,
             Wq.data,
             Wk.data,

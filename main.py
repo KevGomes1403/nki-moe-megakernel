@@ -261,6 +261,7 @@ def prepare_inference(model_cls, args):
     # Load compiled model to Neuron.
     print("\nLoading model to Neuron...")
     model.load(args.compiled_model_path)
+    print("NEURON CONFIG:", {k: v for k, v in vars(model.neuron_config).items() if not callable(v)})
 
     # Load tokenizer.
     tokenizer = load_tokenizer(args.model_path, args.compiled_model_path, neuron_config)
@@ -352,6 +353,30 @@ def benchmark_sampling(model, tokenizer, generation_config, prompts):
 
     # Register latency collectors after warm-up to avoid recording warm-up metrics.
     generation_model = HuggingFaceGenerationAdapter(model)
+
+    # --- per-step timing instrumentation ---
+    import time as _time
+    _step_gaps = []
+    _step_starts = []
+
+    _tkg_wrapper = model.token_generation_model
+    _orig_tkg_forward = _tkg_wrapper.forward.__func__ if hasattr(_tkg_wrapper.forward, '__func__') else None
+    _last_exit = [None]
+
+    def _timed_tkg_forward(self, *args, **kwargs):
+        t0 = _time.perf_counter()
+        if _last_exit[0] is not None:
+            _step_gaps.append((t0 - _last_exit[0]) * 1000)
+        _step_starts.append(t0)
+        result = _orig_tkg_forward(self, *args, **kwargs)
+        _last_exit[0] = _time.perf_counter()
+        return result
+
+    if _orig_tkg_forward is not None:
+        import types
+        _tkg_wrapper.forward = types.MethodType(_timed_tkg_forward, _tkg_wrapper)
+    # --- end instrumentation ---
+
     e2e_benchmark = Benchmark(
         generation_model.generate,
         input_param,
@@ -359,6 +384,12 @@ def benchmark_sampling(model, tokenizer, generation_config, prompts):
         post_warmup_func=post_warmup_func,
     )
     e2e_benchmark.run()
+
+    if _step_gaps:
+        import statistics
+        print(f"\n[TIMING] Inter-step gap (time between forward exit and next forward entry):")
+        print(f"  mean={statistics.mean(_step_gaps):.2f}ms  median={statistics.median(_step_gaps):.2f}ms  "
+              f"min={min(_step_gaps):.2f}ms  max={max(_step_gaps):.2f}ms  n={len(_step_gaps)}")
     report["e2e_model"] = generate_report(
         e2e_benchmark.latency_list,
         neuron_config.max_length,
