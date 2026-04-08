@@ -3,7 +3,7 @@
 **Kernel**: `qwen3_moe_fused_tkg` — RMSNorm + Router + TopK(8) + Expert MLPs, fused end-to-end
 **Target**: ≤100 μs on trn2 (NeuronCore-v3, LNC=2)
 **Reference**: `kernel_v19b.py` (correctness baseline)
-**Current best**: `kernel_v27d.py` — **103.48 μs**
+**Current best**: `kernel_v28f.py` — **98.15 μs**
 
 ---
 
@@ -58,7 +58,9 @@ Phase 2b: compute experts 4-7 (loop k=0..3)
 |---------|--------|--------|---------|
 | v20b | Baseline | 117.46 μs | — |
 | v26g | 2-wave structure, 4 buffer sets (vs 8) | 104.89 μs | −12.57 μs |
-| **v27d** | **Remove 4 redundant inter-wave down_full1 pad re-memsets** | **103.48 μs** | **−1.41 μs** |
+| v27d | Remove 4 redundant inter-wave down_full1 pad re-memsets | 103.48 μs | −1.41 μs |
+| v28e | Router DMA: `dge_mode=0` → `dge_mode=3`, `_ROUTER_BATCH` 4→8 | 98.74 μs | −4.74 μs |
+| **v28f** | **`_ROUTER_BATCH` 8→16 (1 router DMA call instead of 2)** | **98.15 μs** | **−0.59 μs** |
 
 **Why v27d works**: The DMA for each expert writes only to `down_full1_bufs[k][0:I1, :]` (rows 0:64). Rows 64:128 are zeroed once before wave 0 and never touched by any DMA. So the 4 re-memsets between waves were pure overhead with no effect on correctness.
 
@@ -78,7 +80,7 @@ Phase 2b: compute experts 4-7 (loop k=0..3)
 | v27i | Prefetch wave-1 DMAs inside wave-0 compute loop | 105.54 μs | Disrupts compiler's instruction scheduling |
 | v27g | Move PSUM memsets to after Phase 1b DMAs | 110.06 μs | Severely disrupts scheduler (any reordering hurts) |
 
-**Root cause pattern**: The NKI compiler's instruction scheduler is extremely sensitive to code ordering in v27d. Any reordering — even if semantically equivalent — disrupts the schedule and regresses performance.
+**Root cause pattern**: The NKI compiler's instruction scheduler is extremely sensitive to code ordering. Any reordering — even if semantically equivalent — disrupts the schedule and regresses performance.
 
 ### Compute instruction changes
 
@@ -87,12 +89,29 @@ Phase 2b: compute experts 4-7 (loop k=0..3)
 | v27a | Separate PSUM per wave (96 PSUM cols) | 107.15 μs | Extra PSUM size hurts scheduler |
 | v27f | Per-expert PSUM (12 cols), per-expert memset | 106.64 μs | More memset instructions always worse |
 | v27h | `nisa.scalar_tensor_tensor` fused scale+accumulate | 109.05 μs | Switches to scalar engine, disrupts pipeline |
+| v28i | `dma_transpose` for inp/gamma loading (replace 6 instr with 2) | 101.99 μs | Moves TensorE/VectorE work onto DMA engine (already bottleneck), net loss |
+
+### Round 5 — v28f baseline (98.15 μs)
+
+| Version | Idea | Result | Why it failed |
+|---------|------|--------|---------------|
+| v29j | `nl.hbm` → `nl.shared_hbm` (required) + remove dead `aff_bcast` memset | 100.05 μs | +1.9 μs — shared_hbm slightly changes DMA schedule; removing the memset didn't help |
+| v29k | Single wave of 8 experts (merge 2×4 waves into 1×8) | 98.99 μs | PSUM cols doubled (96 vs 48), consistent with v27a lesson: larger PSUM hurts |
+| v29m | Merged down DMA: prepad down_w [E,192,H]→[E,256,H], single DMA per expert | 100.98 μs | 3D DMA pattern generates MORE sw_dma_packets (8192 vs 7936), not fewer — the NKI compiler split the 3D indirect DMA into multiple descriptor chains |
+
+**Round 5 key lessons**:
+- `nl.shared_hbm` output costs ~1-2 μs vs `nl.hbm` due to different DMA scheduling (but is required for correctness)
+- Increasing PSUM cols from 48 to 96 (single-wave 8 experts) regresses — confirms v27a finding
+- A 3D indirect DMA pattern `[[H, 128], [128*H, 2], [1, H_shard]]` does NOT reduce sw_dma_packets; the compiler appears to split it into ≥2 descriptor chains, producing MORE packets than two separate 2D DMAs
+- The `aff_bcast` memset appears technically redundant (all 128 rows overwritten) but removing it hurts — likely a scheduling dependency the compiler relies on
+- DMA batching depth (12/phase) is still the confirmed sweet spot; merging to 8/phase (Plan M removes 1 DMA type) or expanding to 24/phase (Plan K) both regress
 
 **Key lessons**:
 - Every added instruction hurts; every removed instruction (if truly redundant) helps
 - Changing instruction TYPE (e.g., tensor_tensor → scalar_tensor_tensor) disrupts engine pipeline scheduling
 - Fewer PSUM columns is not always better — 48 cols (v27d) beats 12 cols (v27f) and 96 cols (v27a)
-- DMA batching depth matters: 12 DMAs/phase is the sweet spot; going lower (6, 3) causes DMA stalls
+- DMA batching depth matters: 12 DMAs/phase is the sweet spot; going lower (6, 3) or higher (24) causes regressions
+- 3D indirect DMA patterns can generate MORE packets than equivalent 2D patterns — prefer simple 2D patterns for sw_dge DMAs
 
 ---
 
@@ -123,29 +142,24 @@ Phase 2b: compute experts 4-7 (loop k=0..3)
 
 ---
 
-## Remaining Candidate Optimizations (Untested, Low-Risk)
-
-These are instruction REMOVALS in the prologue — the safe pattern.
-
-1. **Remove `nisa.memset(aff_bcast)`**: The memset zeros [128, 8] but then `tensor_copy` overwrites row 0 and `nc_stream_shuffle` ×4 overwrites ALL 128 rows. Memset is redundant.
-   Saves: 1 instruction
-
-2. **Remove `sum_reduced_sb` intermediate + `tensor_copy`**: Write `tensor_partition_reduce` result directly into `norm_sum_sb[0:1, :]` and feed it to the 4 shuffles. Eliminates 1 allocation + 1 tensor_copy.
-   Saves: 1 instruction
-
-3. **`nisa.activation_reduce` for RMSNorm square+sum**: Replace `activation(square)` + `tensor_reduce(add)` with a single `activation_reduce(square, add)`.
-   Saves: 1 instruction, 1 full pass over [128, 16] data
-
-4. **`nisa.activation_reduce` for softmax exp+sum**: Replace `activation(exp)` + `tensor_reduce(add)` with `activation_reduce(exp, add)`.
-   Saves: 1 instruction, 1 full pass over [1, 128] data
-
-Estimated combined savings: ~1–2 μs → predicted ~101–102 μs. May not reach target alone.
 
 ---
 
 ## Ideas Not Yet Explored
 
-- Consolidate down_w loading: currently 2 separate DMAs (I0 + I1 rows); unclear if a single DMA with a richer stride pattern is feasible given I=192 > PMAX=128
-- DMA pattern simplification to reduce sw_dma_packet_count (requires changing ap() patterns, risky)
-- FP8 double-performance mode (major correctness risk, needs quantization infrastructure)
-- Router DMA: currently uses `dge_mode=0` with compile-time offset; could try `dge_mode=3` if the 3-stride pattern is compatible
+- **`activation_reduce` fusions** (see "Remaining Candidate Optimizations" below): replace `activation(square)` + `tensor_reduce(add)` with single `activation_reduce`; same for softmax exp+sum. Low risk, ~1-2 μs potential. Note: `activation_reduce(op=nl.square, reduce_op=nl.add)` was attempted in an earlier round and hit `[NCC_IXCG864] ISA check failed` — verify compiler support before retrying.
+- **FP8 double-performance mode**: major correctness risk, needs quantization infrastructure
+- **Different SBUF tiling for gate_up**: currently loads full [H_free, GU_FLAT] per expert; smaller tiles with higher reuse could reduce SBUF pressure but may hurt DMA efficiency
+- **LNC shard along I dimension**: not viable — I/2=96 < K_min=128 for nc_matmul
+
+## Remaining Candidate Optimizations (Untested, Low-Risk)
+
+These are instruction REMOVALS in the prologue — the safe pattern.
+
+1. **`nisa.activation_reduce` for RMSNorm square+sum**: Replace `activation(square)` + `tensor_reduce(add)` with a single `activation_reduce(square, add)`. Saves: 1 instruction, 1 full pass over [128, 16] data. **Caveat**: compiler rejected `activation_reduce(op=nl.square, reduce_op=nl.add)` in earlier testing with ISA error — verify.
+
+2. **`nisa.activation_reduce` for softmax exp+sum**: Replace `activation(exp)` + `tensor_reduce(add)` with `activation_reduce(exp, add)`. Saves: 1 instruction, 1 full pass over [1, 128] data.
+
+3. **Remove `sum_reduced_sb` intermediate**: Write `tensor_partition_reduce` result directly into `norm_sum_sb[0:1, :]` and eliminate the allocation + tensor_copy. Saves: 1 instruction.
+
+Estimated combined savings: ~1–2 μs. Likely insufficient to close the remaining gap to ≤95 μs without the shared_hbm overhead factored in (which adds ~1.9 μs).

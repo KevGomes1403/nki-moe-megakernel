@@ -1134,6 +1134,7 @@ def qwen3_attn_tkg_fused_oproj_v13bc(
 
     return output, k_rope_out, v_out
 
+
 # Hardware constants
 _PMAX = 128       # partition dimension max
 _PSUM_FREE = 512  # PSUM free-dimension max on trn2
@@ -1157,12 +1158,11 @@ _H_FREE = _H // _PMAX             # = 16 tiles of 128 each
 _H_FREE_SHARD = _H_FREE // _N_PRGS   # = 8
 _H_SHARD = _H_FREE_SHARD * _PMAX     # = 1024
 
-# Router DMA batching: 4 tiles per DMA
-_ROUTER_BATCH = 4
+# Router DMA batching: 16 tiles per DMA (Plan F: doubled from 8, 1 DMA call total)
+_ROUTER_BATCH = 16
 
 # 2-wave constants
 _K_WAVE = 4  # experts per wave
-
 
 @nki.jit(platform_target="trn2")
 def qwen3_moe_fused_tkg(
@@ -1268,7 +1268,7 @@ def qwen3_moe_fused_tkg(
                 pattern=[[E, _PMAX], [_PMAX * E, _ROUTER_BATCH], [1, E]],
                 offset=h_chunk * _ROUTER_BATCH * _PMAX * E,
             ),
-            dge_mode=0,
+            dge_mode=3,  # Plan E1: hw_dge (offset is linear in h_chunk)
         )
         for h_sub in nl.static_range(_ROUTER_BATCH):
             h1 = h_chunk * _ROUTER_BATCH + h_sub
@@ -1524,9 +1524,8 @@ def qwen3_moe_fused_tkg(
         # WAVE 1: Experts 4-7
         # ==================================================================
 
-        # Re-memset down_full1 padding (buffers reused)
-        for k_pad in range(4):
-            nisa.memset(down_full1_bufs[k_pad][nl.ds(I1, I1), 0:H_shard], value=0.0)
+        # NOTE: No down_full1 re-memset needed — DMA only writes [0:I1, :],
+        # rows I1:I0 remain zeroed from initial memset before wave 0.
 
         # PSUM memset for wave 1
         nisa.memset(gate_up_psum, value=0.0)
