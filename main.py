@@ -755,6 +755,7 @@ def main():
 
     # points to your local model definition (for example qwen.py, qwen_with_nki.py, qwen_with_attention_cte.py)
     qwen_module_name = resolve_qwen_module_name(args.qwen, args.enable_nki)
+
     print(f"Loading module: {qwen_module_name}")
     qwen = importlib.import_module(qwen_module_name)
 
