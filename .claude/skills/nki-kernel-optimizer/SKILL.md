@@ -15,7 +15,7 @@ source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
 export NEURON_PLATFORM_TARGET_OVERRIDE=trn2
 ```
 
-**Hardware**: trn2 instance — 4 NeuronCores (NeuronCore-v3 / gen3).
+**Hardware**: AWS Trainium 2/3
 NeuronCores are exclusive: only one Python process can hold them at a time. Run kernels sequentially.
 
 ---
@@ -28,9 +28,12 @@ NeuronCores are exclusive: only one Python process can hold them at a time. Run 
 | `references/performance-playbook.md` | Structured step-by-step optimization workflow |
 | `references/benchmarking-api.md` | Benchmarking harness API, env setup, `BenchmarkResult` fields, metric interpretation |
 | `references/common-pitfalls.md` | Compiler errors, dtype gotchas, scheduling mistakes |
-| `references/templates.md` | Ready-to-use kernel scaffolding and harness templates |
 | `references/logical-neuron-cores.md` | Combining two physical NeuronCores into one logical NeuronCore |
 | `references/trn2-architecture.md` | NeuronCore-v3 hardware specs: engines, memory, DMA transpose, DGE, FP8 double-perf mode |
+| `references/trn3-architecture.md` | NeuronCore-v4 hardware specs: chip-level perf, MXFP8/MXFP4, 32 MiB SBUF, near-memory accumulation, GPSIMD, trn2→trn3 comparison |
+| `references/fp8-mxfp-quantization.md` | FP8 row/static/MX quantization patterns with exact NKI calls, MXFP scale layout, `double_row` matmul, RMSNorm fusion |
+| `references/sbuf-allocation.md` | All-or-nothing auto vs manual SBUF allocation rule; `NCC_EGCA111` cause and fix; `create_auto_alloc_manager` pattern |
+| `references/dma-patterns.md` | `dma_transpose` vs `nc_transpose`, `.ap()` stride patterns, scalar broadcast, `tp_broadcast`, weight ring buffer, PSUM bank interleaving |
 
 Read the relevant reference(s) before generating or modifying any kernel code.
 
@@ -44,6 +47,7 @@ Ask only what you need:
 2. **Op category**: elementwise, reduction, fused, matmul/GEMM, attention primitive, MoE, custom.
 3. **Shapes & dtypes**: all input/output tensor shapes, dtypes, any alignment constraints.
 4. **Existing code**: the kernel to optimize (required for optimization; not required for new kernels).
+5. **PyTorch reference**: a pure-PyTorch function that computes the correct output — **required**. If the user does not provide one, ask for it before proceeding. All correctness checks run against this reference, never against the original NKI kernel.
 
 Profiling data from a prior round (if any) will be provided by the orchestrator — do not ask the user for it.
 
@@ -119,7 +123,7 @@ Present each plan in this format:
 **Change**: <exact code-level change — loop restructure, tile size, API swap, fusion boundary, etc.>
 **Expected effect**: <which profiler metric improves, and why>
 **Correctness risk**: <any numerical or shape concern to watch for>
-**Verification**: assert_allclose(rtol=X, atol=Y) — explain what to compare against
+**Verification**: assert_allclose(rtol=X, atol=Y) against the PyTorch reference — state the tolerances and any dtype considerations
 ```
 
 Do not begin any implementation until all plans are written.
@@ -188,7 +192,7 @@ Also include the complete, runnable kernel code with inline comments.
 
 ### Correctness
 
-Run against the **original unmodified kernel** to establish the reference baseline first. Use the same seed for all subagents.
+Always compare against the **PyTorch reference function provided at intake** — never against the original NKI kernel. Use the same seed for all subagents across all rounds.
 
 ```python
 import numpy as np
@@ -197,7 +201,8 @@ import torch
 rng = np.random.default_rng(42)
 x = rng.random(shape).astype(np.float32)  # replace with actual shape
 
-ref = pytorch_reference(torch.tensor(x))
+# pytorch_reference is the function provided by the user at intake
+ref = pytorch_reference(torch.tensor(x)).numpy()
 result = optimized_kernel(torch.tensor(x).to("xla")).cpu().numpy()
 
 np.testing.assert_allclose(result, ref, rtol=1e-3, atol=1e-3)
@@ -286,3 +291,11 @@ All kernel code produced by this skill must meet these standards:
 - `PSUM` buffers must be copied to SBUF before storing to HBM.
 - `.ap()` works on HBM and SBUF/PSUM tensors; see `nki-syntax-quickref.md` for restrictions and the DGE `scalar_offset` address pitfall.
 - Subagents run sequentially — never dispatch two subagents in parallel.
+- Every SBUF/PSUM tensor in a kernel must use either all-automatic or all-manual allocation — never both. Mixing causes `NCC_EGCA111`. The named tensor in the error is a symptom (longest live range), not the cause. Fix: use `create_auto_alloc_manager()` from nkilib.
+- Prefer `dma_transpose` over `nc_transpose` whenever the source is in HBM — it's free (DMA engine) and avoids an intermediate SBUF allocation. `nc_transpose` is for SBUF→PSUM only.
+- For FP8 kernels, use `perf_mode=nisa.matmul_perf_mode.double_row` on `nc_matmul` when both inputs are FP8 — doubles effective throughput.
+- MXFP scale layout in SBUF is sparse: valid rows are only at `[0-3, 32-35, 64-67, 96-99]` per 128-partition tile. Load with the 4-rows-per-quadrant DMA pattern; never load densely into SBUF.
+- Hoist all quantization scale loads (`nisa.dma_copy` for scales) to outside all loops. Loading inside the inner tile loop causes per-tile HBM traffic that destroys bandwidth.
+- FP8 quantization requires `[T, 1]` scale shape (not `[T]`) for `nisa.activation` broadcasting, and a two-sided clamp to `[-240, 240]` before the dtype cast.
+- Use `stream_shuffle_broadcast` for scalars that must reach all partitions — load once to SBUF `[0,0]`, then broadcast. Avoids ~128 serialized `.ap()` calls.
+- PSUM bank interleaving: assign accumulator tiles via `address=(0, (tile_idx % 4) * PSUM_BANK_SIZE)` to eliminate read-after-write stalls when multiple tiles are in flight.

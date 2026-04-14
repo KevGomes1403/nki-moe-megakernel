@@ -19,6 +19,21 @@ t.ap(pattern=[[32, 128], [1, 32]], offset=0)
 col = sbuf_tensor[0:T, expert_id:expert_id+1]
 ```
 
+### NCC_IXCG864 — ISA check failed on `activation_reduce`
+**Error**: `[NCC_IXCG864] ISA check failed`
+**Cause**: Using `nisa.activation_reduce(op=nl.square, reduce_op=nl.add)` — the compiler does not support this op/reduce combination even though the API exists.
+**Fix**: Replace with separate `nisa.activation(op=nl.square)` followed by `nisa.tensor_reduce(reduce_op=nl.add)`.
+
+### NCC_IBIR530 — `nc_matmul_mx` not supported on Trn2
+**Error**: `[NCC_IBIR530] MatmultMx is not supported on arch Trn2, must be Trn3 or greater`
+**Cause**: Calling `nisa.nc_matmul_mx()` or `nisa.matmul_mx()` on Trn2 hardware.
+**Fix**: MXFP8/MXFP4 matmul is Trn3-only. On Trn2, use standard FP8 `nc_matmul` with `perf_mode=double_row`.
+
+### NCC_INLA001 — Dynamic SBUF access not allowed
+**Error**: `[NCC_INLA001] Dynamic Access is not allowed in the instruction`
+**Cause**: Attempting SBUF-to-SBUF `tensor_copy` with a runtime `scalar_offset` (e.g., indexing into a preloaded scale buffer by a runtime expert ID). The compiler requires all SBUF access patterns to be statically known.
+**Fix**: Accept the HBM traffic cost — load the needed slice from HBM each time rather than preloading into SBUF and indexing dynamically.
+
 ### NCC_IBIR030 — `scalar_offset` without `.ap()` descriptor
 **Error**: `NCC_IBIR030: ...`
 **Cause**: Passing an SBUF tensor directly (or a 1×1 slice) as `scalar_offset` to a DGE instruction without an `.ap()` descriptor. The compiler requires `.ap()` to derive `IndirectDimMaxIndex`.
@@ -49,6 +64,10 @@ nisa.dma_copy(
 eid_offset = eid_scratch.ap(pattern=[[1,1],[1,1]], offset=0)  # always offset=0
 ```
 The `(128,1)` shape preserves `IndirectDimMaxIndex=127` for the compiler.
+
+### `float8_e4m3fn` fails BIR verification in matmul
+**Cause**: Using `nl.float8_e4m3fn` (the finite variant) as the stationary tensor dtype in `nc_matmul` fails hardware BIR verification.
+**Fix**: Use `nl.float8_e4m3` (without `fn`). The non-finite variant maps to `float8e4` which the hardware verifier accepts.
 
 ### "TensorScalarPtr arith immediate dtype must be fp32"
 **Cause**: Using `bfloat16` affinities/scalars in POST_SCALE mode (e.g., MoE with POST_SCALE).
@@ -94,6 +113,14 @@ nl.store(output_hbm[...], sbuf_tmp) # SBUF → HBM
 - Incorrect reduction axis.
 - Missing scale factor (e.g., `1/sqrt(d_k)` in attention).
 
+### Per-partition FP8 scale is mathematically incorrect in matmul
+**Cause**: Computing absmax per partition and using different scales across 128 partitions when those partitions participate in the same `nc_matmul` contraction. The contraction sums values from different partitions — if they carry different scales, dequantization is invalid.
+**Fix**: Use a global (cross-partition) absmax so all K values in a contraction share one scale.
+
+### FP8 correctness test passes vacuously due to NaN bit pattern
+**Cause**: Generating FP8 test weights via `rng.integers(-127, 127).astype(int8)` and reinterpreting as `float8_e4m3`. The bit pattern `0xFF` is NaN — both reference and candidate output NaN, making `assert_allclose` pass trivially.
+**Fix**: Use explicit quantization: `w.clamp(-240, 240).to(float8_e4m3fn).view(int8)` with derived per-neuron scales.
+
 ---
 
 ## Performance Issues
@@ -113,6 +140,38 @@ nl.store(output_hbm[...], sbuf_tmp) # SBUF → HBM
 **Causes**:
 - Tile size too small — increase free-dimension tile size.
 - Stationary matrix not held in SBUF across multiple moving tiles (missing loop reordering).
+
+### Instruction scheduler is extremely sensitive to code order
+**Symptom**: A semantically-equivalent reordering (moving a memset, reordering loop bodies, changing instruction type) causes 3–13% latency regression with no logical change.
+**Cause**: NKI's compiler scheduling is fragile — any reordering changes internal optimization passes. Examples observed:
+- Prefetching Wave-1 DMAs inside Wave-0 loop: +5.5% regression
+- Moving PSUM memsets by a few lines: +6.5% regression
+- Replacing two `ScalarE` calls with one fused instruction of a different engine type: +4.2% regression
+- Replacing 6 `nc_transpose` calls with 2 `dma_transpose` calls on an already DMA-bottlenecked kernel: +3.8% regression
+**Rule**: Change exactly one thing per round. Revert immediately if latency worsens by >2%. Do not "clean up" or reorder working code.
+
+### Merging loops does not improve DMA/compute overlap
+**Symptom**: Combining two sequential `static_range` loops into one expecting overlap — latency increases instead.
+**Cause**: Merged loop bodies create longer dependency chains, reducing the compiler's freedom to parallelize. The compiler already handles inter-loop scheduling adequately.
+**Fix**: Keep loops separate. Do not merge hoping for overlap improvements.
+
+### 3D indirect DMA generates more packets than two 2D DMAs
+**Symptom**: Combining two 2D indirect DMA patterns into one 3D pattern increases `sw_dma_packet_count` and latency.
+**Cause**: The compiler splits 3D indirect DMAs into multiple descriptor chains. Observed: 3D pattern generated 8192 packets vs 7936 for equivalent 2D patterns.
+**Fix**: Use simple 2D DMA patterns for indirect (software DGE) addressing. Multi-dimensional indirect patterns do not offer compiler optimization.
+
+### Removing a "redundant" memset causes regression
+**Symptom**: A memset whose destination is immediately overwritten by subsequent DMAs appears safe to remove — but removing it increases latency.
+**Cause**: The instruction creates a scheduling dependency the compiler relies on, even though the written data is overwritten. Do not remove memsets without profiling before and after.
+
+### `double_row` perf mode does not work at T=1
+**Cause**: `double_row` requires the moving tensor's access pattern to have `Num=2`. At T=1 the moving tensor is `[128, 1]` with `Num=1` — the constraint is not satisfied.
+**Impact**: The 2× FP8 matmul throughput from `double_row` is only available for batch (CTE) workloads, not single-token decode (TKG).
+
+### SBUF pressure directly degrades scheduling quality
+**Finding**: Reducing from 8 buffer sets to 4 freed ~96 KiB of SBUF and improved latency by 12%. Increasing PSUM columns from 48 to 96 caused regression. The 48-column configuration beat both 96 and 12.
+**Why**: SBUF pressure constrains the compiler's ability to assign non-overlapping live ranges, reducing instruction-level parallelism.
+**Rule**: Treat SBUF allocation minimization as a first-order performance lever, not just a correctness concern.
 
 ---
 
@@ -135,6 +194,21 @@ def bench(fn, *args, warmup=5, iters=20):
     torch.xla.sync()
     print(f"{(time.perf_counter()-t0)/iters*1e3:.3f} ms/iter")
 ```
+
+### nkilib kernel JIT invocation: standard vs trace-style
+**Two distinct calling conventions exist — mixing them causes silent failure:**
+- **Standard JIT** (returns output tensor): `out = attention_cte(q, k, v, ...)`
+- **Trace-style JIT** (writes in-place, returns status): `status = attention_tkg_jit(..., out=out_tensor)`
+
+Check the kernel signature before calling. Trace-style kernels require `nki.jit(kernel, mode="trace")` and an explicit `out=` argument.
+
+### "Entry function not found" when wrapping a jitted library kernel
+**Cause**: Calling `nki.jit()` on a function that itself calls an already-jitted nkilib kernel — nested JIT is not supported.
+**Fix**: Apply `nki.jit` only to leaf kernels: `nki.jit(attention_tkg, mode="trace")` directly.
+
+### `neuron-profile` `*_percent` fields are fractions, not percentages
+**Cause**: `neuron-profile summary-json` returns `tensor_engine_percent`, `dma_active_percent`, etc. as values in `[0.0, 1.0]`.
+**Fix**: Multiply by 100 before displaying or comparing against thresholds. A value of `0.85` means 85%, not 0.85%.
 
 ### `NEURON_PLATFORM_TARGET_OVERRIDE` not set
 **Symptom**: Kernel compiles for wrong device or fails with architecture mismatch.
