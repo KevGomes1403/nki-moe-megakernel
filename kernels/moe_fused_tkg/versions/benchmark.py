@@ -108,11 +108,14 @@ def _find_kernel_artifacts(
         new_neffs = _find_new_neffs(inspect_dir, before_inspect)
         if new_neffs:
             profile_neff = max(new_neffs, key=os.path.getmtime)
-            neff_hash = (
+            # neff basename looks like "neff_449630869622063_vnc_3.neff"
+            # Strip prefix/suffix to get the numeric hash, then drop the _vnc_N part.
+            neff_stem = (
                 os.path.basename(profile_neff)
                 .replace("neff_", "")
                 .replace(".neff", "")
             )
+            neff_hash = neff_stem.split("_vnc_")[0]
             ntff_pattern = f"{os.path.dirname(profile_neff)}/{neff_hash}_vnc_*.ntff"
             deadline = time.monotonic() + ntff_wait_s
             while time.monotonic() < deadline:

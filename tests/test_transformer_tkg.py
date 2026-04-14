@@ -45,7 +45,7 @@ import os
 import sys
 import tempfile
 
-os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = "trn2"
+os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = "trn3"
 os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2"
 
 sys.path.insert(0, "/home/ubuntu/nki-moe")
@@ -267,15 +267,15 @@ def main():
 
     results = {}
 
-    results["HBM path (sbuf_residual_and_cc=False)"] = _run_test(
-        "transformer_tkg — TP=2, LNC=2, HBM all-reduce path",
-        sbuf_residual_and_cc=False,
-    )
-
     if args.sbuf:
         results["SBUF path (sbuf_residual_and_cc=True)"] = _run_test(
             "transformer_tkg — TP=2, LNC=2, SBUF residual+CC path",
             sbuf_residual_and_cc=True,
+        )
+    else:
+        results["HBM path (sbuf_residual_and_cc=False)"] = _run_test(
+        "transformer_tkg — TP=2, LNC=2, HBM all-reduce path",
+        sbuf_residual_and_cc=False,
         )
 
     print(f"\n{'='*60}")

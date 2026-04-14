@@ -42,7 +42,7 @@ os.environ["NEURON_RT_INSPECT_ENABLE"]= "1"
 os.environ["NEURON_RT_INSPECT_DEVICE_PROFILE"]= "1"
 os.environ["NEURON_RT_INSPECT_OUTPUT_DIR"]= "./output"
 
-os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = "trn2"
+os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = "trn3"
 os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2"
 
 def _str2bool(value):
@@ -79,7 +79,7 @@ def parse_args():
         ),
     )
     parser.add_argument("--enable-nki", action="store_true")
-    parser.add_argument("--base-latency", type=float, default=526.15)
+parser.add_argument("--base-latency", type=float, default=526.15)
     parser.add_argument("--base-throughput", type=float, default=134.61)
 
     # Model path
@@ -712,6 +712,7 @@ def resolve_qwen_module_name(qwen_name: str, enable_nki: bool) -> str:
         "qwen_baseline_quant": "qwen_baseline_quant",
         "qwen_quant": "qwen_baseline_quant",
         "qwen_fp8": "qwen_baseline_quant",
+        "qwen_fused_transformer": "qwen_fused_transformer",
     }
 
     normalized = qwen_name.strip()
@@ -746,7 +747,8 @@ def configure_neuron_platform_target(platform_target: str) -> None:
 def main():
     args = parse_args()
     configure_neuron_platform_target(args.platform_target)
-    if not args.prompts:
+
+if not args.prompts:
         args.prompts = ["I believe the meaning of life is"]
         
     args.batch_size = len(args.prompts)

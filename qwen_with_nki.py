@@ -89,7 +89,7 @@ from nkilib.core.utils.tensor_view import TensorView
 
 import os
 os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2"  
-os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = "trn2"
+os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = "trn3"
 # from kernels.attn_tkg.agents.v10e import qwen3_attn_tkg_fused_oproj_v10e
 # from kernels.router_topk.qwen3_router_topk_plan_a import qwen3_router_topk_cte
 # from kernels.moe_fused_tkg import kernel_v19b as custom_moe_fused_kernel
@@ -116,7 +116,7 @@ NUM_H_TILES = H // P   # = 16
 # The original T_TILE=64 left the upper half of PSUM empty; 128 doubles utilization.
 T_TILE = 128      # was 64
 
-@nki.jit(platform_target="trn2")
+@nki.jit
 def qwen3_router_topk_cte(
     x,                  # [H, T]    bf16  — hidden states, H-major for burst DMA (Plan A)
     w,                  # [H, E]    bf16  — router weight (transposed from [E, H])
@@ -421,7 +421,7 @@ F_MAX = 512
 EPS = 1e-6
 INV_SQRT_D = float(1.0 / math.sqrt(128.0))
 
-@nki.jit(platform_target="trn2")
+@nki.jit
 def qwen3_attn_tkg_fused_oproj_v13bc(
     hidden_states,   # [B, 1, H]        bf16  (B=1)
     Wq,              # [Hq_tp*d, H]     bf16  [1024, 2048]
@@ -1164,7 +1164,7 @@ _ROUTER_BATCH = 16
 # 2-wave constants
 _K_WAVE = 4  # experts per wave
 
-@nki.jit(platform_target="trn2")
+@nki.jit
 def qwen3_moe_fused_tkg(
     inp,        # [B, 1, H=2048]  bf16
     gamma,      # [1, H=2048]     bf16
@@ -1686,11 +1686,13 @@ class Qwen3MoEWithRouterNeuronConfig(MoENeuronConfig):
     def __init__(self, **kwargs):
         if "blockwise_matmul_config" not in kwargs:
             kwargs["blockwise_matmul_config"] = BlockwiseMatmulConfig.from_kwargs(
-                block_size=128,
+                block_size=256,
                 logical_nc_config=2,
-                skip_dma_token=True,
-                skip_dma_weight=True,
+                # skip_dma_token=True,
+                # skip_dma_weight=True,
                 normalize_top_k_affinities=True,
+                use_shard_on_block_dynamic_while=True,
+                block_sharding_strategy="PING_PONG",
             )
         # Disable KV cache slicing so the kernel receives the full [B, 1, S_prior, d] cache.
         kwargs["attn_tkg_nki_kernel_enabled"] = True
@@ -2323,7 +2325,7 @@ class NeuronQwen3MoeForCausalLMComplete(NeuronBaseForCausalLM):
                 "--cc-pipeline-tiling-factor=4",
                 "--vectorize-strided-dma",
                 "--enable-scalar-dge-vectorization",
-                "--enable-dmacopy-transpose",
+                # "--enable-dmacopy-transpose",
             ]
         elif self.compile_tag == TOKEN_GENERATION_MODEL_TAG:
             optimization_level = "-O3"
@@ -2332,7 +2334,7 @@ class NeuronQwen3MoeForCausalLMComplete(NeuronBaseForCausalLM):
                 "--cc-pipeline-tiling-factor=1",
                 "--vectorize-strided-dma",
                 "--enable-scalar-dge-vectorization",
-                "--enable-dmacopy-transpose",
+                # "--enable-dmacopy-transpose",
                 "--eager-tkg-vectorize-dma",
                 "--enable-dge-on-indirect-dma",
                 "--enable-dge-on-vector-indirect-dma",
@@ -2344,7 +2346,7 @@ class NeuronQwen3MoeForCausalLMComplete(NeuronBaseForCausalLM):
                 "--cc-pipeline-tiling-factor=4",
                 "--vectorize-strided-dma",
                 "--enable-scalar-dge-vectorization",
-                "--enable-dmacopy-transpose",
+                # "--enable-dmacopy-transpose",
             ]
 
         if tensorizer_opts:

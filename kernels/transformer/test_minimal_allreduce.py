@@ -14,8 +14,13 @@ import sys
 import traceback
 import tempfile
 
-os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = "trn2"
+os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = "trn3"
 os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2"
+
+# Capture collective dispatch alg before any enc.cc assert fires
+os.environ["NEURON_RT_LOG_LEVEL"] = "INFO"
+os.environ["NEURON_RT_LOG_LOCATION"] = "console"
+os.environ["NEURON_RT_EXEC_TRACE"] = "1"
 
 sys.path.insert(0, "/home/ubuntu/nki-moe")
 
@@ -34,7 +39,9 @@ from nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
 # ── config ─────────────────────────────────────────────────────────────────
 B = 1
 S = 1
-H = 256
+H = 2048          # match real kernel: H0=128, H1=16
+H0 = 128
+H1 = H // H0      # 16
 TP = 2
 
 COMPILER_ARGS = (
@@ -59,16 +66,16 @@ def kernel_sbuf_allreduce(X):
 
     out = nl.ndarray((B, S, H), dtype=dtype, buffer=nl.shared_hbm)
 
-    # HBM -> SBUF
-    src_sb = nl.ndarray((BxS, H), dtype=dtype, buffer=nl.sbuf)
-    nisa.dma_copy(dst=src_sb, src=X.reshape((BxS, H)))
+    # HBM -> SBUF, canonical TKG layout [H0=128, BxS*H1]
+    src_sb = nl.ndarray((H0, BxS * H1), dtype=dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=src_sb, src=X.reshape((H0, BxS * H1)))
 
-    # SBUF allreduce
-    dst_sb = nl.ndarray((BxS, H), dtype=dtype, buffer=nl.sbuf)
+    # SBUF allreduce on full-hidden-dim tensor (replicated across LNCs)
+    dst_sb = nl.ndarray((H0, BxS * H1), dtype=dtype, buffer=nl.sbuf)
     nccl.all_reduce(dsts=[dst_sb], srcs=[src_sb], op=nl.add, replica_group=rg)
 
     # SBUF -> HBM
-    nisa.dma_copy(dst=out.reshape((BxS, H)), src=dst_sb)
+    nisa.dma_copy(dst=out.reshape((H0, BxS * H1)), src=dst_sb)
 
     return out
 

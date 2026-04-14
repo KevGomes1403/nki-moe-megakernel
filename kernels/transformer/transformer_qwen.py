@@ -19,6 +19,7 @@ from nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
 from nkilib.experimental.transformer.transformer_tkg import (
     _load_input_to_sbuf,
     _store_output_to_hbm,
+    _sb2sb_all_reduce_gather,
 )
 from kernels.attn_tkg.agents.v13bc_sbm_tiled import qwen3_attn_tkg_fused_oproj_v13bc
 from kernels.moe_fused_tkg.versions.kernel_v30a_sbuf_io import _qwen3_moe_sbuf_in_sbuf_out
@@ -37,7 +38,8 @@ SBM_SIZE_BYTES = 200 * 1024
 
 
 def transformer_qwen3_moe_tkg_v2(
-    X,              # [B=1, S_tkg=1, H=2048]  bf16  HBM
+    X,              # [B=1, S_tkg=1, H=2048]  bf16  HBM  (normed — input layernorm already applied)
+    X_residual,     # [B=1, S_tkg=1, H=2048]  bf16  HBM  (original, pre-norm — for residual adds)
     # --- Attention weights (split, not combined W_qkv) ---
     Wq,             # [Hq_tp*d, H]   e.g. [1024, 2048]  bf16
     Wk,             # [Hkv_tp*d, H]  e.g. [128,  2048]  bf16
@@ -94,11 +96,13 @@ def transformer_qwen3_moe_tkg_v2(
     _load_input_to_sbuf(attn_in_sb, X, BxS, H0, H1, H1_SHARD, n_prgs)
 
     # -----------------------------------------------------------------------
-    # Step 2: Save residual
+    # Step 2: Load X_residual (original un-normed X) into residual_attn_sb
+    # X is already normed (input_layernorm applied before calling this kernel),
+    # so we must load the original X separately for the attention skip connection.
     # -----------------------------------------------------------------------
     residual_attn_sb = nl.ndarray((H0, BxS * H1), dtype=dtype, buffer=nl.sbuf,
                                    name="residual_attn_sb")
-    nisa.tensor_copy(dst=residual_attn_sb, src=attn_in_sb)
+    _load_input_to_sbuf(residual_attn_sb, X_residual, BxS, H0, H1, H1_SHARD, n_prgs)
 
     # -----------------------------------------------------------------------
     # Step 3: Attention (v13bc — no sendrecv, no LNC sharding)
@@ -183,25 +187,22 @@ def transformer_qwen3_moe_tkg_v2(
     sbm.set_auto_alloc(False)
 
     # -----------------------------------------------------------------------
-    # Step 8: AllReduce #2 — sum MoE outputs across TP ranks
+    # Step 8: AllReduce #2 (TP) + LNC gather
+    # _sb2sb_all_reduce_gather is the intended consumer of _qwen3_moe_sbuf_in_sbuf_out:
+    # it AllReduces across TP ranks and gathers both LNC shards via sendrecv,
+    # returning the full [H0, BxS*H1] tensor on both cores.
     # -----------------------------------------------------------------------
-    moe_reduced_sb = nl.ndarray(moe_out_sb.shape, dtype=dtype, buffer=nl.sbuf,
-                                 name="moe_reduced_sb")
-    nccl.all_reduce(
-        dsts=[moe_reduced_sb], srcs=[moe_out_sb],
-        op=nl.add, replica_group=rg,
+    moe_gathered_sb, _ = _sb2sb_all_reduce_gather(
+        moe_out_sb, dtype, rg, prg_id, n_prgs, H0, H1, H1_SHARD, BxS
     )
-
-    # Reshape to [H0, BxS*H1] for residual add
-    moe_reduced_flat = moe_reduced_sb.reshape((H0, BxS * H1))
 
     # -----------------------------------------------------------------------
     # Step 9: Residual add #2 + store
+    # Both cores hold the same full moe_gathered_sb — no race on Y.
     # -----------------------------------------------------------------------
-    output_sb = nl.zeros((H0, BxS * H1), dtype=dtype, buffer=nl.sbuf,
+    output_sb = nl.ndarray((H0, BxS * H1), dtype=dtype, buffer=nl.sbuf,
                             name="output_sb")
-    # nisa.tensor_tensor(dst=output_sb, data1=residual_moe_sb,
-    #                    data2=moe_reduced_flat, op=nl.add)
+    nisa.tensor_tensor(dst=output_sb, data1=residual_moe_sb, data2=moe_gathered_sb, op=nl.add)
 
     Y = nl.ndarray((B, S_tkg, H), dtype=dtype, buffer=nl.shared_hbm, name="Y")
     _store_output_to_hbm(Y, output_sb, BxS, H0, H1, H1_SHARD, n_prgs)
