@@ -6,7 +6,7 @@ qwen3_attn_tkg_fused_oproj_v13bc — a sendrecv-free sub-function where both LNC
 produce the full [1, H_wo=2048] output. This allows a bare nccl.all_reduce (no gather,
 no sendrecv) which avoids the ENC_ALG_MESH runtime assert.
 
-Target: Trainium2 (trn2), TP=4, LNC=2.
+Target: Trainium3, TP=4, LNC=2.
 Entry point: transformer_qwen3_moe_tkg_v2_jit[2](...)
 """
 

@@ -112,6 +112,7 @@ def _find_kernel_artifacts(
                 os.path.basename(profile_neff)
                 .replace("neff_", "")
                 .replace(".neff", "")
+                .split("_vnc_")[0]
             )
             ntff_pattern = f"{os.path.dirname(profile_neff)}/{neff_hash}_vnc_*.ntff"
             deadline = time.monotonic() + ntff_wait_s
