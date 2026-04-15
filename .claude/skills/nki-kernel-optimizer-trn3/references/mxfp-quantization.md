@@ -257,3 +257,113 @@ def mxfp8_gemm(
 | Weight size dominates HBM bandwidth | MXFP8 halves weight bytes; MXFP4 quarters them |
 | VectorE is bottleneck | Use offline quantization, or increase K tile to amortize quantize cost |
 | Mixed precision output | Use BF16 output from `nc_matmul_mx` directly — avoids FP32→BF16 cast step |
+
+---
+
+## MoE TKG Quantization Patterns (nkilib reference)
+
+Source: `nkilib/core/moe/moe_tkg/` — the authoritative production implementation.
+
+### Quantization Type Detection
+
+The MoE TKG kernel auto-detects quantization mode from the weight dtype and presence of scale tensors:
+
+| `QuantizationType` | Condition | Notes |
+|--------------------|-----------|-------|
+| `NONE` | weights dtype is bf16/fp16, no scales | standard float path |
+| `ROW` | `expert_gate_up_weights_scale` and `expert_down_weights_scale` provided | FP8 row quantization |
+| `MX` | weights dtype is `float4_e2m1fn_x4` or `float8_e4m3fn_x4` | MXFP path, requires scales |
+
+Static quantization (`gate_up_input_scale`, `down_input_scale`) is **not supported** in the MoE TKG kernel.
+
+### HBM Tensor Shapes (MX path)
+
+All weights are stored **pre-quantized** in HBM. The packing layout encodes the contraction dimension:
+
+| Tensor | HBM Shape | Notes |
+|--------|-----------|-------|
+| `expert_gate_up_weights` | `[E_L, 128_H, 2, H/512, I]` | `x4` packed dtype; dim-2 fuses gate (idx 0) and up (idx 1) |
+| `expert_gate_up_weights_scale` | `[E_L, 16_H, 2, H/512, I]` | uint8; 16P = 128//8 (one scale per 32-element group) |
+| `expert_down_weights` | `[E_L, 128_I, I/512, H]` | `x4` packed dtype |
+| `expert_down_weights_scale` | `[E_L, 16_I, I/512, H]` | uint8; 16P = 128//8 |
+| `hidden_input_scale` (optional) | `[H0, H/512, T]` | uint8; only in all-expert mode when input already quantized |
+
+**Key constants** (from `projection_mx_constants.py`):
+- `MAX_MATMULT_MX_UNPACKED_CONTRACT_DIM = 512` — max H contraction tiles per matmul pass
+- `_q_width = 4` — packing factor (`_x4` dtypes)
+- `_q_height = 8` — scale group height (8 partitions share one scale → 8×4=32 elements per scale)
+
+### All-Expert MX Flow
+
+```
+Input [T, H] (bf16, HBM)
+  │
+  ▼ layout_adapter: swizzle to [128P, H/512, T] in SBUF
+  ▼ quantize_mx  →  input_quant [128P, H/512, T] (MXFP8_x4)
+                 →  input_scale  [16P,  H/512, T] (uint8)
+  │
+  │  (Skip the above if hidden_input_scale is provided — input already quantized upstream)
+  │
+  └─ for each expert in E_L (sequential):
+       │
+       ├─ load_gate_up_weight_scale_bias(expert_idx, gate_or_up_idx=GATE)
+       │     → gate_weight_sb  [128P, H/512, I_local]
+       │     → gate_scale_sb   [128P, H/512, I_local]
+       │
+       ├─ load_gate_up_weight_scale_bias(expert_idx, gate_or_up_idx=UP)
+       │     → up_weight_sb / up_scale_sb  (same shape)
+       │
+       ├─ gate_up_projection_mx_shard_I():
+       │     nc_matmul_mx(gate_weight, input_quant) → gate_psum
+       │     bias_add → clamp → activation(SiLU/Swish) → gate_sb
+       │     nc_matmul_mx(up_weight, input_quant) → up_psum
+       │     bias_add → clamp → up_sb
+       │     gate_sb × up_sb → intermediate_sb
+       │     quantize_mx(intermediate_sb) → inter_quant [128P, I/512, T] (MXFP8_x4)
+       │                                 → inter_scale  [16P,  I/512, T] (uint8)
+       │
+       ├─ load_broadcast_down_weight_scale_bias(expert_idx)
+       │     → down_weight_sb  [128P, I/512_local, H]
+       │     → down_scale_sb   [128P, I/512_local, H]
+       │
+       └─ down_projection_mx():
+             nc_matmul_mx(down_weight, inter_quant) → output_psum
+             optional POST_SCALE: output *= expert_affinity
+             accumulate into output_sb (zero-init on first expert)
+```
+
+### Selective-Expert (Top-K) MX Flow
+
+Selective mode processes one token × one top-k expert at a time. Key differences from all-expert:
+
+- Input is quantized **once** before the loop: `quantize_mx(input) → inp_qtz [128P, H/512, T_padded]`
+- LNC=2 shards on **K** (top-k): each NC handles `K//2` experts, then `nisa.sendrecv` + accumulate
+- Weight loading uses **DGE (dynamic gather engine)** with precomputed `p_idx_vector` indices to avoid per-token HBM round-trips
+- Gate/up uses `process_fused_gate_up_projection_mxfp4()` (H-sharded variant)
+- Down uses `down_projection_mx_tp_shard_H()` (H-sharded variant, output shape `[H0, H1_shard, 4]`)
+- Affinity is applied per-expert before accumulate; result is stored in SBUF `output_temp [H0, T, H1_shard]`
+- Final transpose + DMA store to HBM `output [T, H]`
+
+### LNC=2 Sharding Strategy
+
+| Mode | Shard dimension | Gate/Up | Down | Reduce |
+|------|----------------|---------|------|--------|
+| All-expert | I (intermediate) | Each NC loads I/2 tiles | Each NC loads matching I/2 tiles | `stream_shuffle_broadcast` on H |
+| Selective | K (top-k) | NC0: experts 0..K/2-1, NC1: K/2..K-1 | Same K split | `nisa.sendrecv` between NCs, then add |
+
+For all-expert, `shard_on_I = (total_I512_tiles >= n_prgs)`. When true, NC0 takes first `n_I512_tiles_local` tiles, NC1 takes the rest.
+
+### Pre-Quantized Input Optimization
+
+In all-expert mode, if the upstream kernel (e.g., RMSNorm) already produces MX-quantized output in SBUF, pass it as `hidden_input` (in SBUF) + `hidden_input_scale`. The kernel skips the `layout_adapter` + `quantize_mx` step entirely.
+
+Shape requirement: `hidden_input` must be `[H0, H/512, T]` in SBUF (same layout the adapter produces), `hidden_input_scale` is `[H0, H/512, T]` (uint8).
+
+### Bias Layout (MX path)
+
+| Projection | HBM bias shape |
+|------------|---------------|
+| Gate/Up (fused) | `[E_L, I_p, 2, ceil(I/512), 4]` where `I_p = I//4 if I≤512 else 128` |
+| Down | `[E_L, H]` |
+
+In selective mode, down projection bias is applied **after** down matmul via a weighted sum: `weighted_bias[T, H] = expert_affinities[T, E] @ down_bias[E, H]`.
