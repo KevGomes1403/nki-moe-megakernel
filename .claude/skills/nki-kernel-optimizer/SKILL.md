@@ -2,8 +2,7 @@
 name: nki-kernel-optimizer
 description: |
   Generates, reviews, and optimizes AWS Neuron NKI kernels for Trainium2 (trn2) / NeuronCore-v3.
-  Trigger ONLY when the user explicitly targets trn2, trn1, or inf2 hardware.
-  Do NOT use for trn3 work — use nki-kernel-optimizer-trn3 instead.
+  Trigger ONLY when the user explicitly targets trn3, trn2, trn1, or inf2 hardware.
 ---
 
 # NKI Kernel Optimizer Skill
