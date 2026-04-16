@@ -159,5 +159,6 @@ Report findings clearly: tables for multi-value results, concrete numbers with u
 
 ## References
 
+- [`references/reading_the_profiler.md`](.claude/skills/neuron-profile/references/reading_the_profiler.md) — field guide to profiler terminology (engines, memory spaces, opcodes including `PSEUDO_DMA_*`, DGE, CC-cores) and how to read the Perfetto timeline
 - [`references/layer_latency.md`](.claude/skills/neuron-profile/references/layer_latency.md) — per-decoder-layer timing via CC AllReduce gap analysis
 - [`references/kernel_source_attribution.md`](.claude/skills/neuron-profile/references/kernel_source_attribution.md) — per-instruction source-line attribution via JSON export; recipes for stall attribution, skinny DMAs, idle gaps, bytes-per-line

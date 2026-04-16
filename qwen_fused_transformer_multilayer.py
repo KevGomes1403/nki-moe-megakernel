@@ -1,32 +1,42 @@
 # coding=utf-8
 """
-Qwen3 MoE model with transformer_qwen3_moe_tkg_v2_jit for TKG.
+Qwen3 MoE model with a 48-layer fused TKG megakernel.
 
-CTE path (past_key_value is None):
-    Standard flash attention + standard MoE (self.mlp unchanged).
+CTE: stock per-layer path (unchanged from V2 / baseline).
+TKG: all decoder layers run inside `transformer_qwen3_moe_tkg_multilayer_jit[2]`
+     — a single NKI kernel invocation that keeps the residual SBUF-resident
+     across layer boundaries and writes each layer's K/V in place.
 
-TKG path (past_key_value is not None):
-    Full fused transformer layer via transformer_qwen3_moe_tkg_v2_jit:
-    v13bc attention (plain layout) + bare AllReduce #1 + MoE + AllReduce #2.
+Integration strategy (to avoid overriding NxDI's `forward`):
+  - The kernel dispatch is done from the **first decoder layer**. When layer 0
+    is called with `past_key_value is not None` (TKG), it:
+      1. gathers all per-layer weights from `self._parent_model.layers`,
+      2. gathers all K/V cache tensors from `kv_mgr.past_key_values`
+         (flat ParameterList: [K0, V0, K1, V1, ...]),
+      3. calls the megakernel once (mutating all K/V caches in place),
+      4. returns Y as its own layer output.
+  - Layers 1..N-1 on TKG are pass-throughs: they return the hidden state
+    unchanged. Their compile-time footprint is a no-op.
+  - Kernel does NOT apply final RMSNorm — NxDI's `self.norm` is applied
+    post-loop inside `get_model_output`, so we inherit that behavior cleanly.
 
-Weight layouts:
-  Attention (plain layout for v13bc, no tile-transpose):
-    q_proj.weight   [Hq_tp*d, H]  = [1024, 2048]  reused directly from NeuronAttentionBase
-    k_proj.weight   [Hkv_tp*d, H] = [128,  2048]  reused directly
-    v_proj.weight   [Hkv_tp*d, H] = [128,  2048]  reused directly
-    Wo_nki.weight   [Hq_tp*d, H]  = [1024, 2048]  plain T (o_proj.weight.T)
-  MoE (native layout):
-    gate_up_proj.weight  [E, H, 2*I_tp]  gate cols 0:I_tp, up cols I_tp:2*I_tp
-    down_proj.weight     [E, I_tp, H]
-
-NOTE: The kernel's residual-add step 9 is currently commented out in
-transformer_qwen_v3_v2.py, so Y will be zeros. TKG path is for compilation
-testing only.
+Flag / open items (also in kernel docstring):
+  - `attn_block_tkg_nki_kernel_cache_update=True` is set on the neuron config
+    so NxDI skips its Python KV scatter and trailing `kv_mgr.update_cache`.
+  - Pass-through layers on TKG still participate in the traced graph. The
+    compiler should constant-fold them into no-ops; verify in HLO before
+    declaring the integration free.
+  - Router weight pre-transpose is deferred — we `.T.contiguous()` at
+    forward-time like V2 (traced once per layer, becomes a compile-time
+    constant in the NEFF). Converter stays identical to V2.
+  - Only TKG B=1 is handled by the megakernel. Speculative decoding / B>1
+    must fall back to the per-layer path (not wired yet).
 """
 
 import gc
 import shlex
 import warnings
+import weakref
 from typing import Optional, Tuple
 
 import torch
@@ -60,20 +70,23 @@ from neuronx_distributed_inference.modules.attention.utils import RotaryEmbeddin
 from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm
 from neuronx_distributed_inference.modules.moe_v2 import initialize_moe_module
 
-from kernels.transformer.transformer_qwen import transformer_qwen3_moe_tkg_v2_jit
+from kernels.transformer.transformer_qwen_multilayer import (
+    transformer_qwen3_moe_tkg_multilayer_jit,
+)
 
 GQA_SHARDING_STRATEGY = GQA.REPLICATE_TO_TP_DEGREE
 
 import os
-os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2"  
+os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2"
 os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = "trn3"
+
 
 # ---------------------------------------------------------------------------
 # Neuron config
 # ---------------------------------------------------------------------------
 
-class Qwen3MoEV2TestNeuronConfig(MoENeuronConfig):
-    """MoENeuronConfig for transformer_qwen3_moe_tkg_v2_jit test."""
+class Qwen3MoEV3MultilayerNeuronConfig(MoENeuronConfig):
+    """MoENeuronConfig for the 48-layer fused TKG megakernel."""
 
     def __init__(self, **kwargs):
         if "blockwise_matmul_config" not in kwargs:
@@ -84,8 +97,11 @@ class Qwen3MoEV2TestNeuronConfig(MoENeuronConfig):
                 use_shard_on_block_dynamic_while=True,
                 block_sharding_strategy="PING_PONG",
             )
-        # Disable KV cache slicing so the kernel receives the full [B, 1, S_prior, d] cache.
+        # Full-KV cache layout expected by v14a (no slicing).
         kwargs["attn_tkg_nki_kernel_enabled"] = True
+        # Megakernel scatters K/V in place → NxDI must skip its Python scatter
+        # and the trailing kv_mgr.update_cache (gated on this flag).
+        kwargs["attn_block_tkg_nki_kernel_cache_update"] = True
         kwargs.setdefault("fused_qkv", False)
         kwargs["on_device_sampling_config"] = OnDeviceSamplingConfig(**kwargs)
         super().__init__(**kwargs)
@@ -123,7 +139,8 @@ def maybe_dequantize_layer(neuron_state_dict, config):
 
 
 # ---------------------------------------------------------------------------
-# State dict converter
+# State dict converter — identical to V2 (router pre-transpose deferred to
+# forward-time per the plan's §2.3 "only change" optimization; leave for now).
 # ---------------------------------------------------------------------------
 
 def convert_qwen3_moe_hf_to_neuron_state_dict(neuron_state_dict, config):
@@ -137,7 +154,6 @@ def convert_qwen3_moe_hf_to_neuron_state_dict(neuron_state_dict, config):
         neuron_state_dict[f"layers.{l}.self_attn.rank_util.rank"] = torch.arange(
             0, config.neuron_config.tp_degree, dtype=torch.int32
         )
-        # Rename q/k norm weights.
         neuron_state_dict[f"layers.{l}.self_attn.k_layernorm.weight"] = (
             neuron_state_dict[f"layers.{l}.self_attn.k_norm.weight"].detach().clone()
         )
@@ -147,20 +163,14 @@ def convert_qwen3_moe_hf_to_neuron_state_dict(neuron_state_dict, config):
         )
         del neuron_state_dict[f"layers.{l}.self_attn.q_norm.weight"]
 
-        # Wo_nki: plain transpose of o_proj weight for v13bc kernel.
-        # q_proj, k_proj, v_proj are reused directly — already plain [out_tp, H] after TP sharding.
         o_proj_w = neuron_state_dict[f"layers.{l}.self_attn.o_proj.weight"]   # [H, Hq]
-        neuron_state_dict[f"layers.{l}.self_attn.Wo_nki.weight"] = (
-            o_proj_w.T.contiguous()
-        )
+        neuron_state_dict[f"layers.{l}.self_attn.Wo_nki.weight"] = o_proj_w.T.contiguous()
 
-        # Router weight: HF gate.weight [E, H] → linear_router.weight.
         neuron_state_dict[f"layers.{l}.mlp.router.linear_router.weight"] = (
             neuron_state_dict[f"layers.{l}.mlp.gate.weight"].detach().clone()
         )
         del neuron_state_dict[f"layers.{l}.mlp.gate.weight"]
 
-        # MoE weights: native layout [E, H, 2*I] and [E, I, H].
         intermediate_size, hidden_size = neuron_state_dict[
             f"layers.{l}.mlp.experts.0.gate_proj.weight"
         ].shape
@@ -210,21 +220,11 @@ def convert_qwen3_moe_hf_to_neuron_state_dict(neuron_state_dict, config):
 
 
 # ---------------------------------------------------------------------------
-# NKI attention (v2: only Wo_nki, plain layout for Q/K/V)
+# Attention (V3 — identical in shape/weights to V2; TKG dispatch done at model
+# level, not in this class).
 # ---------------------------------------------------------------------------
 
-class NeuronQwen3MoEAttentionV2(NeuronAttentionBase):
-    """
-    Qwen3 MoE attention for the v2 transformer kernel test.
-
-    CTE: delegates to NeuronAttentionBase.forward() (use_qk_norm=False).
-    TKG: not called — the decoder layer invokes transformer_qwen3_moe_tkg_v2_jit
-         directly, accessing q_proj/k_proj/v_proj weights from this class.
-
-    Only Wo_nki is added as an extra weight holder; q_proj, k_proj, v_proj from
-    NeuronAttentionBase are already in the plain [out_tp, H] layout that v13bc expects.
-    """
-
+class NeuronQwen3MoEAttentionV3(NeuronAttentionBase):
     def __init__(self, config: Qwen3MoeInferenceConfig):
         rotary_emb = RotaryEmbedding(
             config.head_dim,
@@ -246,11 +246,9 @@ class NeuronQwen3MoEAttentionV2(NeuronAttentionBase):
 
         if not parallel_state.model_parallel_is_initialized():
             raise ValueError(
-                "NeuronQwen3MoEAttentionV2 must be initialized in a distributed env."
+                "NeuronQwen3MoEAttentionV3 must be initialized in a distributed env."
             )
 
-        # Wo_nki: ColumnParallelLinear holder for o_proj.weight.T (plain transpose, no tile-transpose).
-        # q/k/v weights are accessed via get_qkv_proj().q_proj/.k_proj/.v_proj (inside GQA).
         _dtype = config.neuron_config.torch_dtype
         _H = config.hidden_size
         _Hq_full = config.num_attention_heads * config.head_dim
@@ -259,25 +257,22 @@ class NeuronQwen3MoEAttentionV2(NeuronAttentionBase):
 
 
 # ---------------------------------------------------------------------------
-# Decoder layer — v2 fused transformer TKG
+# Decoder layer — dispatches the megakernel from idx=0 on TKG.
 # ---------------------------------------------------------------------------
 
-class NeuronQwen3MoeDecoderLayerV2(nn.Module):
-    """Decoder layer with transformer_qwen3_moe_tkg_v2_jit for TKG.
-
-    CTE: standard flash attention + standard MoE (self.mlp unchanged).
-    TKG: full fused transformer kernel (v13bc attention + AllReduce + MoE + AllReduce).
-
-    NOTE: The kernel's residual-add step 9 is currently commented out in
-    transformer_qwen_v3_v2.py, so Y will be zeros. TKG path is for compilation
-    testing only.
+class NeuronQwen3MoeDecoderLayerV3(nn.Module):
+    """
+    CTE path: stock per-layer forward (input_layernorm → self_attn → residual
+              → post_attention_layernorm → mlp → residual).
+    TKG path: layer 0 runs the megakernel over **all** layers and returns Y;
+              layers 1..N-1 are pass-throughs.
     """
 
     def __init__(self, config: Qwen3MoeInferenceConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
-        self.self_attn = NeuronQwen3MoEAttentionV2(config=config)
+        self.self_attn = NeuronQwen3MoEAttentionV3(config=config)
 
         _dtype = config.neuron_config.torch_dtype
         self.input_layernorm = get_rmsnorm_cls()(config.hidden_size, eps=config.rms_norm_eps).to(_dtype)
@@ -290,10 +285,68 @@ class NeuronQwen3MoeDecoderLayerV2(nn.Module):
         self.qkv_kernel_fused_rmsnorm = not self.sequence_parallel_enabled
         self.moe_mask_padded_tokens = config.neuron_config.moe_mask_padded_tokens
 
-        # Replica groups for nccl.all_reduce inside the transformer kernel.
-        # tp_groups are [[0, 1, ..., tp_degree-1]] — nccl.ReplicaGroup expects List[List[int]].
-        # Derived from tp_degree to avoid torch.distributed calls during CTE mock tracing.
+        # Replica groups for nccl.all_reduce inside the megakernel.
+        # Derived from tp_degree to avoid torch.distributed calls during mock tracing.
         self._replica_groups = (list(range(config.neuron_config.tp_degree)),)
+        self._num_hidden_layers = config.num_hidden_layers
+
+        # Set by parent model.init_model so layer 0 can reach sibling layers' weights.
+        # Stored as weakref so nn.Module doesn't register the parent as a child
+        # (which would create a reference cycle and break train()/.eval() recursion).
+        self._parent_model_ref = None
+
+    @property
+    def _parent_model(self):
+        return self._parent_model_ref() if self._parent_model_ref is not None else None
+
+    # ---- helpers for layer 0's megakernel dispatch ----
+
+    def _gather_weights_from_parent(self):
+        """Stack per-layer weights along a new leading layer dim.
+
+        Each returned tensor is [L, ...]; the kernel slices via Wq_all[i]
+        (NKI integer indexing on HBM reduces the layer dim at compile time).
+        NKI's frontend rejects list/tuple-of-tensor args at the top level —
+        stacking sidesteps that by passing a single tensor per weight type.
+        """
+        # All per-layer weights are passed UN-stacked. Stacking + integer slicing
+        # produces an HBM view whose outer-dim stride is the full per-layer size
+        # (e.g. 1024*2048=2097152 for Wq), and the sub-kernels' access-pattern
+        # derivation can't represent that — it trips NCC_IBIR158/243 OOB.
+        # Pass each layer's weight as its own top-level NKI tensor (same pattern
+        # as KV caches).
+        layers = self._parent_model.layers
+        Wq, Wk, Wv, Wo = [], [], [], []
+        qn, kn = [], []
+        gpre = []
+        gpost = []
+        router, gate_up, down = [], [], []
+        for l in layers:
+            qkv = l.self_attn.get_qkv_proj()
+            Wq.append(qkv.q_proj.weight)
+            Wk.append(qkv.k_proj.weight)
+            Wv.append(qkv.v_proj.weight)
+            Wo.append(l.self_attn.Wo_nki.weight)
+            qn.append(l.self_attn.q_layernorm.weight)
+            kn.append(l.self_attn.k_layernorm.weight)
+            gpre.append(l.input_layernorm.weight)
+            gpost.append(l.post_attention_layernorm.weight.unsqueeze(0))    # [1, H]
+            router.append(l.mlp.router.linear_router.weight.T.contiguous())
+            gate_up.append(l.mlp.expert_mlps.mlp_op.gate_up_proj.weight)
+            down.append(l.mlp.expert_mlps.mlp_op.down_proj.weight)
+        return (Wq, Wk, Wv, Wo, qn, kn, gpre, gpost, router, gate_up, down)
+
+    def _gather_kv_caches(self, kv_mgr):
+        """kv_mgr.past_key_values is flat [K0, V0, K1, V1, ...].
+
+        Returned as flat lists; caller spreads them into individual positional
+        args so each KV cache registers as its own top-level NKI tensor input
+        (required for in-place scatter DMA aliasing).
+        """
+        L = self._num_hidden_layers
+        Ks = [kv_mgr.past_key_values[2 * i]     for i in range(L)]
+        Vs = [kv_mgr.past_key_values[2 * i + 1] for i in range(L)]
+        return Ks, Vs
 
     def forward(
         self,
@@ -302,6 +355,9 @@ class NeuronQwen3MoeDecoderLayerV2(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         padding_mask: Optional[torch.Tensor] = None,
+        kv_mgr=None,
+        idx: int = 0,
+        is_for_context_encoding: bool = True,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         if "padding_mask" in kwargs:
@@ -310,95 +366,100 @@ class NeuronQwen3MoeDecoderLayerV2(nn.Module):
                 "Please make sure use `attention_mask` instead."
             )
 
-        residual = hidden_states
-        is_tkg = past_key_value is not None
+        is_tkg = not is_for_context_encoding
 
+        # ------------------------------------------------------------------
+        # TKG: layer 0 runs the megakernel, later layers pass through.
+        # ------------------------------------------------------------------
         if is_tkg:
-            # --- TKG: full fused transformer kernel ---
-            hidden_states = ModuleMarkerStartWrapper()(hidden_states)
-            X_residual_tkg = hidden_states   # original X (pre-norm) for residual adds
-            hidden_states = self.input_layernorm(hidden_states)
+            L = self._num_hidden_layers
+            if self.layer_idx == 0:
+                assert self._parent_model is not None, \
+                    "V3 layer 0 needs _parent_model set by NeuronQwen3MoeModelV3.init_model"
+                assert kv_mgr is not None, \
+                    "V3 TKG path requires kv_mgr (update_kv_per_layer gate must be on)"
 
-            cos_cache, sin_cache = self.self_attn.rotary_emb(hidden_states, position_ids)
-            cos_at_pos = cos_cache.squeeze(1)   # [B, d]
-            sin_at_pos = sin_cache.squeeze(1)   # [B, d]
+                hidden_states = ModuleMarkerStartWrapper()(hidden_states)
 
-            K_cache, V_cache = past_key_value
+                # RoPE cos/sin at position — same shape trick as V2.
+                cos_cache, sin_cache = self.self_attn.rotary_emb(hidden_states, position_ids)
+                cos_at_pos = cos_cache.squeeze(1)   # [B, d]
+                sin_at_pos = sin_cache.squeeze(1)
 
-            # Attention weights — plain layout, no tile-transpose needed for v13bc.
-            # q/k/v live inside self.self_attn.qkv_proj (GQA), accessed via get_qkv_proj().
-            _qkv = self.self_attn.get_qkv_proj()
-            Wq = _qkv.q_proj.weight                  # [Hq_tp*d, H]
-            Wk = _qkv.k_proj.weight                  # [Hkv_tp*d, H]
-            Wv = _qkv.v_proj.weight                  # [Hkv_tp*d, H]
-            Wo = self.self_attn.Wo_nki.weight        # [Hq_tp*d, H]  o_proj.weight.T
+                (Wq_list, Wk_list, Wv_list, Wo_list,
+                 qn_list, kn_list, gpre_list, gpost_list,
+                 router_list, gate_up_list, down_list) = self._gather_weights_from_parent()
+                K_caches, V_caches = self._gather_kv_caches(kv_mgr)
 
-            q_norm_weight = self.self_attn.q_layernorm.weight   # [d]
-            k_norm_weight = self.self_attn.k_layernorm.weight   # [d]
+                kernel_out = transformer_qwen3_moe_tkg_multilayer_jit[2](
+                    hidden_states,
+                    *Wq_list, *Wk_list, *Wv_list, *Wo_list,
+                    *qn_list, *kn_list, *gpre_list, *gpost_list,
+                    *router_list, *gate_up_list, *down_list,
+                    *K_caches, *V_caches,
+                    cos_at_pos, sin_at_pos, position_ids.to(torch.int32),
+                    replica_groups=self._replica_groups,
+                )
+                # Kernel returns (Y, K0, K1, ..., K_{L-1}, V0, V1, ..., V_{L-1}).
+                # Returning KV tensors is what makes the NKI compiler treat
+                # v14a's in-place scatters as live (not DCE'd dead stores).
+                Y = kernel_out[0]
+                K_out = list(kernel_out[1 : 1 + L])
+                V_out = list(kernel_out[1 + L : 1 + 2 * L])
+                Y = ModuleMarkerEndWrapper()(Y)
 
-            # gamma_moe: post-attention layernorm weight for MoE RMSNorm inside kernel.
-            gamma_moe = self.post_attention_layernorm.weight.unsqueeze(0)  # [1, H]
+                # Stash the post-scatter KV handles so pass-through layers can
+                # forward them into next_decoder_cache (NxDI aliases those to
+                # kv_mgr.past_key_values[i]).
+                self._parent_model._tkg_kv_out = (K_out, V_out)
 
-            # router_w: [H, E] — linear_router.weight is [E, H], transpose to [H, E].
-            router_w = self.mlp.router.linear_router.weight.T.contiguous()
-            gate_up_w = self.mlp.expert_mlps.mlp_op.gate_up_proj.weight   # [E, H, 2*I_tp]
-            down_w    = self.mlp.expert_mlps.mlp_op.down_proj.weight       # [E, I_tp, H]
+                return (Y, (K_out[0], V_out[0]), cos_cache, sin_cache, None)
 
-            # Full fused transformer layer:
-            #   normed_X → attn (v13bc) → AllReduce #1 → residual #1 (original X + attn)
-            #   → post_attn_norm → MoE → AllReduce+gather #2 → residual #2 → Y
-            Y = transformer_qwen3_moe_tkg_v2_jit[2](
-                hidden_states,
-                X_residual_tkg,
-                Wq, Wk, Wv, Wo,
-                q_norm_weight, k_norm_weight,
-                K_cache, V_cache,
-                cos_at_pos, sin_at_pos,
-                position_ids.to(torch.int32),
-                gamma_moe,
-                router_w, gate_up_w, down_w,
-                replica_groups=self._replica_groups,
-            )
-            # TODO: Update KV Cache internally
-            present_key_value = past_key_value
+            # Layers 1..L-1 on TKG: pure pass-through. Forward the kernel's
+            # returned KV handles (set by layer 0) so next_decoder_cache aliases
+            # the mutated HBM buffers, not the pre-kernel inputs.
+            K_out, V_out = self._parent_model._tkg_kv_out
+            return (hidden_states,
+                    (K_out[self.layer_idx], V_out[self.layer_idx]),
+                    None, None, None)
 
-            Y = ModuleMarkerEndWrapper()(Y)
-            return (Y, present_key_value, cos_cache, sin_cache, None)
+        # ------------------------------------------------------------------
+        # CTE: stock path (unchanged).
+        # ------------------------------------------------------------------
+        hidden_states = ModuleMarkerStartWrapper()(hidden_states)
+        residual = hidden_states
 
-        else:
-            # --- CTE: standard path ---
-            qkv_fused_rmsnorm = None
-            hidden_states = ModuleMarkerStartWrapper()(hidden_states)
-            if self.input_layernorm:
-                if self.qkv_kernel_enabled and self.qkv_kernel_fused_rmsnorm:
-                    qkv_fused_rmsnorm = self.input_layernorm
-                else:
-                    hidden_states = self.input_layernorm(hidden_states)
+        qkv_fused_rmsnorm = None
+        if self.input_layernorm:
+            if self.qkv_kernel_enabled and self.qkv_kernel_fused_rmsnorm:
+                qkv_fused_rmsnorm = self.input_layernorm
+            else:
+                hidden_states = self.input_layernorm(hidden_states)
 
-            hidden_states, present_key_value, cos_cache, sin_cache = self.self_attn(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_value,
-                rmsnorm=qkv_fused_rmsnorm,
-                **kwargs,
-            )
-            hidden_states = residual + hidden_states
+        hidden_states, present_key_value, cos_cache, sin_cache = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            rmsnorm=qkv_fused_rmsnorm,
+            **kwargs,
+        )
+        hidden_states = residual + hidden_states
 
-            residual = hidden_states
-            hidden_states = self.post_attention_layernorm(hidden_states)
-            hidden_states = self.mlp(hidden_states, padding_mask)[0]
-            hidden_states = residual + hidden_states
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states, padding_mask)[0]
+        hidden_states = residual + hidden_states
 
-            hidden_states = ModuleMarkerEndWrapper()(hidden_states)
-            return (hidden_states, present_key_value, cos_cache, sin_cache, None)
+        hidden_states = ModuleMarkerEndWrapper()(hidden_states)
+        return (hidden_states, present_key_value, cos_cache, sin_cache, None)
 
 
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
 
-class NeuronQwen3MoeModelV2(NeuronBaseModel):
+class NeuronQwen3MoeModelV3(NeuronBaseModel):
     def setup_attr_for_model(self, config: Qwen3MoeInferenceConfig):
         self.on_device_sampling = True
         self.tp_degree = config.neuron_config.tp_degree
@@ -419,9 +480,13 @@ class NeuronQwen3MoeModelV2(NeuronBaseModel):
             shard_across_embedding=True,
         )
         self.layers = nn.ModuleList([
-            NeuronQwen3MoeDecoderLayerV2(config, layer_idx)
+            NeuronQwen3MoeDecoderLayerV3(config, layer_idx)
             for layer_idx in range(config.num_hidden_layers)
         ])
+        # Layer 0 reaches sibling layers for its megakernel dispatch.
+        for layer in self.layers:
+            layer._parent_model_ref = weakref.ref(self)
+
         self.norm = get_rmsnorm_cls()(self.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = ColumnParallelLinear(
             config.hidden_size,
@@ -435,10 +500,10 @@ class NeuronQwen3MoeModelV2(NeuronBaseModel):
 # CausalLM entry point
 # ---------------------------------------------------------------------------
 
-class NeuronQwen3MoeForCausalLMV2(NeuronBaseForCausalLM):
-    """Qwen3 MoE CausalLM with transformer_qwen3_moe_tkg_v2_jit for TKG."""
+class NeuronQwen3MoeForCausalLMV3(NeuronBaseForCausalLM):
+    """Qwen3 MoE CausalLM with 48-layer fused TKG megakernel."""
 
-    _model_cls = NeuronQwen3MoeModelV2
+    _model_cls = NeuronQwen3MoeModelV3
 
     @staticmethod
     def load_hf_model(model_path, **kwargs):
@@ -446,7 +511,7 @@ class NeuronQwen3MoeForCausalLMV2(NeuronBaseForCausalLM):
 
     @classmethod
     def get_neuron_config_cls(cls):
-        return Qwen3MoEV2TestNeuronConfig
+        return Qwen3MoEV3MultilayerNeuronConfig
 
     @classmethod
     def get_config_cls(cls):
@@ -480,10 +545,13 @@ class NeuronQwen3MoeForCausalLMV2(NeuronBaseForCausalLM):
                 "--enable-scalar-dge-vectorization",
             ]
         elif self.compile_tag == TOKEN_GENERATION_MODEL_TAG:
-            optimization_level = "-O3"
+            # TKG graph is massively larger with L=48 unrolled; use -O1 while
+            # iterating, bump to -O3 when stable. Plan §1.6 warns 20-60 min at -O3.
+            optimization_level = "-O1"
             tensorizer_opts = [
                 "--enable-ccop-compute-overlap",
-                "--cc-pipeline-tiling-factor=1",
+                # Plan §1.6: try =2 / =4 to overlap layer i+1 attn AR with layer i MoE.
+                "--cc-pipeline-tiling-factor=2",
                 "--vectorize-strided-dma",
                 "--enable-scalar-dge-vectorization",
                 "--eager-tkg-vectorize-dma",
@@ -506,6 +574,8 @@ class NeuronQwen3MoeForCausalLMV2(NeuronBaseForCausalLM):
         args.append("--auto-cast=none")
         args += ["--internal-enable-dge-levels", "vector_dynamic_offsets"]
         args.append("--internal-hlo2tensorizer-options=--verify-hlo=true")
+        # Larger unrolled TKG graph may trip the default instruction limit.
+        args.append("--internal-max-instruction-limit=30000000")
 
         if self.neuron_config.scratchpad_page_size:
             args.append(f"--hbm-scratchpad-page-size={self.neuron_config.scratchpad_page_size}")
@@ -514,4 +584,4 @@ class NeuronQwen3MoeForCausalLMV2(NeuronBaseForCausalLM):
 
 
 # Alias expected by main.py's `qwen.NeuronQwen3MoeForCausalLM` convention.
-NeuronQwen3MoeForCausalLM = NeuronQwen3MoeForCausalLMV2
+NeuronQwen3MoeForCausalLM = NeuronQwen3MoeForCausalLMV3
