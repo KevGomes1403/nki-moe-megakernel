@@ -1,0 +1,316 @@
+"""
+Qwen3-MoE multi-layer fused TKG megakernel.
+
+Runs all `num_layers` decoder layers inside a single NKI kernel invocation, with
+the residual kept SBUF-resident across layer boundaries and KV caches updated
+in-place by v14a attention. Bypasses NxDI's Python-side per-layer loop.
+
+Per-layer pipeline (SBUF-resident residual):
+  1. attention (v14a_kv_norm): pre-attention RMSNorm(residual_sb, gamma_pre_attn[i])
+     is applied inside the attention sub-function; scatter-DMA writes new K/V
+     rows of K_caches[i] / V_caches[i] at position_ids.
+  2. AllReduce #1 (bare nccl.all_reduce — ENC_ALG_MESH workaround carried over
+     from single-layer v2; retest on trn3 per plan §1.5 / §3.6).
+  3. residual_sb += attn_reduced
+  4. MoE (_qwen3_moe_sbuf_in_sbuf_out): post-attention RMSNorm with
+     gamma_post_attn[i] applied inside the MoE sub-function.
+  5. SB2SB AR-gather over TP × LNC → full tensor on both cores.
+  6. residual_sb += moe_gathered
+
+After the last layer: single HBM store of the post-residual hidden state.
+Final `model.norm` is applied by NxDI's `get_model_output` on the Python side.
+
+Target: Trainium3, TP=4, LNC=2.
+Entry point: transformer_qwen3_moe_tkg_multilayer_jit[2](...)
+
+Argument layout (see plan §2.3):
+  * Per-layer weights are STACKED along a leading layer dim at the call site
+    (torch.stack). The kernel slices them via `Wq_all[i]` etc. — NkiTensor
+    integer indexing on HBM tensors reduces the layer dim to a plain
+    [Hq_out, H] view with no runtime cost.
+  * Per-layer KV caches are passed as INDIVIDUAL tensor args (K_00..K_{L-1},
+    V_00..V_{L-1}). They can't be stacked because each one is a separately
+    aliased NxDI Parameter (in-place scatter DMA updates them).
+
+The exposed kernel function is built by `_build_multilayer_kernel(num_layers)`
+which code-gens the explicit KV signature via `exec`. This keeps the per-layer
+loop body clean while satisfying NKI's "top-level args must be individual
+tensors" constraint.
+"""
+
+import linecache
+
+import nki
+import nki.isa as nisa
+import nki.language as nl
+import nki.collectives as nccl
+from nkilib.core.utils.allocator import BufferManager, Logger
+from nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
+from nkilib.experimental.transformer.transformer_tkg import (
+    _sb2sb_all_reduce_gather,
+)
+from kernels.attn_tkg.agents.v14a_kv_norm import qwen3_attn_tkg_fused_oproj_v13bc_kv_norm
+from kernels.moe_fused_tkg.versions.kernel_v30a_sbuf_io import _qwen3_moe_sbuf_in_sbuf_out
+
+H        = 2048
+H0       = 128
+H1       = H // H0
+N_PRGS   = 2
+H1_SHARD = H1 // N_PRGS
+EPS      = 1e-6
+
+SBM_SIZE_BYTES = 200 * 1024
+
+NUM_LAYERS = 48  # Qwen3-30B-A3B
+
+
+def _multilayer_body(
+    X,             # [B, S_tkg, H]         bf16  HBM  — raw hidden state (pre-norm)
+    Wq_list,       # tuple of L tensors, each [Hq_tp*d, H]      bf16  HBM  — per-layer Q projection
+    Wk_list,       # tuple of L tensors, each [Hkv_tp*d, H]     bf16  HBM  — per-layer K projection
+    Wv_list,       # tuple of L tensors, each [Hkv_tp*d, H]     bf16  HBM  — per-layer V projection
+    Wo_list,       # tuple of L tensors, each [Hq_tp*d, H]      bf16  HBM  — per-layer O projection
+    qn_list,       # tuple of L tensors, each [d]               bf16  HBM  — per-layer Q RMSNorm
+    kn_list,       # tuple of L tensors, each [d]               bf16  HBM  — per-layer K RMSNorm
+    gpre_list,     # tuple of L tensors, each [H]               bf16  HBM  — per-layer pre-attn layernorm
+    gpost_list,    # tuple of L tensors, each [1, H]            bf16  HBM  — per-layer post-attn layernorm
+    router_list,   # tuple of L tensors, each [H, E]            bf16  HBM  — per-layer router weights
+    gate_up_list,  # tuple of L tensors, each [E, H, 384]       bf16  HBM  — per-layer gate+up projection weights
+    down_list,     # tuple of L tensors, each [E, 192, H]       bf16  HBM  — per-layer down projection weights
+    K_caches,      # tuple of L tensors, each [B, 1, S_prior, d]  bf16  HBM  — per-layer K caches (mutated in-place)
+    V_caches,      # tuple of L tensors, each [B, 1, S_prior, d]  bf16  HBM  — per-layer V caches (mutated in-place)
+    cos,           # [B, d]                bf16  HBM  — RoPE cosine, pre-indexed at position_ids
+    sin,           # [B, d]                bf16  HBM  — RoPE sine,   pre-indexed at position_ids
+    position_ids,  # [B, 1]                int32 HBM  — token position in the KV cache
+    num_layers,    # int scalar — number of decoder layers (== L above)
+    replica_groups=None,
+):
+    """Kernel body — runs `num_layers` fused decoder layers.
+
+    Weight tensors are stacked along a leading layer dim; this function slices
+    them via integer indexing per iteration. KV caches arrive as a Python tuple
+    of already-registered NkiTensors (built by the code-gen wrapper).
+    """
+    B, S_tkg, _ = X.shape
+    dtype = X.dtype
+    BxS = B * S_tkg
+    T   = BxS
+
+    _, n_prgs, prg_id = get_verified_program_sharding_info(
+        "transformer_qwen3_moe_tkg_multilayer", (0, 1), N_PRGS
+    )
+
+    rg = nccl.ReplicaGroup(replica_groups) if replica_groups is not None else None
+
+    sbm = BufferManager(0, SBM_SIZE_BYTES, Logger("transformer_qwen3_moe_tkg_multilayer"))
+    sbm.set_auto_alloc(False)
+
+    # -----------------------------------------------------------------------
+    # Load X into SBUF as the initial residual [H0, BxS*H1].
+    # This tensor is updated in-place at each layer boundary
+    # (attn residual add, then MoE residual add).
+    # -----------------------------------------------------------------------
+    # Plain-linear layout: residual_sb[p, b*H1 + t] = X[b, 0, t*H0 + p].
+    # Matches what v14a (gamma_pre_attn load) and v30a (gamma load) expect;
+    # do NOT use _load_input_to_sbuf (channel-interleaved — scrambles RMSNorm).
+    residual_sb = nl.ndarray((H0, BxS * H1), dtype=dtype, buffer=nl.sbuf,
+                              name="residual_sb")
+    X_flat = X.reshape((BxS * H,))
+    nisa.dma_copy(
+        dst=residual_sb,
+        src=X_flat.ap(pattern=[[1, H0], [H0, H1], [H, BxS]], offset=0),
+        dge_mode=nisa.dge_mode.hwdge,
+    )
+
+    for layer_idx in range(num_layers):
+        # ------------------------------------------------------------------
+        # ATTENTION (v14a_kv_norm)
+        # Slicing Wq_all[layer_idx] etc. reduces the leading [L] dim via
+        # NkiTensor integer indexing — no runtime copy or transpose.
+        # Pre-attn RMSNorm (input_layernorm) is fused inside the sub-function.
+        # K/V are scattered in-place into K_caches[layer_idx] / V_caches[layer_idx].
+        # ------------------------------------------------------------------
+        sbm.set_name_prefix(f"L{layer_idx}_attn_")
+        sbm.set_auto_alloc(True)
+
+        out_sb = qwen3_attn_tkg_fused_oproj_v13bc_kv_norm(
+            hidden_sb=residual_sb,
+            Wq=Wq_list[layer_idx],          # [Hq_tp*d, H]  = [1024, 2048]
+            Wk=Wk_list[layer_idx],          # [Hkv_tp*d, H] = [128,  2048]
+            Wv=Wv_list[layer_idx],          # [Hkv_tp*d, H] = [128,  2048]
+            Wo=Wo_list[layer_idx],          # [Hq_tp*d, H]  = [1024, 2048]
+            q_norm_weight=qn_list[layer_idx],    # [d] = [128]
+            k_norm_weight=kn_list[layer_idx],    # [d] = [128]
+            gamma_pre_attn=gpre_list[layer_idx], # [H] = [2048]
+            K_cache=K_caches[layer_idx],        # [B, 1, S_prior, d]
+            V_cache=V_caches[layer_idx],        # [B, 1, S_prior, d]
+            cos=cos,
+            sin=sin,
+            position_ids=position_ids,
+            sbm=sbm,
+        )
+        # out_sb: [H0, BxS*H1] = [128, 16] bf16 in SBUF — partial-sum (TP shard)
+
+        # ------------------------------------------------------------------
+        # AllReduce #1 — sum partial-sum output across TP ranks.
+        # Bare nccl.all_reduce (no sendrecv/gather) since v14a produces the
+        # full [128, 16] output on both LNC cores already.
+        # ------------------------------------------------------------------
+        attn_reduced_sb = nl.zeros((H0, BxS * H1), dtype=dtype, buffer=nl.sbuf,
+                                      name=f"L{layer_idx}_attn_reduced_sb")
+        nccl.all_reduce(
+            dsts=[attn_reduced_sb], srcs=[out_sb],
+            op=nl.add, replica_group=rg,
+        )
+
+        sbm.close_scope()
+        sbm.set_auto_alloc(False)
+
+        # Residual add #1: residual_sb += attn_reduced_sb (in-place)
+        nisa.tensor_tensor(dst=residual_sb, data1=residual_sb,
+                           data2=attn_reduced_sb, op=nl.add)
+
+        # ------------------------------------------------------------------
+        # MOE (_qwen3_moe_sbuf_in_sbuf_out)
+        # Post-attn RMSNorm (post_attention_layernorm) is fused inside.
+        # Returns moe_out_sb as an H1_SHARD-wide shard on each LNC core.
+        # ------------------------------------------------------------------
+        sbm.set_name_prefix(f"L{layer_idx}_moe_")
+        sbm.set_auto_alloc(True)
+
+        moe_out_sb = _qwen3_moe_sbuf_in_sbuf_out(
+            inp_sb=residual_sb,
+            dtype=dtype,
+            T=T,
+            gamma=gpost_list[layer_idx],        # [1, H] = [1, 2048]
+            router_w=router_list[layer_idx],    # [H, E] = [2048, 128]
+            gate_up_w=gate_up_list[layer_idx],  # [E, H, 384]
+            down_w=down_list[layer_idx],        # [E, 192, H]
+            sbm=sbm,
+        )
+
+        # AllReduce #2 + LNC gather: both TP shards → full [H0, BxS*H1] on each core
+        moe_gathered_sb, _ = _sb2sb_all_reduce_gather(
+            moe_out_sb, dtype, rg, prg_id, n_prgs, H0, H1, H1_SHARD, BxS
+        )
+
+        # Free all sbm allocs from the MoE block
+        while sbm.heap:
+            sbm.pop_heap()
+        sbm.set_auto_alloc(False)
+
+        # Residual add #2: residual_sb += moe_gathered_sb (in-place)
+        nisa.tensor_tensor(dst=residual_sb, data1=residual_sb,
+                           data2=moe_gathered_sb, op=nl.add)
+
+    # -----------------------------------------------------------------------
+    # After the last layer: single HBM store of the post-residual hidden state.
+    # Final model.norm (RMSNorm) is applied by NxDI's get_model_output — we
+    # deliberately do NOT apply it here.
+    # -----------------------------------------------------------------------
+    Y = nl.ndarray((B, S_tkg, H), dtype=dtype, buffer=nl.shared_hbm, name="Y")
+    # Plain-linear store: Y[b, 0, t*H0 + p] = residual_sb[p, b*H1 + t].
+    # Gate on prg_id==0 to avoid duplicate writes across LNC cores.
+    if prg_id == 0:
+        Y_flat = Y.reshape((BxS, H))
+        for b in nl.static_range(BxS):
+            for t in nl.static_range(H1):
+                col_psum = nl.ndarray((1, H0), dtype=dtype, buffer=nl.psum)
+                nisa.nc_transpose(col_psum, residual_sb[0:H0, b*H1 + t : b*H1 + t + 1])
+                col_sb = nl.ndarray((1, H0), dtype=dtype, buffer=nl.sbuf,
+                                    name=f"out_col_b{b}_t{t}_sb")
+                nisa.tensor_copy(col_sb, col_psum)
+                nisa.dma_copy(
+                    dst=Y_flat[b:b+1, t*H0:(t+1)*H0],
+                    src=col_sb,
+                    dge_mode=nisa.dge_mode.hwdge,
+                )
+    if n_prgs > 1:
+        nisa.core_barrier(data=Y, cores=(0, 1))
+
+    # Return KV caches as pass-through outputs so the NKI compiler preserves
+    # v14a's in-place scatter DMAs (without this, writes are DCE'd as dead
+    # stores to read-only inputs). NxDI's model_wrapper aliases each returned
+    # KV tensor back to its kv_mgr.past_key_values[i] slot.
+    return (Y,) + tuple(K_caches) + tuple(V_caches)
+
+
+def _build_multilayer_kernel(num_layers: int):
+    """Code-gen a kernel function with 48 explicit K and V tensor args.
+
+    NKI's frontend classifies top-level args as either individual tensors or
+    scalars; tuples/lists of tensors are scalar-classified and never get HBM
+    bindings, which breaks both tracing and input-output aliasing for
+    in-place KV scatter. So each KV cache must appear as its own top-level arg.
+
+    Stacked weights (Wq_all etc.) don't need aliasing — a single tensor per
+    weight type is fine.
+    """
+    def names(prefix):
+        return [f"{prefix}_{i:02d}" for i in range(num_layers)]
+
+    wq_names     = names("Wq")
+    wk_names     = names("Wk")
+    wv_names     = names("Wv")
+    wo_names     = names("Wo")
+    qn_names     = names("Qn")
+    kn_names     = names("Kn")
+    gpre_names   = names("Gpre")
+    gpost_names  = names("Gpost")
+    router_names = names("Router")
+    gu_names     = names("GateUp")
+    down_names   = names("Down")
+    k_names      = names("K")
+    v_names      = names("V")
+
+    sig = ",\n    ".join(
+        ["X"]
+        + wq_names + wk_names + wv_names + wo_names
+        + qn_names + kn_names + gpre_names + gpost_names
+        + router_names + gu_names + down_names
+        + k_names + v_names
+        + ["cos", "sin", "position_ids"]
+    )
+
+    def tup(ns):
+        return "(" + ", ".join(ns) + ",)"
+
+    src = (
+        f"def transformer_qwen3_moe_tkg_multilayer(\n"
+        f"    {sig},\n"
+        f"    replica_groups=None,\n"
+        f"):\n"
+        f"    Wq_list      = {tup(wq_names)}\n"
+        f"    Wk_list      = {tup(wk_names)}\n"
+        f"    Wv_list      = {tup(wv_names)}\n"
+        f"    Wo_list      = {tup(wo_names)}\n"
+        f"    qn_list      = {tup(qn_names)}\n"
+        f"    kn_list      = {tup(kn_names)}\n"
+        f"    gpre_list    = {tup(gpre_names)}\n"
+        f"    gpost_list   = {tup(gpost_names)}\n"
+        f"    router_list  = {tup(router_names)}\n"
+        f"    gate_up_list = {tup(gu_names)}\n"
+        f"    down_list    = {tup(down_names)}\n"
+        f"    K_caches     = {tup(k_names)}\n"
+        f"    V_caches     = {tup(v_names)}\n"
+        f"    return _multilayer_body(\n"
+        f"        X, Wq_list, Wk_list, Wv_list, Wo_list,\n"
+        f"        qn_list, kn_list, gpre_list, gpost_list,\n"
+        f"        router_list, gate_up_list, down_list,\n"
+        f"        K_caches, V_caches,\n"
+        f"        cos, sin, position_ids,\n"
+        f"        num_layers={num_layers},\n"
+        f"        replica_groups=replica_groups,\n"
+        f"    )\n"
+    )
+
+    fname = f"<generated:multilayer_L{num_layers}>"
+    linecache.cache[fname] = (len(src), None, src.splitlines(keepends=True), fname)
+    code = compile(src, fname, "exec")
+    ns = {"_multilayer_body": _multilayer_body}
+    exec(code, ns)
+    return ns["transformer_qwen3_moe_tkg_multilayer"]
+
+
+transformer_qwen3_moe_tkg_multilayer = _build_multilayer_kernel(NUM_LAYERS)
+transformer_qwen3_moe_tkg_multilayer_jit = nki.jit(transformer_qwen3_moe_tkg_multilayer)

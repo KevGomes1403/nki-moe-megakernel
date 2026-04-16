@@ -155,7 +155,7 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm(
     # Sum across 128 partitions → total Σx², replicated for each partition
     h_sq_sum_bf16 = sbm.alloc_stack((PMAX, 1), nl.bfloat16, name="h_sq_sum_bf16")
     nisa.tensor_copy(h_sq_sum_bf16, h_sq_sum)
-    h_sq_total_psum = nl.zeros((PMAX, 1), nl.float32, buffer=nl.psum, name="h_sq_total_psum")
+    h_sq_total_psum = nl.zeros((PMAX, 1), nl.float32, buffer=nl.psum)
     nisa.nc_matmul(h_sq_total_psum, stationary=rms_ones, moving=h_sq_sum_bf16)
     h_sq_total = sbm.alloc_stack((PMAX, 1), nl.float32, name="h_sq_total")
     nisa.tensor_copy(h_sq_total, h_sq_total_psum)
@@ -169,11 +169,11 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm(
     nisa.activation(h_rms_inv, op=nl.rsqrt, data=h_mean_sq)
 
     # Broadcast h_rms_inv [PMAX,1] → [PMAX, num_h_tiles] via stride-0 ap + double transpose
-    h_rms_T_psum = nl.ndarray((num_h_tiles, PMAX), nl.float32, buffer=nl.psum, name="h_rms_T_psum")
+    h_rms_T_psum = nl.ndarray((num_h_tiles, PMAX), nl.float32, buffer=nl.psum)
     nisa.nc_transpose(h_rms_T_psum, h_rms_inv.ap([[1, PMAX], [0, num_h_tiles]], offset=0))
     h_rms_T = sbm.alloc_stack((num_h_tiles, PMAX), nl.float32, name="h_rms_T")
     nisa.tensor_copy(h_rms_T, h_rms_T_psum)
-    h_rms_expanded_psum = nl.ndarray((PMAX, num_h_tiles), nl.float32, buffer=nl.psum, name="h_rms_expanded_psum")
+    h_rms_expanded_psum = nl.ndarray((PMAX, num_h_tiles), nl.float32, buffer=nl.psum)
     nisa.nc_transpose(h_rms_expanded_psum, h_rms_T)
     h_rms_expanded = sbm.alloc_stack((PMAX, num_h_tiles), nl.float32, name="h_rms_expanded")
     nisa.tensor_copy(h_rms_expanded, h_rms_expanded_psum)
@@ -269,7 +269,7 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm(
         ),
     )
 
-    k_psum = nl.zeros((PMAX, B), dtype=nl.float32, buffer=nl.psum, name="k_psum")
+    k_psum = nl.zeros((PMAX, B), dtype=nl.float32, buffer=nl.psum)
     for h_t in nl.affine_range(NUM_H_TILES):
         nisa.nc_matmul(k_psum, stationary=wk_sb[0:PMAX, h_t*d:(h_t+1)*d], moving=h_all[0:PMAX, h_t:h_t+1])
 
@@ -281,7 +281,7 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm(
     nisa.tensor_tensor(k_sq, k_vec, k_vec, op=nl.multiply)
     k_sq_bf16 = sbm.alloc_stack((PMAX, B), nl.bfloat16, name="k_sq_bf16")
     nisa.tensor_copy(k_sq_bf16, k_sq)
-    k_sum_psum = nl.zeros((PMAX, B), dtype=nl.float32, buffer=nl.psum, name="k_sum_psum")
+    k_sum_psum = nl.zeros((PMAX, B), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_matmul(k_sum_psum, stationary=rms_ones, moving=k_sq_bf16)
     k_sum_sb = sbm.alloc_stack((PMAX, B), nl.float32, name="k_sum_sb")
     nisa.tensor_copy(k_sum_sb, k_sum_psum)
@@ -309,7 +309,7 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm(
 
     # Transpose k_rope to [B, PMAX] for KV cache scatter (k_rope_T_sb alloc'd at attn_outer)
     nisa.tensor_copy(k_rope_bf16, k_rope)
-    k_rope_T_psum = nl.ndarray((B, PMAX), dtype=nl.bfloat16, buffer=nl.psum, name="k_rope_T_psum")
+    k_rope_T_psum = nl.ndarray((B, PMAX), dtype=nl.bfloat16, buffer=nl.psum)
     nisa.nc_transpose(k_rope_T_psum, k_rope_bf16)
     nisa.tensor_copy(k_rope_T_sb, k_rope_T_psum)
 
@@ -337,7 +337,7 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm(
         ),
     )
 
-    v_psum = nl.zeros((PMAX, B), dtype=nl.float32, buffer=nl.psum, name="v_psum")
+    v_psum = nl.zeros((PMAX, B), dtype=nl.float32, buffer=nl.psum)
     for h_t in nl.affine_range(NUM_H_TILES):
         nisa.nc_matmul(v_psum, stationary=wv_sb[0:PMAX, h_t*d:(h_t+1)*d], moving=h_all[0:PMAX, h_t:h_t+1])
 
@@ -347,7 +347,7 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm(
     # Transpose v_active to [B, PMAX] for KV cache scatter (v_T_sb alloc'd at attn_outer)
     v_bf16 = sbm.alloc_stack((PMAX, B), nl.bfloat16, name="v_bf16")
     nisa.tensor_copy(v_bf16, v_active)
-    v_T_psum = nl.ndarray((B, PMAX), dtype=nl.bfloat16, buffer=nl.psum, name="v_T_psum")
+    v_T_psum = nl.ndarray((B, PMAX), dtype=nl.bfloat16, buffer=nl.psum)
     nisa.nc_transpose(v_T_psum, v_bf16)
     nisa.tensor_copy(v_T_sb, v_T_psum)
 
@@ -361,7 +361,7 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm(
     # Q projection — use consolidated per-head wq_head_sb (slice per h_t)
     q_packed_f32 = sbm.alloc_stack((PMAX, GQA), nl.float32, name="q_packed_f32")
     for q_h in nl.affine_range(HQ_TP_CONST):
-        q_psum = nl.zeros((PMAX, B), dtype=nl.float32, buffer=nl.psum, name=f"q_psum_{q_h}")
+        q_psum = nl.zeros((PMAX, B), dtype=nl.float32, buffer=nl.psum)
         for h_t in nl.affine_range(NUM_H_TILES):
             nisa.nc_matmul(q_psum,
                            stationary=wq_head_sb[q_h][0:PMAX, h_t*d:(h_t+1)*d],
@@ -373,7 +373,7 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm(
     nisa.tensor_tensor(q_sq, q_packed_f32, q_packed_f32, op=nl.multiply)
     q_sq_bf16 = sbm.alloc_stack((PMAX, GQA), nl.bfloat16, name="q_sq_bf16")
     nisa.tensor_copy(q_sq_bf16, q_sq)
-    q_sum_psum = nl.zeros((PMAX, GQA), dtype=nl.float32, buffer=nl.psum, name="q_sum_psum")
+    q_sum_psum = nl.zeros((PMAX, GQA), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_matmul(q_sum_psum, stationary=rms_ones, moving=q_sq_bf16)
     q_sum_sb = sbm.alloc_stack((PMAX, GQA), nl.float32, name="q_sum_sb")
     nisa.tensor_copy(q_sum_sb, q_sum_psum)
@@ -385,11 +385,11 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm(
     nisa.tensor_tensor(q_normed, q_packed_f32, q_rms_inv, op=nl.multiply)
 
     # Apply norm weight via tp_broadcast
-    qnw_gqa_psum_T = nl.ndarray((GQA, PMAX), dtype=nl.float32, buffer=nl.psum, name="qnw_gqa_psum_T")
+    qnw_gqa_psum_T = nl.ndarray((GQA, PMAX), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_transpose(qnw_gqa_psum_T, qnw_sb.ap([[1, PMAX], [0, GQA]], offset=0))
     qnw_gqa_sbuf_T = sbm.alloc_stack((GQA, PMAX), nl.float32, name="qnw_gqa_sbuf_T")
     nisa.tensor_copy(qnw_gqa_sbuf_T, qnw_gqa_psum_T)
-    qnw_gqa_psum = nl.ndarray((PMAX, GQA), dtype=nl.float32, buffer=nl.psum, name="qnw_gqa_psum")
+    qnw_gqa_psum = nl.ndarray((PMAX, GQA), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_transpose(qnw_gqa_psum, qnw_gqa_sbuf_T)
     qnw_gqa = sbm.alloc_stack((PMAX, GQA), nl.float32, name="qnw_gqa")
     nisa.tensor_copy(qnw_gqa, qnw_gqa_psum)
@@ -398,20 +398,20 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm(
     nisa.tensor_tensor(q_normed2, q_normed, qnw_gqa, op=nl.multiply)
 
     # Q RoPE — tp_broadcast cos/sin
-    cos_gqa_psum_T = nl.ndarray((GQA, PMAX), dtype=nl.float32, buffer=nl.psum, name="cos_gqa_psum_T")
+    cos_gqa_psum_T = nl.ndarray((GQA, PMAX), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_transpose(cos_gqa_psum_T, cos_f32.ap([[1, PMAX], [0, GQA]], offset=0))
     cos_gqa_sbuf_T = sbm.alloc_stack((GQA, PMAX), nl.float32, name="cos_gqa_sbuf_T")
     nisa.tensor_copy(cos_gqa_sbuf_T, cos_gqa_psum_T)
-    cos_gqa_psum = nl.ndarray((PMAX, GQA), dtype=nl.float32, buffer=nl.psum, name="cos_gqa_psum")
+    cos_gqa_psum = nl.ndarray((PMAX, GQA), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_transpose(cos_gqa_psum, cos_gqa_sbuf_T)
     cos_gqa = sbm.alloc_stack((PMAX, GQA), nl.float32, name="cos_gqa")
     nisa.tensor_copy(cos_gqa, cos_gqa_psum)
 
-    sin_gqa_psum_T = nl.ndarray((GQA, PMAX), dtype=nl.float32, buffer=nl.psum, name="sin_gqa_psum_T")
+    sin_gqa_psum_T = nl.ndarray((GQA, PMAX), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_transpose(sin_gqa_psum_T, sin_f32.ap([[1, PMAX], [0, GQA]], offset=0))
     sin_gqa_sbuf_T = sbm.alloc_stack((GQA, PMAX), nl.float32, name="sin_gqa_sbuf_T")
     nisa.tensor_copy(sin_gqa_sbuf_T, sin_gqa_psum_T)
-    sin_gqa_psum = nl.ndarray((PMAX, GQA), dtype=nl.float32, buffer=nl.psum, name="sin_gqa_psum")
+    sin_gqa_psum = nl.ndarray((PMAX, GQA), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_transpose(sin_gqa_psum, sin_gqa_sbuf_T)
     sin_gqa = sbm.alloc_stack((PMAX, GQA), nl.float32, name="sin_gqa")
     nisa.tensor_copy(sin_gqa, sin_gqa_psum)
@@ -455,11 +455,11 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm(
 
     # Active position score: broadcast k_rope [PMAX,1] → [PMAX,GQA], then element-wise * q_bf16,
     # then sum across partition dim via nc_matmul with rms_ones. Matches v13bc_sbm_tiled pattern.
-    k_rope_packed_psum_T = nl.ndarray((GQA, PMAX), dtype=nl.float32, buffer=nl.psum, name="k_rope_packed_psum_T")
+    k_rope_packed_psum_T = nl.ndarray((GQA, PMAX), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_transpose(k_rope_packed_psum_T, k_rope.ap([[1, PMAX], [0, GQA]], offset=0))
     k_rope_packed_sbuf_T = sbm.alloc_stack((GQA, PMAX), nl.float32, name="k_rope_packed_sbuf_T")
     nisa.tensor_copy(k_rope_packed_sbuf_T, k_rope_packed_psum_T)
-    k_rope_packed_psum = nl.ndarray((PMAX, GQA), dtype=nl.float32, buffer=nl.psum, name="k_rope_packed_psum")
+    k_rope_packed_psum = nl.ndarray((PMAX, GQA), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_transpose(k_rope_packed_psum, k_rope_packed_sbuf_T)
     k_rope_packed = sbm.alloc_stack((PMAX, GQA), nl.float32, name="k_rope_packed")
     nisa.tensor_copy(k_rope_packed, k_rope_packed_psum)
@@ -468,7 +468,7 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm(
     nisa.tensor_tensor(kq_elem, k_rope_packed, q_bf16, op=nl.multiply)
     kq_elem_bf16 = sbm.alloc_stack((PMAX, GQA), nl.bfloat16, name="kq_elem_bf16")
     nisa.tensor_copy(kq_elem_bf16, kq_elem)
-    score_active_psum = nl.zeros((PMAX, GQA), dtype=nl.float32, buffer=nl.psum, name="score_active_psum")
+    score_active_psum = nl.zeros((PMAX, GQA), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_matmul(score_active_psum, stationary=rms_ones, moving=kq_elem_bf16)
     score_active = sbm.alloc_stack((PMAX, GQA), nl.float32, name="score_active")
     nisa.tensor_copy(score_active, score_active_psum)
@@ -504,7 +504,7 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm(
         nisa.dma_copy(dst=k_raw, src=K_cache_2d[s_t * PMAX:(s_t + 1) * PMAX, :], dge_mode=nisa.dge_mode.hwdge)
 
         # PE transpose
-        k_ct_psum = nl.ndarray((PMAX, PMAX), dtype=nl.bfloat16, buffer=nl.psum, name=f"k_ct_psum_{s_t}")
+        k_ct_psum = nl.ndarray((PMAX, PMAX), dtype=nl.bfloat16, buffer=nl.psum)
         nisa.nc_transpose(k_ct_psum, k_raw)
         nisa.tensor_copy(k_ct, k_ct_psum)
 
@@ -515,7 +515,7 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm(
                            op0=nl.multiply, operand0=-1.0,
                            op1=nl.add, operand1=float(tile_start))
 
-        neg_thresh_psum = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.psum, name=f"neg_thresh_psum_{s_t}")
+        neg_thresh_psum = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_transpose(neg_thresh_psum, neg_threshold.ap([[1, 1], [0, PMAX]], offset=0))
         neg_thresh_sb = sbm.alloc_stack((PMAX, 1), nl.float32, name=f"neg_thresh_sb_{s_t}")
         nisa.tensor_copy(neg_thresh_sb, neg_thresh_psum)
@@ -537,11 +537,11 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm(
         nisa.tensor_scalar(mask_tile_f32, clamped, op0=nl.multiply, operand0=-1e9)
 
         # Pre-broadcast mask [PMAX,1] → [PMAX,GQA] via double transpose
-        mask_gqa_pre_psum_T = nl.ndarray((GQA, PMAX), dtype=nl.float32, buffer=nl.psum, name=f"mask_gqa_pre_psum_T_{s_t}")
+        mask_gqa_pre_psum_T = nl.ndarray((GQA, PMAX), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_transpose(mask_gqa_pre_psum_T, mask_tile_f32.ap([[1, PMAX], [0, GQA]], offset=0))
         mask_gqa_pre_sbuf_T = sbm.alloc_stack((GQA, PMAX), nl.float32, name=f"mask_gqa_pre_sbuf_T_{s_t}")
         nisa.tensor_copy(mask_gqa_pre_sbuf_T, mask_gqa_pre_psum_T)
-        mask_gqa_pre_psum = nl.ndarray((PMAX, GQA), dtype=nl.float32, buffer=nl.psum, name=f"mask_gqa_pre_psum_{s_t}")
+        mask_gqa_pre_psum = nl.ndarray((PMAX, GQA), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_transpose(mask_gqa_pre_psum, mask_gqa_pre_sbuf_T)
         nisa.tensor_copy(mask_gqa_pre, mask_gqa_pre_psum)
 
@@ -567,7 +567,7 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm(
     global_max_g1 = sbm.alloc_stack((GQA, 1), nl.float32, name="global_max_g1")
     nisa.memset(global_max_g1, value=-1e9)
 
-    score_act_T_psum = nl.zeros((GQA, PMAX), dtype=nl.float32, buffer=nl.psum, name="score_act_T_psum")
+    score_act_T_psum = nl.zeros((GQA, PMAX), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_transpose(score_act_T_psum, score_active)
     score_act_T_sb = sbm.alloc_stack((GQA, PMAX), nl.float32, name="score_act_T_sb")
     nisa.tensor_copy(score_act_T_sb, score_act_T_psum)
@@ -584,7 +584,7 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm(
 
         sbm.open_scope(f"p1_tile_{s_t}")
 
-        score_psum = nl.zeros((PMAX, GQA), dtype=nl.float32, buffer=nl.psum, name=f"score_psum_{s_t}")
+        score_psum = nl.zeros((PMAX, GQA), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_matmul(score_psum, stationary=k_cache_tiles[s_t], moving=q_bf16)
         score_sb = sbm.alloc_stack((PMAX, GQA), nl.float32, name=f"score_sb_{s_t}")
         nisa.tensor_copy(score_sb, score_psum)
@@ -592,7 +592,7 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm(
         mask_gqa = mask_gqa_tiles[s_t]
         nisa.tensor_tensor(score_sb_masked, score_sb, mask_gqa, op=nl.add)
 
-        score_T_psum = nl.ndarray((GQA, PMAX), dtype=nl.float32, buffer=nl.psum, name=f"score_T_psum_{s_t}")
+        score_T_psum = nl.ndarray((GQA, PMAX), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_transpose(score_T_psum, score_sb_masked)
         score_T_sb = sbm.alloc_stack((GQA, PMAX), nl.float32, name=f"score_T_sb_{s_t}")
         nisa.tensor_copy(score_T_sb, score_T_psum)
@@ -609,7 +609,7 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm(
     neg_max_g1 = sbm.alloc_stack((GQA, 1), nl.float32, name="neg_max_g1")
     nisa.tensor_scalar(neg_max_g1, global_max_g1, op0=nl.multiply, operand0=-1.0)
 
-    neg_max_psum = nl.ndarray((PMAX, GQA), dtype=nl.float32, buffer=nl.psum, name="neg_max_psum")
+    neg_max_psum = nl.ndarray((PMAX, GQA), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_transpose(
         neg_max_psum,
         neg_max_g1.ap([[1, GQA], [0, PMAX]], offset=0),
@@ -640,13 +640,13 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm(
         score2_exp_bf16 = sbm.alloc_stack((PMAX, GQA), nl.bfloat16, name=f"score2_exp_bf16_{s_t}")
         nisa.tensor_copy(score2_exp_bf16, score2_exp)
 
-        tile_sum_psum = nl.zeros((PMAX, GQA), dtype=nl.float32, buffer=nl.psum, name=f"tile_sum_psum_{s_t}")
+        tile_sum_psum = nl.zeros((PMAX, GQA), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_matmul(tile_sum_psum, stationary=rms_ones, moving=score2_exp_bf16)
         tile_sum = sbm.alloc_stack((PMAX, GQA), nl.float32, name=f"tile_sum_{s_t}")
         nisa.tensor_copy(tile_sum, tile_sum_psum)
         nisa.tensor_tensor(sum_acc, sum_acc, tile_sum, op=nl.add)
 
-        v_weighted_psum = nl.zeros((PMAX, GQA), dtype=nl.float32, buffer=nl.psum, name=f"v_weighted_psum_{s_t}")
+        v_weighted_psum = nl.zeros((PMAX, GQA), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_matmul(v_weighted_psum, stationary=v_cache_tiles[s_t], moving=score2_exp_bf16)
         v_weighted = sbm.alloc_stack((PMAX, GQA), nl.float32, name=f"v_weighted_{s_t}")
         nisa.tensor_copy(v_weighted, v_weighted_psum)
@@ -660,11 +660,11 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm(
     nisa.tensor_tensor(sum_acc, sum_acc, score_act_exp, op=nl.add)
 
     # v_active broadcast: [PMAX,1] → [PMAX,GQA]
-    v_act_packed_psum_T = nl.ndarray((GQA, PMAX), dtype=nl.float32, buffer=nl.psum, name="v_act_packed_psum_T")
+    v_act_packed_psum_T = nl.ndarray((GQA, PMAX), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_transpose(v_act_packed_psum_T, v_active.ap([[1, PMAX], [0, GQA]], offset=0))
     v_act_packed_sbuf_T = sbm.alloc_stack((GQA, PMAX), nl.float32, name="v_act_packed_sbuf_T")
     nisa.tensor_copy(v_act_packed_sbuf_T, v_act_packed_psum_T)
-    v_act_packed_psum = nl.ndarray((PMAX, GQA), dtype=nl.float32, buffer=nl.psum, name="v_act_packed_psum")
+    v_act_packed_psum = nl.ndarray((PMAX, GQA), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_transpose(v_act_packed_psum, v_act_packed_sbuf_T)
     v_act_packed = sbm.alloc_stack((PMAX, GQA), nl.float32, name="v_act_packed")
     nisa.tensor_copy(v_act_packed, v_act_packed_psum)
@@ -701,13 +701,13 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm(
     out_sb_tmp = sbm.alloc_stack((1, F_MAX), nl.bfloat16, name="out_sb_tmp")
     col_tmp = sbm.alloc_stack((PMAX, 1), nl.bfloat16, name="col_tmp")
     # Single PSUM buffer reused for all 16 transpositions (sequential, no overlap needed)
-    chunk_T_psum = nl.ndarray((PMAX, 1), dtype=nl.bfloat16, buffer=nl.psum, name="chunk_T_psum")
+    chunk_T_psum = nl.ndarray((PMAX, 1), dtype=nl.bfloat16, buffer=nl.psum)
 
     # Pre-allocate all 4 output PSUMs
-    res_psum_0 = nl.zeros((1, F_MAX), dtype=nl.float32, buffer=nl.psum, name="res_psum_0")
-    res_psum_1 = nl.zeros((1, F_MAX), dtype=nl.float32, buffer=nl.psum, name="res_psum_1")
-    res_psum_2 = nl.zeros((1, F_MAX), dtype=nl.float32, buffer=nl.psum, name="res_psum_2")
-    res_psum_3 = nl.zeros((1, F_MAX), dtype=nl.float32, buffer=nl.psum, name="res_psum_3")
+    res_psum_0 = nl.zeros((1, F_MAX), dtype=nl.float32, buffer=nl.psum)
+    res_psum_1 = nl.zeros((1, F_MAX), dtype=nl.float32, buffer=nl.psum)
+    res_psum_2 = nl.zeros((1, F_MAX), dtype=nl.float32, buffer=nl.psum)
+    res_psum_3 = nl.zeros((1, F_MAX), dtype=nl.float32, buffer=nl.psum)
 
     for head in nl.affine_range(HQ_TP_CONST):
         nisa.nc_matmul(res_psum_0, stationary=attn_out[0:PMAX, head:head+1], moving=wo_sbuf[head][0:PMAX, 0*F_MAX:1*F_MAX])

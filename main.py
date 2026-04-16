@@ -75,11 +75,12 @@ def parse_args():
             "qwen_with_router_attn_tkg (or qwen_router_attn_tkg/qwen_attn_tkg), "
             "qwen_with_nkilib_moe_tkg (or qwen_nkilib_moe_tkg/qwen_nkilib), "
             "qwen_complete (or qwen_fused_moe_attn_tkg/qwen_full_tkg), "
+            "qwen_fused_transformer_multilayer (or qwen_multilayer/qwen_megakernel/qwen_full_fused): 48-layer fused TKG megakernel, "
             "qwen_baseline_quant (or qwen_quant/qwen_fp8): offline blockwise FP8 expert quantization."
         ),
     )
     parser.add_argument("--enable-nki", action="store_true")
-parser.add_argument("--base-latency", type=float, default=526.15)
+    parser.add_argument("--base-latency", type=float, default=526.15)
     parser.add_argument("--base-throughput", type=float, default=134.61)
 
     # Model path
@@ -713,6 +714,11 @@ def resolve_qwen_module_name(qwen_name: str, enable_nki: bool) -> str:
         "qwen_quant": "qwen_baseline_quant",
         "qwen_fp8": "qwen_baseline_quant",
         "qwen_fused_transformer": "qwen_fused_transformer",
+        # Multi-layer fused TKG megakernel (all 48 decoder layers in one NKI invocation).
+        "qwen_fused_transformer_multilayer": "qwen_fused_transformer_multilayer",
+        "qwen_multilayer": "qwen_fused_transformer_multilayer",
+        "qwen_megakernel": "qwen_fused_transformer_multilayer",
+        "qwen_full_fused": "qwen_fused_transformer_multilayer",
     }
 
     normalized = qwen_name.strip()
@@ -748,7 +754,7 @@ def main():
     args = parse_args()
     configure_neuron_platform_target(args.platform_target)
 
-if not args.prompts:
+    if not args.prompts:
         args.prompts = ["I believe the meaning of life is"]
         
     args.batch_size = len(args.prompts)
