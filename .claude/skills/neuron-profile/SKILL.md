@@ -50,8 +50,13 @@ neuron-profile view -n <model.neff> -s <file.ntff> --output-format summary-json
 # Perfetto binary timeline (open in ui.perfetto.dev)
 neuron-profile view -n <model.neff> -s <file.ntff> --output-format perfetto --output-file out.pb
 
-# Parquet (tabular, for pandas/polars analysis)
-neuron-profile view -n <model.neff> -s <file.ntff> --output-format parquet --output-file out.parquet
+# Full per-instruction JSON with source-line attribution (kernel-level analysis)
+# Each instruction has: timestamp, duration, evt_wait_time (stall!), engine label,
+# opcode, hbm/sbuf bytes, layer (PyTorch module path), bir_debug_info_source_location,
+# nki_source_location, hlo_attrs. Write to /tmp — output is ~1 GB per 250k instructions.
+neuron-profile view -n <model.neff> -s <file.ntff> --output-format json --output-file /tmp/prof.json
+
+# NOTE: --output-format parquet is NOT supported (tool says "use neuron-explorer"). Use json.
 ```
 
 ---
@@ -65,6 +70,7 @@ neuron-profile view -n <model.neff> -s <file.ntff> --output-format parquet --out
 | `show-session --show-trace` | Per-instruction timestamps, engine type (Tensor/Vector/Scalar/GpSimd/Sync), PC, start/end; also collective events (TPB_TRIGGER, SEMAPHORE_WAIT, DMA_ADVANCE) per CC-core |
 | `show-session --show-dma` | Per-DMA-queue events (M2S_SOP, S2M_EOP, S2M_COMPLETION) with absolute timestamps and CRC |
 | `view summary-text/json` | Aggregated metrics: `total_time`, `tensor_engine_active_time`, `vector_engine_active_time`, `dma_active_time`, `hbm_read_bytes`, `hbm_write_bytes`, `sbuf_read_bytes`, `sbuf_write_bytes`, `mfu_estimated_percent`, `mm_arithmetic_intensity`, `cc_op_count`, `cc_op_active_time`, `spill_reload_bytes`, `psum_*` |
+| `view --output-format json` | **Per-instruction table with source-line attribution.** Every instruction tagged with `bir_debug_info_source_location`, `nki_source_location`, PyTorch `layer` path, plus `timestamp`, `duration`, `evt_wait_time` (stall), engine `label`, `opcode`, and per-instr HBM/SBUF bytes. Essential for kernel-level analysis (skinny DMAs, stall attribution, idle gaps, bytes-per-line). See [`references/kernel_source_attribution.md`](.claude/skills/neuron-profile/references/kernel_source_attribution.md). |
 
 ---
 
@@ -89,7 +95,8 @@ Based on what the user wants to know, pick the right data source:
 - **DMA bandwidth / transfer sizes** → `show-session --show-dma`
 - **Spill/reload pressure** → `view summary-text`, `spill_reload_bytes`
 - **MFU / arithmetic intensity** → `view summary-text`, `mfu_estimated_percent` + `mm_arithmetic_intensity`
-- **Custom op-level breakdown** → `view parquet` + python3 analysis
+- **Kernel-level attribution (stalls per source line, skinny DMAs, idle gaps, bytes-per-line)** → `view --output-format json` + python3, see [`references/kernel_source_attribution.md`](.claude/skills/neuron-profile/references/kernel_source_attribution.md)
+- **Custom op-level breakdown** → `view --output-format json` + python3 analysis
 
 ### 3. Extract the data
 
@@ -153,3 +160,4 @@ Report findings clearly: tables for multi-value results, concrete numbers with u
 ## References
 
 - [`references/layer_latency.md`](.claude/skills/neuron-profile/references/layer_latency.md) — per-decoder-layer timing via CC AllReduce gap analysis
+- [`references/kernel_source_attribution.md`](.claude/skills/neuron-profile/references/kernel_source_attribution.md) — per-instruction source-line attribution via JSON export; recipes for stall attribution, skinny DMAs, idle gaps, bytes-per-line
