@@ -9,8 +9,7 @@ Per-layer pipeline (SBUF-resident residual):
   1. attention (v14a_kv_norm): pre-attention RMSNorm(residual_sb, gamma_pre_attn[i])
      is applied inside the attention sub-function; scatter-DMA writes new K/V
      rows of K_caches[i] / V_caches[i] at position_ids.
-  2. AllReduce #1 (bare nccl.all_reduce — ENC_ALG_MESH workaround carried over
-     from single-layer v2; retest on trn3 per plan §1.5 / §3.6).
+  2. AllReduce #1
   3. residual_sb += attn_reduced
   4. MoE (_qwen3_moe_sbuf_in_sbuf_out): post-attention RMSNorm with
      gamma_post_attn[i] applied inside the MoE sub-function.
@@ -49,8 +48,8 @@ from nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
 from nkilib.experimental.transformer.transformer_tkg import (
     _sb2sb_all_reduce_gather,
 )
-from kernels.attn_tkg.agents.v14a_kv_norm import qwen3_attn_tkg_fused_oproj_v13bc_kv_norm
-from kernels.moe_fused_tkg.versions.kernel_v30a_sbuf_io import _qwen3_moe_sbuf_in_sbuf_out
+from kernels.attn_tkg.agents.v14c_kv_norm_hoisted import qwen3_attn_tkg_fused_oproj_v13bc_kv_norm_hoisted
+from kernels.moe_fused_tkg.versions.kernel_v30b_gu_shard import _qwen3_moe_sbuf_in_sbuf_out
 
 H        = 2048
 H0       = 128
@@ -58,6 +57,8 @@ H1       = H // H0
 N_PRGS   = 2
 H1_SHARD = H1 // N_PRGS
 EPS      = 1e-6
+PMAX     = 128
+NH       = H // PMAX   # num_h_tiles = 16
 
 SBM_SIZE_BYTES = 200 * 1024
 
@@ -122,6 +123,62 @@ def _multilayer_body(
         dge_mode=nisa.dge_mode.hwdge,
     )
 
+    # -----------------------------------------------------------------------
+    # Hoist layer-invariant attention constants out of the per-layer loop
+    # -----------------------------------------------------------------------
+    sbm.set_name_prefix("hoist_")
+    sbm.open_scope(name="hoist")
+    sbm.set_auto_alloc(True)
+
+    cos_col = cos.reshape((PMAX, B))
+    sin_col = sin.reshape((PMAX, B))
+
+    cos_bf16_all = sbm.alloc_stack((PMAX, B), dtype, name="cos_bf16_all")
+    sin_bf16_all = sbm.alloc_stack((PMAX, B), dtype, name="sin_bf16_all")
+    nisa.dma_copy(dst=cos_bf16_all, src=cos_col, dge_mode=nisa.dge_mode.hwdge)
+    nisa.dma_copy(dst=sin_bf16_all, src=sin_col, dge_mode=nisa.dge_mode.hwdge)
+    cos_f32_all = sbm.alloc_stack((PMAX, B), nl.float32, name="cos_f32_all")
+    sin_f32_all = sbm.alloc_stack((PMAX, B), nl.float32, name="sin_f32_all")
+    nisa.tensor_copy(cos_f32_all, cos_bf16_all)
+    nisa.tensor_copy(sin_f32_all, sin_bf16_all)
+
+    # Stacked per-layer constants. Shapes match one slice per layer matching
+    # what v14c expects internally: qnw/knw = [PMAX, 1], gpan = [PMAX, NH].
+    qnw_bf16_all  = sbm.alloc_stack((PMAX, num_layers),      dtype, name="qnw_bf16_all")
+    knw_bf16_all  = sbm.alloc_stack((PMAX, num_layers),      dtype, name="knw_bf16_all")
+    gpan_bf16_all = sbm.alloc_stack((PMAX, num_layers * NH), dtype, name="gpan_bf16_all")
+
+    # Each DMA is independent across layers — compiler can parallelize them.
+    for li in nl.affine_range(num_layers):
+        nisa.dma_copy(
+            dst=qnw_bf16_all[0:PMAX, li:li + 1],
+            src=qn_list[li].reshape((PMAX, 1)),
+            dge_mode=nisa.dge_mode.hwdge,
+        )
+        nisa.dma_copy(
+            dst=knw_bf16_all[0:PMAX, li:li + 1],
+            src=kn_list[li].reshape((PMAX, 1)),
+            dge_mode=nisa.dge_mode.hwdge,
+        )
+        # gpan layout: gpan_bf16[p, h_t] = gpre[h_t*PMAX + p]
+        nisa.dma_copy(
+            dst=gpan_bf16_all[0:PMAX, li * NH:(li + 1) * NH],
+            src=gpre_list[li].reshape((H, 1)).ap(
+                pattern=[[1, PMAX], [PMAX, NH]], offset=0,
+            ),
+            dge_mode=nisa.dge_mode.hwdge,
+        )
+
+    # Bulk bf16→f32 cast (Vector engine, three instructions total).
+    qnw_f32_all  = sbm.alloc_stack((PMAX, num_layers),      nl.float32, name="qnw_f32_all")
+    knw_f32_all  = sbm.alloc_stack((PMAX, num_layers),      nl.float32, name="knw_f32_all")
+    gpan_f32_all = sbm.alloc_stack((PMAX, num_layers * NH), nl.float32, name="gpan_f32_all")
+    nisa.tensor_copy(qnw_f32_all,  qnw_bf16_all)
+    nisa.tensor_copy(knw_f32_all,  knw_bf16_all)
+    nisa.tensor_copy(gpan_f32_all, gpan_bf16_all)
+
+    sbm.set_auto_alloc(False)
+
     for layer_idx in range(num_layers):
         # ------------------------------------------------------------------
         # ATTENTION (v14a_kv_norm)
@@ -133,21 +190,27 @@ def _multilayer_body(
         sbm.set_name_prefix(f"L{layer_idx}_attn_")
         sbm.set_auto_alloc(True)
 
-        out_sb = qwen3_attn_tkg_fused_oproj_v13bc_kv_norm(
+        out_sb = qwen3_attn_tkg_fused_oproj_v13bc_kv_norm_hoisted(
             hidden_sb=residual_sb,
             Wq=Wq_list[layer_idx],          # [Hq_tp*d, H]  = [1024, 2048]
             Wk=Wk_list[layer_idx],          # [Hkv_tp*d, H] = [128,  2048]
             Wv=Wv_list[layer_idx],          # [Hkv_tp*d, H] = [128,  2048]
             Wo=Wo_list[layer_idx],          # [Hq_tp*d, H]  = [1024, 2048]
-            q_norm_weight=qn_list[layer_idx],    # [d] = [128]
-            k_norm_weight=kn_list[layer_idx],    # [d] = [128]
-            gamma_pre_attn=gpre_list[layer_idx], # [H] = [2048]
+            q_norm_weight=qn_list[layer_idx],    # HBM fallback — unused when qnw_f32_sb is set
+            k_norm_weight=kn_list[layer_idx],    # HBM fallback — unused when knw_f32_sb is set
+            gamma_pre_attn=gpre_list[layer_idx], # HBM fallback — unused when gpan_f32_sb is set
             K_cache=K_caches[layer_idx],        # [B, 1, S_prior, d]
             V_cache=V_caches[layer_idx],        # [B, 1, S_prior, d]
-            cos=cos,
-            sin=sin,
+            cos=cos,                             # HBM fallback — unused when cos_f32_sb is set
+            sin=sin,                             # HBM fallback — unused when sin_f32_sb is set
             position_ids=position_ids,
             sbm=sbm,
+            # Plan A: pre-loaded layer-invariant constants (hoisted outside the loop)
+            qnw_f32_sb  = qnw_f32_all[0:PMAX, layer_idx:layer_idx + 1],
+            knw_f32_sb  = knw_f32_all[0:PMAX, layer_idx:layer_idx + 1],
+            cos_f32_sb  = cos_f32_all,
+            sin_f32_sb  = sin_f32_all,
+            gpan_f32_sb = gpan_f32_all[0:PMAX, layer_idx * NH:(layer_idx + 1) * NH],
         )
         # out_sb: [H0, BxS*H1] = [128, 16] bf16 in SBUF — partial-sum (TP shard)
 
@@ -202,6 +265,9 @@ def _multilayer_body(
         # Residual add #2: residual_sb += moe_gathered_sb (in-place)
         nisa.tensor_tensor(dst=residual_sb, data1=residual_sb,
                            data2=moe_gathered_sb, op=nl.add)
+
+    # Close the hoisted-constants scope now that all layers are done.
+    sbm.close_scope()
 
     # -----------------------------------------------------------------------
     # After the last layer: single HBM store of the post-residual hidden state.

@@ -22,7 +22,7 @@ os.environ["NEURON_FRAMEWORK_DEBUG"] = "1"
 import nki, nki.language as nl, nki.isa as nisa
 import torch, numpy as np
 from nkilib.core.utils.allocator import SbufManager
-from v13bc_kv_norm import qwen3_attn_tkg_fused_oproj_v13bc_kv_norm
+from v14a_kv_norm import qwen3_attn_tkg_fused_oproj_v13bc_kv_norm
 from benchmark import wrap_benchmark
 
 PMAX = 128

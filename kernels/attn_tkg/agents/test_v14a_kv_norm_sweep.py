@@ -225,7 +225,7 @@ def run_one(seed, pos_val, rng_weights, hidden_rng):
     Vfull_max = (V_full_nki.float() - ref_V_full.float()).abs().max().item()
 
     # assert_allclose-style pass: |a - b| <= atol + rtol * |b|
-    def close(a, b, rtol=1e-2, atol=1e-2):
+    def close(a, b, rtol=1e-2, atol=1e-5):
         return bool(torch.all(torch.abs(a.float() - b.float()) <= atol + rtol * torch.abs(b.float())).item())
 
     pass_attn = close(attn_nki.reshape(B, -1), ref_out)

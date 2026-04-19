@@ -112,9 +112,14 @@ def _find_kernel_artifacts(
                 os.path.basename(profile_neff)
                 .replace("neff_", "")
                 .replace(".neff", "")
-                .split("_vnc_")[0]
             )
-            ntff_pattern = f"{os.path.dirname(profile_neff)}/{neff_hash}_vnc_*.ntff"
+            # Strip the trailing _vnc_N suffix so the hash matches the NTFF name.
+            # NEFF:  neff_<hash>_vnc_N.neff  → neff_hash after strip = "<hash>_vnc_N"
+            # NTFF:  <hash>_vnc_0.ntff
+            # We need just <hash> for the NTFF glob to work.
+            import re as _re
+            neff_hash_base = _re.sub(r"_vnc_\d+$", "", neff_hash)
+            ntff_pattern = f"{os.path.dirname(profile_neff)}/{neff_hash_base}_vnc_*.ntff"
             deadline = time.monotonic() + ntff_wait_s
             while time.monotonic() < deadline:
                 candidates = glob.glob(ntff_pattern)
