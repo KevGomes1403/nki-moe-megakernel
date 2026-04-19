@@ -1,0 +1,81 @@
+Warning:
+2 map information files for pre-existing threads were
+not processed, if there are samples for addresses they
+will not be resolved, you may find out which are these
+threads by running with -v and redirecting the output
+to a file.
+The time limit to process proc map is too short?
+Increase it by --proc-map-timeout
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 13  of event 'cycles'
+# Event count (approx.): 6770633
+#
+# Overhead|Command|Shared Object    |Symbol                                                                                                                                                                                                                                                                                                                                                                                                                                             
+ 12.78% |kill   |[kernel.kallsyms]|[k] asm_exc_page_fault
+            |
+            ---asm_exc_page_fault
+               __close_nocancel
+
+ 7.39%  |kill   |[kernel.kallsyms]|[k] perf_event_mmap_event
+            |
+            ---perf_event_mmap_event
+               0x7ac10c48dd2c
+
+ 7.39%  |node   |[kernel.kallsyms]|[k] __memcg_slab_free_hook
+            |
+            ---__memcg_slab_free_hook
+               read
+
+ 7.39%  |node   |[kernel.kallsyms]|[k] futex_unqueue
+            |
+            ---futex_unqueue
+               0x7f389b098d71
+
+ 7.39%  |node   |libc.so.6        |[.] 0x00000000000a91f0
+            |
+            ---0x7f389b0a91f0
+
+ 7.39%  |node   |watcher.node     |[.] std::__detail::_Executor<__gnu_cxx::__normal_iterator<char const*, std::string>, std::allocator<std::sub_match<__gnu_cxx::__normal_iterator<char const*, std::string> > >, std::regex_traits<char>, true>::_M_dfs(std::__detail::_Executor<__gnu_cxx::__normal_iterator<char const*, std::string>, std::allocator<std::sub_match<__gnu_cxx::__normal_iterator<char const*, std::string> > >, std::regex_traits<char>, true>::_Match_mode, long)
+            |
+            ---std::__detail::_Executor<__gnu_cxx::__normal_iterator<char const*, std::string>, std::allocator<std::sub_match<__gnu_cxx::__normal_iterator<char const*, std::string> > >, std::regex_traits<char>, true>::_M_dfs(std::__detail::_Executor<__gnu_cxx::__normal_iterator<char const*, std::string>, std::allocator<std::sub_match<__gnu_cxx::__normal_iterator<char const*, std::string> > >, std::regex_traits<char>, true>::_Match_mode, long)
+
+ 7.39%  |perf   |[kernel.kallsyms]|[k] copy_folio_from_iter_atomic
+            |
+            ---copy_folio_from_iter_atomic
+               write
+
+ 7.39%  |perf   |[kernel.kallsyms]|[k] rep_movs_alternative
+            |
+            ---rep_movs_alternative
+               write
+
+ 7.39%  |sudo   |[kernel.kallsyms]|[k] __memcg_slab_free_hook
+            |
+            ---__memcg_slab_free_hook
+
+ 7.39%  |sudo   |[kernel.kallsyms]|[k] handle_mm_fault
+            |
+            ---handle_mm_fault
+               0x7269f0d27870
+
+ 7.39%  |sudo   |[kernel.kallsyms]|[k] zap_present_ptes.constprop.0
+            |
+            ---zap_present_ptes.constprop.0
+
+ 6.65%  |sudo   |[kernel.kallsyms]|[k] __tlb_remove_folio_pages
+            |
+            ---__tlb_remove_folio_pages
+
+ 6.65%  |sudo   |sudoers.so       |[.] 0x0000000000037908
+            |
+            ---0x7269f03a7908
+
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

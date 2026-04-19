@@ -22,6 +22,7 @@ PMAX = 128
 F_MAX = 512
 EPS = 1e-6
 INV_SQRT_D = float(1.0 / math.sqrt(128.0))
+PSUM_BANK_SIZE = 2048
 
 
 def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm(
@@ -424,19 +425,34 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm(
     # =========================================================================
     sbm.open_scope("q_proj")
 
-    # Q projection — use consolidated per-head wq_head_sb (slice per h_t)
-    # LNC sharding: each core computes only its owned heads; non-owned columns zero-init
-    # so downstream RMSNorm/RoPE/flash-decode produce zeros (not NaN) for those heads, and
-    # o_proj skips non-owned heads so zero columns never flow to out_sb.
+    # Q projection — Plan B: PSUM bank interleaving to eliminate RAW stalls at head boundaries.
+    # Pre-allocate all per-head PSUMs with explicit bank assignments so consecutive heads
+    # land in different PSUM banks. Using (i % 4) * PSUM_BANK_SIZE generalizes to both
+    # LNC=1 (8 heads, cycling 4 banks) and LNC=2 (4 heads, 4 unique banks).
+    # Outer h_t loop lets the compiler overlap Wq DMA for h_t+1 with matmul for h_t.
+    # Note: nl.zeros does not accept address; use nl.ndarray + memset instead.
+    q_psums = []
+    for i in range(len(owned_heads)):
+        q_h = owned_heads[i]
+        q_p = nl.ndarray((PMAX, B), dtype=nl.float32, buffer=nl.psum,
+                         name=f"q_psum_{q_h}")
+        nisa.memset(q_p, value=0.0)
+        q_psums.append(q_p)
+
+    # Outer h_t → 4 (or 8) matmuls per iteration (one per head), no bank stalls
+    for h_t in nl.affine_range(NUM_H_TILES):
+        for i in range(len(owned_heads)):
+            q_h = owned_heads[i]
+            nisa.nc_matmul(q_psums[i],
+                           stationary=wq_head_sb[q_h][0:PMAX, h_t * d:(h_t + 1) * d],
+                           moving=h_all[0:PMAX, h_t:h_t + 1])
+
+    # Copy all PSUMs to q_packed_f32 after all h_t iterations
     q_packed_f32 = sbm.alloc_stack((PMAX, GQA), nl.float32, name="q_packed_f32")
-    nisa.memset(q_packed_f32, value=0.0)
-    for q_h in owned_heads:
-        q_psum = nl.zeros((PMAX, B), dtype=nl.float32, buffer=nl.psum, name=f"q_psum_{q_h}")
-        for h_t in nl.affine_range(NUM_H_TILES):
-            nisa.nc_matmul(q_psum,
-                           stationary=wq_head_sb[q_h][0:PMAX, h_t*d:(h_t+1)*d],
-                           moving=h_all[0:PMAX, h_t:h_t+1])
-        nisa.tensor_copy(q_packed_f32[0:PMAX, q_h:q_h + 1], q_psum)
+    nisa.memset(q_packed_f32, value=0.0)  # zero unused head columns (for LNC=2)
+    for i in range(len(owned_heads)):
+        q_h = owned_heads[i]
+        nisa.tensor_copy(q_packed_f32[0:PMAX, q_h:q_h + 1], q_psums[i])
 
     # Q RMSNorm
     q_sq = sbm.alloc_stack((PMAX, GQA), nl.float32, name="q_sq")

@@ -112,3 +112,157 @@ _Add one entry per optimization attempt below._
 | Date | Change | Target line | Pre stall | Post stall | Per-layer Δ | Notes |
 |---|---|---|---|---|---|---|
 | 2026-04-16 | (baseline) | — | — | — | 143 µs | Initial profile analysis |
+
+---
+
+## Round 2 — 2026-04-17 · LNC-ceiling sweep on `v14b_kv_norm_pretransposed`
+
+Working kernel: `v14b_kv_norm_pretransposed.py`. Baseline re-measured standalone: **device_time_us ≈ 75.9 µs** (50-iter bench, LNC=2).
+
+Existing LNC pattern in baseline: head-shard Wq + Wo (4 of 8 heads per core) + one `sendrecv`-based all-reduce on the o-proj output. Wk, Wv, KV cache, pre-attn RMSNorm, and Q/K broadcast scratch all duplicated on both cores.
+
+Standalone bench profile:
+- VectorE 52.7% (~40 µs) — dominant
+- TensorE 39.8% (~30 µs)
+- DMA 47.8% (~35 µs)
+- spill 163,840 B (unchanged across all variants)
+- hbm_read 11,554 KiB, hbm_write 656.5 KiB
+
+### Plans attempted (nkilib-pattern review)
+
+After reading `nkilib/experimental/transformer/{transformer_tkg,attention_block_tkg,attention_block_tkg_sharding}.py`, the validated AWS pattern is: shard the hidden dim `H1_shard = H1 // n_prgs`, run **one** `all_reduce` per block boundary via `_sb2sb_all_reduce_gather` — not per-tensor `sendrecv` chains. Both LNC variants below applied this lens.
+
+| Variant | File | Strategy | device_us | vs base | Outcome |
+|---|---|---|---|---|---|
+| v15a | `v15a_peer_split_kv.py` | Peer-split Wk/Wv + K/V cache; 14 `sendrecv`s | **100.3** | **−32%** | Regression — collectives serialize pipeline |
+| v15a2 | `v15a2_h_shard_qkv.py` | nkilib-style H-shard of QKV (tiles 0–7 / 8–15); 4 `sendrecv`s | **85.4** | **−15%** | Regression — HBM-read −27% but still serialization-bound |
+| v15b | `v15b_oproj_collapse.py` | Drop `col_tmp` intermediate in 16-col o-proj transpose | **74.96** | ~0% | Wash — compiler DCE'd the redundant `tensor_copy` |
+| v15c | `v15c_broadcast_elim.py` | Replace 6 sites of `nc_transpose`→PSUM→transpose broadcast chains with stride-0 `.ap` inline broadcast inside `tensor_tensor` | **75.10** | **+1.1%** | Modest win; engine-time freed, DMA became critical path |
+
+### Per-engine delta for v15c (the only net improvement)
+
+| Metric | baseline | v15c | Δ |
+|---|---|---|---|
+| TensorE | 30.2 µs (39.8%) | 24.5 µs (32.6%) | **−5.7 µs** |
+| VectorE | 40.0 µs (52.7%) | 35.8 µs (47.7%) | **−4.1 µs** |
+| DMA active | 47.8% | **53.0%** | +5.2 pp |
+| device_time | 75.9 µs | 75.1 µs | −0.8 µs |
+
+~9.8 µs of engine time was freed but only ~0.8 µs surfaced as wall-clock — the freed cycles were already overlapped with DMA.
+
+### v15c sites converted (broadcast `[PMAX,1] → [PMAX,GQA=8]`)
+
+1. `qnw_gqa` — multiplied into `q_normed2`
+2. `cos_gqa` — `q_normed2 * cos_gqa`
+3. `sin_gqa` — `rot_q * sin_gqa`
+4. `k_rope_packed` — `k_rope * q_bf16` (mixed fp32/bf16 accepted by `tensor_tensor`)
+5. `v_act_packed` — `v_act * score_act_exp`
+6. `mask_gqa_pre` — removed per-tile 2-transpose broadcast in the 8-iter `NUM_S_TILES` loop (largest single source of freed cycles)
+
+AP pattern used: `X.ap(pattern=[[1, PMAX], [0, GQA]], offset=0)` inlined as the broadcast operand. Validator requires `[[part_stride, part_size], [free_stride, free_size]]` order.
+
+`neg_max` broadcast (`[GQA,1] → [PMAX,GQA]`) left alone — that's a partition-dim broadcast, different pattern.
+
+### Lessons (for future rounds)
+
+1. **LNC-sharding floor is the existing head-shard + single final all-reduce.** On a kernel this small and already DMA-overlapped, every additional `sendrecv` on the hot path costs more than the HBM savings buy — confirmed across two independent shard strategies (peer-split and H-shard). Even a correctly-implemented H-shard à la nkilib regresses 15%.
+2. **Engine-time wins don't convert 1:1 to device-time** once DMA becomes critical path. v15c freed ~10 µs of TensorE+VectorE; only ~1 µs came out in wall-clock because DMA now owns the schedule.
+3. **Compiler already eliminates trivial intermediate copies** (`col_tmp` in o-proj). Don't spend plans on DCE-eligible rewrites.
+4. **`tensor_tensor` accepts stride-0 `.ap` broadcasts across dtype mixes** (fp32 × bf16). This generalizes well — worth applying to any future `[PMAX, small]` broadcast site that is currently materialized via PSUM round-trip.
+
+### New bottleneck after v15c
+
+DMA (53.0% active, 11.5 MiB HBM read/core). To make further progress without serialization:
+- FP8 / MXFP8 weight quantization on Wq/Wk/Wv/Wo — cuts weight DMA by 2–4× (trn3 supports 2× FP8 TFLOPS so no compute cost).
+- Multi-layer fusion: reuse Wo or residual across layers in the megakernel context (see `docs/multilayer_fused_tkg_plan.md`).
+- Weight ring-buffer / prefetch between layers.
+
+**Best current variant: `v15c_broadcast_elim.py` @ 75.1 µs.**
+
+---
+
+## Round 3 — 2026-04-17 · v16a S-tile sequence-parallel (LNC=2)
+
+Working kernel: `v16a_seq_parallel.py`. Goal: reduce per-core KV-cache DMA by sharding the flash-decode sequence axis across the two LNC cores, in addition to the existing head-sharding for Wq/Wo.
+
+### Design
+
+With `NUM_S_TILES=8` (S=640, PMAX=128):
+- Core 0 owns S-tiles [0,1,2,3] and Q-heads [0,1,2,3]
+- Core 1 owns S-tiles [4,5,6,7] and Q-heads [4,5,6,7]
+- Active position (current token) accumulated on core 0 only
+- Cross-core log-sum-exp merge via `nisa.sendrecv` (pipe_id=1,2,3 for max/sum/v)
+- Final Wo all-reduce via `nisa.sendrecv` (pipe_id=0), unchanged from v14b
+
+### Bugs fixed
+
+| # | Root cause | Fix |
+|---|---|---|
+| 1 | `list(range(N))` returns a `range` object rejected by NKI compiler | Replaced with literal `[0,1,2,3,4,5,6,7]` |
+| 2 | Python dicts with int keys rejected by NKI compiler | Converted all `{s_t: tensor}` dicts to lists |
+| 3 | `enumerate()` not supported in NKI trace loops | Replaced with indexed `for i in range(len(…)): s_t = owned_s_tiles[i]` |
+| 4 | Test file passed `Wv_np` (not pre-transposed) to device | Fixed to `Wv_pt` |
+| 5 | `nki.simulate` hangs with `nisa.sendrecv` (single-threaded) | Rewrote test to use `torch_xla` on-device execution |
+| 6 | **Design flaw**: Q was computed only for owned heads (non-owned heads had Q=0); S-tile sharding requires correct Q for ALL heads on each core so that each core's partial KV scores are correct before the log-sum-exp merge | Wq loaded for all 8 heads on both cores; Q projection computed for all 8 heads; removed head-ownership masking code that was attempting to paper over this |
+
+**Bug 6 root cause detail**: In v14b (no S-tile sharding), both cores process ALL S-tiles. Non-owned heads have Q=0, but this only affects non-owned head columns in `attn_out`—which are never read in the per-owned-head Wo projection. With v16a S-tile sharding, core 1 holds tiles 4-7 which may be entirely masked for small position values. After the log-sum-exp merge, core 1's `attn_out` for its owned heads (4-7) is assembled from its masked tiles + core 0's tiles 0-3 via `sum_peer`/`v_peer`. But core 0's `sum_acc[h=4..7]` was zero (Q=0 → scores=0 but NOT what core 1 needs). Loading full Wq on both cores is the correct fix.
+
+### Correctness results
+
+| LNC | pos | attn_max | nk_max | nv_max | verdict |
+|---|---|---|---|---|---|
+| 1 | 0 | 2.44e-04 | 4.88e-04 | 2.44e-04 | PASS |
+| 1 | 63 | 9.77e-04 | 9.77e-04 | 1.22e-04 | PASS |
+| 1 | 64 | 9.77e-04 | 2.44e-04 | 2.44e-04 | PASS |
+| 1 | 127 | 9.77e-04 | 4.88e-04 | 2.44e-04 | PASS |
+| 1 | 128 | 9.77e-04 | 2.44e-04 | 2.44e-04 | PASS |
+| 1 | 129 | 9.77e-04 | 2.44e-04 | 2.44e-04 | PASS |
+| 1 | 255 | 4.88e-04 | 4.88e-04 | 1.22e-04 | PASS |
+| 1 | 320 | 4.88e-04 | 4.88e-04 | 2.44e-04 | PASS |
+| 2 | 0 | 2.44e-04 | 4.88e-04 | 2.44e-04 | PASS |
+| 2 | 63 | 9.77e-04 | 9.77e-04 | 1.22e-04 | PASS |
+| 2 | 64 | 9.77e-04 | 2.44e-04 | 2.44e-04 | PASS |
+| 2 | 127 | 9.77e-04 | 4.88e-04 | 2.44e-04 | PASS |
+| 2 | 128 | 9.77e-04 | 2.44e-04 | 2.44e-04 | PASS |
+| 2 | 129 | 9.77e-04 | 2.44e-04 | 2.44e-04 | PASS |
+| 2 | 255 | 4.88e-04 | 4.88e-04 | 1.22e-04 | PASS |
+| 2 | 320 | 4.88e-04 | 4.88e-04 | 2.44e-04 | PASS |
+
+**16/16 PASS** (atol=1e-3, rtol=1e-2 vs fp32-promoted PyTorch reference)
+
+### Benchmark
+
+| Metric | v14b_pretransposed (baseline) | v16a_seq_parallel (LNC=1) | v16a_seq_parallel (LNC=2) |
+|---|---|---|---|
+| device_time_us | 75.42 | 78.60 | 81.73 |
+| TensorE % | 39.2% | 34.7% | 35.3% |
+| VectorE % | 51.9% | 44.4% | 48.1% |
+| DMA active % | 47.5% | 45.1% | 47.0% |
+| spill_bytes | 163,840 | 163,840 | 131,072 |
+| hbm_read_KiB | 11,554 | 10,193 | 15,026 |
+| hbm_write_KiB | 656.5 | 652.5 | 656.5 |
+
+### Analysis
+
+v16a **regresses** vs v14b by +6.3 µs (LNC=2). The S-tile sharding saves ~50% KV-cache DMA (each core loads 4 tiles × PMAX×d instead of 8), but the bug fix required loading all 8 heads' Wq on both cores instead of 4 heads per core. This doubles the Wq DMA bandwidth — 15,026 KiB vs 11,554 KiB baseline, an increase of ~3,500 KiB. The added Wq DMA overwhelms the KV cache savings.
+
+HBM read breakdown (LNC=2 v16a vs baseline):
+- **KV cache** (tiles 0-3 per core): ~½ of baseline KV reads — savings ~1,920 KiB per core
+- **Wq** (all 8 heads vs 4): doubled — extra ~3,500 KiB
+- Net: **+1,580 KiB** extra HBM read → measured +3,472 KiB (additional scheduling overhead likely)
+
+DMA is still the critical path at 47% active on both variants.
+
+### Lessons
+
+1. **S-tile sharding is only beneficial when Wq can also be head-sharded.** In the current design, S-tile sharding forces full Wq loads (all heads on both cores), negating the KV savings. A correct S-tile-only design would require broadcasting Q across cores via sendrecv before computing KV scores.
+2. **`nki.simulate` cannot execute two-core `nisa.sendrecv`** — it runs single-threaded and deadlocks. Always use `torch_xla` on-device execution for LNC=2 correctness tests.
+3. **Python `range`, `enumerate`, and int-keyed dicts are not valid** in NKI kernel trace loops. Use Python `range(N)` with index access, or explicit literal lists.
+
+### Potential path to improvement
+
+To recover v16a's intended savings without the Wq overhead:
+- **Q exchange via sendrecv**: Core 0 projects Q for heads 0-3, core 1 for heads 4-7; exchange via one `sendrecv` (pipe_id=4); then each core computes KV scores for its owned tiles with complete Q. Net: 4 heads Wq each + 1 Q exchange sendrecv vs 8 heads Wq each.
+- **FP8 / MXFP8 weight quantization** (Wq/Wk/Wv/Wo): 2× DMA reduction, compatible with any sharding strategy. Target: <38 µs from MBU ceiling.
+
+**Best current variant: `v15c_broadcast_elim.py` @ 75.1 µs (v16a @ 81.7 µs is a regression).**

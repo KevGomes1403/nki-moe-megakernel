@@ -1,0 +1,109 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+Warning:
+1 map information files for pre-existing threads were
+not processed, if there are samples for addresses they
+will not be resolved, you may find out which are these
+threads by running with -v and redirecting the output
+to a file.
+The time limit to process proc map is too short?
+Increase it by --proc-map-timeout
+#
+# Total Lost Samples: 0
+#
+# Samples: 19  of event 'cycles'
+# Event count (approx.): 11357644
+#
+# Overhead|Command        |Shared Object        |Symbol                                  
+ 12.86% |sudo           |libsudo_util.so.0.0.0|[.] sudo_debug_printf2_v1
+            |
+            ---sudo_debug_printf2_v1
+
+ 7.68%  |sudo           |ld-linux-x86-64.so.2 |[.] 0x000000000000dd8b
+            |
+            ---0x7aa369ba1d8b
+
+ 7.68%  |python         |[kernel.kallsyms]    |[k] __kvm_handle_async_pf
+            |
+            ---__kvm_handle_async_pf
+               0x759182ba17e8
+
+ 6.85%  |kill           |[kernel.kallsyms]    |[k] mprotect_fixup
+            |
+            ---mprotect_fixup
+               0x7e48503ebdbb
+
+ 4.88%  |systemd-journal|[kernel.kallsyms]    |[k] __scm_send
+            |
+            ---__scm_send
+               sendmsg
+
+ 4.41%  |node           |[kernel.kallsyms]    |[k] available_idle_cpu
+            |
+            ---available_idle_cpu
+               pthread_cond_broadcast
+
+ 4.41%  |perf           |perf                 |[.] perf_mmap__read_head
+            |
+            ---perf_mmap__read_head
+
+ 4.41%  |python         |[kernel.kallsyms]    |[k] _raw_spin_lock
+            |
+            ---_raw_spin_lock
+               0x759182ba17e8
+
+ 4.41%  |python         |[kernel.kallsyms]    |[k] rcu_all_qs
+            |
+            ---rcu_all_qs
+               0x759182ba17e8
+
+ 4.41%  |python         |libc.so.6            |[.] 0x00000000001a17b5
+            |
+            ---0x759182ba17b5
+
+ 4.41%  |sudo           |[kernel.kallsyms]    |[k] __kmalloc_noprof
+            |
+            ---__kmalloc_noprof
+               setresgid
+
+ 4.41%  |sudo           |[kernel.kallsyms]    |[k] entry_SYSCALL_64
+            |
+            ---entry_SYSCALL_64
+               __close
+
+ 4.41%  |sudo           |ld-linux-x86-64.so.2 |[.] 0x000000000000da54
+            |
+            ---0x7aa369ba1a54
+
+ 4.41%  |sudo           |libc.so.6            |[.] 0x000000000019b153
+            |
+            ---0x7aa36999b153
+
+ 4.41%  |systemd-journal|[kernel.kallsyms]    |[k] __d_lookup
+            |
+            ---__d_lookup
+               open64
+
+ 4.41%  |systemd-journal|[kernel.kallsyms]    |[k] vma_is_shmem
+            |
+            ---vma_is_shmem
+               0x7825a7a69554
+
+ 4.41%  |systemd-resolve|[kernel.kallsyms]    |[k] __netif_receive_skb_core.constprop.0
+            |
+            ---__netif_receive_skb_core.constprop.0
+               sendmsg
+
+ 3.58%  |sudo           |[kernel.kallsyms]    |[k] __get_pfnblock_flags_mask.isra.0
+            |
+            ---__get_pfnblock_flags_mask.isra.0
+
+ 3.58%  |sudo           |[kernel.kallsyms]    |[k] zap_present_ptes.constprop.0
+            |
+            ---zap_present_ptes.constprop.0
+
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#
