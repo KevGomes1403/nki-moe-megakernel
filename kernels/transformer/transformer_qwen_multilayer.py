@@ -48,8 +48,8 @@ from nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
 from nkilib.experimental.transformer.transformer_tkg import (
     _sb2sb_all_reduce_gather,
 )
-from kernels.attn_tkg.agents.v14c_kv_norm_hoisted import qwen3_attn_tkg_fused_oproj_v13bc_kv_norm_hoisted
-from kernels.moe_fused_tkg.versions.kernel_v30b_gu_shard import _qwen3_moe_sbuf_in_sbuf_out
+from kernels.attn_tkg.agents.v14d_kv_norm_hoisted_weights import qwen3_attn_tkg_fused_oproj_v13bc_kv_norm_hoisted_weights
+from kernels.moe_fused_tkg.versions.kernel_v30c_hoisted import _qwen3_moe_sbuf_in_sbuf_out_hoisted
 
 H        = 2048
 H0       = 128
@@ -117,11 +117,14 @@ def _multilayer_body(
     residual_sb = nl.ndarray((H0, BxS * H1), dtype=dtype, buffer=nl.sbuf,
                               name="residual_sb")
     X_flat = X.reshape((BxS * H,))
+    residual_load_sb = nl.ndarray((H0, BxS * H1), dtype=dtype, buffer=nl.sbuf,
+                                   name="residual_load_sb")
     nisa.dma_copy(
-        dst=residual_sb,
+        dst=residual_load_sb,
         src=X_flat.ap(pattern=[[1, H0], [H0, H1], [H, BxS]], offset=0),
         dge_mode=nisa.dge_mode.hwdge,
     )
+    nisa.tensor_copy(residual_sb, residual_load_sb)
 
     # -----------------------------------------------------------------------
     # Hoist layer-invariant attention constants out of the per-layer loop
@@ -177,9 +180,94 @@ def _multilayer_body(
     nisa.tensor_copy(knw_f32_all,  knw_bf16_all)
     nisa.tensor_copy(gpan_f32_all, gpan_bf16_all)
 
+    # -----------------------------------------------------------------------
+    # Plan B steps 4 & 5: double-buffered cross-layer weight prefetch.
+    # Uses an interleave_degree=2 sub-scope: each layer allocates a fresh slot
+    # via sbm.alloc_stack and increment_section rotates the physical SBUF
+    # backing between two sections, so current-layer consumption and
+    # next-layer prefetch don't alias.
+    #
+    # Step 4: Wk, Wv     (1× tensor per slot)
+    # Step 5: Wq, Wo     (NOH=4 owned-head tensors per slot — LNC sharded)
+    #         Router_w   (wide [PMAX, ROUTER_BATCH=16, E=128] form per slot)
+    # -----------------------------------------------------------------------
+
+    # Owned head indices mirror v14d's internal LNC sharding (4 heads/core at N_PRGS=2).
+    # Used both at prefetch time (which Wq/Wo head slice to DMA) and to align
+    # the per-head SBUF list passed back into v14d.
+    if prg_id == 0:
+        OWNED = [0, 1, 2, 3]
+    else:
+        OWNED = [4, 5, 6, 7]
+    NOH = 4
+    HQ_TP = 8           # total Q heads per TP rank — used in Wo reshape
+    ROUTER_BATCH = 16   # mirrors _ROUTER_BATCH in v30c
+    E = 128             # num experts (Qwen3-30B-A3B)
+
+    # Switch to explicit-address mode so interleave_degree=2 actually cycles
+    # the SBUF backing. With auto_alloc=True the allocator ignores the
+    # section cursor (see _get_safe_batch_interleave_degree in attention_tkg).
     sbm.set_auto_alloc(False)
+    sbm.set_name_prefix("weights_")
+    # interleave_degree=2 gives the compiler a second physical slot per
+    # per-iteration alloc_stack, so it can schedule iter (i+1)'s weight DMAs
+    # in parallel with iter i's attention/MoE compute without any explicit
+    # prefetch loop on our part.
+    sbm.open_scope(interleave_degree=2, name="weight_db")
 
     for layer_idx in range(num_layers):
+        # Fresh per-iter alloc in the current ring section; increment_section
+        # at the end of the iter rotates the next alloc into the other slot.
+        Wk_cur = sbm.alloc_stack((PMAX, NH * PMAX), dtype, name=f"Wk_L{layer_idx}")
+        Wv_cur = sbm.alloc_stack((PMAX, NH * PMAX), dtype, name=f"Wv_L{layer_idx}")
+        Wq_cur = []
+        Wo_cur = []
+        for hi in range(NOH):
+            Wq_cur.append(sbm.alloc_stack(
+                (PMAX, NH * PMAX), dtype, name=f"Wq_L{layer_idx}_h{hi}"
+            ))
+            Wo_cur.append(sbm.alloc_stack(
+                (PMAX, H), dtype, name=f"Wo_L{layer_idx}_h{hi}"
+            ))
+        Wq_cur = tuple(Wq_cur)
+        Wo_cur = tuple(Wo_cur)
+        Router_cur = sbm.alloc_stack(
+            (PMAX, ROUTER_BATCH, E), nl.float32, name=f"Router_L{layer_idx}"
+        )
+
+        # HBM → SBUF loads for this layer's weights. No explicit "prefetch":
+        # interleave_degree=2 lets the compiler overlap these with the
+        # previous iteration's compute automatically.
+        nisa.dma_copy(dst=Wk_cur, src=Wk_list[layer_idx], dge_mode=nisa.dge_mode.hwdge)
+        nisa.dma_copy(dst=Wv_cur, src=Wv_list[layer_idx], dge_mode=nisa.dge_mode.hwdge)
+        for hi in nl.affine_range(NOH):
+            q_h = OWNED[hi]
+            nisa.dma_copy(
+                dst=Wq_cur[hi],
+                src=Wq_list[layer_idx][q_h * PMAX:(q_h + 1) * PMAX, :],
+                dge_mode=nisa.dge_mode.hwdge,
+            )
+            # Wo AP pattern matches v14d's internal Wo loader (lines 512-521):
+            # Wo.reshape((Hq_tp, d, H_wo)) then per-head [PMAX, H_wo] tile via stride pattern.
+            nisa.dma_copy(
+                dst=Wo_cur[hi],
+                src=Wo_list[layer_idx].reshape((HQ_TP, PMAX, H)).ap(
+                    pattern=[[H, PMAX], [1, H]],
+                    offset=q_h * PMAX * H,
+                ),
+                dge_mode=nisa.dge_mode.hwdge,
+            )
+        # Router wide DMA — single h_chunk since H_free=16 == ROUTER_BATCH=16.
+        # Pattern mirrors v30c lines 192-199.
+        nisa.dma_copy(
+            dst=Router_cur,
+            src=router_list[layer_idx].ap(
+                pattern=[[E, PMAX], [PMAX * E, ROUTER_BATCH], [1, E]],
+                offset=0,
+            ),
+            dge_mode=3,
+        )
+
         # ------------------------------------------------------------------
         # ATTENTION (v14a_kv_norm)
         # Slicing Wq_all[layer_idx] etc. reduces the leading [L] dim via
@@ -190,11 +278,15 @@ def _multilayer_body(
         sbm.set_name_prefix(f"L{layer_idx}_attn_")
         sbm.set_auto_alloc(True)
 
-        out_sb = qwen3_attn_tkg_fused_oproj_v13bc_kv_norm_hoisted(
-            hidden_sb=residual_sb,
+        hidden_sb_bf16 = nl.ndarray((H0, BxS * H1), dtype=dtype, buffer=nl.sbuf,
+                                     name=f"L{layer_idx}_hidden_bf16")
+        nisa.tensor_copy(hidden_sb_bf16, residual_sb)
+
+        out_sb = qwen3_attn_tkg_fused_oproj_v13bc_kv_norm_hoisted_weights(
+            hidden_sb=hidden_sb_bf16,
             Wq=Wq_list[layer_idx],          # [Hq_tp*d, H]  = [1024, 2048]
-            Wk=Wk_list[layer_idx],          # [Hkv_tp*d, H] = [128,  2048]
-            Wv=Wv_list[layer_idx],          # [Hkv_tp*d, H] = [128,  2048]
+            Wk=Wk_list[layer_idx],          # HBM fallback — unused when wk_sb is set
+            Wv=Wv_list[layer_idx],          # HBM fallback — unused when wv_sb is set
             Wo=Wo_list[layer_idx],          # [Hq_tp*d, H]  = [1024, 2048]
             q_norm_weight=qn_list[layer_idx],    # HBM fallback — unused when qnw_f32_sb is set
             k_norm_weight=kn_list[layer_idx],    # HBM fallback — unused when knw_f32_sb is set
@@ -211,6 +303,13 @@ def _multilayer_body(
             cos_f32_sb  = cos_f32_all,
             sin_f32_sb  = sin_f32_all,
             gpan_f32_sb = gpan_f32_all[0:PMAX, layer_idx * NH:(layer_idx + 1) * NH],
+            # Plan B step 4: pre-loaded Wk / Wv from the current ring slot.
+            wk_sb = Wk_cur,
+            wv_sb = Wv_cur,
+            # Plan B step 5: pre-loaded per-owned-head Wq / Wo from current slot.
+            # Tuple of NOH=4 tensors; v14d aligns these with its internal owned_heads.
+            wq_heads_sb = Wq_cur,
+            wo_heads_sb = Wo_cur,
         )
         # out_sb: [H0, BxS*H1] = [128, 16] bf16 in SBUF — partial-sum (TP shard)
 
@@ -229,7 +328,7 @@ def _multilayer_body(
         sbm.close_scope()
         sbm.set_auto_alloc(False)
 
-        # Residual add #1: residual_sb += attn_reduced_sb (in-place)
+        # Residual add #1: bf16 add into bf16 residual
         nisa.tensor_tensor(dst=residual_sb, data1=residual_sb,
                            data2=attn_reduced_sb, op=nl.add)
 
@@ -241,15 +340,21 @@ def _multilayer_body(
         sbm.set_name_prefix(f"L{layer_idx}_moe_")
         sbm.set_auto_alloc(True)
 
-        moe_out_sb = _qwen3_moe_sbuf_in_sbuf_out(
-            inp_sb=residual_sb,
+        moe_inp_bf16 = nl.ndarray((H0, BxS * H1), dtype=dtype, buffer=nl.sbuf,
+                                   name=f"L{layer_idx}_moe_inp_bf16")
+        nisa.tensor_copy(moe_inp_bf16, residual_sb)
+
+        moe_out_sb = _qwen3_moe_sbuf_in_sbuf_out_hoisted(
+            inp_sb=moe_inp_bf16,
             dtype=dtype,
             T=T,
-            gamma=gpost_list[layer_idx],        # [1, H] = [1, 2048]
-            router_w=router_list[layer_idx],    # [H, E] = [2048, 128]
+            gamma=gpost_list[layer_idx],        # HBM fallback — gpost not yet hoisted
+            router_w=router_list[layer_idx],    # HBM fallback — unused when router_w_wide_sb is set
             gate_up_w=gate_up_list[layer_idx],  # [E, H, 384]
             down_w=down_list[layer_idx],        # [E, 192, H]
             sbm=sbm,
+            # Plan B step 5: pre-loaded wide router_w from the current ring slot.
+            router_w_wide_sb = Router_cur,
         )
 
         # AllReduce #2 + LNC gather: both TP shards → full [H0, BxS*H1] on each core
@@ -262,12 +367,19 @@ def _multilayer_body(
             sbm.pop_heap()
         sbm.set_auto_alloc(False)
 
-        # Residual add #2: residual_sb += moe_gathered_sb (in-place)
+        # Residual add #2: bf16 add into bf16 residual
         nisa.tensor_tensor(dst=residual_sb, data1=residual_sb,
                            data2=moe_gathered_sb, op=nl.add)
 
-    # Close the hoisted-constants scope now that all layers are done.
-    sbm.close_scope()
+        # Rotate to the other SBUF section for the next layer's weight alloc.
+        # The compiler uses this to double-buffer: next iter's DMAs land in
+        # the freed section and can issue while this iter's compute is still
+        # reading the current section.
+        sbm.increment_section()
+
+    # Close the weight double-buffer + hoisted-constants scopes.
+    sbm.close_scope()  # weight_db
+    sbm.close_scope()  # hoist
 
     # -----------------------------------------------------------------------
     # After the last layer: single HBM store of the post-residual hidden state.
@@ -275,14 +387,18 @@ def _multilayer_body(
     # deliberately do NOT apply it here.
     # -----------------------------------------------------------------------
     Y = nl.ndarray((B, S_tkg, H), dtype=dtype, buffer=nl.shared_hbm, name="Y")
-    # Plain-linear store: Y[b, 0, t*H0 + p] = residual_sb[p, b*H1 + t].
+    # Cast f32 residual to bf16 before storing to HBM (matches baseline bf16 output dtype).
+    residual_out_bf16_sb = nl.ndarray((H0, BxS * H1), dtype=dtype, buffer=nl.sbuf,
+                                       name="residual_out_bf16_sb")
+    nisa.tensor_copy(residual_out_bf16_sb, residual_sb)
+    # Plain-linear store: Y[b, 0, t*H0 + p] = residual_out_bf16_sb[p, b*H1 + t].
     # Gate on prg_id==0 to avoid duplicate writes across LNC cores.
     if prg_id == 0:
         Y_flat = Y.reshape((BxS, H))
         for b in nl.static_range(BxS):
             for t in nl.static_range(H1):
                 col_psum = nl.ndarray((1, H0), dtype=dtype, buffer=nl.psum)
-                nisa.nc_transpose(col_psum, residual_sb[0:H0, b*H1 + t : b*H1 + t + 1])
+                nisa.nc_transpose(col_psum, residual_out_bf16_sb[0:H0, b*H1 + t : b*H1 + t + 1])
                 col_sb = nl.ndarray((1, H0), dtype=dtype, buffer=nl.sbuf,
                                     name=f"out_col_b{b}_t{t}_sb")
                 nisa.tensor_copy(col_sb, col_psum)
