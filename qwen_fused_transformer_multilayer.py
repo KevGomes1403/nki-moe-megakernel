@@ -89,13 +89,14 @@ class Qwen3MoEV3MultilayerNeuronConfig(MoENeuronConfig):
     """MoENeuronConfig for the 48-layer fused TKG megakernel."""
 
     def __init__(self, **kwargs):
-        if "blockwise_matmul_config" not in kwargs:
+        if not isinstance(kwargs.get("blockwise_matmul_config"), BlockwiseMatmulConfig):
             kwargs["blockwise_matmul_config"] = BlockwiseMatmulConfig.from_kwargs(
-                block_size=256,
-                logical_nc_config=2,
-                normalize_top_k_affinities=True,
-                use_shard_on_block_dynamic_while=True,
-                block_sharding_strategy="PING_PONG",
+                use_torch_block_wise=True,
+                # block_size=256,
+                # logical_nc_config=2,
+                # normalize_top_k_affinities=True,
+                # use_shard_on_block_dynamic_while=True,
+                # block_sharding_strategy="PING_PONG",
             )
         # Full-KV cache layout expected by v14a (no slicing).
         kwargs["attn_tkg_nki_kernel_enabled"] = True
@@ -104,6 +105,8 @@ class Qwen3MoEV3MultilayerNeuronConfig(MoENeuronConfig):
         kwargs["attn_block_tkg_nki_kernel_cache_update"] = True
         kwargs.setdefault("fused_qkv", False)
         kwargs["on_device_sampling_config"] = OnDeviceSamplingConfig(**kwargs)
+        kwargs["output_logits"] = True
+        kwargs["async_mode"] = True
         super().__init__(**kwargs)
 
 
@@ -166,8 +169,35 @@ def convert_qwen3_moe_hf_to_neuron_state_dict(neuron_state_dict, config):
         o_proj_w = neuron_state_dict[f"layers.{l}.self_attn.o_proj.weight"]   # [H, Hq]
         neuron_state_dict[f"layers.{l}.self_attn.Wo_nki.weight"] = o_proj_w.T.contiguous()
 
+        # Tile-transposed layout for pretransposed attention kernel:
+        #   W_pt[head*d+p, tile*d+f] = W[head*d+f, tile*d+p]
+        #   Produced by: W.reshape(n_heads, d, n_tiles, d).permute(0, 3, 2, 1).reshape(n_heads*d, H)
+        _d        = config.head_dim                       # 128
+        _nh       = config.num_attention_heads            # 32
+        _nkv      = config.num_key_value_heads            # 4
+        _H_cfg    = config.hidden_size                    # 2048
+        _nh_tiles = _H_cfg // _d                          # 16
+
+        q_proj_w = neuron_state_dict[f"layers.{l}.self_attn.q_proj.weight"]   # [Hq, H]
+        neuron_state_dict[f"layers.{l}.self_attn.Wq_nki.weight"] = (
+            q_proj_w.reshape(_nh, _d, _nh_tiles, _d)
+            .permute(0, 3, 2, 1).reshape(_nh * _d, _H_cfg).contiguous()
+        )
+
+        k_proj_w = neuron_state_dict[f"layers.{l}.self_attn.k_proj.weight"]   # [nkv*d, H]
+        neuron_state_dict[f"layers.{l}.self_attn.Wk_nki.weight"] = (
+            k_proj_w.reshape(_nkv, _d, _nh_tiles, _d)
+            .permute(0, 3, 2, 1).reshape(_nkv * _d, _H_cfg).contiguous()
+        )
+
+        v_proj_w = neuron_state_dict[f"layers.{l}.self_attn.v_proj.weight"]   # [nkv*d, H]
+        neuron_state_dict[f"layers.{l}.self_attn.Wv_nki.weight"] = (
+            v_proj_w.reshape(_nkv, _d, _nh_tiles, _d)
+            .permute(0, 3, 2, 1).reshape(_nkv * _d, _H_cfg).contiguous()
+        )
+
         neuron_state_dict[f"layers.{l}.mlp.router.linear_router.weight"] = (
-            neuron_state_dict[f"layers.{l}.mlp.gate.weight"].detach().clone()
+            neuron_state_dict[f"layers.{l}.mlp.gate.weight"].detach().clone().to(torch.float32)
         )
         del neuron_state_dict[f"layers.{l}.mlp.gate.weight"]
 
@@ -231,16 +261,32 @@ class NeuronQwen3MoEAttentionV3(NeuronAttentionBase):
             max_position_embeddings=config.max_position_embeddings,
             base=config.rope_theta,
         )
-        super().__init__(
-            config=config,
-            hidden_size=config.hidden_size,
-            num_attention_heads=config.num_attention_heads,
-            num_key_value_heads=config.num_key_value_heads,
-            head_dim=config.head_dim,
-            rotary_emb=rotary_emb,
-            rms_norm_eps=config.rms_norm_eps,
-            use_qk_norm=False,
-        )
+        # Temporarily mask attn_block_tkg_nki_kernel_enabled during super().__init__()
+        # so init_gqa_properties constructs the CTE o_proj with out_proj_kernel_enabled=False,
+        # matching qwen.py's plain o_proj matmul. Without this, the deprecated-alias
+        # auto-promotion (config.py:459-467) forces out_proj_kernel_enabled=True on the CTE
+        # path (attention_base.py:376), which transposes the weight and routes CTE through
+        # _kernel_o_proj (a different numerics path than the reference).
+        # V3's TKG layer 0 dispatches the megakernel directly and layers 1..L-1 return early,
+        # so NxDI's self_attn is never called on TKG; the instance attr
+        # self.attn_block_tkg_nki_kernel_enabled being False is harmless.
+        # The config-level flag stays True so model_base.py's update_kv_per_layer gate
+        # (which requires attn_block_tkg_nki_kernel_cache_update + _enabled) still fires.
+        _saved_block_flag = config.neuron_config.attn_block_tkg_nki_kernel_enabled
+        config.neuron_config.attn_block_tkg_nki_kernel_enabled = False
+        try:
+            super().__init__(
+                config=config,
+                hidden_size=config.hidden_size,
+                num_attention_heads=config.num_attention_heads,
+                num_key_value_heads=config.num_key_value_heads,
+                head_dim=config.head_dim,
+                rotary_emb=rotary_emb,
+                rms_norm_eps=config.rms_norm_eps,
+                use_qk_norm=False,
+            )
+        finally:
+            config.neuron_config.attn_block_tkg_nki_kernel_enabled = _saved_block_flag
         self.q_layernorm = get_rmsnorm_cls()(self.head_dim, self.rms_norm_eps)
         self.k_layernorm = get_rmsnorm_cls()(self.head_dim, self.rms_norm_eps)
 
@@ -252,8 +298,12 @@ class NeuronQwen3MoEAttentionV3(NeuronAttentionBase):
         _dtype = config.neuron_config.torch_dtype
         _H = config.hidden_size
         _Hq_full = config.num_attention_heads * config.head_dim
+        _Hkv_full = config.num_key_value_heads * config.head_dim
         self._nki_d = config.head_dim
-        self.Wo_nki = ColumnParallelLinear(_H, _Hq_full, bias=False, gather_output=False, dtype=_dtype)
+        self.Wq_nki = ColumnParallelLinear(_H, _Hq_full,  bias=False, gather_output=False, dtype=_dtype)
+        self.Wk_nki = ColumnParallelLinear(_H, _Hkv_full, bias=False, gather_output=False, dtype=_dtype)
+        self.Wv_nki = ColumnParallelLinear(_H, _Hkv_full, bias=False, gather_output=False, dtype=_dtype)
+        self.Wo_nki = ColumnParallelLinear(_H, _Hq_full,  bias=False, gather_output=False, dtype=_dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -275,8 +325,8 @@ class NeuronQwen3MoeDecoderLayerV3(nn.Module):
         self.self_attn = NeuronQwen3MoEAttentionV3(config=config)
 
         _dtype = config.neuron_config.torch_dtype
-        self.input_layernorm = get_rmsnorm_cls()(config.hidden_size, eps=config.rms_norm_eps).to(_dtype)
-        self.post_attention_layernorm = get_rmsnorm_cls()(config.hidden_size, eps=config.rms_norm_eps).to(_dtype)
+        self.input_layernorm = get_rmsnorm_cls()(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = get_rmsnorm_cls()(config.hidden_size, eps=config.rms_norm_eps)
 
         self.mlp = initialize_moe_module(config=config)
 
@@ -322,10 +372,9 @@ class NeuronQwen3MoeDecoderLayerV3(nn.Module):
         gpost = []
         router, gate_up, down = [], [], []
         for l in layers:
-            qkv = l.self_attn.get_qkv_proj()
-            Wq.append(qkv.q_proj.weight)
-            Wk.append(qkv.k_proj.weight)
-            Wv.append(qkv.v_proj.weight)
+            Wq.append(l.self_attn.Wq_nki.weight)
+            Wk.append(l.self_attn.Wk_nki.weight)
+            Wv.append(l.self_attn.Wv_nki.weight)
             Wo.append(l.self_attn.Wo_nki.weight)
             qn.append(l.self_attn.q_layernorm.weight)
             kn.append(l.self_attn.k_layernorm.weight)
@@ -456,6 +505,33 @@ class NeuronQwen3MoeDecoderLayerV3(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Pre-transposed LM head
+# ---------------------------------------------------------------------------
+
+class PreTransposedColumnParallelLinear(ColumnParallelLinear):
+    """Stores lm_head weight as [hidden, vocab_per_partition] instead of
+    [vocab_per_partition, hidden], so HBM loads require no transpose_mode=ENABLED."""
+
+    def set_weight_and_bias_config(self):
+        self.weight_shape = (self.input_size, self.output_size_per_partition)
+        self.weight_partition_dim = 1
+        self.bias_shape = None
+
+    def preshard_hook(self, model_state_dict, prefix):
+        if prefix.endswith("weight"):
+            w = model_state_dict[prefix]  # HF shape: [vocab, hidden]
+            model_state_dict[prefix] = w.t().contiguous()  # → [hidden, vocab]
+        # partition_dim=1 → NxDI shards along vocab axis automatically
+
+    def forward(self, input, slice_indices=None):
+        input_parallel = self._cpl_maybe_input_copy_to_tp_region(input)
+        # weight is [hidden, vocab_per_partition] — matmul directly, no .t()
+        weight = self.weight[:, slice_indices] if slice_indices is not None else self.weight
+        output_parallel = torch.matmul(input_parallel, weight)
+        return self._cpl_maybe_gather_output(output_parallel)
+
+
+# ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
 
@@ -488,10 +564,10 @@ class NeuronQwen3MoeModelV3(NeuronBaseModel):
             layer._parent_model_ref = weakref.ref(self)
 
         self.norm = get_rmsnorm_cls()(self.hidden_size, eps=config.rms_norm_eps)
-        self.lm_head = ColumnParallelLinear(
+        self.lm_head = PreTransposedColumnParallelLinear(
             config.hidden_size,
             config.vocab_size,
-            gather_output=False if self.on_device_sampling else True,
+            gather_output=not self.on_device_sampling,
             bias=False,
         )
 
@@ -535,6 +611,7 @@ class NeuronQwen3MoeForCausalLMV3(NeuronBaseForCausalLM):
             "--enable-mixed-precision-accumulation",
             "--model-type",
             "transformer",
+            f"--lnc={self.neuron_config.logical_nc_config}",
         ]
         if self.compile_tag == CONTEXT_ENCODING_MODEL_TAG:
             optimization_level = "-O1"
@@ -544,20 +621,26 @@ class NeuronQwen3MoeForCausalLMV3(NeuronBaseForCausalLM):
                 "--vectorize-strided-dma",
                 "--enable-scalar-dge-vectorization",
             ]
+            # model_wrapper adds this only on the default (compiler_args=None) path;
+            # force modular flow here too so NKI mac-ops don't defeat graph partitioner.
+            hlo2tensorizer_extra = "--modular-flow-mac-threshold=10"
         elif self.compile_tag == TOKEN_GENERATION_MODEL_TAG:
             # TKG graph is massively larger with L=48 unrolled; use -O1 while
             # iterating, bump to -O3 when stable. Plan §1.6 warns 20-60 min at -O3.
-            optimization_level = "-O1"
+            optimization_level = "-O3"
             tensorizer_opts = [
                 "--enable-ccop-compute-overlap",
                 # Plan §1.6: try =2 / =4 to overlap layer i+1 attn AR with layer i MoE.
-                "--cc-pipeline-tiling-factor=2",
+                "--cc-pipeline-tiling-factor=4",
                 "--vectorize-strided-dma",
-                "--enable-scalar-dge-vectorization",
                 "--eager-tkg-vectorize-dma",
                 "--enable-dge-on-indirect-dma",
                 "--enable-dge-on-vector-indirect-dma",
             ]
+            hlo2tensorizer_extra = ""
+            # NCC-6661: NKI in-place KV scatter triggers the backend verifier; disable it.
+            # model_wrapper adds this automatically only when compiler_args=None.
+            args.append("--internal-backend-options=--enable-verifier=false")
         else:
             optimization_level = "-O1"
             tensorizer_opts = [
@@ -566,6 +649,7 @@ class NeuronQwen3MoeForCausalLMV3(NeuronBaseForCausalLM):
                 "--vectorize-strided-dma",
                 "--enable-scalar-dge-vectorization",
             ]
+            hlo2tensorizer_extra = ""
 
         if tensorizer_opts:
             args.append(f"--tensorizer-options={' '.join(tensorizer_opts)}")
@@ -573,12 +657,18 @@ class NeuronQwen3MoeForCausalLMV3(NeuronBaseForCausalLM):
         args.append(optimization_level)
         args.append("--auto-cast=none")
         args += ["--internal-enable-dge-levels", "vector_dynamic_offsets"]
-        args.append("--internal-hlo2tensorizer-options=--verify-hlo=true")
         # Larger unrolled TKG graph may trip the default instruction limit.
         args.append("--internal-max-instruction-limit=30000000")
 
         if self.neuron_config.scratchpad_page_size:
             args.append(f"--hbm-scratchpad-page-size={self.neuron_config.scratchpad_page_size}")
+
+        # model_wrapper always appends --internal-hlo2tensorizer-options after get_compiler_args();
+        # do NOT add it here or it will appear twice. Pass extra hlo2tensorizer flags via the
+        # config's layer_boundary_markers / modular-flow path instead (see model_wrapper:85-162).
+        # The one exception is hlo2tensorizer_extra which model_wrapper won't add on the custom path.
+        if hlo2tensorizer_extra:
+            args.append(f"--internal-hlo2tensorizer-options={hlo2tensorizer_extra} --verify-hlo=true")
 
         return shlex.join(args)
 
