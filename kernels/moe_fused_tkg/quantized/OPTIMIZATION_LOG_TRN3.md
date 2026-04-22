@@ -1000,6 +1000,104 @@ Numbers at death:
 - (b1) config + (v.1) Parameter registration + (H1) hook fix in `qwen_complete.py`.
 - HLO probe evidence in `/tmp/hlo_probe.log` (read-only reference going forward).
 
+---
+
+## Phase 3 — CLOSEOUT (2026-04-22)
+
+**Decision**: Phase 3 end-to-end measurement is closed. No further retry attempts. The remaining blocker is an **infrastructure constraint** (NxDI load-time DRAM peak on a 124 GB-DRAM trn3.3xlarge), not a kernel problem. Continued iteration has diminishing returns.
+
+### What IS validated (shippable)
+
+| Artifact | Evidence | Status |
+|---|---|---|
+| **v15c MoE kernel** — 72.88 μs, −17.2% vs v14a (88.06 μs) | Bit-exact vs v14a (`probe_v14a_v15c_zero_check.py`, absmean ~11.6, range [−49, 55]); Round 1 synthesis table | **Locked** |
+| **int8-reinterpret HWDGE trick** (novel trn3 primitive) | v15c source + Round 1 win narrative | **Locked** |
+| **qwen_complete trn3 compile path** | 6/6 NEFFs (3 CTE + 3 TKG) compile cleanly under (b1)+(v.1) | **Locked** |
+| **(b1) CTE shard-on-block config** | qwen_complete CTE HLO drops to 12.85–12.99 MB; all 3 buckets compile | **Locked** |
+| **(v.1) Parameter promotion** (`register_buffer` → `nn.Parameter(requires_grad=False)`) | TKG HLO `constant` bytes collapse 30.25 GB → <2 GB; `ByteSize()` succeeds | **Locked** |
+| **(H1) in-place dtype hook** | `_apply_protect_quant` mutates `p.data` rather than allocating new `nn.Parameter`; preserves identity in `_parameters[...]` | **Locked** |
+| **L6 NxDI streaming shard_checkpoint monkey-patch** | qwen_complete.py:111-232, `NKI_STREAMING_SHARD_PATCH=1`; logged `[L6] NxDI streaming shard_checkpoint patch ACTIVE` at runtime | **Installed, correct — never exercised (superseded by L7)** |
+| **L1-L5 NKI landmines catalog** | `docs/integration_findings.md` | **Locked** |
+
+### What is NOT captured
+
+Real on-device e2e measurements — specifically:
+- **TTFT** (time-to-first-token)
+- **tok/s** (throughput)
+- **NKI_FLOP_Ratio** per prompt
+- **Final Score** vs baseline
+
+### Exact reason
+
+The `/tmp/phase0_e2e.log` run (1593 lines, 2026-04-22 05:41 UTC) SIGKILL'd at **t=1167.8s on prompt 0** (`returncode=-9`). Last logged action was the dtype-cast pass:
+
+```
+Neuron: casting layers.47.mlp.moe_fused_tkg.down_scales_tkg from torch.bfloat16 to torch.float32
+[launcher] prompt 0 finished in 1167.8s  returncode=-9
+```
+
+The L6 streaming-shard patch was active (`[L6] NxDI streaming shard_checkpoint patch ACTIVE` at log line 22) and correctly installed — but the process died **one stage upstream** of where the patch intercepts. `~/qwen-30b-a3b/traced_model/weights/` is empty (no `tp{0..3}_sharded_checkpoint.safetensors`); `shard_checkpoint` was never reached.
+
+**Root cause — L7**: NxDI's load-time dtype conversion pass at
+`neuronx_distributed_inference/models/application_base.py:655`
+(`Found torch.float32 weights in checkpoint: ... Will convert to torch.bfloat16`)
+allocates a fresh tensor at the new dtype while the original tensor is still resident in the checkpoint dict. For Qwen3-30B-A3B with 48 layers × `down_scales_tkg` (fp32 scales) + the full bf16 checkpoint and the original fp32 copies, this doubles precision-varying tensors in RAM **before `shard_weights` ever runs**. Peak crosses the 124 GB DRAM ceiling with only the 32 GB `/swapfile` available.
+
+**Memory headroom options we considered and ruled out** for further retry:
+- **Bigger swap** — `/` has only 58 GB free after the 57 GB `hf_model` and current compile artifacts; can't grow swap to 96 GB+ without disk cleanup that risks the preserved NEFF cache.
+- **fp32-scales-in-checkpoint** — would require invasive changes to the HF checkpoint format and the preshard hook contract; high risk, out of scope.
+- **Larger-DRAM instance** — simplest resolution but requires instance-class change beyond trn3.3xlarge (not available this session).
+
+### L7 added to landmines catalog
+
+- **L6**: NxDI `shard_checkpoint` accumulates all TP-rank sharded dicts in RAM before returning (~4×15 GB for Qwen3-30B TP=4). Fix: streaming monkey-patch in qwen_complete.py. **Installed, correct — superseded by L7 as dominant peak.**
+- **L7** (new): NxDI load-time dtype cast pass (`application_base.py:655`) doubles precision-varying tensors in RAM without streaming. Peak occurs **before** any disk write. 48×`down_scales_tkg` bf16↔fp32 round-trip + full checkpoint residency exceeds 124 GB DRAM on trn3.3xlarge. No streaming hook available in NxDI; fix requires either upstream NxDI change, offline fp32-scales checkpoint preparation, or a larger-DRAM host.
+
+See `docs/integration_findings.md` for postmortems and cross-references.
+
+---
+
+## Phase 3 — ESTIMATED e2e (placeholder, computed from isolated benches)
+
+**These numbers are estimates, not measured.** They are assembled from single-kernel isolated benchmarks and coarse per-layer glue costs. Real e2e numbers are blocked on L7 (see CLOSEOUT above).
+
+### Per-layer composition
+
+```
+implied_per_layer_us = v15c(72.88) + v13bc_sbm_tiled(53.71) + AR_est(12) + gap_est(25)
+                     = 72.88 + 53.71 + 12 + 25
+                     = 163.59 μs
+```
+
+Components and sources:
+
+| Component | Value (μs) | Source | Confidence |
+|---|---|---|---|
+| v15c MoE (MXFP4+HWDGE, 1 layer, TP=4 shard, TKG) | 72.88 | Round 1 synthesis, `OPTIMIZATION_LOG_TRN3.md` § "Round 1 results" | **Measured, locked** |
+| v13bc_sbm_tiled attention (1 layer, TP=4 shard, TKG, seq=0 active) | 53.71 | `bench_v13bc_sbm_tiled.py` Round 1 | **Measured, locked** |
+| `AR_est` — 2× AllReduce (qkv+ffn) per layer | 12 | Placeholder: typical trn3 AR at H=2048 TP=4; NOT measured | **Estimate** |
+| `gap_est` — residuals + RMSNorm + router + inter-op scheduling gaps | 25 | Placeholder: budget from prior transformer TKG timings; NOT measured | **Estimate** |
+
+### Model-level composition
+
+```
+implied_e2e_ms = 48 × implied_per_layer_us + post_transformer
+               = 48 × 163.59 μs + post_transformer_est
+               = 7852 μs + post_transformer_est
+               ≈ 7.85 ms + post_transformer_est
+```
+
+Where `post_transformer_est` covers final RMSNorm + LM head + sampler + host-side overhead (sub-ms on a well-compiled graph, order 500 μs–2 ms range).
+
+**Implied TKG latency**: ~**8–10 ms per token** on trn3 TP=4 LNC=2, assuming the estimates above hold. Baseline for comparison is `base_latency=12498.0 μs` → 12.5 ms per token (from `main.py` config), giving an implied **~20-35% TKG latency improvement** attributable to v15c+v13bc+(b1)+(v.1)+(H1).
+
+**Explicit disclaimers**:
+- `AR_est` and `gap_est` are load-bearing placeholders. Neither is measured on this model at this TP config. They could be materially off (±50%) once measured.
+- Isolated single-kernel benches do not capture inter-kernel scheduling gaps, NeuronCore stalls around AllReduce, or compiler decisions at the 48-layer scope. NTFF-based per-layer timing would replace these with ground truth.
+- The v15c −17.2% win is **verified and durable** at the kernel level. Its translation to e2e is estimated, not measured.
+- Do not cite these numbers as submission results. They exist to set expectations during handoff only.
+
+
 
 
 

@@ -168,6 +168,55 @@ tkg.weight = nn.Parameter(tensor, requires_grad=False)
 
 **Dtype protection note**: if you have an `_apply` hook protecting buffer dtypes from `model.to(bfloat16)` coercion (as in `_install_nki_router`'s `weight_T` protection), swap `tkg._buffers[name]` → `tkg._parameters[name]` to match the new registration — and wrap in `nn.Parameter(...data.to(dtype), requires_grad=False)` since assigning a plain tensor to `_parameters[...]` is an error.
 
+### L6 — `ModelBuilder.shard_checkpoint` accumulates all TP-rank sharded dicts in RAM before returning
+
+**Observed in**: Phase 3 STEP 2 retry (2026-04-22 04:34 UTC). SIGKILL'd at 127 GB RSS + 32 GB swap saturated on trn3.3xlarge.
+
+**Mechanism**: `neuronx_distributed/trace/model_builder.py:827-858` `shard_checkpoint` builds a Python list holding **all TP-rank** sharded checkpoint dicts before returning. For Qwen3-30B-A3B with TP=4, each sharded dict is ~15 GB bf16; the loop peaks at 4×15 GB = 60 GB **on top of** the original checkpoint still resident in scope (~60 GB). Net peak ≈ 120 GB, which OOMs on a 124 GB instance with 32 GB swap.
+
+NxDI exposes **no config knob** that toggles the accumulation — `save_sharded_checkpoint` and `skip_sharding` only pick WHERE sharding happens (compile vs load), not HOW the loop buffers ranks.
+
+**Fix pattern** (installed in `qwen_complete.py:111-232`, gated by `NKI_STREAMING_SHARD_PATCH=1`): monkey-patch `ModelBuilder.shard_checkpoint` with a streaming version that calls `save_file(sharded, path)` per rank and `del sharded; gc.collect()` between ranks, returning `[]` (caller at `application_base.py:254` ignores the return value).
+
+**Status**: **Installed, correct — but not exercised at runtime** because the process SIGKILL'd upstream during the load-time dtype cast pass (see L7). The patch remains installed for future use on an instance where L7 is not the dominant peak.
+
+### L7 — NxDI load-time dtype cast pass doubles precision-varying tensors in RAM before any disk write
+
+**Observed in**: Phase 3 CLOSEOUT run (2026-04-22 05:41 UTC). SIGKILL at t=1167.8s during the cast pass, **before** L6's streaming-shard patch was reached. `~/qwen-30b-a3b/traced_model/weights/` was empty at death.
+
+**Mechanism**: `neuronx_distributed_inference/models/application_base.py:655` iterates the loaded checkpoint and emits warnings of the form:
+
+```
+UserWarning: Found torch.float32 weights in checkpoint: layers.N.mlp.moe_fused_tkg.down_scales_tkg. Will convert to torch.bfloat16
+```
+
+followed by model-side casts:
+
+```
+Neuron: casting layers.N.mlp.moe_fused_tkg.down_scales_tkg from torch.bfloat16 to torch.float32
+```
+
+For each precision-varying tensor the cast allocates a fresh tensor at the new dtype while the original remains held by the enclosing `checkpoint: Dict[str, Tensor]`. For Qwen3-30B-A3B with 48 layers × quant scales buffers + the full bf16 checkpoint retained, peak DRAM exceeds the 124 GB ceiling on trn3.3xlarge (32 GB swapfile insufficient). **The peak occurs before `shard_weights` ever runs**, so the L6 streaming-shard fix does not help.
+
+**No streaming hook** is exposed in NxDI for this pass. Fix options:
+1. **Upstream NxDI change** — add a streaming cast that mutates `checkpoint[k]` in place (`.data = .data.to(dtype)`) and `gc.collect()` between keys. Not attempted in this session.
+2. **Offline checkpoint preparation** — pre-cast quantization scales to fp32 in the `hf_model/` checkpoint so the runtime cast pass is a no-op for those keys. Invasive; requires changing the (H1) `_apply_protect_quant` contract and the preshard hook.
+3. **Larger-DRAM instance** — straightforward but requires instance-class change beyond trn3.3xlarge.
+
+**Rule**: before declaring a Qwen3-30B-class model trn3.3xlarge-ready, audit every entry in `named_buffers()` and `named_parameters()` for dtype mismatch against the loaded checkpoint. Any mismatch triggers the cast pass. If cumulative mismatched-tensor bytes exceed ~30 GB, expect a load-time DRAM spike in the 1.3×–2× checkpoint-size range.
+
+### L6 ↔ L7 cross-reference
+
+| Aspect | **L6** | **L7** |
+|---|---|---|
+| Stage | `shard_checkpoint` (post-compile, pre-load) | Load-time dtype cast (before `shard_checkpoint`) |
+| NxDI location | `neuronx_distributed/trace/model_builder.py:827-858` | `neuronx_distributed_inference/models/application_base.py:655` |
+| Peak source | Python list holding all TP-rank dicts | Original + converted tensors co-resident in checkpoint dict |
+| Fixable by us? | Yes — `ModelBuilder.shard_checkpoint` monkey-patch | No — no Python hook point exposed |
+| Status | Installed, correct, **not exercised** (superseded) | **Unresolved blocker** on trn3.3xlarge-class instances |
+
+The L6 patch is preserved in `qwen_complete.py` and becomes load-bearing if the workflow runs on a host where L7's peak fits (e.g., larger-DRAM instance or after upstream NxDI adds streaming casts).
+
 ---
 
 ## Finding 2 — loose correctness tolerance masks critical bugs
