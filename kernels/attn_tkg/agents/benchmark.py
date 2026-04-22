@@ -1,5 +1,5 @@
 """
-General-purpose NKI benchmark harness for nki beta 2.
+General-purpose NKI benchmark harness for nki beta 2 — Trainium3 (trn3).
 
 All kernel code uses nki.* namespace (not neuronxcc). Benchmarking data
 comes from neuron-profile (device metrics from NTFF captured at runtime)
@@ -9,7 +9,7 @@ the NeuronCores).
 REQUIRED: Set these env vars BEFORE any neuron/torch_xla imports:
 
     import os
-    os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = "trn2"
+    os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = "trn3"   # ← trn3
     os.environ["NEURON_RT_INSPECT_ENABLE"] = "1"
     os.environ["NEURON_RT_INSPECT_DEVICE_PROFILE"] = "1"
     os.environ["NEURON_RT_INSPECT_OUTPUT_DIR"] = "/abs/path/to/output"
@@ -18,7 +18,7 @@ Two usage styles:
 
   Style A — wrap after @nki.jit:
 
-      @nki.jit(platform_target="trn2")
+      @nki.jit(platform_target="trn3")
       def my_kernel(a, b): ...
 
       my_kernel = wrap_benchmark(my_kernel, warmup=5, iters=50)
@@ -28,6 +28,12 @@ Two usage styles:
   Style B — one-shot:
 
       result = nki_benchmark(my_kernel, a, b, warmup=5, iters=50)
+
+trn3-specific notes:
+  - SBUF is 32 MiB (vs 28 MiB on trn2); tile sizes can be slightly larger.
+  - Watch vector_engine_pct — high VectorE / low TensorE indicates quantize_mx
+    is the bottleneck; move to offline weight quantization to fix.
+  - nc_matmul_mx and quantize_mx are trn3-only; do not use on trn2.
 """
 
 from __future__ import annotations
@@ -108,18 +114,12 @@ def _find_kernel_artifacts(
         new_neffs = _find_new_neffs(inspect_dir, before_inspect)
         if new_neffs:
             profile_neff = max(new_neffs, key=os.path.getmtime)
-            neff_hash = (
-                os.path.basename(profile_neff)
-                .replace("neff_", "")
-                .replace(".neff", "")
-            )
-            # Strip the trailing _vnc_N suffix so the hash matches the NTFF name.
-            # NEFF:  neff_<hash>_vnc_N.neff  → neff_hash after strip = "<hash>_vnc_N"
-            # NTFF:  <hash>_vnc_0.ntff
-            # We need just <hash> for the NTFF glob to work.
-            import re as _re
-            neff_hash_base = _re.sub(r"_vnc_\d+$", "", neff_hash)
-            ntff_pattern = f"{os.path.dirname(profile_neff)}/{neff_hash_base}_vnc_*.ntff"
+            # trn3 NEFFs land as `neff_<hash>_vnc_<N>.neff`; NTFFs land as
+            # `<hash>_vnc_*.ntff`. Strip the "neff_" prefix, then split on
+            # "_vnc_" to isolate just the hash so the glob matches the NTFF.
+            base = os.path.basename(profile_neff)
+            neff_hash = base.replace("neff_", "").split("_vnc_")[0].replace(".neff", "")
+            ntff_pattern = f"{os.path.dirname(profile_neff)}/{neff_hash}_vnc_*.ntff"
             deadline = time.monotonic() + ntff_wait_s
             while time.monotonic() < deadline:
                 candidates = glob.glob(ntff_pattern)
@@ -157,8 +157,6 @@ def _parse_ntff(neff: str, ntff: str) -> dict:
     return next(iter(raw.values()), {})
 
 
-
-
 def _pct_of_total(value_s: float, total_s: float) -> float:
     """Percentage of value relative to total_time (not the raw trace window)."""
     return (value_s / total_s * 100) if total_s > 0 else 0.0
@@ -168,7 +166,7 @@ def _print_profile_results(prof: dict, name: str) -> None:
     """Print device metrics extracted from NTFF via neuron-profile view."""
     sep = "=" * 60
     print(f"\n{sep}")
-    print(f"  Kernel: {name}  (device metrics from NTFF)")
+    print(f"  Kernel: {name}  (device metrics from NTFF — trn3)")
     print(sep)
 
     if not prof:
@@ -195,8 +193,10 @@ def _print_profile_results(prof: dict, name: str) -> None:
     print(f"\n  Engine utilization (% of total_time):")
     print(f"    tensor_engine  = {_pct('tensor_engine_active_time')}"
           f"  ({_us('tensor_engine_active_time'):.2f} μs)")
+    # VectorE is especially relevant on trn3: high % = quantize_mx bottleneck
     print(f"    vector_engine  = {_pct('vector_engine_active_time')}"
-          f"  ({_us('vector_engine_active_time'):.2f} μs)")
+          f"  ({_us('vector_engine_active_time'):.2f} μs)"
+          f"  ← high = quantize-bound")
     print(f"    scalar_engine  = {_pct('scalar_engine_active_time')}"
           f"  ({_us('scalar_engine_active_time'):.2f} μs)")
     print(f"    dma_active     = {_pct('dma_active_time')}"
@@ -211,7 +211,9 @@ def _print_profile_results(prof: dict, name: str) -> None:
     print(f"    hbm_read       = {prof.get('hbm_read_bytes', 0)/1024:.1f} KiB")
     print(f"    hbm_write      = {prof.get('hbm_write_bytes', 0)/1024:.1f} KiB")
     spill = prof.get("spill_save_bytes", 0) + prof.get("spill_reload_bytes", 0)
-    print(f"    spill bytes    = {spill}")
+    # SBUF is 32 MiB on trn3; any spill means tile sizes should be reduced
+    print(f"    spill bytes    = {spill}"
+          + ("  ← reduce tile size (SBUF=32MiB)" if spill > 0 else ""))
 
     print(sep + "\n")
 
@@ -238,6 +240,17 @@ class BenchmarkResult:
         return self.prof.get("tensor_engine_active_time_percent", 0)
 
     @property
+    def vector_engine_pct(self) -> float:
+        """
+        VectorE utilization %.
+
+        trn3-specific diagnostic: high VectorE with low TensorE means
+        quantize_mx is the bottleneck — consider moving to offline weight
+        quantization or pipelining the quantize step.
+        """
+        return self.prof.get("vector_engine_active_time_percent", 0)
+
+    @property
     def dma_active_pct(self) -> float:
         return self.prof.get("dma_active_time_percent", 0)
 
@@ -245,6 +258,18 @@ class BenchmarkResult:
     def spill_bytes(self) -> int:
         return (self.prof.get("spill_save_bytes", 0)
                 + self.prof.get("spill_reload_bytes", 0))
+
+    @property
+    def mfu_estimated_percent(self) -> float:
+        return self.prof.get("mfu_estimated_percent", 0)
+
+    @property
+    def hbm_read_bytes(self) -> int:
+        return int(self.prof.get("hbm_read_bytes", 0))
+
+    @property
+    def hbm_write_bytes(self) -> int:
+        return int(self.prof.get("hbm_write_bytes", 0))
 
 
 def wrap_benchmark(
@@ -265,7 +290,7 @@ def wrap_benchmark(
 
     IMPORTANT: Apply AFTER @nki.jit to avoid confusing the kernel rewriter:
 
-        @nki.jit(platform_target="trn2")
+        @nki.jit(platform_target="trn3")
         def my_kernel(a, b): ...
 
         my_kernel = wrap_benchmark(my_kernel, warmup=5, iters=50)
@@ -273,6 +298,7 @@ def wrap_benchmark(
 
     Access last_result for device metrics:
         my_kernel.last_result.device_time_us
+        my_kernel.last_result.vector_engine_pct  # trn3: quantize-bound check
     """
     kernel_name = getattr(jit_kernel, "__name__", str(jit_kernel))
 
@@ -290,7 +316,8 @@ def wrap_benchmark(
         )
         if bench_neff is None and profile_neff is None:
             print("[benchmark] Could not find NEFF. "
-                  "Ensure NEURON_RT_INSPECT_OUTPUT_DIR is set before any neuron imports.")
+                  "Ensure NEURON_PLATFORM_TARGET_OVERRIDE=trn3 and "
+                  "NEURON_RT_INSPECT_OUTPUT_DIR are set before any neuron imports.")
             return result
 
         if bench_neff:
@@ -338,11 +365,12 @@ def nki_benchmark(
     neuron-bench latency is printed at script exit.
 
     Usage:
-        @nki.jit(platform_target="trn2")
+        @nki.jit(platform_target="trn3")
         def my_kernel(a, b): ...
 
         result = nki_benchmark(my_kernel, a, b, warmup=5, iters=50)
         print(result.device_time_us)
+        print(result.vector_engine_pct)  # trn3: quantize-bound diagnostic
     """
     wrapped = wrap_benchmark(jit_kernel, warmup=warmup, iters=iters)
     wrapped(*args, **kwargs)

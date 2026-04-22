@@ -1,22 +1,44 @@
-import os, sys
-os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = "trn3"  # trn3 target
+"""
+Benchmark for v15e (Plan A [X3]: scalar_tensor_tensor fusion of post-matmul
+activation chain) using the trn3 skill's benchmark harness.
+
+Reports the same fields as bench_v15c_trn3.py so the comparison is direct.
+"""
+import os
+import sys
+
+os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = "trn3"
 os.environ["NEURON_RT_INSPECT_ENABLE"] = "1"
 os.environ["NEURON_RT_INSPECT_DEVICE_PROFILE"] = "1"
 os.environ["NEURON_RT_INSPECT_OUTPUT_DIR"] = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "_bench_out_v12i_trn3"
+    os.path.dirname(os.path.abspath(__file__)), "_bench_out_v15e_trn3"
 )
+
 import shutil
+_HERE = os.path.dirname(os.path.abspath(__file__))
 shutil.copy(
     "/home/ubuntu/nki-moe/.claude/skills/nki-kernel-optimizer-trn3/scripts/benchmark.py",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmark.py"),
+    os.path.join(_HERE, "benchmark.py"),
 )
+
 sys.path.insert(0, "/home/ubuntu/nki-moe")
+sys.path.insert(0, _HERE)
 from benchmark import wrap_benchmark
+
 import torch
 import torch_xla.core.xla_model as xm
-from kernels.moe_fused_tkg.quantized.v12i import qwen3_moe_fused_tkg
 
-_E = 128; _H = 2048; _I = 192; _GU_FLAT = 384
+from kernels.moe_fused_tkg.quantized.v15e import qwen3_moe_fused_tkg
+from kernels.moe_fused_tkg.quantized.v15c import pack_gate_up  # reuse v15c packer
+
+_E = 128
+_H = 2048
+_I = 192
+_GU_FLAT = 2 * _I
+_PMAX = 128
+_H_FREE = _H // _PMAX  # 16
+_GU_PACKED_PLANES = _H_FREE + 1  # 17
+
 
 def make_inputs(seed=42):
     torch.manual_seed(seed)
@@ -24,26 +46,46 @@ def make_inputs(seed=42):
     inp = torch.randn(1, 1, _H, dtype=torch.bfloat16).to(device)
     gamma = torch.randn(1, _H, dtype=torch.bfloat16).to(device)
     router_w = torch.randn(_H, _E, dtype=torch.bfloat16).to(device)
+
+    # Build gate_up weight + scales using the same recipe as bench_v15c_trn3.py
     gate_up_w_fp32 = torch.randn(_E, _H, _GU_FLAT) * 0.1
     gate_up_scales = (gate_up_w_fp32.abs().amax(dim=1) / 240.0).clamp(min=1e-6)
-    gate_up_w = (gate_up_w_fp32 / gate_up_scales.unsqueeze(1)).clamp(-240, 240).to(torch.float8_e4m3fn).view(torch.int8).to(device)
-    gate_up_scales = gate_up_scales.to(device)
+    gate_up_w_i8 = (
+        gate_up_w_fp32 / gate_up_scales.unsqueeze(1)
+    ).clamp(-240, 240).to(torch.float8_e4m3fn).view(torch.int8)
+
+    # v15e: same packed layout as v15c (pack_gate_up helper shared).
+    gate_up_packed = pack_gate_up(gate_up_w_i8, gate_up_scales).to(device)
+
     down_w_fp32 = torch.randn(_E, _I, _H) * 0.1
     down_scales = (down_w_fp32.abs().amax(dim=1) / 240.0).clamp(min=1e-6)
-    down_w = (down_w_fp32 / down_scales.unsqueeze(1)).clamp(-240, 240).to(torch.float8_e4m3fn).view(torch.int8).to(device)
+    down_w = (
+        down_w_fp32 / down_scales.unsqueeze(1)
+    ).clamp(-240, 240).to(torch.float8_e4m3fn).view(torch.int8).to(device)
     down_scales = down_scales.to(device)
-    return inp, gamma, router_w, gate_up_w, gate_up_scales, down_w, down_scales
 
-kernel = wrap_benchmark(lambda *args: qwen3_moe_fused_tkg[2](*args), warmup=5, iters=50)
+    return inp, gamma, router_w, gate_up_packed, down_w, down_scales
+
+
+kernel = wrap_benchmark(
+    lambda *args: qwen3_moe_fused_tkg[2](*args),
+    warmup=5,
+    iters=50,
+)
+
 args = make_inputs()
 xm.mark_step()
-print("Benchmarking v12i on trn3...")
+
+print("Running v15e bench (trn3 harness)...")
 kernel(*args)
+
 r = kernel.last_result
 if r and r.prof:
     prof = r.prof
     def pct(key): return prof.get(key, 0) * 100
-    print(f"\n=== v12i trn3 Benchmark ===")
+    total_us = prof.get("total_time", 0) * 1e6
+
+    print("\n=== v15e Benchmark (trn3 harness) ===")
     print(f"device_time_us       = {r.device_time_us:.2f}")
     print(f"tensor_engine_pct    = {pct('tensor_engine_active_time_percent'):.2f}%")
     print(f"vector_engine_pct    = {pct('vector_engine_active_time_percent'):.2f}%")
@@ -58,9 +100,6 @@ if r and r.prof:
     print(f"hbm_write_KiB        = {prof.get('hbm_write_bytes', 0)/1024:.1f}")
     print(f"cc_op_count          = {prof.get('cc_op_count', 0)}")
     print(f"cc_op_active_time_us = {prof.get('cc_op_active_time', 0)*1e6:.2f}")
-    print(f"\n--- declared v12i trn3 baseline (89.80 μs) ---")
-    delta = r.device_time_us - 89.80
-    sign = '+' if delta >= 0 else ''
-    print(f"delta = {sign}{delta:.2f} μs  ({sign}{delta/89.80*100:.1f}%)")
+    print(f"\nv15c baseline (brief): 72.88 μs  delta={r.device_time_us - 72.88:+.2f} μs")
 else:
-    print("No benchmark result — check env var setup")
+    print("No profile. Check env vars before imports.")

@@ -1,25 +1,30 @@
 # coding=utf-8
 """
-Qwen3 MoE model with NKI-fused attention TKG (v10e) and NKI-fused MoE TKG (kernel_v19b).
+Qwen3 MoE model with NKI-fused attention TKG (v17_fast_exp) and NKI-fused MoE TKG (v15c).
 
 CTE path (past_key_value is None):
-    Standard flash attention + standard MoE (self.mlp unchanged).
+    Standard flash attention + standard MoE (self.mlp unchanged; bf16 gate_up/down retained
+    alongside the TKG-only int8 buffers).
 
 TKG path (past_key_value is not None):
-    Attention: qwen3_attn_tkg_fused_oproj_v10e — fused QKV proj + per-head RMSNorm
-               + RoPE + flash decode + output proj. Mask generated on-chip from position_ids.
-    MoE:       kernel_v19b.qwen3_moe_fused_tkg — fused RMSNorm + Router + TopK(8)
-               + Expert MLPs in one NKI kernel.
+    Attention: v17_fast_exp (Plan B [X1], 53.28 us) — fused QKV proj + per-head RMSNorm
+               + RoPE + flash decode + output proj, with nisa.exponential fast-exp.
+               Wrapped in qwen3_attn_tkg_v17_wrapper to match v10e's [B, 1, H] output shape.
+    MoE:       v15c (Plan C [F3], 72.88 us) — fused RMSNorm + Router + TopK(8) + Expert MLPs
+               with FP8-packed gate_up weights (merged weight+scale DMA, HWDGE offload).
 
 Weight layouts (set up by convert_qwen3_moe_hf_to_neuron_state_dict):
-  Attention (tile-transposed for v10e Plan A):
-    Wq_nki.weight  [Hq_tp*d, H]  = [1024, 2048]  reshape→permute(0,3,2,1)
-    Wk_nki.weight  [d, H]        = [128,  2048]  reshape→permute(0,3,2,1)
-    Wv_nki.weight  [d, H]        = [128,  2048]  reshape→permute(0,3,2,1)
+  Attention (tile-transposed for v17/v10e Plan A):
+    Wq_nki.weight  [Hq_tp*d, H]  = [1024, 2048]  reshape->permute(0,3,2,1)
+    Wk_nki.weight  [d, H]        = [128,  2048]  reshape->permute(0,3,2,1)
+    Wv_nki.weight  [d, H]        = [128,  2048]  reshape->permute(0,3,2,1)
     Wo_nki.weight  [Hq_tp*d, H]  = [1024, 2048]  plain T, no tile-transpose
-  MoE (native layout for kernel_v19b):
-    gate_up_proj.weight  [E, H, 2*I=384]  gate cols 0:I, up cols I:2I
-    down_proj.weight     [E, I=192, H]    no shard pre-split
+  MoE (v15c native layout):
+    gate_up_proj.weight    [E, H, 2*I=384]            bf16  (kept for CTE)
+    down_proj.weight       [E, I=192, H]              bf16  (kept for CTE)
+    gate_up_packed_w_tkg   [E, H_free+1=17, 128, 384] int8  (v15c packed FP8 + scales, TKG-only)
+    down_w_tkg             [E, I=192, H]              int8  (FP8 bytes, TKG-only)
+    down_scales_tkg        [E, H]                     fp32  (FP8 scales, TKG-only)
 """
 
 import gc
@@ -81,9 +86,17 @@ from neuronx_distributed_inference.utils.hf_adapter import (
 
 torch.manual_seed(0)
 
-from kernels.attn_tkg.agents.v10e import qwen3_attn_tkg_fused_oproj_v10e
 from kernels.router_topk.qwen3_router_topk_plan_a import qwen3_router_topk_cte
-from kernels.moe_fused_tkg import kernel_v19b as custom_moe_fused_kernel
+# Round 2 [Z.1]: MoE TKG upgrade v19b -> v15c (72.88 us, bit-exact vs v14a, Plan C [F3] merged DMA).
+from kernels.moe_fused_tkg.quantized import v15c as custom_moe_fused_kernel
+# Round 2 [Z.1]: Attention TKG upgrade v10e -> v17_fast_exp (53.28 us, nisa.exponential fast-exp).
+# v17_fast_exp exports a sub-function; we wrap it in a @nki.jit that produces
+# v10e-compatible [B, 1, H_wo] output so qwen_complete's call site is unchanged.
+from kernels.moe_fused_tkg.quantized._qwen_integration import (
+    qwen3_attn_tkg_v17_wrapper as qwen3_attn_tkg_fused_oproj_v10e,
+    quantize_and_pack_gate_up,
+    quantize_down,
+)
 
 SampleOutput = Union[SampleEncoderDecoderOutput, SampleDecoderOnlyOutput]
 GQA_SHARDING_STRATEGY = GQA.REPLICATE_TO_TP_DEGREE
@@ -95,6 +108,133 @@ _ROUTER_K = 8      # top_k
 
 
 # ---------------------------------------------------------------------------
+# [L6] NxDI streaming shard_checkpoint monkey-patch (Round 3 [M1b] workaround)
+# ---------------------------------------------------------------------------
+#
+# LANDMINE L6 (integration_findings.md):
+#   neuronx_distributed/trace/model_builder.py:827-858 `shard_checkpoint`
+#   accumulates ALL TP-rank sharded checkpoint dicts in a single Python list
+#   before returning. For Qwen3-30B-A3B with TP=4, each sharded dict is ~15 GB
+#   bf16 → the loop holds 4 × 15 GB = 60 GB on top of the 60 GB original
+#   checkpoint, producing a ~120 GB peak that SIGKILLs the process on a
+#   124 GB-DRAM trn3.3xlarge even with 32 GB swap (observed 04:34 UTC 2026-04-22:
+#   mem=127GB + swap=32GB saturated, child_rss=124GB).
+#
+#   NxDI exposes NO config knob (`save_sharded_checkpoint`, `skip_sharding`)
+#   that disables the per-rank accumulation — both flags only toggle WHERE
+#   sharding happens (compile vs load), not HOW the loop buffers ranks.
+#
+# FIX: replace `ModelBuilder.shard_checkpoint` with a streaming version that
+#   flushes each rank to disk via `save_file(...)` and drops the in-RAM dict
+#   before the next rank starts. The upstream caller at
+#   application_base.py:254 ignores the return value, so we return [].
+#
+# GATED by NKI_STREAMING_SHARD_PATCH env var (default "1"). Set to "0" to
+#   disable and fall back to stock NxDI behavior.
+#
+# Requires `save_sharded_checkpoint=True` on the NeuronConfig so that:
+#   (a) compile-time `shard_weights` calls `shard_checkpoint(serialize_path=...)`
+#       (application_base.py:252-254), which triggers our streaming write.
+#   (b) load-time `load_weights` reads per-rank from disk
+#       (application_base.py:389-399) — avoids a second accumulating call.
+import os as _os
+
+if _os.environ.get("NKI_STREAMING_SHARD_PATCH", "1") == "1":
+    import gc as _gc
+    import time as _time
+    import torch as _torch
+    from neuronx_distributed.trace.model_builder import ModelBuilder as _NxDModelBuilder
+    from neuronx_distributed.trace.trace import (
+        _mock_parallel_state as _mock_ps,  # noqa: F401  (keep import parity with upstream)
+        preprocess_checkpoint as _preprocess_ckpt,
+    )
+    from neuronx_distributed.utils.model_utils import init_on_device as _init_on_device
+    from neuronx_distributed.trace.mock_torchdist import mock_distributed as _mock_distributed
+    from neuronx_distributed.parallel_layers import parallel_state as _parallel_state
+    from safetensors.torch import save_file as _save_file
+
+    _ORIG_SHARD_CHECKPOINT = _NxDModelBuilder.shard_checkpoint
+
+    def _streaming_shard_checkpoint(self, serialize_path=None):
+        """Streaming replacement for ModelBuilder.shard_checkpoint (L6 workaround).
+
+        Mirrors upstream (NxDI 2.9, model_builder.py:817-858) but flushes each
+        rank's sharded checkpoint to disk via save_file() and drops the in-RAM
+        copy BEFORE the next rank starts. Caller ignores the return value
+        (application_base.py:254), so we return []."""
+        if serialize_path is None:
+            # If caller didn't request disk write, we can't stream — fall back
+            # to upstream behavior to preserve semantics for other code paths.
+            return _ORIG_SHARD_CHECKPOINT(self, serialize_path=serialize_path)
+        if not _os.path.exists(serialize_path):
+            _os.makedirs(serialize_path)
+
+        source_model_key = list(self.model_collection.keys())[0]
+        model_container = self.model_collection[source_model_key]
+        logger.info(
+            f"[L6 streaming shard] Sharding weights for ranks: "
+            f"{self.start_rank_id}...{self.start_rank_id + self.local_ranks_size - 1}"
+        )
+        t0 = _time.monotonic()
+        with _mock_distributed(world_size=self.world_size), _init_on_device(
+            _torch.device("meta"), force_custom_init_on_device=True
+        ):
+            _torch.distributed.init_process_group(
+                backend="xla", rank=0, world_size=self.world_size
+            )
+            _parallel_state.initialize_model_parallel(
+                tensor_model_parallel_size=self.tp_degree,
+                pipeline_model_parallel_size=self.pp_degree,
+                expert_model_parallel_size=self.ep_degree,
+                skip_collective_init=True,
+                lnc_size=self.logical_nc_config,
+            )
+            if self.init_custom_process_group_fn:
+                self.init_custom_process_group_fn()
+
+            model_container.model_instance.load_module()
+            func_kwargs = (
+                {}
+                if model_container.bucket_config is None
+                else model_container.bucket_config.get_func_kwargs_for_bucket_rank(0)
+            )
+            if "bucket_rank" in func_kwargs:
+                func_kwargs.pop("bucket_rank")
+            model, _io_aliases = model_container.model_instance.get(0, **func_kwargs)
+            checkpoint = self.checkpoint_loader()
+            _preprocess_ckpt(model, checkpoint)
+            self.cast_weights(checkpoint, model, "")
+
+            for rank in range(self.start_rank_id, self.start_rank_id + self.local_ranks_size):
+                # shard_weights_with_cache calls checkpoint.copy() (shallow),
+                # then get_sharded_checkpoint mutates the copy in place (new
+                # tensors for parallel layers), then save_file writes to disk.
+                sharded = self.shard_weights_with_cache(
+                    rank, model, checkpoint, serialize_path
+                )
+                # CRITICAL: drop the sharded dict NOW, not after the loop.
+                del sharded
+                _gc.collect()
+                logger.info(
+                    f"[L6 streaming shard] rank {rank} flushed to disk, "
+                    f"elapsed={_time.monotonic() - t0:.1f}s"
+                )
+
+            _parallel_state.destroy_model_parallel()
+            _torch.distributed.destroy_process_group()
+        logger.info(
+            f"[L6 streaming shard] Done sharding (streaming) in "
+            f"{_time.monotonic() - t0:.1f}s"
+        )
+        return []  # caller (application_base.py:254) ignores return value
+
+    _NxDModelBuilder.shard_checkpoint = _streaming_shard_checkpoint
+    logger.info("[L6] NxDI streaming shard_checkpoint patch ACTIVE")
+else:
+    logger.info("[L6] NxDI streaming shard_checkpoint patch DISABLED via env")
+
+
+# ---------------------------------------------------------------------------
 # Neuron config
 # ---------------------------------------------------------------------------
 
@@ -103,16 +243,39 @@ class Qwen3MoEWithRouterNeuronConfig(MoENeuronConfig):
 
     def __init__(self, **kwargs):
         if "blockwise_matmul_config" not in kwargs:
+            # Round 3 [M1a] fix: route CTE through forward_blockwise with
+            # use_shard_on_block_dynamic_while=True so the dispatcher picks
+            # _call_bwmm_shard_on_block_kernel (beta2 nkilib `bwmm_shard_on_block`,
+            # installed — verified via `probe` on this SDK and STEP A smoke test
+            # on qwen_fused_transformer, which compiled all CTE HLO buckets
+            # cleanly without the protobuf 2 GB error).
+            #
+            # Replaces Phase 0's block_size=8192 workaround, which was motivated
+            # by the apparent "missing private blockwise_mm kernel" narrative but
+            # actually created the real problem: forward_all_experts has a Python
+            # `for e in range(num_experts)` loop that unrolls into 128 expert
+            # sub-ops × 48 layers = 6144 HLO sub-ops → protobuf serialization fail.
+            #
+            # Config pattern mirrored from `qwen_fused_transformer.py:78-86` —
+            # the block_size/dynamic_while/block_sharding_strategy triple is the
+            # (b1) path from `docs/m1_investigation.md`. skip_dma_token/weight
+            # and normalize_top_k_affinities preserved from the prior config.
             kwargs["blockwise_matmul_config"] = BlockwiseMatmulConfig.from_kwargs(
-                block_size=128,
+                block_size=256,
                 logical_nc_config=2,
                 skip_dma_token=True,
                 skip_dma_weight=True,
                 normalize_top_k_affinities=True,
+                use_shard_on_block_dynamic_while=True,
+                block_sharding_strategy="PING_PONG",
             )
         # Disable KV cache slicing so the kernel receives the full [B, 1, S_prior, d] cache.
         kwargs.setdefault("attn_tkg_nki_kernel_enabled", True)
         kwargs.setdefault("fused_qkv", False)
+        # Round 3 [M1b]: enable on-compile disk write + per-rank load from disk
+        # so L6 streaming shard patch (above) can flush each rank and avoid the
+        # ~120 GB accumulated-shard peak that SIGKILLs on 124 GB trn3.3xlarge.
+        kwargs.setdefault("save_sharded_checkpoint", True)
         super().__init__(**kwargs)
 
 
@@ -289,6 +452,32 @@ def convert_qwen3_moe_hf_to_neuron_state_dict(neuron_state_dict, config):
         if pad_size > 0:
             down_proj = torch.nn.functional.pad(down_proj, (0, 0, 0, pad_size))
         neuron_state_dict[f"layers.{l}.mlp.expert_mlps.mlp_op.down_proj.weight"] = down_proj
+
+        # Round 2 [Z.2]: Offline FP8 quantization + v15c packing for the TKG kernel.
+        # The bf16 gate_up_proj / down_proj params stay in the state_dict for the CTE
+        # path (which uses the standard MoE module). The packed int8 buffers below are
+        # loaded into TKG-only keys via the preshard hook (see _install_nki_router).
+        #
+        # gate_up_packed_w layout (see v15c.pack_gate_up):
+        #   [E, H_free+1=17, PMAX=128, GU=384] int8
+        #     planes 0..15  = fp8_e4m3fn bytes of gate_up weight
+        #     plane 16      = fp32 scales (first 12 bytes per row = 3 scales)
+        gate_up_packed_tkg = quantize_and_pack_gate_up(gate_up_proj.detach())
+        neuron_state_dict[
+            f"layers.{l}.mlp.moe_fused_tkg.gate_up_packed_w_tkg"
+        ] = gate_up_packed_tkg
+
+        # TODO(Round 2 Plan B [F3b]): down_w is currently int8 bytes + fp32 scales
+        # (v14a / v15c layout). If [F3b] lands a new down_w layout (e.g. packed or
+        # sharded), swap the call below to the new packer and update the TKG call
+        # site in NeuronQwen3MoeDecoderLayerComplete.forward accordingly.
+        down_w_tkg_i8, down_scales_tkg_f32 = quantize_down(down_proj.detach())
+        neuron_state_dict[
+            f"layers.{l}.mlp.moe_fused_tkg.down_w_tkg"
+        ] = down_w_tkg_i8
+        neuron_state_dict[
+            f"layers.{l}.mlp.moe_fused_tkg.down_scales_tkg"
+        ] = down_scales_tkg_f32
         gc.collect()
     if config.neuron_config.fused_qkv:
         neuron_state_dict = convert_state_dict_to_fused_qkv(neuron_state_dict, config)
@@ -367,6 +556,90 @@ class NKIRouterTopK(RouterTopK):
         expert_index      = ei.to(torch.long)
 
         return router_logits, expert_affinities, expert_index
+
+
+def _register_tkg_quant_buffers(mlp, config) -> None:
+    """Register TKG-only quantized MoE weights on ``mlp.moe_fused_tkg``.
+
+    v15c expects:
+      - gate_up_packed_w_tkg: [E, H_free+1=17, PMAX=128, GU=384] int8
+      - down_w_tkg:           [E, I, H]                          int8
+      - down_scales_tkg:      [E, H]                              fp32
+
+    These are loaded from the state dict at keys populated by
+    ``convert_qwen3_moe_hf_to_neuron_state_dict`` (see quantize_and_pack_gate_up
+    / quantize_down). The existing bf16 gate_up_proj / down_proj parameters on
+    ``expert_mlps.mlp_op`` remain untouched for the CTE path.
+
+    IMPLEMENTATION NOTE (Round 3 [M1a'] fix — 2026-04-21):
+    These tensors MUST be registered as ``nn.Parameter`` (with requires_grad=
+    False for inference), not ``register_buffer``. NxDI's
+    ``neuronx_distributed/trace/model_builder.py:806`` iterates
+    ``model.named_parameters()`` to collect trace inputs — buffers are NOT
+    included. Buffers get captured as Python closures in the forward, and
+    XLA materializes them as ``constant`` HLO ops (upcast int8 → fp32,
+    4× bloat). For Qwen3-30B that pushes TKG HLO from ~200 MB to > 30 GB,
+    blowing past protobuf's 2 GB SerializeToString limit. The fix is simply
+    Parameter registration — same as ``weight_T`` in ``_install_nki_router``.
+    See ``docs/integration_findings.md`` landmine L5 for the full writeup.
+    """
+    E = config.num_experts
+    H = config.hidden_size
+    # config.moe_intermediate_size is post-pad (see Qwen3MoeInferenceConfig.maybe_pad_intermediate);
+    # config.moe_intermediate_pad_size is the pad delta. I_padded equals moe_intermediate_size.
+    I_padded = getattr(config, "moe_intermediate_size", None)
+    if I_padded is None:
+        I_padded = config.intermediate_size
+
+    GU_FLAT = 2 * I_padded                       # 2*I (gate||up along last dim)
+    PMAX = 128
+    H_FREE = H // PMAX
+    PLANES = H_FREE + 1                          # 17
+
+    # Shapes match the output of _qwen_integration.quantize_and_pack_gate_up /
+    # quantize_down given the [E, H, 2*I] / [E, I, H] inputs after any pad.
+    tkg = mlp.moe_fused_tkg
+    # Register as nn.Parameter(requires_grad=False) so NxDI trace captures
+    # these as model inputs (HLO parameter ops), not inlined constants. The
+    # zero-init here is a placeholder; real values come from state_dict().
+    tkg.gate_up_packed_w_tkg = nn.Parameter(
+        torch.zeros(E, PLANES, PMAX, GU_FLAT, dtype=torch.int8),
+        requires_grad=False,
+    )
+    tkg.down_w_tkg = nn.Parameter(
+        torch.zeros(E, I_padded, H, dtype=torch.int8),
+        requires_grad=False,
+    )
+    tkg.down_scales_tkg = nn.Parameter(
+        torch.zeros(E, H, dtype=torch.float32),
+        requires_grad=False,
+    )
+
+    # Protect int8/fp32 Parameter dtypes from model.to(bfloat16). Mirrors the
+    # pattern used for router.weight_T in _install_nki_router — operates on
+    # tkg._parameters (was tkg._buffers when these were register_buffer).
+    #
+    # H1 (Round 3 fix, 2026-04-22): use in-place `p.data = p.data.to(dtype)`
+    # instead of creating a fresh nn.Parameter(...) on dtype mismatch. The
+    # in-place update preserves the Parameter identity in tkg._parameters[...]
+    # so NxDI's state_dict loader doesn't lose its reference during the cast
+    # ping-pong between `model.to(bfloat16)` (coerces fp32 → bf16) and this
+    # hook (restores back to fp32/int8). Recreation was also compounding
+    # memory pressure during the sharded-checkpoint write phase by holding
+    # stale Parameter objects until Python GC.
+    _orig_apply = tkg._apply
+    def _apply_protect_quant(fn):
+        _orig_apply(fn)
+        for name, want_dtype in [
+            ("gate_up_packed_w_tkg", torch.int8),
+            ("down_w_tkg", torch.int8),
+            ("down_scales_tkg", torch.float32),
+        ]:
+            p = tkg._parameters.get(name)
+            if p is not None and p.dtype != want_dtype:
+                p.data = p.data.to(want_dtype)
+        return tkg
+    tkg._apply = _apply_protect_quant
 
 
 def _install_nki_router(mlp) -> None:
@@ -580,6 +853,7 @@ class NeuronQwen3MoeDecoderLayerComplete(nn.Module):
             config=config, rmsnorm=self.post_attention_layernorm, init_tkg_module=True
         )
         _install_nki_router(self.mlp)
+        _register_tkg_quant_buffers(self.mlp, config)
 
         self.qkv_kernel_enabled = config.neuron_config.qkv_kernel_enabled
         self.sequence_parallel_enabled = False
@@ -622,23 +896,27 @@ class NeuronQwen3MoeDecoderLayerComplete(nn.Module):
         )
         hidden_states = residual + hidden_states
 
-        # MoE block — kernel_v19b for TKG, standard mlp for CTE.
+        # MoE block — v15c for TKG, standard mlp for CTE.
         residual = hidden_states
         is_tkg = past_key_value is not None
         if is_tkg:
-            # kernel_v19b handles RMSNorm + Router + TopK(8) + Expert MLPs internally.
-            # inp:      [B, 1, H]         — pre-norm hidden states
-            # gamma:    [1, H]            — post-attention RMSNorm weight
-            # router_w: [H, E] float32   — weight_T, set up by _install_nki_router
-            # gate_up:  [E, H, 2*I=384]  — native layout (gate cols 0:I, up cols I:2I)
-            # down_w:   [E, I=192, H]    — native layout, no shard pre-split
+            # v15c handles RMSNorm + Router + TopK(8) + Expert MLPs internally.
+            # inp:              [B, 1, H]                            — pre-norm hidden states
+            # gamma:            [1, H]                                — post-attention RMSNorm weight
+            # router_w:         [H, E] float32                        — weight_T, set up by _install_nki_router
+            # gate_up_packed_w: [E, H_free+1=17, 128, 384] int8      — FP8 weights + fp32 scales packed offline
+            # down_w:           [E, I=192, H] int8                    — FP8 weight bytes
+            # down_scales:      [E, H] fp32                           — FP8 per-H scales
+            # TODO(Round 2 Plan B [F3b]): when the new down_w layout lands, update
+            # the down_w_tkg / down_scales_tkg buffers to match and adjust the call here.
             tkg = self.mlp.moe_fused_tkg
             moe_out = custom_moe_fused_kernel.qwen3_moe_fused_tkg[2](
                 hidden_states.data,
                 self.post_attention_layernorm.weight.unsqueeze(0).data,        # [1, H]
                 tkg.router.weight_T.data,                                      # [H, E] float32
-                tkg.expert_mlps.mlp_op.gate_up_proj.weight.data,               # [E, H, 2*I=384]
-                tkg.expert_mlps.mlp_op.down_proj.weight.data,                  # [E, I=192, H]
+                tkg.gate_up_packed_w_tkg.data,                                 # [E, 17, 128, 384] int8 (v15c packed)
+                tkg.down_w_tkg.data,                                           # [E, I=192, H] int8 (fp8 bytes)
+                tkg.down_scales_tkg.data,                                      # [E, H] fp32 (fp8 scales)
             )                                                                  # returns [T, H] bf16
             if isinstance(moe_out, (tuple, list)):
                 moe_out = moe_out[0]

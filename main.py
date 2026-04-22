@@ -93,6 +93,10 @@ def parse_args():
     parser.add_argument("--divergence-difference-tol", type=float, default=0.001)
     parser.add_argument("--tol-map", type=str)
     parser.add_argument("--num-tokens-to-check", type=int)
+    parser.add_argument("--skip-accuracy-check", action="store_true",
+                        help="Skip baseline model load + accuracy comparison. "
+                             "Produces latency/throughput/NKI_FLOP_Ratio only. "
+                             "Use when DRAM < 2x model size.")
 
     # Generation
     parser.add_argument("--prompt", dest="prompts", action="append")
@@ -807,6 +811,13 @@ def main():
 
         if args.platform_target == 'trn2':
             accuracy = 1
+            accuracy_is_placeholder = False
+        elif args.skip_accuracy_check:
+            # DRAM-constrained path: skip baseline_qwen load + check_accuracy_logits.
+            # Accuracy becomes a numeric placeholder (1.0) so calculate_score works;
+            # clearly labelled as placeholder in the printed output.
+            accuracy = 1.0
+            accuracy_is_placeholder = True
         else:
             base_model, _, base_generation_config = prepare_inference(
                 baseline_qwen.NeuronQwen3MoeForCausalLM, args
@@ -823,6 +834,7 @@ def main():
                 args.tol_map,
                 num_tokens_to_check=args.num_tokens_to_check,
             )
+            accuracy_is_placeholder = False
 
         report = benchmark_sampling(model, tokenizer, generation_config, args.prompts)
 
@@ -834,10 +846,11 @@ def main():
         nki_flop_ratio = count_nki_flop_ratio(ctx_enc_hlo_path, tkg_gen_hlo_path)
 
         score = calculate_score(args.base_latency, args.base_throughput, accuracy, latency, throughput, nki_flop_ratio)
+        accuracy_label = f"{accuracy} (PLACEHOLDER — baseline skipped)" if accuracy_is_placeholder else f"{accuracy}"
         print(
             f"Prompt: {args.prompts[0]}\n"
             f"Final Score: {score}\n"
-            f"\tAccuracy: {accuracy}\n"
+            f"\tAccuracy: {accuracy_label}\n"
             f"\tLatency: {latency}\n"
             f"\tThroughput: {throughput}\n"
             f"\tNKI FLOPs Ratio: {nki_flop_ratio}"
@@ -886,11 +899,12 @@ def main():
         print(f"\nTotal Score: {total_score}\n")
         
     elif args.mode == "evaluate_all" and args.platform_target == 'trn3':
-        
+
         model, tokenizer, generation_config = prepare_inference(qwen.NeuronQwen3MoeForCausalLM, args)
 
-        base_model, _, base_generation_config = prepare_inference(baseline_qwen.NeuronQwen3MoeForCausalLM, args)
-        
+        if not args.skip_accuracy_check:
+            base_model, _, base_generation_config = prepare_inference(baseline_qwen.NeuronQwen3MoeForCausalLM, args)
+
         prompts = parse_prompts("prompts.txt")
         prompt_data = parse_prompt_data("prompt_data_trn3.txt")
         assert len(prompts) == len(prompt_data)
@@ -899,22 +913,27 @@ def main():
 
         # Iterate through the prompts
         for i, prompt in enumerate(prompts):
-            
+
             data = prompt_data[i]
             base_latency = float(data[3])
             base_throughput = float(data[4])
-            
-            accuracy = run_accuracy_check(
-                base_model,
-                base_generation_config,
-                model,
-                tokenizer,
-                generation_config,
-                [prompt],
-                args.divergence_difference_tol,
-                args.tol_map,
-                num_tokens_to_check=args.num_tokens_to_check,
-            )
+
+            if args.skip_accuracy_check:
+                accuracy = 1.0
+                accuracy_is_placeholder = True
+            else:
+                accuracy = run_accuracy_check(
+                    base_model,
+                    base_generation_config,
+                    model,
+                    tokenizer,
+                    generation_config,
+                    [prompt],
+                    args.divergence_difference_tol,
+                    args.tol_map,
+                    num_tokens_to_check=args.num_tokens_to_check,
+                )
+                accuracy_is_placeholder = False
 
             report = benchmark_sampling(model, tokenizer, generation_config, [prompt])
 
@@ -922,14 +941,15 @@ def main():
             throughput = report["e2e_model"]["throughput"]
 
             ctx_enc_hlo_path, tkg_gen_hlo_path = find_hlos()
-    
+
             nki_flop_ratio = count_nki_flop_ratio(ctx_enc_hlo_path, tkg_gen_hlo_path)
 
             score = calculate_score(base_latency, base_throughput, accuracy, latency, throughput, nki_flop_ratio)
+            accuracy_label = f"{accuracy} (PLACEHOLDER — baseline skipped)" if accuracy_is_placeholder else f"{accuracy}"
             print(
                 f"Prompt: {prompt}\n"
                 f"Final Score: {score}\n"
-                f"\tAccuracy: {accuracy}\n"
+                f"\tAccuracy: {accuracy_label}\n"
                 f"\tLatency: {latency}\n"
                 f"\tThroughput: {throughput}\n"
                 f"\tNKI FLOPs Ratio: {nki_flop_ratio}"

@@ -80,7 +80,7 @@ T_TILE = 128      # was 64
 X_HBM_LAYOUT = "HT"
 
 
-@nki.jit(platform_target="trn2")
+@nki.jit
 def qwen3_router_topk_cte(
     x,                  # [H, T]    bf16  — hidden states, H-major for burst DMA (Plan A)
     w,                  # [H, E]    bf16  — router weight (transposed from [E, H])
