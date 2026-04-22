@@ -1,0 +1,2 @@
+team_id,member_id,base_latency,base_throughput,accuracy,latency,throughput,nki_flop_ratio,increased_throughput,reduced_latency,final_score,timestamp
+,,526.15,134.61,False,7391.63188457489,90.97124292010223,0.0,0.6758134085142428,0.07118184566225325,0.0,2026-04-20 17:00:46

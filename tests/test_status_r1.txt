@@ -1,0 +1,45 @@
+Complete Error Summary                                                                                            
+These errors are normalized for each token by the largest expected logit for that token                           
+{                                                                                                                 
+    "max_top_k_errors": {                                                                                         
+        "null": {                                                                                                 
+            "error": 0.7335622310638428,
+            "batch_index": 0,
+            "token_index": 176
+        },
+        "1000": {
+            "error": 0.7335622310638428,
+            "batch_index": 0,
+            "token_index": 176
+        },
+        "50": {
+            "error": 0.5793867707252502,
+            "batch_index": 0,
+            "token_index": 47
+        },
+        "5": {
+            "error": 0.5225147604942322,
+            "batch_index": 0,
+            "token_index": 47
+        }
+    },
+    "average_over_tokens": { 
+        "null": {
+            "mean_abs_error": 0.005622934301756854,
+            "mean_squared_error": 0.00016550611738402708, 
+            "max_abs_error": 0.04201527791668618,
+            "max_squared_error": 0.007614888066975471
+        },
+        "1000": {
+            "max_abs_error": 0.03719245694874893,
+            "max_squared_error": 0.006483091589314794
+        },
+        "50": {
+            "max_abs_error": 0.030701537657011224,
+            "max_squared_error": 0.004586692157364413
+        },
+        "5": {
+            "max_abs_error": 0.02175375372717616,
+            "max_squared_error": 0.0027154079870573304       }                                                
+    }                                                    
+}             

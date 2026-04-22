@@ -1,0 +1,205 @@
+Actual Logits Shape:  torch.Size([418, 1, 151936])
+STATUS MSG Divergence at index 25. Validating 25 tokens in each batch.
+Test failed at batch 0 token 2. Top k = 1000 error 0.03645457699894905 > 0.03.
+Test failed at batch 0 token 3. Top k = None error 0.06207646057009697 > 0.05. Top k = 1000 error 0.05889054015278816 > 0.03. Top k = 50 error 0.040187060832977295 > 0.03.
+Test failed at batch 0 token 6. Top k = None error 0.07543428987264633 > 0.05. Top k = 1000 error 0.06016601622104645 > 0.03. Top k = 50 error 0.06016601622104645 > 0.03. Top k = 5 error 0.06016601622104645 > 0.03.
+Test failed at batch 0 token 8. Top k = 1000 error 0.044655151665210724 > 0.03. Top k = 50 error 0.044655151665210724 > 0.03. Top k = 5 error 0.041182927787303925 > 0.03.
+Test failed at batch 0 token 9. Top k = 1000 error 0.042808085680007935 > 0.03. Top k = 50 error 0.03693953901529312 > 0.03. Top k = 5 error 0.036939505487680435 > 0.03.
+Test failed at batch 0 token 10. Top k = 1000 error 0.04074825718998909 > 0.03. Top k = 50 error 0.038400836288928986 > 0.03. Top k = 5 error 0.038400836288928986 > 0.03.
+Test failed at batch 0 token 11. Top k = None error 0.06314445286989212 > 0.05. Top k = 1000 error 0.05865878984332085 > 0.03. Top k = 50 error 0.03820424526929855 > 0.03. Top k = 5 error 0.03820424526929855 > 0.03.
+Test failed at batch 0 token 13. Top k = None error 0.06674632430076599 > 0.05. Top k = 1000 error 0.06674632430076599 > 0.03. Top k = 50 error 0.04138403385877609 > 0.03. Top k = 5 error 0.04138403385877609 > 0.03.
+Test failed at batch 0 token 14. Top k = None error 0.07939260452985764 > 0.05. Top k = 1000 error 0.07939260452985764 > 0.03. Top k = 50 error 0.07154946774244308 > 0.03. Top k = 5 error 0.05194162204861641 > 0.03.
+Test failed at batch 0 token 15. Top k = 1000 error 0.0383199118077755 > 0.03.
+Test failed at batch 0 token 16. Top k = 1000 error 0.043565843254327774 > 0.03.
+Test failed at batch 0 token 17. Top k = 1000 error 0.040451183915138245 > 0.03.
+Test failed at batch 0 token 18. Top k = 1000 error 0.04041009023785591 > 0.03. Top k = 50 error 0.04041009023785591 > 0.03.
+Test failed at batch 0 token 24. Top k = None error 0.4338858425617218 > 0.05. Top k = 1000 error 0.4338858425617218 > 0.03. Top k = 50 error 0.4338858425617218 > 0.03. Top k = 5 error 0.4338858425617218 > 0.03. Divergence difference 8.5 > 0.001.
+Divergence at index 33. Validating 8 tokens in each batch.
+Test failed at batch 0 token 32. Top k = None error 0.35658276081085205 > 0.05. Top k = 1000 error 0.3435957729816437 > 0.03. Top k = 50 error 0.340386301279068 > 0.03. Top k = 5 error 0.18237759172916412 > 0.03. Divergence difference 1.125 > 0.001.
+Divergence at index 37. Validating 4 tokens in each batch.
+Test failed at batch 0 token 35. Top k = None error 0.4437885880470276 > 0.05. Top k = 1000 error 0.2641349136829376 > 0.03. Top k = 50 error 0.21002234518527985 > 0.03. Top k = 5 error 0.11032327264547348 > 0.03.
+Test failed at batch 0 token 36. Top k = None error 0.5735663175582886 > 0.05. Top k = 1000 error 0.5735663175582886 > 0.03. Top k = 50 error 0.21126911044120789 > 0.03. Top k = 5 error 0.1620887815952301 > 0.03. Divergence difference 4.25 > 0.001.
+Divergence at index 39. Validating 2 tokens in each batch.
+Test failed at batch 0 token 38. Top k = None error 0.409229576587677 > 0.05. Top k = 1000 error 0.409229576587677 > 0.03. Top k = 50 error 0.409229576587677 > 0.03. Top k = 5 error 0.409229576587677 > 0.03. Divergence difference 9.125 > 0.001.
+Divergence at index 43. Validating 4 tokens in each batch.
+Test failed at batch 0 token 42. Top k = None error 0.654053270816803 > 0.05. Top k = 1000 error 0.654053270816803 > 0.03. Top k = 50 error 0.654053270816803 > 0.03. Top k = 5 error 0.4088379442691803 > 0.03. Divergence difference 12.5 > 0.001.
+Divergence at index 48. Validating 5 tokens in each batch.
+Test failed at batch 0 token 45. Top k = None error 0.2866426408290863 > 0.05. Top k = 1000 error 0.2866426408290863 > 0.03. Top k = 50 error 0.2235991656780243 > 0.03. Top k = 5 error 0.1931643784046173 > 0.03.
+Test failed at batch 0 token 46. Top k = None error 0.15132080018520355 > 0.05. Top k = 1000 error 0.15132080018520355 > 0.03. Top k = 50 error 0.0939437597990036 > 0.03. Top k = 5 error 0.061156872659921646 > 0.03.
+Test failed at batch 0 token 47. Top k = None error 0.6855210661888123 > 0.05. Top k = 1000 error 0.6855210661888123 > 0.03. Top k = 50 error 0.6855210661888123 > 0.03. Top k = 5 error 0.5297154188156128 > 0.03. Divergence difference 9.312500953674316 > 0.001.
+Divergence at index 54. Validating 6 tokens in each batch.
+Test failed at batch 0 token 53. Top k = None error 0.4679989516735077 > 0.05. Top k = 1000 error 0.4679989516735077 > 0.03. Top k = 50 error 0.4679989516735077 > 0.03. Top k = 5 error 0.4679989516735077 > 0.03. Divergence difference 2.75 > 0.001.
+Divergence at index 60. Validating 6 tokens in each batch.
+Test failed at batch 0 token 55. Top k = None error 0.3164283037185669 > 0.05. Top k = 1000 error 0.3164283037185669 > 0.03. Top k = 50 error 0.3164283037185669 > 0.03. Top k = 5 error 0.07483164966106415 > 0.03.
+Test failed at batch 0 token 56. Top k = None error 0.06635597348213196 > 0.05. Top k = 1000 error 0.06377865374088287 > 0.03.
+Test failed at batch 0 token 57. Top k = None error 0.08131758868694305 > 0.05. Top k = 1000 error 0.07681307196617126 > 0.03. Top k = 50 error 0.07681307196617126 > 0.03.
+Test failed at batch 0 token 58. Top k = None error 0.0790943130850792 > 0.05. Top k = 1000 error 0.0790943130850792 > 0.03. Top k = 50 error 0.06909428536891937 > 0.03. Top k = 5 error 0.06509428471326828 > 0.03.
+Test failed at batch 0 token 59. Top k = None error 0.25805550813674927 > 0.05. Top k = 1000 error 0.2524699866771698 > 0.03. Top k = 50 error 0.24194365739822388 > 0.03. Top k = 5 error 0.24194365739822388 > 0.03. Divergence difference 0.25 > 0.001.
+Divergence at index 70. Validating 10 tokens in each batch.
+Test failed at batch 0 token 65. Top k = None error 0.40888312458992004 > 0.05. Top k = 1000 error 0.40888312458992004 > 0.03. Top k = 50 error 0.40888312458992004 > 0.03. Top k = 5 error 0.40888312458992004 > 0.03.
+Test failed at batch 0 token 66. Top k = 1000 error 0.03744962066411972 > 0.03.
+Test failed at batch 0 token 67. Top k = None error 0.09071910381317139 > 0.05. Top k = 1000 error 0.09071910381317139 > 0.03. Top k = 50 error 0.0622103326022625 > 0.03.
+Test failed at batch 0 token 68. Top k = None error 0.11440161615610123 > 0.05. Top k = 1000 error 0.11440161615610123 > 0.03. Top k = 50 error 0.10652759671211243 > 0.03. Top k = 5 error 0.051409490406513214 > 0.03.
+Test failed at batch 0 token 69. Top k = None error 0.3289826214313507 > 0.05. Top k = 1000 error 0.3263784945011139 > 0.03. Top k = 50 error 0.25174573063850403 > 0.03. Top k = 5 error 0.22830818593502045 > 0.03. Divergence difference 4.625 > 0.001.
+Divergence at index 76. Validating 6 tokens in each batch.
+Test failed at batch 0 token 75. Top k = None error 0.4791632294654846 > 0.05. Top k = 1000 error 0.4791632294654846 > 0.03. Top k = 50 error 0.4791632294654846 > 0.03. Top k = 5 error 0.06215910241007805 > 0.03. Divergence difference 3.000001907348633 > 0.001.
+Divergence at index 90. Validating 14 tokens in each batch.
+Test failed at batch 0 token 85. Top k = None error 0.33990180492401123 > 0.05. Top k = 1000 error 0.29145348072052 > 0.03. Top k = 50 error 0.19371534883975983 > 0.03. Top k = 5 error 0.09865684807300568 > 0.03.
+Test failed at batch 0 token 86. Top k = None error 0.1882828176021576 > 0.05. Top k = 1000 error 0.13524581491947174 > 0.03. Top k = 50 error 0.13524581491947174 > 0.03. Top k = 5 error 0.13524581491947174 > 0.03.
+Test failed at batch 0 token 87. Top k = None error 0.13545259833335876 > 0.05. Top k = 1000 error 0.13545259833335876 > 0.03. Top k = 50 error 0.10018286108970642 > 0.03. Top k = 5 error 0.0503903292119503 > 0.03.
+Test failed at batch 0 token 88. Top k = None error 0.08622844517230988 > 0.05. Top k = 1000 error 0.08396326005458832 > 0.03. Top k = 50 error 0.0660361498594284 > 0.03. Top k = 5 error 0.04295922815799713 > 0.03.
+Test failed at batch 0 token 89. Top k = None error 0.2857881784439087 > 0.05. Top k = 1000 error 0.2857881784439087 > 0.03. Top k = 50 error 0.2857881784439087 > 0.03. Top k = 5 error 0.2857881784439087 > 0.03. Divergence difference 6.375 > 0.001.
+Divergence at index 100. Validating 10 tokens in each batch.
+Test failed at batch 0 token 92. Top k = 1000 error 0.03692803159356117 > 0.03.
+Test failed at batch 0 token 95. Top k = None error 0.40944966673851013 > 0.05. Top k = 1000 error 0.2662961483001709 > 0.03. Top k = 50 error 0.13559071719646454 > 0.03. Top k = 5 error 0.08579818904399872 > 0.03.
+Test failed at batch 0 token 96. Top k = None error 0.14573732018470764 > 0.05. Top k = 1000 error 0.07887685298919678 > 0.03. Top k = 50 error 0.055621035397052765 > 0.03. Top k = 5 error 0.046703800559043884 > 0.03.
+Test failed at batch 0 token 97. Top k = None error 0.1059802770614624 > 0.05. Top k = 1000 error 0.09889525175094604 > 0.03. Top k = 50 error 0.07865230739116669 > 0.03. Top k = 5 error 0.04221506044268608 > 0.03.
+Test failed at batch 0 token 98. Top k = None error 0.1181623786687851 > 0.05. Top k = 1000 error 0.1181623786687851 > 0.03. Top k = 50 error 0.057943399995565414 > 0.03. Top k = 5 error 0.03604558855295181 > 0.03.
+Test failed at batch 0 token 99. Top k = None error 0.31709107756614685 > 0.05. Top k = 1000 error 0.30799078941345215 > 0.03. Top k = 50 error 0.2942545413970947 > 0.03. Top k = 5 error 0.2805183231830597 > 0.03. Divergence difference 4.625 > 0.001.
+Divergence at index 125. Validating 25 tokens in each batch.
+Test failed at batch 0 token 102. Top k = 1000 error 0.04801185801625252 > 0.03. Top k = 50 error 0.03991468995809555 > 0.03.
+Test failed at batch 0 token 107. Top k = None error 0.060977715998888016 > 0.05. Top k = 1000 error 0.04791571944952011 > 0.03. Top k = 50 error 0.043963149189949036 > 0.03.
+Test failed at batch 0 token 120. Top k = None error 0.3570539951324463 > 0.05. Top k = 1000 error 0.33767417073249817 > 0.03. Top k = 50 error 0.17488345503807068 > 0.03. Top k = 5 error 0.04992213100194931 > 0.03.
+Test failed at batch 0 token 121. Top k = None error 0.08514569699764252 > 0.05. Top k = 1000 error 0.07794374227523804 > 0.03.
+Test failed at batch 0 token 122. Top k = None error 0.14419060945510864 > 0.05. Top k = 1000 error 0.14419060945510864 > 0.03. Top k = 50 error 0.11744160950183868 > 0.03. Top k = 5 error 0.086577408015728 > 0.03.
+Test failed at batch 0 token 123. Top k = None error 0.16664472222328186 > 0.05. Top k = 1000 error 0.16664472222328186 > 0.03. Top k = 50 error 0.16664472222328186 > 0.03. Top k = 5 error 0.16664472222328186 > 0.03.
+Test failed at batch 0 token 124. Top k = None error 0.3680107593536377 > 0.05. Top k = 1000 error 0.3680107593536377 > 0.03. Top k = 50 error 0.3208409547805786 > 0.03. Top k = 5 error 0.2782149314880371 > 0.03. Divergence difference 7.875 > 0.001.
+Divergence at index 140. Validating 15 tokens in each batch.
+Test failed at batch 0 token 132. Top k = None error 0.09743153303861618 > 0.05. Top k = 1000 error 0.0872151106595993 > 0.03. Top k = 50 error 0.07684165984392166 > 0.03. Top k = 5 error 0.07061759382486343 > 0.03.
+Test failed at batch 0 token 135. Top k = None error 0.33784812688827515 > 0.05. Top k = 1000 error 0.2519949972629547 > 0.03. Top k = 50 error 0.24027623236179352 > 0.03. Top k = 5 error 0.0644950121641159 > 0.03.
+Test failed at batch 0 token 136. Top k = None error 0.08722606301307678 > 0.05. Top k = 1000 error 0.07506316155195236 > 0.03. Top k = 50 error 0.04888574779033661 > 0.03. Top k = 5 error 0.04888574779033661 > 0.03.
+Test failed at batch 0 token 137. Top k = None error 0.3779556453227997 > 0.05. Top k = 1000 error 0.3779556453227997 > 0.03. Top k = 50 error 0.22059142589569092 > 0.03. Top k = 5 error 0.195695161819458 > 0.03.
+Test failed at batch 0 token 138. Top k = None error 0.1028311476111412 > 0.05. Top k = 1000 error 0.0772959366440773 > 0.03. Top k = 50 error 0.06497199088335037 > 0.03.
+Test failed at batch 0 token 139. Top k = None error 0.4276876449584961 > 0.05. Top k = 1000 error 0.4276876449584961 > 0.03. Top k = 50 error 0.4276876449584961 > 0.03. Top k = 5 error 0.4276876449584961 > 0.03. Divergence difference 4.375 > 0.001.
+Divergence at index 150. Validating 10 tokens in each batch.
+Test failed at batch 0 token 142. Top k = 1000 error 0.036146096885204315 > 0.03.
+Test failed at batch 0 token 148. Top k = 1000 error 0.0351860336959362 > 0.03. Top k = 50 error 0.0351860336959362 > 0.03.
+Divergence at index 215. Validating 65 tokens in each batch.
+Test failed at batch 0 token 206. Top k = 1000 error 0.05216600373387337 > 0.03. Top k = 50 error 0.05216600373387337 > 0.03.
+Test failed at batch 0 token 207. Top k = None error 0.39056316018104553 > 0.05. Top k = 1000 error 0.39056316018104553 > 0.03. Top k = 50 error 0.39056316018104553 > 0.03. Top k = 5 error 0.39056316018104553 > 0.03.
+Test failed at batch 0 token 208. Top k = None error 0.12069941312074661 > 0.05. Top k = 1000 error 0.06439310312271118 > 0.03. Top k = 50 error 0.06439310312271118 > 0.03. Top k = 5 error 0.037366077303886414 > 0.03.
+Test failed at batch 0 token 209. Top k = None error 0.21558870375156403 > 0.05. Top k = 1000 error 0.18253566324710846 > 0.03. Top k = 50 error 0.14746372401714325 > 0.03. Top k = 5 error 0.11253566294908524 > 0.03.
+Test failed at batch 0 token 210. Top k = None error 0.10915122926235199 > 0.05. Top k = 1000 error 0.10915122926235199 > 0.03. Top k = 50 error 0.09637750685214996 > 0.03. Top k = 5 error 0.039808161556720734 > 0.03.
+Test failed at batch 0 token 211. Top k = None error 0.13086651265621185 > 0.05. Top k = 1000 error 0.13086651265621185 > 0.03. Top k = 50 error 0.10576190799474716 > 0.03. Top k = 5 error 0.08902550488710403 > 0.03.
+Test failed at batch 0 token 212. Top k = None error 0.09535479545593262 > 0.05. Top k = 1000 error 0.09535479545593262 > 0.03. Top k = 50 error 0.07843750715255737 > 0.03. Top k = 5 error 0.052121713757514954 > 0.03.
+Test failed at batch 0 token 213. Top k = None error 0.21182292699813843 > 0.05. Top k = 1000 error 0.17706523835659027 > 0.03. Top k = 50 error 0.14817632734775543 > 0.03. Top k = 5 error 0.09484298527240753 > 0.03.
+Test failed at batch 0 token 214. Top k = None error 0.32153522968292236 > 0.05. Top k = 1000 error 0.2963763475418091 > 0.03. Top k = 50 error 0.26351550221443176 > 0.03. Top k = 5 error 0.26351550221443176 > 0.03. Divergence difference 1.5 > 0.001.
+No divergence. Validating the remaining 418 tokens in each batch.
+Test failed at batch 0 token 225. Top k = None error 0.08929021656513214 > 0.05. Top k = 1000 error 0.0704873576760292 > 0.03. Top k = 50 error 0.044277697801589966 > 0.03. Top k = 5 error 0.044277697801589966 > 0.03.
+Test failed at batch 0 token 233. Top k = None error 0.18085135519504547 > 0.05. Top k = 1000 error 0.14376042783260345 > 0.03. Top k = 50 error 0.09070810675621033 > 0.03. Top k = 5 error 0.0403205081820488 > 0.03.
+Test failed at batch 0 token 241. Top k = None error 0.06580261886119843 > 0.05. Top k = 1000 error 0.059729743748903275 > 0.03.
+Test failed at batch 0 token 249. Top k = 1000 error 0.035104427486658096 > 0.03.
+Test failed at batch 0 token 252. Top k = 1000 error 0.04754394292831421 > 0.03. Top k = 50 error 0.04754394292831421 > 0.03. Top k = 5 error 0.04754394292831421 > 0.03.
+Test failed at batch 0 token 257. Top k = 1000 error 0.03941730037331581 > 0.03.
+Test failed at batch 0 token 265. Top k = None error 0.058805081993341446 > 0.05. Top k = 1000 error 0.05168481916189194 > 0.03. Top k = 50 error 0.041136328130960464 > 0.03.
+Test failed at batch 0 token 267. Top k = 1000 error 0.05224207043647766 > 0.03. Top k = 50 error 0.046767618507146835 > 0.03.
+Test failed at batch 0 token 271. Top k = 1000 error 0.03522365912795067 > 0.03.
+Test failed at batch 0 token 273. Top k = 1000 error 0.04256940260529518 > 0.03.
+Test failed at batch 0 token 275. Top k = 1000 error 0.04503019154071808 > 0.03. Top k = 50 error 0.04503016546368599 > 0.03. Top k = 5 error 0.04503016546368599 > 0.03.
+Test failed at batch 0 token 280. Top k = None error 0.05798456817865372 > 0.05. Top k = 1000 error 0.03824774548411369 > 0.03.
+Test failed at batch 0 token 281. Top k = 1000 error 0.03911525756120682 > 0.03.
+Test failed at batch 0 token 289. Top k = None error 0.15922020375728607 > 0.05. Top k = 1000 error 0.15454433858394623 > 0.03. Top k = 50 error 0.09229737520217896 > 0.03. Top k = 5 error 0.09229737520217896 > 0.03.
+Test failed at batch 0 token 291. Top k = None error 0.09070935100317001 > 0.05. Top k = 1000 error 0.09070935100317001 > 0.03. Top k = 50 error 0.09070935100317001 > 0.03. Top k = 5 error 0.09070935100317001 > 0.03.
+Test failed at batch 0 token 297. Top k = None error 0.06149725988507271 > 0.05. Top k = 1000 error 0.051840607076883316 > 0.03. Top k = 50 error 0.04969468340277672 > 0.03. Top k = 5 error 0.04111102595925331 > 0.03.
+Test failed at batch 0 token 307. Top k = None error 0.1469583362340927 > 0.05. Top k = 1000 error 0.12128926068544388 > 0.03. Top k = 50 error 0.09939145296812057 > 0.03. Top k = 5 error 0.07749363780021667 > 0.03.
+Test failed at batch 0 token 314. Top k = 1000 error 0.038670942187309265 > 0.03. Top k = 50 error 0.038670942187309265 > 0.03.
+Test failed at batch 0 token 321. Top k = None error 0.10705945640802383 > 0.05. Top k = 1000 error 0.07930810004472733 > 0.03. Top k = 50 error 0.0673515796661377 > 0.03. Top k = 5 error 0.06735154986381531 > 0.03.
+Test failed at batch 0 token 323. Top k = None error 0.10572310537099838 > 0.05. Top k = 1000 error 0.09263189136981964 > 0.03. Top k = 50 error 0.07911835610866547 > 0.03. Top k = 5 error 0.06222646310925484 > 0.03.
+Test failed at batch 0 token 331. Top k = None error 0.09563128650188446 > 0.05. Top k = 1000 error 0.0902741402387619 > 0.03. Top k = 50 error 0.0902741402387619 > 0.03. Top k = 5 error 0.06170271337032318 > 0.03.
+Test failed at batch 0 token 339. Top k = 1000 error 0.03832479566335678 > 0.03. Top k = 50 error 0.03832479566335678 > 0.03.
+Test failed at batch 0 token 345. Top k = None error 0.09342268854379654 > 0.05. Top k = 1000 error 0.09342268854379654 > 0.03. Top k = 50 error 0.09342268854379654 > 0.03. Top k = 5 error 0.09342268854379654 > 0.03.
+Test failed at batch 0 token 346. Top k = None error 0.05571779981255531 > 0.05. Top k = 1000 error 0.04913885146379471 > 0.03. Top k = 50 error 0.04913885146379471 > 0.03.
+Test failed at batch 0 token 347. Top k = None error 0.07972314953804016 > 0.05. Top k = 1000 error 0.07366173714399338 > 0.03. Top k = 50 error 0.07366173714399338 > 0.03. Top k = 5 error 0.06504105031490326 > 0.03.
+Test failed at batch 0 token 354. Top k = None error 0.06389479339122772 > 0.05. Top k = 1000 error 0.05509059503674507 > 0.03. Top k = 50 error 0.038617733865976334 > 0.03.
+Test failed at batch 0 token 355. Top k = None error 0.11313620209693909 > 0.05. Top k = 1000 error 0.10090437531471252 > 0.03. Top k = 50 error 0.10090437531471252 > 0.03. Top k = 5 error 0.10090437531471252 > 0.03.
+Test failed at batch 0 token 361. Top k = None error 0.16993796825408936 > 0.05. Top k = 1000 error 0.11384822428226471 > 0.03. Top k = 50 error 0.10957472026348114 > 0.03. Top k = 5 error 0.06563827395439148 > 0.03.
+Test failed at batch 0 token 362. Top k = None error 0.06163301691412926 > 0.05. Top k = 1000 error 0.05239308997988701 > 0.03. Top k = 50 error 0.036171700805425644 > 0.03.
+Test failed at batch 0 token 370. Top k = None error 0.06321480125188828 > 0.05.
+Test failed at batch 0 token 371. Top k = None error 0.19670669734477997 > 0.05. Top k = 1000 error 0.15731962025165558 > 0.03. Top k = 50 error 0.15731962025165558 > 0.03. Top k = 5 error 0.1019505113363266 > 0.03.
+Test failed at batch 0 token 378. Top k = 1000 error 0.03884364292025566 > 0.03.
+Test failed at batch 0 token 386. Top k = None error 0.07381552457809448 > 0.05. Top k = 1000 error 0.06938638538122177 > 0.03. Top k = 50 error 0.06938638538122177 > 0.03.
+Test failed at batch 0 token 387. Top k = 1000 error 0.04873039200901985 > 0.03. Top k = 50 error 0.04163813591003418 > 0.03. Top k = 5 error 0.04163813591003418 > 0.03.
+Test failed at batch 0 token 393. Top k = None error 0.06824693083763123 > 0.05. Top k = 1000 error 0.05312170088291168 > 0.03. Top k = 50 error 0.05104702711105347 > 0.03. Top k = 5 error 0.05104702711105347 > 0.03.
+Test failed at batch 0 token 402. Top k = 1000 error 0.04000351205468178 > 0.03.
+Test failed at batch 0 token 403. Top k = 1000 error 0.047945536673069 > 0.03. Top k = 50 error 0.03553418815135956 > 0.03.
+Test failed at batch 0 token 404. Top k = 1000 error 0.04023183509707451 > 0.03.
+Test failed at batch 0 token 406. Top k = 1000 error 0.03855516016483307 > 0.03.
+Test failed at batch 0 token 417. Top k = None error 0.05540962517261505 > 0.05. Top k = 1000 error 0.05540962517261505 > 0.03. Top k = 50 error 0.05540962517261505 > 0.03. Top k = 5 error 0.040579117834568024 > 0.03.
+Test failed at batch 0 token 418. Top k = None error 0.07723715901374817 > 0.05. Top k = 1000 error 0.07723715901374817 > 0.03. Top k = 50 error 0.051117755472660065 > 0.03. Top k = 5 error 0.03843385726213455 > 0.03.
+Test failed at batch 0 token 425. Top k = None error 0.15610142052173615 > 0.05. Top k = 1000 error 0.11799430102109909 > 0.03. Top k = 50 error 0.11799430102109909 > 0.03. Top k = 5 error 0.05976143106818199 > 0.03.
+Test failed at batch 0 token 428. Top k = 1000 error 0.04454687237739563 > 0.03.
+Test failed at batch 0 token 433. Top k = None error 0.06848340481519699 > 0.05. Top k = 1000 error 0.06848340481519699 > 0.03. Top k = 50 error 0.06848340481519699 > 0.03. Top k = 5 error 0.038822416216135025 > 0.03.
+Test failed at batch 0 token 435. Top k = 1000 error 0.03567461296916008 > 0.03. Top k = 50 error 0.03567461296916008 > 0.03.
+Test failed at batch 0 token 449. Top k = None error 0.06518394500017166 > 0.05. Top k = 1000 error 0.06518394500017166 > 0.03. Top k = 50 error 0.06518394500017166 > 0.03. Top k = 5 error 0.043997474014759064 > 0.03.
+Test failed at batch 0 token 450. Top k = None error 0.07598958164453506 > 0.05. Top k = 1000 error 0.06889617443084717 > 0.03. Top k = 50 error 0.06889617443084717 > 0.03. Top k = 5 error 0.03859313204884529 > 0.03.
+Test failed at batch 0 token 457. Top k = None error 0.06499207019805908 > 0.05. Top k = 1000 error 0.06499207019805908 > 0.03. Top k = 50 error 0.06499207019805908 > 0.03.
+Test failed at batch 0 token 458. Top k = 1000 error 0.04343846067786217 > 0.03.
+Test failed at batch 0 token 464. Top k = 1000 error 0.04894354194402695 > 0.03.
+Test failed at batch 0 token 474. Top k = None error 0.05512968450784683 > 0.05. Top k = 1000 error 0.04810158535838127 > 0.03.
+Test failed at batch 0 token 482. Top k = None error 0.071312315762043 > 0.05. Top k = 1000 error 0.06438092142343521 > 0.03. Top k = 50 error 0.06438092142343521 > 0.03.
+Test failed at batch 0 token 486. Top k = 1000 error 0.03750985860824585 > 0.03.
+Test failed at batch 0 token 489. Top k = None error 0.1294228583574295 > 0.05. Top k = 1000 error 0.09959115087985992 > 0.03. Top k = 50 error 0.079518161714077 > 0.03. Top k = 5 error 0.06309480220079422 > 0.03.
+Test failed at batch 0 token 490. Top k = None error 0.05588441342115402 > 0.05. Top k = 1000 error 0.04813247546553612 > 0.03.
+Test failed at batch 0 token 492. Top k = 1000 error 0.046311959624290466 > 0.03. Top k = 50 error 0.046311959624290466 > 0.03.
+Test failed at batch 0 token 494. Top k = 1000 error 0.04228086397051811 > 0.03.
+Test failed at batch 0 token 496. Top k = 1000 error 0.035978857427835464 > 0.03.
+Test failed at batch 0 token 510. Top k = 1000 error 0.03593563660979271 > 0.03. Top k = 50 error 0.03593563660979271 > 0.03.
+Test failed at batch 0 token 518. Top k = 1000 error 0.03822410851716995 > 0.03.
+Test failed at batch 0 token 528. Top k = None error 0.06848979741334915 > 0.05. Top k = 1000 error 0.05310894548892975 > 0.03.
+Test failed at batch 0 token 538. Top k = 1000 error 0.050451040267944336 > 0.03.
+Test failed at batch 0 token 546. Top k = None error 0.05559711158275604 > 0.05. Top k = 1000 error 0.05172114446759224 > 0.03.
+Test failed at batch 0 token 550. Top k = 1000 error 0.039247628301382065 > 0.03. Top k = 50 error 0.039247628301382065 > 0.03.
+Test failed at batch 0 token 554. Top k = None error 0.060885537415742874 > 0.05. Top k = 1000 error 0.03644944727420807 > 0.03.
+Test failed at batch 0 token 560. Top k = None error 0.14523448050022125 > 0.05. Top k = 1000 error 0.1249333843588829 > 0.03. Top k = 50 error 0.09938593953847885 > 0.03. Top k = 5 error 0.09573635458946228 > 0.03.
+Test failed at batch 0 token 588. Top k = 1000 error 0.03951103240251541 > 0.03. Top k = 50 error 0.03951103240251541 > 0.03.
+Test failed at batch 0 token 592. Top k = 1000 error 0.037255093455314636 > 0.03.
+Test failed at batch 0 token 598. Top k = 1000 error 0.03592837601900101 > 0.03. Top k = 50 error 0.03592837601900101 > 0.03. Top k = 5 error 0.03592837601900101 > 0.03.
+Test failed at batch 0 token 607. Top k = None error 0.06743937730789185 > 0.05. Top k = 1000 error 0.04729881510138512 > 0.03. Top k = 50 error 0.04729881510138512 > 0.03. Top k = 5 error 0.04729881510138512 > 0.03.
+Test failed at batch 0 token 618. Top k = None error 0.05755987763404846 > 0.05. Top k = 1000 error 0.05267706513404846 > 0.03. Top k = 50 error 0.036075517535209656 > 0.03.
+Summary: Max divergence difference = 12.5 at index (batch 0 token 42), Top k = None max error = 0.6855210661888123 at index (batch 0 token 47), Top k = 1000 max error = 0.6855210661888123 at index (batch 0 token 47), Top k = 50 max error = 0.6855210661888123 at index (batch 0 token 47), Top k = 5 max error = 0.5297154188156128 at index (batch 0 token 47)
+Complete Error Summary
+These errors are normalized for each token by the largest expected logit for that token
+{
+    "max_top_k_errors": {
+        "null": {
+            "error": 0.6855210661888123,
+            "batch_index": 0,
+            "token_index": 47
+        },
+        "1000": {
+            "error": 0.6855210661888123,
+            "batch_index": 0,
+            "token_index": 47
+        },
+        "50": {
+            "error": 0.6855210661888123,
+            "batch_index": 0,
+            "token_index": 47
+        },
+        "5": {
+            "error": 0.5297154188156128,
+            "batch_index": 0,
+            "token_index": 47
+        }
+    },
+    "average_over_tokens": {
+        "null": {
+            "mean_abs_error": 0.006018897784523365,
+            "mean_squared_error": 0.00020234956376467285,
+            "max_abs_error": 0.04519812969673325,
+            "max_squared_error": 0.008558903379273805
+        },
+        "1000": {
+            "max_abs_error": 0.04066601470348206,
+            "max_squared_error": 0.007579562544932938
+        },
+        "50": {
+            "max_abs_error": 0.03448524880980687,
+            "max_squared_error": 0.006024050757830134
+        },
+        "5": {
+            "max_abs_error": 0.025665945940379548,
+            "max_squared_error": 0.003904833708217171
+        }
+    }
+}
