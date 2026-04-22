@@ -2,6 +2,20 @@
 
 When fixing NKI kernels, never remove existing optimizations (e.g., SBUF hoisting, DMA optimizations) unless explicitly asked. Fixes must preserve performance characteristics.
 
+**Important.** All generated kernels must be exactly accurate to reference implementations when tested with the same precision.
+
+## Kernel-Level Accuracy Tolerances
+
+E2E validation (`main.py --mode validate`) compares bf16-on-Neuron outputs against the baseline NxDI model using `logit_validation` with:
+- `tol_map = {None: (1e-5, 0.05), 1000: (1e-5, 0.03), 50: (1e-5, 0.03), 5: (1e-5, 0.03)}` — keys are top-k ranks, values are `(atol, rtol)` on logits
+- `divergence_difference_tol = 0.001` — max allowed score gap when argmax diverges
+
+For **individual kernel tests** 
+
+- Against a fp32-promoted reference, i.e. inputs in bf16, arithmetic in fp32, outputs cast to bf16: `atol=1e-3, rtol=1e-2` — within bf16 quantization noise (~3.9e-3 machine epsilon)
+- Against a bf16-native reference: `atol=1e-5, rtol=1e-2`
+
+
 ## General Rules
 Do not modify files the user hasn't asked you to modify. If integration work requires changes to adjacent files, ask first before editing.
 

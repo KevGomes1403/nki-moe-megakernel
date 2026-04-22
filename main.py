@@ -12,7 +12,7 @@ from torch_neuronx.pyhlo.hlo_pb2 import HloModuleProto
 from torch_neuronx.testing.validation import logit_validation
 from transformers import AutoTokenizer, GenerationConfig
 
-from neuronx_distributed_inference.models.config import OnDeviceSamplingConfig, to_torch_dtype
+from neuronx_distributed_inference.models.config import OnDeviceSamplingConfig, TensorCaptureConfig, to_torch_dtype
 from neuronx_distributed_inference.modules.generation.sampling import prepare_sampling_params
 from neuronx_distributed_inference.utils.accuracy import get_generate_outputs
 from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config, HuggingFaceGenerationAdapter
@@ -31,16 +31,41 @@ from test import parse_prompts, parse_prompt_data
 
 BENCHMARK_REPORT_FILENAME = "benchmark_report.json"
 
+_DEBUG_TENSOR_NAMES = ["attn_out", "kv_k", "kv_v", "final_hidden_states"]
+
+def make_debug_dump_hook(save_path="debug_tensors.pt", tkg_save_path="debug_dump_tkg.pt"):
+    """
+    Returns a tensor_capture_hook that saves layer-0 intermediates on the first two
+    forward calls:
+      call 1 (CTE)          → save_path          (default: debug_tensors.pt)
+      call 2 (first TKG)    → tkg_save_path       (default: debug_dump_tkg.pt)
+    Subsequent calls are silently ignored.
+    Requires the model to have been compiled with --debug-dump (tensor_capture_config set).
+    """
+    _count = [0]
+    def hook(model, captured_tensors):
+        _count[0] += 1
+        if _count[0] > 2:
+            return
+        path = save_path if _count[0] == 1 else tkg_save_path
+        tag  = "CTE" if _count[0] == 1 else "TKG step 1"
+        data = {name: t.detach().cpu() for name, t in zip(_DEBUG_TENSOR_NAMES, captured_tensors)}
+        torch.save(data, path)
+        print(f"Debug tensors ({tag}) saved to {path}:")
+        for name, t in data.items():
+            print(f"  {name}: shape={tuple(t.shape)} dtype={t.dtype}")
+    return hook
+
 set_random_seed(0)
 
 # Profiling
 import os
-os.environ["NEURON_FRAMEWORK_DEBUG"] = "1"
-os.environ["XLA_IR_DEBUG"]= "1"
-os.environ["XLA_HLO_DEBUG"]= "1"
-os.environ["NEURON_RT_INSPECT_ENABLE"]= "1"
-os.environ["NEURON_RT_INSPECT_DEVICE_PROFILE"]= "1"
-os.environ["NEURON_RT_INSPECT_OUTPUT_DIR"]= "./output"
+# os.environ["NEURON_FRAMEWORK_DEBUG"] = "1"
+# os.environ["XLA_IR_DEBUG"]= "1"
+# os.environ["XLA_HLO_DEBUG"]= "1"
+# os.environ["NEURON_RT_INSPECT_ENABLE"]= "1"
+# os.environ["NEURON_RT_INSPECT_DEVICE_PROFILE"]= "1"
+# os.environ["NEURON_RT_INSPECT_OUTPUT_DIR"]= "./output"
 
 os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = "trn3"
 os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2"
@@ -87,6 +112,8 @@ def parse_args():
     parser.add_argument("--model-path", type=str, default="~/models/Qwen3-MoE/")
     parser.add_argument("--compiled-model-path", type=str,
                         default="/home/ubuntu/Qwen3-30B-A3B/traced_model")
+    parser.add_argument("--baseline-compiled-model-path", type=str,
+                        default="~/models/Qwen-baseline-compiled/")
 
     # Evaluation
     parser.add_argument("--benchmark", action="store_true")
@@ -212,6 +239,13 @@ def parse_args():
     parser.add_argument("--quantized-kernel-lower-bound", type=float, default=1200.0)
     parser.add_argument("--mlp-kernel-fuse-residual-add", action="store_true")
 
+    # Debug tensor dump
+    parser.add_argument("--debug-dump", action="store_true",
+                        help="Compile with tensor capture and dump attn_out/kv_k/kv_v/final_hidden_states to a .pt file. "
+                             "Requires recompile (skip_compile=False) to wire the tensors into the traced graph.")
+    parser.add_argument("--debug-dump-path", type=str, default="debug_tensors.pt",
+                        help="Path for the debug .pt file (default: debug_tensors.pt)")
+
     return parser.parse_args()
 
 
@@ -228,7 +262,7 @@ def load_tokenizer(model_path, compiled_model_path, neuron_config):
     return tokenizer
 
 
-def prepare_inference(model_cls, args):
+def prepare_inference(model_cls, args, compiled_model_path=None, skip_compile=None):
     # Initialize configs.
     print("Loading configs...")
 
@@ -236,37 +270,58 @@ def prepare_inference(model_cls, args):
     config_kwargs = copy.deepcopy(vars(args))
     config_kwargs = {k: v for k, v in config_kwargs.items() if v is not None}
 
+    # Pop debug flags before they reach MoENeuronConfig (not valid kwargs there).
+    debug_dump = config_kwargs.pop("debug_dump", False)
+    config_kwargs.pop("debug_dump_path", None)
+
     if args.on_device_sampling:
         config_kwargs["on_device_sampling_config"] = OnDeviceSamplingConfig(**config_kwargs)
 
+    if debug_dump:
+        if skip_compile is False or (skip_compile is None and not args.skip_compile):
+            # TensorCaptureConfig requires on_device_sampling_config; add defaults if not already set.
+            if "on_device_sampling_config" not in config_kwargs:
+                config_kwargs["on_device_sampling_config"] = OnDeviceSamplingConfig(
+                    do_sample=True, top_k=20, top_p=0.95, temperature=0.6
+                )
+            config_kwargs["tensor_capture_config"] = TensorCaptureConfig(max_intermediate_tensors=4)
+        else:
+            print("WARNING: --debug-dump with --skip-compile=True only works if the loaded model "
+                  "was compiled with --debug-dump. Tensor capture will be silently empty otherwise.")
+
+    config_kwargs["blockwise_matmul_config"] = {'use_torch_block_wise': True}
     neuron_config = model_cls.get_neuron_config_cls()(**config_kwargs)
 
     config = model_cls.get_config_cls()(
         neuron_config, load_config=load_pretrained_config(args.model_path)
     )
-    
+
+    config.num_hidden_layers = 1  # debug: single-layer mode using only layer 0 weights
 
     model = model_cls(args.model_path, config)
 
-    if not args.skip_compile:
+    _compiled_model_path = compiled_model_path if compiled_model_path is not None else args.compiled_model_path
+    _skip_compile = skip_compile if skip_compile is not None else args.skip_compile
+
+    if not _skip_compile:
 
         # Compile and save model.
-        # to do, add save sharded checkpoint here 
+        # to do, add save sharded checkpoint here
         compiling_start_time = time.monotonic()
         print("\nCompiling and saving model...")
-        model.compile(args.compiled_model_path, debug=False)
-    
+        model.compile(_compiled_model_path, debug=False)
+
         compiling_end_time = time.monotonic()
         total_compiling_time = compiling_end_time - compiling_start_time
         print(f"Compiling and tracing time: {total_compiling_time} seconds")
 
     # Load compiled model to Neuron.
     print("\nLoading model to Neuron...")
-    model.load(args.compiled_model_path)
+    model.load(_compiled_model_path)
     print("NEURON CONFIG:", {k: v for k, v in vars(model.neuron_config).items() if not callable(v)})
 
     # Load tokenizer.
-    tokenizer = load_tokenizer(args.model_path, args.compiled_model_path, neuron_config)
+    tokenizer = load_tokenizer(args.model_path, _compiled_model_path, neuron_config)
     neuron_config.pad_token_id = tokenizer.pad_token_id
 
     # Configure generation config.
@@ -501,18 +556,30 @@ def check_accuracy_logits(base_model, base_generation_config, neuron_model, toke
     print("Passed logits validation")
 
 
-def run_generation(model, tokenizer, prompts, generation_config):
+def run_generation(model, tokenizer, prompts, generation_config, tensor_capture_hook=None):
     print("\nGenerating outputs...")
     print(f"Prompts: {prompts}")
 
-    _, output_tokens = get_generate_outputs(
-        model,
-        prompts,
-        tokenizer,
-        is_hf=False,
-        generation_config=generation_config,
-        max_length=model.neuron_config.max_length,
-    )
+    if tensor_capture_hook is not None:
+        inputs = tokenizer(prompts, padding=True, return_tensors="pt")
+        generation_adapter = HuggingFaceGenerationAdapter(model)
+        outputs = generation_adapter.generate(
+            inputs.input_ids,
+            attention_mask=inputs.attention_mask,
+            generation_config=generation_config,
+            max_length=model.neuron_config.max_length,
+            tensor_capture_hook=tensor_capture_hook,
+        )
+        output_tokens = tokenizer.batch_decode(outputs, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+    else:
+        _, output_tokens = get_generate_outputs(
+            model,
+            prompts,
+            tokenizer,
+            is_hf=False,
+            generation_config=generation_config,
+            max_length=model.neuron_config.max_length,
+        )
 
     print("Generated outputs:")
     for i, output_token in enumerate(output_tokens):
@@ -719,6 +786,12 @@ def resolve_qwen_module_name(qwen_name: str, enable_nki: bool) -> str:
         "qwen_multilayer": "qwen_fused_transformer_multilayer",
         "qwen_megakernel": "qwen_fused_transformer_multilayer",
         "qwen_full_fused": "qwen_fused_transformer_multilayer",
+        # NxDI stock attention + per-layer MoE NKI kernel (A/B isolation variant
+        # of qwen_fused_transformer_multilayer — only the MoE path differs from
+        # the NxDI reference, attention is stock).
+        "qwen_nxd_attn_moe_kernel": "qwen_nxd_attn_moe_kernel",
+        "qwen_nxd_attn": "qwen_nxd_attn_moe_kernel",
+        "qwen_moe_kernel_only": "qwen_nxd_attn_moe_kernel",
     }
 
     normalized = qwen_name.strip()
@@ -769,22 +842,28 @@ def main():
 
     if args.mode == "generate":
         model, tokenizer, generation_config = prepare_inference(qwen.NeuronQwen3MoeForCausalLM, args)
-        
+
+        hook = make_debug_dump_hook(args.debug_dump_path) if args.debug_dump else None
         run_generation(
             model,
             tokenizer,
             args.prompts,
-            generation_config
+            generation_config,
+            tensor_capture_hook=hook,
         )
 
     elif args.mode == "validate":
         if args.platform_target == 'trn2':
             print ('Validation not supported for trn2, exiting.')
             quit()
-            
+
         model, tokenizer, generation_config = prepare_inference(qwen.NeuronQwen3MoeForCausalLM, args)
-        
-        base_model, _, base_generation_config = prepare_inference(baseline_qwen.NeuronQwen3MoeForCausalLM, args)
+
+        base_model, _, base_generation_config = prepare_inference(
+            baseline_qwen.NeuronQwen3MoeForCausalLM, args,
+            compiled_model_path=os.path.expanduser(args.baseline_compiled_model_path),
+            skip_compile=True,
+        )
 
         passed = run_accuracy_check(
             base_model,
@@ -809,7 +888,9 @@ def main():
             accuracy = 1
         else:
             base_model, _, base_generation_config = prepare_inference(
-                baseline_qwen.NeuronQwen3MoeForCausalLM, args
+                baseline_qwen.NeuronQwen3MoeForCausalLM, args,
+                compiled_model_path=os.path.expanduser(args.baseline_compiled_model_path),
+                skip_compile=True,
             )
 
             accuracy = run_accuracy_check(
@@ -886,10 +967,14 @@ def main():
         print(f"\nTotal Score: {total_score}\n")
         
     elif args.mode == "evaluate_all" and args.platform_target == 'trn3':
-        
+
         model, tokenizer, generation_config = prepare_inference(qwen.NeuronQwen3MoeForCausalLM, args)
 
-        base_model, _, base_generation_config = prepare_inference(baseline_qwen.NeuronQwen3MoeForCausalLM, args)
+        base_model, _, base_generation_config = prepare_inference(
+            baseline_qwen.NeuronQwen3MoeForCausalLM, args,
+            compiled_model_path=os.path.expanduser(args.baseline_compiled_model_path),
+            skip_compile=True,
+        )
         
         prompts = parse_prompts("prompts.txt")
         prompt_data = parse_prompt_data("prompt_data_trn3.txt")

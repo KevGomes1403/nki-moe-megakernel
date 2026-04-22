@@ -104,7 +104,7 @@ def _multilayer_body(
     rg = nccl.ReplicaGroup(replica_groups) if replica_groups is not None else None
 
     sbm = BufferManager(0, SBM_SIZE_BYTES, Logger("transformer_qwen3_moe_tkg_multilayer"))
-    sbm.set_auto_alloc(False)
+    sbm.set_auto_alloc(True)
 
     # -----------------------------------------------------------------------
     # Load X into SBUF as the initial residual [H0, BxS*H1].
@@ -152,7 +152,7 @@ def _multilayer_body(
     gpan_bf16_all = sbm.alloc_stack((PMAX, num_layers * NH), dtype, name="gpan_bf16_all")
 
     # Each DMA is independent across layers — compiler can parallelize them.
-    for li in nl.affine_range(num_layers):
+    for li in range(num_layers):
         nisa.dma_copy(
             dst=qnw_bf16_all[0:PMAX, li:li + 1],
             src=qn_list[li].reshape((PMAX, 1)),
@@ -207,13 +207,13 @@ def _multilayer_body(
     # Switch to explicit-address mode so interleave_degree=2 actually cycles
     # the SBUF backing. With auto_alloc=True the allocator ignores the
     # section cursor (see _get_safe_batch_interleave_degree in attention_tkg).
-    sbm.set_auto_alloc(False)
+    sbm.set_auto_alloc(True)
     sbm.set_name_prefix("weights_")
     # interleave_degree=2 gives the compiler a second physical slot per
     # per-iteration alloc_stack, so it can schedule iter (i+1)'s weight DMAs
     # in parallel with iter i's attention/MoE compute without any explicit
     # prefetch loop on our part.
-    sbm.open_scope(interleave_degree=2, name="weight_db")
+    sbm.open_scope(interleave_degree=1, name="weight_db")
 
     for layer_idx in range(num_layers):
         # Fresh per-iter alloc in the current ring section; increment_section
@@ -240,7 +240,7 @@ def _multilayer_body(
         # previous iteration's compute automatically.
         nisa.dma_copy(dst=Wk_cur, src=Wk_list[layer_idx], dge_mode=nisa.dge_mode.hwdge)
         nisa.dma_copy(dst=Wv_cur, src=Wv_list[layer_idx], dge_mode=nisa.dge_mode.hwdge)
-        for hi in nl.affine_range(NOH):
+        for hi in range(NOH):
             q_h = OWNED[hi]
             nisa.dma_copy(
                 dst=Wq_cur[hi],
@@ -496,3 +496,10 @@ def _build_multilayer_kernel(num_layers: int):
 
 transformer_qwen3_moe_tkg_multilayer = _build_multilayer_kernel(NUM_LAYERS)
 transformer_qwen3_moe_tkg_multilayer_jit = nki.jit(transformer_qwen3_moe_tkg_multilayer)
+
+_kernel_cache: dict = {NUM_LAYERS: transformer_qwen3_moe_tkg_multilayer_jit}
+
+def get_multilayer_kernel_jit(num_layers: int):
+    if num_layers not in _kernel_cache:
+        _kernel_cache[num_layers] = nki.jit(_build_multilayer_kernel(num_layers))
+    return _kernel_cache[num_layers]

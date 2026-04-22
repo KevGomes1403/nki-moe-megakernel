@@ -36,7 +36,7 @@ from transformers import Qwen3MoeForCausalLM
 from transformers.generation import SampleDecoderOnlyOutput, SampleEncoderDecoderOutput
 from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeRMSNorm
 
-from neuronx_distributed_inference.models.config import InferenceConfig, MoENeuronConfig, SHARD_ON_INTERMEDIATE_DIMENSION_PER_TP, MOE_TKG_MK_INTERMEDIATE_PER_TP
+from neuronx_distributed_inference.models.config import InferenceConfig, MoENeuronConfig, MOE_TKG_MK_INTERMEDIATE_PER_TP, TensorCaptureConfig
 from neuronx_distributed_inference.models.model_wrapper import CONTEXT_ENCODING_MODEL_TAG, TOKEN_GENERATION_MODEL_TAG
 from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
 from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
@@ -47,6 +47,12 @@ from neuronx_distributed_inference.models.layer_boundary_marker import (
 )
 
 _flash_fwd_call = nki_jit()(attention_isa_kernel)
+
+try:
+    from neuronx_distributed.utils.tensor_capture import register_tensor as _register_tensor
+except ImportError:
+    def _register_tensor(name, tensor):
+        pass
 
 SampleOutput = Union[SampleEncoderDecoderOutput, SampleDecoderOnlyOutput]
 
@@ -272,9 +278,9 @@ class Qwen3MoeInferenceConfig(InferenceConfig):
         moe_tp_degree = self.neuron_config.moe_tp_degree
         I_TP = self.moe_intermediate_size // moe_tp_degree
         if getattr(self.neuron_config.blockwise_matmul_config, "use_shard_on_intermediate_dynamic_while", False):
-            # If shard-on-I enabled, check the intermediate size per tp is divisible by SHARD_ON_INTERMEDIATE_DIMENSION_PER_TP
-            if I_TP % SHARD_ON_INTERMEDIATE_DIMENSION_PER_TP != 0:
-                padded_moe_intermediate_size = math.ceil(I_TP / SHARD_ON_INTERMEDIATE_DIMENSION_PER_TP) * SHARD_ON_INTERMEDIATE_DIMENSION_PER_TP * moe_tp_degree
+            # If shard-on-I enabled, check the intermediate size per tp is divisible by SHARD_ON_INTERMEDIATE_DIMENTION_PER_TP
+            if I_TP % SHARD_ON_INTERMEDIATE_DIMENTION_PER_TP != 0:
+                padded_moe_intermediate_size = math.ceil(I_TP / SHARD_ON_INTERMEDIATE_DIMENTION_PER_TP) * SHARD_ON_INTERMEDIATE_DIMENTION_PER_TP * moe_tp_degree
                 self.moe_intermediate_pad_size = max(padded_moe_intermediate_size - self.moe_intermediate_size, 0)
                 # set moe_intermediate_size to padded size
                 self.moe_intermediate_size = padded_moe_intermediate_size
@@ -349,6 +355,8 @@ class NeuronQwen3MoeDecoderLayer(nn.Module):
     def __init__(self, config: Qwen3MoeInferenceConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.layer_idx = layer_idx
+        self.debug_tensor_capture = getattr(config.neuron_config, "tensor_capture_config", None) is not None
         self.self_attn = NeuronQwen3MoEAttention(config=config)
         self.moe_fused_nki_kernel_enabled = getattr(config, "moe_fused_nki_kernel_enabled", False)
 
@@ -420,6 +428,22 @@ class NeuronQwen3MoeDecoderLayer(nn.Module):
             rmsnorm=qkv_fused_rmsnorm,
             **kwargs,
         )
+        if self.debug_tensor_capture and self.layer_idx == 0:
+            _register_tensor("attn_out", hidden_states)
+            if past_key_value is None:
+                # CTE: no prior cache; present_key_value already holds the full
+                # context K/V ([B, nkv, S_cte, d]).
+                _register_tensor("kv_k", present_key_value[0])
+                _register_tensor("kv_v", present_key_value[1])
+            else:
+                # TKG: present_key_value is only the new row; kv_mgr.update_cache()
+                # scatters it outside the layer loop. Reconstruct the full updated
+                # cache to match K_out[0] from the megakernel ([B, nkv, S_max, d]).
+                _pos = position_ids[0]  # [1] in TKG
+                _full_k = torch.index_copy(past_key_value[0], 2, _pos, present_key_value[0])
+                _full_v = torch.index_copy(past_key_value[1], 2, _pos, present_key_value[1])
+                _register_tensor("kv_k", _full_k)
+                _register_tensor("kv_v", _full_v)
         hidden_states = residual + hidden_states
 
         # MoE
@@ -428,6 +452,8 @@ class NeuronQwen3MoeDecoderLayer(nn.Module):
             hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states, padding_mask)[0]
         hidden_states = residual + hidden_states
+        if self.debug_tensor_capture and self.layer_idx == 0:
+            _register_tensor("final_hidden_states", hidden_states)
 
         # End module marker
         hidden_states = ModuleMarkerEndWrapper()(hidden_states)
@@ -539,7 +565,36 @@ class NeuronQwen3MoeForCausalLM(NeuronBaseForCausalLM):
         return compiler_args
 
 
-def generate(skip_compile=False):
+def make_debug_dump_hook(save_path="debug_tensors.pt", tkg_save_path="debug_dump_tkg.pt"):
+    """
+    Returns a tensor_capture_hook that saves the 4 layer-0 intermediates
+    (attn_out, kv_k, kv_v, final_hidden_states) on the first two forward calls:
+      call 1 (CTE)        → save_path       (default: debug_tensors.pt)
+      call 2 (first TKG)  → tkg_save_path   (default: debug_dump_tkg.pt)
+    Subsequent calls are silently ignored.
+    """
+    _DEBUG_TENSOR_NAMES = ["attn_out", "kv_k", "kv_v", "final_hidden_states"]
+    _count = [0]
+
+    def hook(model, captured_tensors):
+        _count[0] += 1
+        if _count[0] > 2:
+            return
+        path = save_path if _count[0] == 1 else tkg_save_path
+        tag  = "CTE" if _count[0] == 1 else "TKG step 1"
+        data = {
+            name: t.detach().cpu()
+            for name, t in zip(_DEBUG_TENSOR_NAMES, captured_tensors)
+        }
+        torch.save(data, path)
+        print(f"Debug tensors ({tag}) saved to {path}:")
+        for name, t in data.items():
+            print(f"  {name}: shape={tuple(t.shape)} dtype={t.dtype}")
+
+    return hook
+
+
+def generate(skip_compile=False, debug_dump=False):
     # Initialize configs and tokenizer.
     generation_config = GenerationConfig.from_pretrained(model_path)
 
@@ -551,7 +606,8 @@ def generate(skip_compile=False):
             seq_len=1024,
             on_device_sampling_config=OnDeviceSamplingConfig(do_sample=True, temperature=0.6, top_k=20, top_p=0.95),
             enable_bucketing=False,
-            flash_decoding_enabled=False
+            flash_decoding_enabled=False,
+            tensor_capture_config=TensorCaptureConfig(max_intermediate_tensors=4) if debug_dump else None,
         )
         config = Qwen3MoeInferenceConfig(
             neuron_config,
@@ -585,14 +641,15 @@ def generate(skip_compile=False):
     )
     inputs = tokenizer([text], padding=True, return_tensors="pt")
     generation_model = HuggingFaceGenerationAdapter(model)
+    hook = make_debug_dump_hook() if debug_dump else None
     outputs = generation_model.generate(
         inputs.input_ids,
         generation_config=generation_config,
         attention_mask=inputs.attention_mask,
         max_length=model.config.neuron_config.max_length,
+        tensor_capture_hook=hook,
     )
     output_tokens = tokenizer.batch_decode(outputs, skip_special_tokens=True, clean_up_tokenization_spaces=False)
     print("Generated outputs:")
     for i, output_token in enumerate(output_tokens):
         print(f"Output {i}: {output_token}")
-

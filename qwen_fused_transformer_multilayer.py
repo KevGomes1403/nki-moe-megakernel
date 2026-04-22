@@ -51,6 +51,7 @@ from neuronx_distributed.utils import cpu_mode
 from neuronx_distributed_inference.models.config import (
     MoENeuronConfig,
     OnDeviceSamplingConfig,
+    TensorCaptureConfig,
 )
 from neuronx_distributed_inference.models.layer_boundary_marker import (
     ModuleMarkerEndWrapper,
@@ -72,7 +73,17 @@ from neuronx_distributed_inference.modules.moe_v2 import initialize_moe_module
 
 from kernels.transformer.transformer_qwen_multilayer import (
     transformer_qwen3_moe_tkg_multilayer_jit,
+    get_multilayer_kernel_jit,
 )
+from kernels.transformer.transformer_qwen_multilayer_debug import (
+    get_multilayer_debug_kernel_jit,
+)
+
+try:
+    from neuronx_distributed.utils.tensor_capture import register_tensor as _register_tensor
+except ImportError:
+    def _register_tensor(name, tensor):
+        pass
 
 GQA_SHARDING_STRATEGY = GQA.REPLICATE_TO_TP_DEGREE
 
@@ -104,7 +115,12 @@ class Qwen3MoEV3MultilayerNeuronConfig(MoENeuronConfig):
         # and the trailing kv_mgr.update_cache (gated on this flag).
         kwargs["attn_block_tkg_nki_kernel_cache_update"] = True
         kwargs.setdefault("fused_qkv", False)
+        # Pop tensor_capture_config before passing to OnDeviceSamplingConfig — it
+        # doesn't accept that kwarg and will raise TypeError if it sees it.
+        _tcc = kwargs.pop("tensor_capture_config", None)
         kwargs["on_device_sampling_config"] = OnDeviceSamplingConfig(**kwargs)
+        if _tcc is not None:
+            kwargs["tensor_capture_config"] = _tcc
         kwargs["output_logits"] = True
         kwargs["async_mode"] = True
         super().__init__(**kwargs)
@@ -334,6 +350,7 @@ class NeuronQwen3MoeDecoderLayerV3(nn.Module):
         self.sequence_parallel_enabled = False
         self.qkv_kernel_fused_rmsnorm = not self.sequence_parallel_enabled
         self.moe_mask_padded_tokens = config.neuron_config.moe_mask_padded_tokens
+        self.debug_tensor_capture = getattr(config.neuron_config, "tensor_capture_config", None) is not None
 
         # Replica groups for nccl.all_reduce inside the megakernel.
         # Derived from tp_degree to avoid torch.distributed calls during mock tracing.
@@ -440,7 +457,12 @@ class NeuronQwen3MoeDecoderLayerV3(nn.Module):
                  router_list, gate_up_list, down_list) = self._gather_weights_from_parent()
                 K_caches, V_caches = self._gather_kv_caches(kv_mgr)
 
-                kernel_out = transformer_qwen3_moe_tkg_multilayer_jit[2](
+                _kernel_fn = (
+                    get_multilayer_debug_kernel_jit(L)[2]
+                    if self.debug_tensor_capture
+                    else get_multilayer_kernel_jit(L)[2]
+                )
+                kernel_out = _kernel_fn(
                     hidden_states,
                     *Wq_list, *Wk_list, *Wv_list, *Wo_list,
                     *qn_list, *kn_list, *gpre_list, *gpost_list,
@@ -449,12 +471,22 @@ class NeuronQwen3MoeDecoderLayerV3(nn.Module):
                     cos_at_pos, sin_at_pos, position_ids.to(torch.int32),
                     replica_groups=self._replica_groups,
                 )
-                # Kernel returns (Y, K0, K1, ..., K_{L-1}, V0, V1, ..., V_{L-1}).
-                # Returning KV tensors is what makes the NKI compiler treat
-                # v14a's in-place scatters as live (not DCE'd dead stores).
                 Y = kernel_out[0]
-                K_out = list(kernel_out[1 : 1 + L])
-                V_out = list(kernel_out[1 + L : 1 + 2 * L])
+                if self.debug_tensor_capture:
+                    # Debug kernel returns (Y, attn_out_l0, final_hidden_states_l0,
+                    #                       K0..K_{L-1}, V0..V_{L-1}).
+                    attn_out_l0            = kernel_out[1]
+                    final_hidden_states_l0 = kernel_out[2]
+                    K_out = list(kernel_out[3     : 3 + L])
+                    V_out = list(kernel_out[3 + L : 3 + 2 * L])
+                    _register_tensor("attn_out",            attn_out_l0)
+                    _register_tensor("kv_k",                K_out[0])
+                    _register_tensor("kv_v",                V_out[0])
+                    _register_tensor("final_hidden_states", final_hidden_states_l0)
+                else:
+                    # Production kernel returns (Y, K0..K_{L-1}, V0..V_{L-1}).
+                    K_out = list(kernel_out[1     : 1 + L])
+                    V_out = list(kernel_out[1 + L : 1 + 2 * L])
                 Y = ModuleMarkerEndWrapper()(Y)
 
                 # Stash the post-scatter KV handles so pass-through layers can
@@ -493,12 +525,18 @@ class NeuronQwen3MoeDecoderLayerV3(nn.Module):
             rmsnorm=qkv_fused_rmsnorm,
             **kwargs,
         )
+        if self.debug_tensor_capture and self.layer_idx == 0:
+            _register_tensor("attn_out", hidden_states)
+            _register_tensor("kv_k", present_key_value[0])
+            _register_tensor("kv_v", present_key_value[1])
         hidden_states = residual + hidden_states
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states, padding_mask)[0]
         hidden_states = residual + hidden_states
+        if self.debug_tensor_capture and self.layer_idx == 0:
+            _register_tensor("final_hidden_states", hidden_states)
 
         hidden_states = ModuleMarkerEndWrapper()(hidden_states)
         return (hidden_states, present_key_value, cos_cache, sin_cache, None)
@@ -671,6 +709,35 @@ class NeuronQwen3MoeForCausalLMV3(NeuronBaseForCausalLM):
             args.append(f"--internal-hlo2tensorizer-options={hlo2tensorizer_extra} --verify-hlo=true")
 
         return shlex.join(args)
+
+
+def make_debug_dump_hook(save_path="debug_tensors.pt", tkg_save_path="debug_dump_tkg.pt"):
+    """Returns a tensor_capture_hook that saves layer-0 intermediates on the first two
+    forward calls:
+      call 1 (CTE)        → save_path       (default: debug_tensors.pt)
+      call 2 (first TKG)  → tkg_save_path   (default: debug_dump_tkg.pt)
+    Subsequent calls are silently ignored.
+    Tensor names: attn_out, kv_k, kv_v, final_hidden_states.
+    """
+    _DEBUG_TENSOR_NAMES = ["attn_out", "kv_k", "kv_v", "final_hidden_states"]
+    _count = [0]
+
+    def hook(model, captured_tensors):
+        _count[0] += 1
+        if _count[0] > 2:
+            return
+        path = save_path if _count[0] == 1 else tkg_save_path
+        tag  = "CTE" if _count[0] == 1 else "TKG step 1"
+        data = {
+            name: t.detach().cpu()
+            for name, t in zip(_DEBUG_TENSOR_NAMES, captured_tensors)
+        }
+        torch.save(data, path)
+        print(f"Debug tensors ({tag}) saved to {path}:")
+        for name, t in data.items():
+            print(f"  {name}: shape={tuple(t.shape)} dtype={t.dtype}")
+
+    return hook
 
 
 # Alias expected by main.py's `qwen.NeuronQwen3MoeForCausalLM` convention.

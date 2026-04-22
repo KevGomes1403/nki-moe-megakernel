@@ -117,6 +117,7 @@ def _qwen3_moe_sbuf_in_sbuf_out_hoisted(
     rmsnorm_normed_bf16 = sbm.alloc_heap((_PMAX, H_free * T), dtype, buffer=nl.sbuf, name="rmsnorm_normed_bf16")
     # heap: fp32 normed output — must survive close_scope(rmsnorm) for fp32 router matmul
     rmsnorm_normed = sbm.alloc_heap((_PMAX, H_free * T), nl.float32, buffer=nl.sbuf, name="rmsnorm_normed")
+    rmsnorm_normed_rt_fp32 = sbm.alloc_heap((_PMAX, H_free * T), nl.float32, buffer=nl.sbuf, name="rmsnorm_normed_rt_fp32")
 
     sbm.open_scope(name="rmsnorm")
 
@@ -173,6 +174,7 @@ def _qwen3_moe_sbuf_in_sbuf_out_hoisted(
     nisa.tensor_tensor(rmsnorm_normed[...], gamma_mult[...], norm_factor_bcast.get_view(), nl.multiply)
 
     nisa.activation(rmsnorm_normed_bf16[...], op=nl.copy, data=rmsnorm_normed[...])
+    nisa.activation(rmsnorm_normed_rt_fp32[...], op=nl.copy, data=rmsnorm_normed_bf16[...])
 
     sbm.close_scope()  # frees all rmsnorm transient sbuf tensors (not gamma_sb_ready — caller-owned)
 
@@ -203,12 +205,13 @@ def _qwen3_moe_sbuf_in_sbuf_out_hoisted(
             h1 = h_chunk * _ROUTER_BATCH + h_sub
             nisa.nc_matmul(
                 dst=logits_psum[0:T, 0:E],
-                stationary=rmsnorm_normed[0:_PMAX, nl.ds(h1 * T, T)],
+                stationary=rmsnorm_normed_rt_fp32[0:_PMAX, nl.ds(h1 * T, T)],
                 moving=_router_w_wide_sb[0:_PMAX, h_sub, 0:E],
             )
 
     logits_sb = sbm.alloc_stack((T, E), nl.float32, buffer=nl.sbuf, name="logits_sb")
     nisa.activation(logits_sb[0:T, 0:E], op=nl.copy, data=logits_psum[0:T, 0:E])
+    sbm.pop_heap()  # rmsnorm_normed_rt_fp32 — no longer needed after router matmul
     sbm.pop_heap()  # rmsnorm_normed (fp32) — no longer needed after router matmul
 
     # -----------------------------------------------------------------------

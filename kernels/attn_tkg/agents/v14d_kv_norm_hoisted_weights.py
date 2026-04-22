@@ -217,10 +217,6 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm_hoisted_weights(
     else:
         sin_f32 = sin_f32_sb
 
-    # --- rms_ones (always allocated; no HBM load needed) ---
-    rms_ones = sbm.alloc_stack((PMAX, PMAX), nl.bfloat16, name="rms_ones")
-    nisa.memset(rms_ones, value=1.0)
-
     # --- gamma_pre_attn ---
     if gpan_f32_sb is None:
         gpan_bf16 = sbm.alloc_stack((PMAX, num_h_tiles), nl.bfloat16, name="gpan_bf16")
@@ -245,46 +241,63 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm_hoisted_weights(
     # =========================================================================
     h_all = sbm.alloc_stack((PMAX, num_h_tiles), nl.bfloat16, name="h_all")
 
+    # =========================================================================
+    # SHARED RMSNorm ISA constants — allocated once, shared across 3 sites.
+    # Match neuronxcc.nki._pre_prod_kernels.rmsnorm_tkg ISA constants exactly.
+    # =========================================================================
+    rms_zero_bias = sbm.alloc_stack((PMAX, 1), nl.float32, name="rms_zero_bias")
+    nisa.memset(rms_zero_bias, value=0.0)
+    rms_ones = sbm.alloc_stack((PMAX, PMAX), nl.float32, name="rms_ones")
+    nisa.memset(rms_ones, value=1.0)
+    rms_eps_sb = sbm.alloc_stack((PMAX, 1), nl.float32, name="rms_eps_sb")
+    nisa.memset(rms_eps_sb, value=EPS)
+
     # =====================================================================
-    # PRE-ATTENTION RMSNORM
+    # PRE-ATTENTION RMSNORM — library ISA sequence
+    # Input: hidden_sb bf16 [PMAX, num_h_tiles=16], H_total=2048
+    # Changes from pre-R9:
+    #   - activation(square, bias=zero) for squaring (scalar engine, single instruction)
+    #   - fused activation(rsqrt, scale=1/H, bias=eps_sb) (library ISA, single instruction)
+    # Cross-partition sum: nc_transpose chain (same as pre-R9)
     # =====================================================================
     sbm.open_scope("pre_attn_norm")
 
+    # Load input to fp32
     h_f32 = sbm.alloc_stack((PMAX, num_h_tiles), nl.float32, name="h_f32")
     nisa.tensor_copy(h_f32, hidden_sb)
 
+    # Step 1: Square via scalar-engine activation (library ISA)
     h_sq = sbm.alloc_stack((PMAX, num_h_tiles), nl.float32, name="h_sq")
-    nisa.tensor_tensor(h_sq, h_f32, h_f32, op=nl.multiply)
+    nisa.activation(h_sq, op=nl.square, data=h_f32, bias=rms_zero_bias)
 
-    # Cross-partition sum in fp32 (avoid bf16 downcast to match ref's pure-fp32 mean(x²)):
-    # 1. Transpose h_sq [PMAX, num_h_tiles] → [num_h_tiles, PMAX] so we can reduce over PMAX
+    # Cross-partition sum via nc_transpose chain (as pre-R9)
+    # 1. Transpose h_sq [PMAX, num_h_tiles] → [num_h_tiles, PMAX]
     h_sq_T_psum = nl.ndarray((num_h_tiles, PMAX), nl.float32, buffer=nl.psum)
     nisa.nc_transpose(h_sq_T_psum, h_sq)
     h_sq_T_sb = sbm.alloc_stack((num_h_tiles, PMAX), nl.float32, name="h_sq_T_sb")
     nisa.tensor_copy(h_sq_T_sb, h_sq_T_psum)
     # 2. Sum over PMAX (free dim) → [num_h_tiles, 1]
     h_sq_sum_tiles = sbm.alloc_stack((num_h_tiles, 1), nl.float32, name="h_sq_sum_tiles")
-    nisa.tensor_reduce(dst=h_sq_sum_tiles, op=nl.add, data=h_sq_T_sb, axis=1)
-    # 3. Transpose [num_h_tiles, 1] → [1, num_h_tiles] then sum free dim → scalar [1, 1]
+    nisa.tensor_reduce(h_sq_sum_tiles, op=nl.add, data=h_sq_T_sb, axis=1)
+    # 3. Transpose [num_h_tiles, 1] → [1, num_h_tiles] then sum → scalar [1, 1]
     h_sq_sum_tiles_T_psum = nl.ndarray((1, num_h_tiles), nl.float32, buffer=nl.psum)
     nisa.nc_transpose(h_sq_sum_tiles_T_psum, h_sq_sum_tiles)
     h_sq_sum_tiles_T_sb = sbm.alloc_stack((1, num_h_tiles), nl.float32, name="h_sq_sum_tiles_T_sb")
     nisa.tensor_copy(h_sq_sum_tiles_T_sb, h_sq_sum_tiles_T_psum)
     h_sq_scalar = sbm.alloc_stack((1, 1), nl.float32, name="h_sq_scalar")
-    nisa.tensor_reduce(dst=h_sq_scalar, op=nl.add, data=h_sq_sum_tiles_T_sb, axis=1)
+    nisa.tensor_reduce(h_sq_scalar, op=nl.add, data=h_sq_sum_tiles_T_sb, axis=1)
     # 4. Broadcast scalar [1, 1] → [PMAX, 1]
     h_sq_total_psum = nl.ndarray((PMAX, 1), nl.float32, buffer=nl.psum)
     nisa.nc_transpose(h_sq_total_psum, h_sq_scalar.ap([[1, 1], [0, PMAX]], offset=0))
     h_sq_total = sbm.alloc_stack((PMAX, 1), nl.float32, name="h_sq_total")
     nisa.tensor_copy(h_sq_total, h_sq_total_psum)
 
-    h_mean_sq = sbm.alloc_stack((PMAX, 1), nl.float32, name="h_mean_sq")
-    nisa.tensor_scalar(h_mean_sq, h_sq_total,
-                       op0=nl.multiply, operand0=1.0/H,
-                       op1=nl.add,      operand1=EPS)
+    # Fused scale+bias+rsqrt in one scalar-engine instruction (library ISA)
+    # rsqrt(total_sum * (1/H) + eps) where H=2048
     h_rms_inv = sbm.alloc_stack((PMAX, 1), nl.float32, name="h_rms_inv")
-    nisa.activation(h_rms_inv, op=nl.rsqrt, data=h_mean_sq)
+    nisa.activation(h_rms_inv, op=nl.rsqrt, data=h_sq_total, scale=1.0/H, bias=rms_eps_sb)
 
+    # Broadcast rms_inv [PMAX,1] → [PMAX, num_h_tiles] via nc_transpose pattern
     h_rms_T_psum = nl.ndarray((num_h_tiles, PMAX), nl.float32, buffer=nl.psum)
     nisa.nc_transpose(h_rms_T_psum, h_rms_inv.ap([[1, PMAX], [0, num_h_tiles]], offset=0))
     h_rms_T = sbm.alloc_stack((num_h_tiles, PMAX), nl.float32, name="h_rms_T")
@@ -294,10 +307,10 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm_hoisted_weights(
     h_rms_expanded = sbm.alloc_stack((PMAX, num_h_tiles), nl.float32, name="h_rms_expanded")
     nisa.tensor_copy(h_rms_expanded, h_rms_expanded_psum)
 
+    # Multiply x by rms_inv, apply gamma (same order as pre-R9)
     h_normed = sbm.alloc_stack((PMAX, num_h_tiles), nl.float32, name="h_normed")
     nisa.tensor_tensor(h_normed, h_f32, h_rms_expanded, op=nl.multiply)
     nisa.tensor_tensor(h_normed, h_normed, gpan_f32, op=nl.multiply)
-
     nisa.tensor_copy(h_all, h_normed)
 
     sbm.close_scope()  # pre_attn_norm
@@ -377,23 +390,34 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm_hoisted_weights(
     k_vec = sbm.alloc_stack((PMAX, B), nl.float32, name="k_vec")
     nisa.tensor_copy(k_vec, k_psum)
 
-    # K RMSNorm — cross-partition sum in fp32 (nc_transpose+tensor_reduce avoids bf16 downcast)
+    # Match PyTorch baseline: K-norm receives bf16 from the Wk matmul (ColumnParallelLinear
+    # outputs bf16; CustomRMSNorm re-casts to fp32 internally). We emulate the same bf16
+    # quantization by round-tripping the fp32 PSUM result through bf16 before the RMS math.
+    k_vec_bf16 = sbm.alloc_stack((PMAX, B), nl.bfloat16, name="k_vec_bf16")
+    nisa.tensor_copy(k_vec_bf16, k_vec)
+    nisa.tensor_copy(k_vec, k_vec_bf16)
+
+    # K RMSNorm — library ISA sequence (H=128=d, H_free=B=1)
+    # Changes from pre-R9: activation(square) for squaring, fused activation(rsqrt)
+    # Cross-partition sum: nc_transpose chain (as pre-R9, B=1)
+    # Step 1: Square via scalar-engine activation (library ISA)
     k_sq = sbm.alloc_stack((PMAX, B), nl.float32, name="k_sq")
-    nisa.tensor_tensor(k_sq, k_vec, k_vec, op=nl.multiply)
+    nisa.activation(k_sq, op=nl.square, data=k_vec, bias=rms_zero_bias)
+    # Cross-partition sum via nc_transpose chain (pre-R9 style, adapted for B=1)
     k_sq_T_psum = nl.ndarray((B, PMAX), nl.float32, buffer=nl.psum)
     nisa.nc_transpose(k_sq_T_psum, k_sq)
     k_sq_T_sb = sbm.alloc_stack((B, PMAX), nl.float32, name="k_sq_T_sb")
     nisa.tensor_copy(k_sq_T_sb, k_sq_T_psum)
     k_sq_scalar = sbm.alloc_stack((B, 1), nl.float32, name="k_sq_scalar")
-    nisa.tensor_reduce(dst=k_sq_scalar, op=nl.add, data=k_sq_T_sb, axis=1)
+    nisa.tensor_reduce(k_sq_scalar, op=nl.add, data=k_sq_T_sb, axis=1)
     k_sum_psum = nl.ndarray((PMAX, B), nl.float32, buffer=nl.psum)
     nisa.nc_transpose(k_sum_psum, k_sq_scalar.ap([[1, B], [0, PMAX]], offset=0))
-    k_sum_sb = sbm.alloc_stack((PMAX, B), nl.float32, name="k_sum_sb")
+    k_sum_sb = sbm.alloc_stack((PMAX, 1), nl.float32, name="k_sum_sb")
     nisa.tensor_copy(k_sum_sb, k_sum_psum)
-    k_mean_sq = sbm.alloc_stack((PMAX, B), nl.float32, name="k_mean_sq")
-    nisa.tensor_scalar(k_mean_sq, k_sum_sb, op0=nl.multiply, operand0=1.0/d, op1=nl.add, operand1=EPS)
-    k_rms_inv = sbm.alloc_stack((PMAX, B), nl.float32, name="k_rms_inv")
-    nisa.activation(k_rms_inv, op=nl.rsqrt, data=k_mean_sq)
+    # Fused scale+bias+rsqrt in one scalar-engine instruction (library ISA, H=d=128)
+    k_rms_inv = sbm.alloc_stack((PMAX, 1), nl.float32, name="k_rms_inv")
+    nisa.activation(k_rms_inv, op=nl.rsqrt, data=k_sum_sb, scale=1.0/d, bias=rms_eps_sb)
+    # Multiply k_vec by rms_inv, then apply gamma
     k_normed = sbm.alloc_stack((PMAX, B), nl.float32, name="k_normed")
     nisa.tensor_tensor(k_normed, k_vec, k_rms_inv, op=nl.multiply)
     k_normed2 = sbm.alloc_stack((PMAX, B), nl.float32, name="k_normed2")
@@ -467,26 +491,14 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm_hoisted_weights(
         q_h = owned_heads[i]
         nisa.tensor_copy(q_packed_f32[0:PMAX, q_h:q_h + 1], q_psums[i])
 
-    # Q RMSNorm — cross-partition sum in fp32 (nc_transpose+tensor_reduce avoids bf16 downcast)
-    q_sq = sbm.alloc_stack((PMAX, GQA), nl.float32, name="q_sq")
-    nisa.tensor_tensor(q_sq, q_packed_f32, q_packed_f32, op=nl.multiply)
-    q_sq_T_psum = nl.ndarray((GQA, PMAX), nl.float32, buffer=nl.psum)
-    nisa.nc_transpose(q_sq_T_psum, q_sq)
-    q_sq_T_sb = sbm.alloc_stack((GQA, PMAX), nl.float32, name="q_sq_T_sb")
-    nisa.tensor_copy(q_sq_T_sb, q_sq_T_psum)
-    q_sq_sums = sbm.alloc_stack((GQA, 1), nl.float32, name="q_sq_sums")
-    nisa.tensor_reduce(dst=q_sq_sums, op=nl.add, data=q_sq_T_sb, axis=1)
-    q_sum_psum = nl.ndarray((PMAX, GQA), nl.float32, buffer=nl.psum)
-    nisa.nc_transpose(q_sum_psum, q_sq_sums.ap([[1, GQA], [0, PMAX]], offset=0))
-    q_sum_sb = sbm.alloc_stack((PMAX, GQA), nl.float32, name="q_sum_sb")
-    nisa.tensor_copy(q_sum_sb, q_sum_psum)
-    q_mean_sq = sbm.alloc_stack((PMAX, GQA), nl.float32, name="q_mean_sq")
-    nisa.tensor_scalar(q_mean_sq, q_sum_sb, op0=nl.multiply, operand0=1.0/d, op1=nl.add, operand1=EPS)
-    q_rms_inv = sbm.alloc_stack((PMAX, GQA), nl.float32, name="q_rms_inv")
-    nisa.activation(q_rms_inv, op=nl.rsqrt, data=q_mean_sq)
-    q_normed = sbm.alloc_stack((PMAX, GQA), nl.float32, name="q_normed")
-    nisa.tensor_tensor(q_normed, q_packed_f32, q_rms_inv, op=nl.multiply)
+    # Match PyTorch baseline: Q-norm receives bf16 from the Wq matmul. Quantize the fp32
+    # PSUM result through bf16 before the RMS math (same reasoning as K path).
+    q_packed_bf16 = sbm.alloc_stack((PMAX, GQA), nl.bfloat16, name="q_packed_bf16")
+    nisa.tensor_copy(q_packed_bf16, q_packed_f32)
+    nisa.tensor_copy(q_packed_f32, q_packed_bf16)
 
+    # Q RMSNorm — library ISA sequence (H=128=d, H_free=GQA)
+    # First, broadcast qnw_sb [PMAX,1] → [PMAX,GQA] (needed before gamma multiply)
     qnw_gqa_psum_T = nl.ndarray((GQA, PMAX), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_transpose(qnw_gqa_psum_T, qnw_sb.ap([[1, PMAX], [0, GQA]], offset=0))
     qnw_gqa_sbuf_T = sbm.alloc_stack((GQA, PMAX), nl.float32, name="qnw_gqa_sbuf_T")
@@ -496,6 +508,35 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm_hoisted_weights(
     qnw_gqa = sbm.alloc_stack((PMAX, GQA), nl.float32, name="qnw_gqa")
     nisa.tensor_copy(qnw_gqa, qnw_gqa_psum)
 
+    # Q RMSNorm — library ISA sequence (H=128=d, H_free=GQA)
+    # Changes from pre-R9: activation(square) for squaring, fused activation(rsqrt)
+    # Cross-partition sum: nc_transpose chain (as pre-R9)
+    # Step 1: Square via scalar-engine activation (library ISA)
+    q_sq = sbm.alloc_stack((PMAX, GQA), nl.float32, name="q_sq")
+    nisa.activation(q_sq, op=nl.square, data=q_packed_f32, bias=rms_zero_bias)
+    # Cross-partition sum via nc_transpose chain (as pre-R9)
+    q_sq_T_psum = nl.ndarray((GQA, PMAX), nl.float32, buffer=nl.psum)
+    nisa.nc_transpose(q_sq_T_psum, q_sq)
+    q_sq_T_sb = sbm.alloc_stack((GQA, PMAX), nl.float32, name="q_sq_T_sb")
+    nisa.tensor_copy(q_sq_T_sb, q_sq_T_psum)
+    q_sq_sums = sbm.alloc_stack((GQA, 1), nl.float32, name="q_sq_sums")
+    nisa.tensor_reduce(q_sq_sums, op=nl.add, data=q_sq_T_sb, axis=1)
+    q_sum_psum = nl.ndarray((PMAX, GQA), nl.float32, buffer=nl.psum)
+    nisa.nc_transpose(q_sum_psum, q_sq_sums.ap([[1, GQA], [0, PMAX]], offset=0))
+    q_sum_sb = sbm.alloc_stack((PMAX, GQA), nl.float32, name="q_sum_sb")
+    nisa.tensor_copy(q_sum_sb, q_sum_psum)
+    # q_sum_sb [PMAX, GQA] has the cross-partition sum per Q head.
+    # But for RMSNorm we need one scalar per token (all heads share), not per head.
+    # Take first column (all GQA partitions hold same sum per original pre-R9 logic):
+    # Actually pre-R9 had per-head sum. Let me use the same path.
+    # The mean_sq is over d=128 elements (one full head), not all GQA heads.
+    # q_sum_sb holds sum_{partition}(q_sq[p, g]) for each g. We need rsqrt(sum/d + eps).
+    # Fused scale+bias+rsqrt (library ISA, H=d=128)
+    q_rms_inv = sbm.alloc_stack((PMAX, GQA), nl.float32, name="q_rms_inv")
+    nisa.activation(q_rms_inv, op=nl.rsqrt, data=q_sum_sb, scale=1.0/d, bias=rms_eps_sb)
+    # Multiply q by rms_inv (element-wise, [PMAX,GQA] × [PMAX,GQA]), then apply gamma
+    q_normed = sbm.alloc_stack((PMAX, GQA), nl.float32, name="q_normed")
+    nisa.tensor_tensor(q_normed, q_packed_f32, q_rms_inv, op=nl.multiply)
     q_normed2 = sbm.alloc_stack((PMAX, GQA), nl.float32, name="q_normed2")
     nisa.tensor_tensor(q_normed2, q_normed, qnw_gqa, op=nl.multiply)
 
@@ -540,7 +581,9 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm_hoisted_weights(
     q_rope = sbm.alloc_stack((PMAX, GQA), nl.bfloat16, name="q_rope")
     nisa.tensor_tensor(q_rope, q_cos, q_sin_part, op=nl.add)
 
-    nisa.tensor_scalar(q_bf16, q_rope, op0=nl.multiply, operand0=INV_SQRT_D)
+    # R2: softmax scale is applied post-matmul on scores (not pre-matmul on Q),
+    # matching baseline's `matmul(Q, K) / sqrt(128)`. Keep q_bf16 = q_rope unchanged here.
+    nisa.tensor_copy(q_bf16, q_rope)
 
     sbm.close_scope()  # q_proj
 
@@ -576,10 +619,12 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm_hoisted_weights(
     nisa.nc_transpose(score_active_psum, score_act_g_sb.ap([[1, GQA], [0, PMAX]], offset=0))
     score_active = sbm.alloc_stack((PMAX, GQA), nl.float32, name="score_active")
     nisa.tensor_copy(score_active, score_active_psum)
-    # Round active score to bf16 to match reference (score in bf16 before promotion to fp32)
-    score_active_bf16_tmp = sbm.alloc_stack((PMAX, GQA), nl.bfloat16, name="score_active_bf16_tmp")
-    nisa.tensor_copy(score_active_bf16_tmp, score_active)
-    nisa.tensor_copy(score_active, score_active_bf16_tmp)
+    # R2: apply softmax scale (1/sqrt(d)) in bf16 post-matmul, folded into the existing
+    # bf16 round-trip. Mirrors baseline: `score = matmul(Q, K) / sqrt(128)` where the
+    # divide produces a bf16 result.
+    score_active_scaled_bf16 = sbm.alloc_stack((PMAX, GQA), nl.bfloat16, name="score_active_scaled_bf16")
+    nisa.tensor_scalar(score_active_scaled_bf16, score_active, op0=nl.multiply, operand0=INV_SQRT_D)
+    nisa.tensor_copy(score_active, score_active_scaled_bf16)
 
     position_ids_2d = position_ids.reshape((B, 1))
     pos_f32 = sbm.alloc_stack((1, 1), nl.float32, name="pos_f32")
@@ -670,10 +715,10 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm_hoisted_weights(
         nisa.nc_matmul(score_psum, stationary=k_cache_tiles[s_t], moving=q_bf16)
         score_sb = sbm.alloc_stack((PMAX, GQA), nl.float32, name=f"score_sb_{s_t}")
         nisa.tensor_copy(score_sb, score_psum)
-        # Round score to bf16 to match reference (matmul result in bf16 before mask)
-        score_sb_bf16_tmp = sbm.alloc_stack((PMAX, GQA), nl.bfloat16, name=f"score_sb_bf16_{s_t}")
-        nisa.tensor_copy(score_sb_bf16_tmp, score_sb)
-        nisa.tensor_copy(score_sb, score_sb_bf16_tmp)
+        # R2: apply softmax scale in bf16 post-matmul, folded into the existing bf16 round-trip.
+        score_scaled_bf16 = sbm.alloc_stack((PMAX, GQA), nl.bfloat16, name=f"score_scaled_bf16_{s_t}")
+        nisa.tensor_scalar(score_scaled_bf16, score_sb, op0=nl.multiply, operand0=INV_SQRT_D)
+        nisa.tensor_copy(score_sb, score_scaled_bf16)
 
         mask_gqa = mask_gqa_tiles[s_t]
         nisa.tensor_tensor(score_sb_masked, score_sb, mask_gqa, op=nl.add)
@@ -705,14 +750,16 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm_hoisted_weights(
     attn_out = sbm.alloc_stack((PMAX, GQA), nl.bfloat16, name="attn_out")
 
     # =========================================================================
-    # PASS 2
+    # PASS 2 — two sub-passes to match baseline bf16 softmax quantization
     # =========================================================================
     sbm.open_scope("pass2")
 
-    v_acc = sbm.alloc_stack((PMAX, GQA), nl.float32, name="v_acc")
-    nisa.memset(v_acc, value=0.0)
-    sum_acc = sbm.alloc_stack((PMAX, GQA), nl.float32, name="sum_acc")
-    nisa.memset(sum_acc, value=0.0)
+    # ---- Sub-pass 2a: compute all exp tiles (fp32), accumulate fp32 denom [GQA,1] ----
+
+    sum_acc_gqa = sbm.alloc_stack((GQA, 1), nl.float32, name="sum_acc_gqa")
+    nisa.memset(sum_acc_gqa, value=0.0)
+
+    exp_tiles = []
 
     for s_t in nl.affine_range(NUM_S_TILES):
         score2_shifted = sbm.alloc_stack((PMAX, GQA), nl.float32, name=f"score2_shifted_{s_t}")
@@ -720,29 +767,74 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm_hoisted_weights(
 
         score2_exp = sbm.alloc_stack((PMAX, GQA), nl.float32, name=f"score2_exp_{s_t}")
         nisa.activation(score2_exp, op=nl.exp, data=score2_shifted)
+        exp_tiles.append(score2_exp)
 
-        score2_exp_bf16 = sbm.alloc_stack((PMAX, GQA), nl.bfloat16, name=f"score2_exp_bf16_{s_t}")
-        nisa.tensor_copy(score2_exp_bf16, score2_exp)
+        # Reduce exp tile [PMAX, GQA] → [GQA, 1] via transpose + tensor_reduce
+        exp_T_psum = nl.ndarray((GQA, PMAX), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_transpose(exp_T_psum, score2_exp)
+        exp_T_sb = sbm.alloc_stack((GQA, PMAX), nl.float32, name=f"exp_T_sb_{s_t}")
+        nisa.tensor_copy(exp_T_sb, exp_T_psum)
+        tile_sum_gqa = sbm.alloc_stack((GQA, 1), nl.float32, name=f"tile_sum_gqa_{s_t}")
+        nisa.tensor_reduce(dst=tile_sum_gqa, op=nl.add, data=exp_T_sb, axis=1)
+        nisa.tensor_tensor(sum_acc_gqa, sum_acc_gqa, tile_sum_gqa, op=nl.add)
 
-        tile_sum_psum = nl.zeros((PMAX, GQA), dtype=nl.float32, buffer=nl.psum)
-        nisa.nc_matmul(tile_sum_psum, stationary=rms_ones, moving=score2_exp_bf16)
-        tile_sum = sbm.alloc_stack((PMAX, GQA), nl.float32, name=f"tile_sum_{s_t}")
-        nisa.tensor_copy(tile_sum, tile_sum_psum)
-        nisa.tensor_tensor(sum_acc, sum_acc, tile_sum, op=nl.add)
-
-        v_weighted_psum = nl.zeros((PMAX, GQA), dtype=nl.float32, buffer=nl.psum)
-        nisa.nc_matmul(v_weighted_psum, stationary=v_cache_tiles[s_t], moving=score2_exp_bf16)
-        v_weighted = sbm.alloc_stack((PMAX, GQA), nl.float32, name=f"v_weighted_{s_t}")
-        nisa.tensor_copy(v_weighted, v_weighted_psum)
-        nisa.tensor_tensor(v_acc, v_acc, v_weighted, op=nl.add)
-
-    # Active position contribution
+    # Active position exp contribution
     score_act_shifted = sbm.alloc_stack((PMAX, GQA), nl.float32, name="score_act_shifted")
     nisa.tensor_tensor(score_act_shifted, score_active, neg_max, op=nl.add)
     score_act_exp = sbm.alloc_stack((PMAX, GQA), nl.float32, name="score_act_exp")
     nisa.activation(score_act_exp, op=nl.exp, data=score_act_shifted)
-    nisa.tensor_tensor(sum_acc, sum_acc, score_act_exp, op=nl.add)
 
+    # score_act_exp is broadcast (all PMAX partitions hold same value per head).
+    # Transpose → [GQA, PMAX], then take first column [GQA, 1] to get per-head exp value.
+    score_act_exp_T_psum = nl.ndarray((GQA, PMAX), dtype=nl.float32, buffer=nl.psum)
+    nisa.nc_transpose(score_act_exp_T_psum, score_act_exp)
+    score_act_exp_T_sb = sbm.alloc_stack((GQA, PMAX), nl.float32, name="score_act_exp_T_sb")
+    nisa.tensor_copy(score_act_exp_T_sb, score_act_exp_T_psum)
+    exp_active_gqa = sbm.alloc_stack((GQA, 1), nl.float32, name="exp_active_gqa")
+    nisa.tensor_copy(exp_active_gqa, score_act_exp_T_sb[0:GQA, 0:1])
+    nisa.tensor_tensor(sum_acc_gqa, sum_acc_gqa, exp_active_gqa, op=nl.add)
+
+    # ---- Reciprocal of denom: rsqrt² without +1e-9 eps ----
+    rsqrt_sum_gqa = sbm.alloc_stack((GQA, 1), nl.float32, name="rsqrt_sum_gqa")
+    nisa.activation(rsqrt_sum_gqa, op=nl.rsqrt, data=sum_acc_gqa)
+    inv_denom_gqa = sbm.alloc_stack((GQA, 1), nl.float32, name="inv_denom_gqa")
+    nisa.tensor_tensor(inv_denom_gqa, rsqrt_sum_gqa, rsqrt_sum_gqa, op=nl.multiply)
+
+    # Broadcast inv_denom_gqa [GQA, 1] → [PMAX, GQA] (same pattern as neg_max broadcast)
+    inv_denom_psum = nl.ndarray((PMAX, GQA), dtype=nl.float32, buffer=nl.psum)
+    nisa.nc_transpose(
+        inv_denom_psum,
+        inv_denom_gqa.ap([[1, GQA], [0, PMAX]], offset=0),
+    )
+    inv_denom_bcast = sbm.alloc_stack((PMAX, GQA), nl.float32, name="inv_denom_bcast")
+    nisa.tensor_copy(inv_denom_bcast, inv_denom_psum)
+
+    # ---- Sub-pass 2b: normalize, cast to bf16, V-matmul ----
+
+    v_acc = sbm.alloc_stack((PMAX, GQA), nl.float32, name="v_acc")
+    nisa.memset(v_acc, value=0.0)
+
+    for s_t in nl.affine_range(NUM_S_TILES):
+        # softmax tile: fp32 multiply then cast to bf16
+        softmax_fp32 = sbm.alloc_stack((PMAX, GQA), nl.float32, name=f"softmax_fp32_{s_t}")
+        nisa.tensor_tensor(softmax_fp32, exp_tiles[s_t], inv_denom_bcast, op=nl.multiply)
+        softmax_bf16 = sbm.alloc_stack((PMAX, GQA), nl.bfloat16, name=f"softmax_bf16_{s_t}")
+        nisa.tensor_copy(softmax_bf16, softmax_fp32)
+
+        # V-matmul: bf16 softmax × bf16 V_cache → fp32 PSUM
+        v_weighted_psum = nl.zeros((PMAX, GQA), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_matmul(v_weighted_psum, stationary=v_cache_tiles[s_t], moving=softmax_bf16)
+        v_weighted = sbm.alloc_stack((PMAX, GQA), nl.float32, name=f"v_weighted_{s_t}")
+        nisa.tensor_copy(v_weighted, v_weighted_psum)
+        nisa.tensor_tensor(v_acc, v_acc, v_weighted, op=nl.add)
+
+    # Active: softmax_active = score_act_exp * inv_denom in fp32, cast bf16
+    softmax_act_fp32 = sbm.alloc_stack((PMAX, GQA), nl.float32, name="softmax_act_fp32")
+    nisa.tensor_tensor(softmax_act_fp32, score_act_exp, inv_denom_bcast, op=nl.multiply)
+    softmax_act_bf16 = sbm.alloc_stack((PMAX, GQA), nl.bfloat16, name="softmax_act_bf16")
+    nisa.tensor_copy(softmax_act_bf16, softmax_act_fp32)
+
+    # Broadcast V_active from [PMAX, B=1] to [PMAX, GQA] in fp32, then cast to bf16
     v_act_packed_psum_T = nl.ndarray((GQA, PMAX), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_transpose(v_act_packed_psum_T, v_from_bf16.ap([[1, PMAX], [0, GQA]], offset=0))
     v_act_packed_sbuf_T = sbm.alloc_stack((GQA, PMAX), nl.float32, name="v_act_packed_sbuf_T")
@@ -751,19 +843,16 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm_hoisted_weights(
     nisa.nc_transpose(v_act_packed_psum, v_act_packed_sbuf_T)
     v_act_packed = sbm.alloc_stack((PMAX, GQA), nl.float32, name="v_act_packed")
     nisa.tensor_copy(v_act_packed, v_act_packed_psum)
+    v_act_packed_bf16 = sbm.alloc_stack((PMAX, GQA), nl.bfloat16, name="v_act_packed_bf16")
+    nisa.tensor_copy(v_act_packed_bf16, v_act_packed)
 
-    v_act_weighted = sbm.alloc_stack((PMAX, GQA), nl.float32, name="v_act_weighted")
-    nisa.tensor_tensor(v_act_weighted, v_act_packed, score_act_exp, op=nl.multiply)
-    nisa.tensor_tensor(v_acc, v_acc, v_act_weighted, op=nl.add)
+    # bf16 * bf16 → fp32 accumulation (tensor_tensor with bf16 inputs, fp32 dst)
+    v_act_weighted_fp32 = sbm.alloc_stack((PMAX, GQA), nl.float32, name="v_act_weighted_fp32")
+    nisa.tensor_tensor(v_act_weighted_fp32, v_act_packed_bf16, softmax_act_bf16, op=nl.multiply)
+    nisa.tensor_tensor(v_acc, v_acc, v_act_weighted_fp32, op=nl.add)
 
-    sum_safe = sbm.alloc_stack((PMAX, GQA), nl.float32, name="sum_safe")
-    nisa.tensor_scalar(sum_safe, sum_acc, op0=nl.add, operand0=1e-9)
-    rsqrt_sum = sbm.alloc_stack((PMAX, GQA), nl.float32, name="rsqrt_sum")
-    nisa.activation(rsqrt_sum, op=nl.rsqrt, data=sum_safe)
-    inv_sum = sbm.alloc_stack((PMAX, GQA), nl.float32, name="inv_sum")
-    nisa.tensor_tensor(inv_sum, rsqrt_sum, rsqrt_sum, op=nl.multiply)
-
-    nisa.tensor_tensor(attn_out, v_acc, inv_sum, op=nl.multiply)
+    # Final cast to bf16 for attn_out
+    nisa.tensor_copy(attn_out, v_acc)
 
     sbm.close_scope()  # pass2
 

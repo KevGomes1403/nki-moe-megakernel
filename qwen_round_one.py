@@ -1684,7 +1684,7 @@ class Qwen3MoEWithRouterNeuronConfig(MoENeuronConfig):
     """MoENeuronConfig with NKI-CTE blockwise defaults and normalize_top_k_affinities=True."""
 
     def __init__(self, **kwargs):
-        if "blockwise_matmul_config" not in kwargs:
+        if not isinstance(kwargs.get("blockwise_matmul_config"), BlockwiseMatmulConfig):
             kwargs["blockwise_matmul_config"] = BlockwiseMatmulConfig.from_kwargs(
                 block_size=256,
                 logical_nc_config=2,
@@ -1698,6 +1698,8 @@ class Qwen3MoEWithRouterNeuronConfig(MoENeuronConfig):
         kwargs["attn_tkg_nki_kernel_enabled"] = True
         kwargs.setdefault("fused_qkv", False)
         kwargs["on_device_sampling_config"] = OnDeviceSamplingConfig(**kwargs)
+        kwargs["output_logits"] = True
+        kwargs["async_mode"] = True
         super().__init__(**kwargs)
 
 
