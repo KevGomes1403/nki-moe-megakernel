@@ -1,0 +1,4 @@
+interface:
+  display_name: "NKI Kernel Debug"
+  short_description: "Debug Neuron NKI kernels end-to-end."
+  default_prompt: "Use $nki-kernel-debug to debug an NKI kernel against a Neuron reference implementation."

@@ -1,0 +1,5332 @@
+name: "PyLoweringContext.189"
+entry_computation_name: "PyLoweringContext.189"
+computations {
+  name: "HloRmsNormForwardImpl.8"
+  instructions {
+    name: "p0.9"
+    opcode: "parameter"
+    shape {
+      element_type: F32
+      dimensions: 1
+      dimensions: 1
+      dimensions: 2048
+      layout {
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    id: 9
+  }
+  instructions {
+    name: "p1.10"
+    opcode: "parameter"
+    shape {
+      element_type: BF16
+      dimensions: 2048
+      layout {
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+    }
+    parameter_number: 1
+    id: 10
+  }
+  instructions {
+    name: "constant.11"
+    opcode: "constant"
+    shape {
+      element_type: F32
+      layout {
+      }
+    }
+    literal {
+      shape {
+        element_type: F32
+        layout {
+        }
+      }
+      f32s: 1e-06
+    }
+    id: 11
+  }
+  instructions {
+    name: "custom-call.12"
+    opcode: "custom-call"
+    shape {
+      element_type: F32
+      dimensions: 1
+      dimensions: 1
+      dimensions: 2048
+      layout {
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    custom_call_target: "AwsNeuronRmsNorm"
+    id: 12
+    operand_ids: 9
+    operand_ids: 10
+    operand_ids: 11
+    backend_config: "2"
+  }
+  program_shape {
+    parameters {
+      element_type: F32
+      dimensions: 1
+      dimensions: 1
+      dimensions: 2048
+      layout {
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    parameters {
+      element_type: BF16
+      dimensions: 2048
+      layout {
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+    }
+    result {
+      element_type: F32
+      dimensions: 1
+      dimensions: 1
+      dimensions: 2048
+      layout {
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    parameter_names: "p0"
+    parameter_names: "p1"
+  }
+  id: 8
+  root_id: 12
+}
+computations {
+  name: "RmsNormForwardImpl.13"
+  instructions {
+    name: "p0.14"
+    opcode: "parameter"
+    shape {
+      element_type: F32
+      dimensions: 1
+      dimensions: 1
+      dimensions: 2048
+      layout {
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+    }
+    id: 14
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "p1.15"
+    opcode: "parameter"
+    shape {
+      element_type: BF16
+      dimensions: 2048
+      layout {
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+    }
+    metadata {
+    }
+    parameter_number: 1
+    id: 15
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "call.16"
+    opcode: "call"
+    shape {
+      element_type: F32
+      dimensions: 1
+      dimensions: 1
+      dimensions: 2048
+      layout {
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+    }
+    id: 16
+    operand_ids: 14
+    operand_ids: 15
+    called_computation_ids: 8
+    frontend_attributes {
+    }
+  }
+  program_shape {
+    parameters {
+      element_type: F32
+      dimensions: 1
+      dimensions: 1
+      dimensions: 2048
+      layout {
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    parameters {
+      element_type: BF16
+      dimensions: 2048
+      layout {
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+    }
+    result {
+      element_type: F32
+      dimensions: 1
+      dimensions: 1
+      dimensions: 2048
+      layout {
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    parameter_names: "p0"
+    parameter_names: "p1"
+  }
+  id: 13
+  root_id: 16
+}
+computations {
+  name: "HloTopKImpl.23"
+  instructions {
+    name: "p0.24"
+    opcode: "parameter"
+    shape {
+      element_type: BF16
+      dimensions: 1
+      dimensions: 128
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    id: 24
+  }
+  instructions {
+    name: "custom-call.25"
+    opcode: "custom-call"
+    shape {
+      element_type: TUPLE
+      tuple_shapes {
+        element_type: BF16
+        dimensions: 1
+        dimensions: 8
+        layout {
+          minor_to_major: 1
+          minor_to_major: 0
+        }
+        is_dynamic_dimension: false
+        is_dynamic_dimension: false
+      }
+      tuple_shapes {
+        element_type: U32
+        dimensions: 1
+        dimensions: 8
+        layout {
+          minor_to_major: 1
+          minor_to_major: 0
+        }
+        is_dynamic_dimension: false
+        is_dynamic_dimension: false
+      }
+    }
+    custom_call_target: "AwsNeuronTopK"
+    id: 25
+    operand_ids: 24
+    backend_config: "8"
+  }
+  program_shape {
+    parameters {
+      element_type: BF16
+      dimensions: 1
+      dimensions: 128
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    result {
+      element_type: TUPLE
+      tuple_shapes {
+        element_type: BF16
+        dimensions: 1
+        dimensions: 8
+        layout {
+          minor_to_major: 1
+          minor_to_major: 0
+        }
+        is_dynamic_dimension: false
+        is_dynamic_dimension: false
+      }
+      tuple_shapes {
+        element_type: U32
+        dimensions: 1
+        dimensions: 8
+        layout {
+          minor_to_major: 1
+          minor_to_major: 0
+        }
+        is_dynamic_dimension: false
+        is_dynamic_dimension: false
+      }
+    }
+    parameter_names: "p0"
+  }
+  id: 23
+  root_id: 25
+}
+computations {
+  name: "TopKImpl.26"
+  instructions {
+    name: "p0.27"
+    opcode: "parameter"
+    shape {
+      element_type: BF16
+      dimensions: 1
+      dimensions: 128
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+    }
+    id: 27
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "call.28"
+    opcode: "call"
+    shape {
+      element_type: TUPLE
+      tuple_shapes {
+        element_type: BF16
+        dimensions: 1
+        dimensions: 8
+        layout {
+          minor_to_major: 1
+          minor_to_major: 0
+        }
+        is_dynamic_dimension: false
+        is_dynamic_dimension: false
+      }
+      tuple_shapes {
+        element_type: U32
+        dimensions: 1
+        dimensions: 8
+        layout {
+          minor_to_major: 1
+          minor_to_major: 0
+        }
+        is_dynamic_dimension: false
+        is_dynamic_dimension: false
+      }
+    }
+    metadata {
+    }
+    id: 28
+    operand_ids: 27
+    called_computation_ids: 23
+    frontend_attributes {
+    }
+  }
+  program_shape {
+    parameters {
+      element_type: BF16
+      dimensions: 1
+      dimensions: 128
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    result {
+      element_type: TUPLE
+      tuple_shapes {
+        element_type: BF16
+        dimensions: 1
+        dimensions: 8
+        layout {
+          minor_to_major: 1
+          minor_to_major: 0
+        }
+        is_dynamic_dimension: false
+        is_dynamic_dimension: false
+      }
+      tuple_shapes {
+        element_type: U32
+        dimensions: 1
+        dimensions: 8
+        layout {
+          minor_to_major: 1
+          minor_to_major: 0
+        }
+        is_dynamic_dimension: false
+        is_dynamic_dimension: false
+      }
+    }
+    parameter_names: "p0"
+  }
+  id: 26
+  root_id: 28
+}
+computations {
+  name: "MaxComputation.63"
+  instructions {
+    name: "x.64"
+    opcode: "parameter"
+    shape {
+      element_type: F32
+      layout {
+      }
+    }
+    metadata {
+    }
+    id: 64
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "y.65"
+    opcode: "parameter"
+    shape {
+      element_type: F32
+      layout {
+      }
+    }
+    metadata {
+    }
+    parameter_number: 1
+    id: 65
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "maximum.66"
+    opcode: "maximum"
+    shape {
+      element_type: F32
+      layout {
+      }
+    }
+    metadata {
+    }
+    id: 66
+    operand_ids: 64
+    operand_ids: 65
+    frontend_attributes {
+    }
+  }
+  program_shape {
+    parameters {
+      element_type: F32
+      layout {
+      }
+    }
+    parameters {
+      element_type: F32
+      layout {
+      }
+    }
+    result {
+      element_type: F32
+      layout {
+      }
+    }
+    parameter_names: "x"
+    parameter_names: "y"
+  }
+  id: 63
+  root_id: 66
+}
+computations {
+  name: "AddComputation.72"
+  instructions {
+    name: "x.73"
+    opcode: "parameter"
+    shape {
+      element_type: F32
+      layout {
+      }
+    }
+    metadata {
+    }
+    id: 73
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "y.74"
+    opcode: "parameter"
+    shape {
+      element_type: F32
+      layout {
+      }
+    }
+    metadata {
+    }
+    parameter_number: 1
+    id: 74
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "add.75"
+    opcode: "add"
+    shape {
+      element_type: F32
+      layout {
+      }
+    }
+    metadata {
+    }
+    id: 75
+    operand_ids: 73
+    operand_ids: 74
+    frontend_attributes {
+    }
+  }
+  program_shape {
+    parameters {
+      element_type: F32
+      layout {
+      }
+    }
+    parameters {
+      element_type: F32
+      layout {
+      }
+    }
+    result {
+      element_type: F32
+      layout {
+      }
+    }
+    parameter_names: "x"
+    parameter_names: "y"
+  }
+  id: 72
+  root_id: 75
+}
+computations {
+  name: "AddComputation.84"
+  instructions {
+    name: "x.85"
+    opcode: "parameter"
+    shape {
+      element_type: BF16
+      layout {
+      }
+    }
+    metadata {
+    }
+    id: 85
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "y.86"
+    opcode: "parameter"
+    shape {
+      element_type: BF16
+      layout {
+      }
+    }
+    metadata {
+    }
+    parameter_number: 1
+    id: 86
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "add.87"
+    opcode: "add"
+    shape {
+      element_type: BF16
+      layout {
+      }
+    }
+    metadata {
+    }
+    id: 87
+    operand_ids: 85
+    operand_ids: 86
+    frontend_attributes {
+    }
+  }
+  program_shape {
+    parameters {
+      element_type: BF16
+      layout {
+      }
+    }
+    parameters {
+      element_type: BF16
+      layout {
+      }
+    }
+    result {
+      element_type: BF16
+      layout {
+      }
+    }
+    parameter_names: "x"
+    parameter_names: "y"
+  }
+  id: 84
+  root_id: 87
+}
+computations {
+  name: "add_BF16.141"
+  instructions {
+    name: "lhs.142"
+    opcode: "parameter"
+    shape {
+      element_type: BF16
+      layout {
+      }
+    }
+    metadata {
+    }
+    id: 142
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "rhs.143"
+    opcode: "parameter"
+    shape {
+      element_type: BF16
+      layout {
+      }
+    }
+    metadata {
+    }
+    parameter_number: 1
+    id: 143
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "add.144"
+    opcode: "add"
+    shape {
+      element_type: BF16
+      layout {
+      }
+    }
+    metadata {
+    }
+    id: 144
+    operand_ids: 142
+    operand_ids: 143
+    frontend_attributes {
+    }
+  }
+  program_shape {
+    parameters {
+      element_type: BF16
+      layout {
+      }
+    }
+    parameters {
+      element_type: BF16
+      layout {
+      }
+    }
+    result {
+      element_type: BF16
+      layout {
+      }
+    }
+    parameter_names: "lhs"
+    parameter_names: "rhs"
+  }
+  id: 141
+  root_id: 144
+}
+computations {
+  name: "HloSiluForwardImpl.159"
+  instructions {
+    name: "p0.160"
+    opcode: "parameter"
+    shape {
+      element_type: BF16
+      dimensions: 8
+      dimensions: 1
+      dimensions: 1
+      dimensions: 192
+      layout {
+        minor_to_major: 3
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    id: 160
+  }
+  instructions {
+    name: "custom-call.161"
+    opcode: "custom-call"
+    shape {
+      element_type: BF16
+      dimensions: 8
+      dimensions: 1
+      dimensions: 1
+      dimensions: 192
+      layout {
+        minor_to_major: 3
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    custom_call_target: "AwsNeuronSilu"
+    id: 161
+    operand_ids: 160
+  }
+  program_shape {
+    parameters {
+      element_type: BF16
+      dimensions: 8
+      dimensions: 1
+      dimensions: 1
+      dimensions: 192
+      layout {
+        minor_to_major: 3
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    result {
+      element_type: BF16
+      dimensions: 8
+      dimensions: 1
+      dimensions: 1
+      dimensions: 192
+      layout {
+        minor_to_major: 3
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    parameter_names: "p0"
+  }
+  id: 159
+  root_id: 161
+}
+computations {
+  name: "SiluForwardImpl.162"
+  instructions {
+    name: "p0.163"
+    opcode: "parameter"
+    shape {
+      element_type: BF16
+      dimensions: 8
+      dimensions: 1
+      dimensions: 1
+      dimensions: 192
+      layout {
+        minor_to_major: 3
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+    }
+    id: 163
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "call.164"
+    opcode: "call"
+    shape {
+      element_type: BF16
+      dimensions: 8
+      dimensions: 1
+      dimensions: 1
+      dimensions: 192
+      layout {
+        minor_to_major: 3
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+    }
+    id: 164
+    operand_ids: 163
+    called_computation_ids: 159
+    frontend_attributes {
+    }
+  }
+  program_shape {
+    parameters {
+      element_type: BF16
+      dimensions: 8
+      dimensions: 1
+      dimensions: 1
+      dimensions: 192
+      layout {
+        minor_to_major: 3
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    result {
+      element_type: BF16
+      dimensions: 8
+      dimensions: 1
+      dimensions: 1
+      dimensions: 192
+      layout {
+        minor_to_major: 3
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    parameter_names: "p0"
+  }
+  id: 162
+  root_id: 164
+}
+computations {
+  name: "AddComputation.180"
+  instructions {
+    name: "x.181"
+    opcode: "parameter"
+    shape {
+      element_type: BF16
+      layout {
+      }
+    }
+    metadata {
+    }
+    id: 181
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "y.182"
+    opcode: "parameter"
+    shape {
+      element_type: BF16
+      layout {
+      }
+    }
+    metadata {
+    }
+    parameter_number: 1
+    id: 182
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "add.183"
+    opcode: "add"
+    shape {
+      element_type: BF16
+      layout {
+      }
+    }
+    metadata {
+    }
+    id: 183
+    operand_ids: 181
+    operand_ids: 182
+    frontend_attributes {
+    }
+  }
+  program_shape {
+    parameters {
+      element_type: BF16
+      layout {
+      }
+    }
+    parameters {
+      element_type: BF16
+      layout {
+      }
+    }
+    result {
+      element_type: BF16
+      layout {
+      }
+    }
+    parameter_names: "x"
+    parameter_names: "y"
+  }
+  id: 180
+  root_id: 183
+}
+computations {
+  name: "PyLoweringContext.189"
+  instructions {
+    name: "xlaconst0"
+    opcode: "constant"
+    shape {
+      element_type: BF16
+      layout {
+      }
+    }
+    metadata {
+      op_type: "xla__device_data"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.clamp_min.default/xla__device_data"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch_neuronx/experimental/profiler/v2_x/custom_op_name.py"
+      source_line: 603
+      stack_frame_id: 18
+    }
+    literal {
+      shape {
+        element_type: BF16
+        layout {
+        }
+      }
+      bf16s: "\200\177"
+    }
+    id: 1
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "xlaconst1"
+    opcode: "constant"
+    shape {
+      element_type: BF16
+      layout {
+      }
+    }
+    metadata {
+      op_type: "xla__device_data"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.clamp_min.default/xla__device_data"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch_neuronx/experimental/profiler/v2_x/custom_op_name.py"
+      source_line: 603
+      stack_frame_id: 18
+    }
+    literal {
+      shape {
+        element_type: BF16
+        layout {
+        }
+      }
+      bf16s: "\215+"
+    }
+    id: 2
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "p1"
+    opcode: "parameter"
+    shape {
+      element_type: BF16
+      dimensions: 128
+      dimensions: 2048
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "xla__device_data"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/RouterTopK[.1][1]/get_router_logits[0]/Linear[.1]/aten.t.default/xla__device_data"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch_neuronx/experimental/profiler/v2_x/custom_op_name.py"
+      source_line: 603
+      stack_frame_id: 24
+    }
+    parameter_number: 1
+    id: 3
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "transpose.4"
+    opcode: "transpose"
+    shape {
+      element_type: BF16
+      dimensions: 2048
+      dimensions: 128
+      layout {
+        minor_to_major: 0
+        minor_to_major: 1
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__permute"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/RouterTopK[.1][1]/get_router_logits[0]/Linear[.1]/aten.t.default/aten__permute"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch_neuronx/experimental/profiler/v2_x/custom_op_name.py"
+      source_line: 603
+      stack_frame_id: 24
+    }
+    dimensions: 1
+    dimensions: 0
+    id: 4
+    operand_ids: 3
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "p2"
+    opcode: "parameter"
+    shape {
+      element_type: BF16
+      dimensions: 2048
+      layout {
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "xla__device_data"
+      op_name: "RefMoEModule[.1]/CustomRMSNorm[.1][1]/aten._to_copy.default/xla__device_data"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 27
+    }
+    parameter_number: 2
+    id: 5
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "p0"
+    opcode: "parameter"
+    shape {
+      element_type: BF16
+      dimensions: 1
+      dimensions: 1
+      dimensions: 2048
+      layout {
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "xla__device_data"
+      op_name: "aten._to_copy.default/xla__device_data"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch_neuronx/xla_impl/hlo_conversion.py"
+      source_line: 601
+      stack_frame_id: 6
+    }
+    id: 6
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "convert.7"
+    opcode: "convert"
+    shape {
+      element_type: F32
+      dimensions: 1
+      dimensions: 1
+      dimensions: 2048
+      layout {
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "xla__cast"
+      op_name: "RefMoEModule[.1]/CustomRMSNorm[.1][1]/aten._to_copy.default/xla__cast"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 27
+    }
+    id: 7
+    operand_ids: 6
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "call.17"
+    opcode: "call"
+    shape {
+      element_type: F32
+      dimensions: 1
+      dimensions: 1
+      dimensions: 2048
+      layout {
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "xla___op_RmsNormForwardImpl"
+      op_name: "RefMoEModule[.1]/CustomRMSNorm[.1][1]/aten._to_copy.default/xla___op_RmsNormForwardImpl"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 27
+    }
+    id: 17
+    operand_ids: 7
+    operand_ids: 5
+    called_computation_ids: 13
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "convert.18"
+    opcode: "convert"
+    shape {
+      element_type: BF16
+      dimensions: 1
+      dimensions: 1
+      dimensions: 2048
+      layout {
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "xla__cast"
+      op_name: "RefMoEModule[.1]/CustomRMSNorm[.1][1]/aten._to_copy.default/xla__cast"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 27
+    }
+    id: 18
+    operand_ids: 17
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "reshape.19"
+    opcode: "reshape"
+    shape {
+      element_type: BF16
+      dimensions: 1
+      dimensions: 2048
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__view"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/RouterTopK[.1][1]/get_router_logits[0]/Linear[.1]/aten.view.default/aten__view"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch_neuronx/experimental/profiler/v2_x/custom_op_name.py"
+      source_line: 603
+      stack_frame_id: 24
+    }
+    id: 19
+    operand_ids: 18
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "dot.20"
+    opcode: "dot"
+    shape {
+      element_type: BF16
+      dimensions: 1
+      dimensions: 128
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__mm"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/RouterTopK[.1][1]/get_router_logits[0]/Linear[.1]/aten.mm.default/aten__mm"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch_neuronx/experimental/profiler/v2_x/custom_op_name.py"
+      source_line: 603
+      stack_frame_id: 24
+    }
+    dot_dimension_numbers {
+      lhs_contracting_dimensions: 1
+      rhs_contracting_dimensions: 0
+    }
+    id: 20
+    operand_ids: 19
+    operand_ids: 4
+    precision_config {
+      operand_precision: DEFAULT
+      operand_precision: DEFAULT
+    }
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "reshape.21"
+    opcode: "reshape"
+    shape {
+      element_type: BF16
+      dimensions: 1
+      dimensions: 1
+      dimensions: 128
+      layout {
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__view"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/RouterTopK[.1][1]/get_router_logits[0]/aten.view.default/aten__view"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 21
+    }
+    id: 21
+    operand_ids: 20
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "reshape.22"
+    opcode: "reshape"
+    shape {
+      element_type: BF16
+      dimensions: 1
+      dimensions: 128
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__view"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/RouterTopK[.1][1]/get_router_logits[0]/aten.view.default/aten__view"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 21
+    }
+    id: 22
+    operand_ids: 21
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "call.29"
+    opcode: "call"
+    shape {
+      element_type: TUPLE
+      tuple_shapes {
+        element_type: BF16
+        dimensions: 1
+        dimensions: 8
+        layout {
+          minor_to_major: 1
+          minor_to_major: 0
+        }
+        is_dynamic_dimension: false
+        is_dynamic_dimension: false
+      }
+      tuple_shapes {
+        element_type: U32
+        dimensions: 1
+        dimensions: 8
+        layout {
+          minor_to_major: 1
+          minor_to_major: 0
+        }
+        is_dynamic_dimension: false
+        is_dynamic_dimension: false
+      }
+    }
+    metadata {
+      op_type: "xla___op_TopKImpl"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/RouterTopK[.1][1]/aten.detach.default/xla___op_TopKImpl"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1775
+      stack_frame_id: 20
+    }
+    id: 29
+    operand_ids: 22
+    called_computation_ids: 26
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "get-tuple-element.31"
+    opcode: "get-tuple-element"
+    shape {
+      element_type: U32
+      dimensions: 1
+      dimensions: 8
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "xla___op_TopKImpl"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/RouterTopK[.1][1]/aten.detach.default/xla___op_TopKImpl"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1775
+      stack_frame_id: 20
+    }
+    tuple_index: 1
+    id: 31
+    operand_ids: 29
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "convert.32"
+    opcode: "convert"
+    shape {
+      element_type: S64
+      dimensions: 1
+      dimensions: 8
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "xla__cast"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/RouterTopK[.1][1]/aten._to_copy.default/xla__cast"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1775
+      stack_frame_id: 20
+    }
+    id: 32
+    operand_ids: 31
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "xlaconst2"
+    opcode: "constant"
+    shape {
+      element_type: S64
+      layout {
+      }
+    }
+    metadata {
+      op_type: "xla__device_data"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.index.Tensor/xla__device_data"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    literal {
+      shape {
+        element_type: S64
+        layout {
+        }
+      }
+      s64s: 128
+    }
+    id: 33
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "reshape.34"
+    opcode: "reshape"
+    shape {
+      element_type: S64
+      dimensions: 1
+      dimensions: 1
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__expand"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.index.Tensor/aten__expand"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    id: 34
+    operand_ids: 33
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "broadcast.35"
+    opcode: "broadcast"
+    shape {
+      element_type: S64
+      dimensions: 1
+      dimensions: 1
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__expand"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.index.Tensor/aten__expand"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    dimensions: 0
+    dimensions: 1
+    id: 35
+    operand_ids: 34
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "reshape.36"
+    opcode: "reshape"
+    shape {
+      element_type: S64
+      dimensions: 1
+      layout {
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__expand"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.index.Tensor/aten__expand"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    id: 36
+    operand_ids: 35
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "broadcast.37"
+    opcode: "broadcast"
+    shape {
+      element_type: S64
+      dimensions: 1
+      dimensions: 8
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__expand"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.index.Tensor/aten__expand"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    dimensions: 0
+    id: 37
+    operand_ids: 36
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "add.38"
+    opcode: "add"
+    shape {
+      element_type: S64
+      dimensions: 1
+      dimensions: 8
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__add"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.index.Tensor/aten__add"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    id: 38
+    operand_ids: 32
+    operand_ids: 37
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "xlaconst3"
+    opcode: "constant"
+    shape {
+      element_type: S64
+      layout {
+      }
+    }
+    metadata {
+      op_type: "xla__device_data"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.index.Tensor/xla__device_data"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    literal {
+      shape {
+        element_type: S64
+        layout {
+        }
+      }
+      s64s: 0
+    }
+    id: 39
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "broadcast.40"
+    opcode: "broadcast"
+    shape {
+      element_type: S64
+      dimensions: 1
+      dimensions: 8
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__lt"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.index.Tensor/aten__lt"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    id: 40
+    operand_ids: 39
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "compare.41"
+    opcode: "compare"
+    shape {
+      element_type: PRED
+      dimensions: 1
+      dimensions: 8
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__lt"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.index.Tensor/aten__lt"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    id: 41
+    operand_ids: 32
+    operand_ids: 40
+    comparison_direction: "LT"
+    frontend_attributes {
+    }
+    comparison_type: "SIGNED"
+  }
+  instructions {
+    name: "select.42"
+    opcode: "select"
+    shape {
+      element_type: S64
+      dimensions: 1
+      dimensions: 8
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__where"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.index.Tensor/aten__where"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    id: 42
+    operand_ids: 41
+    operand_ids: 38
+    operand_ids: 32
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "constant.43"
+    opcode: "constant"
+    shape {
+      element_type: S64
+      dimensions: 1
+      layout {
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "prim__Constant"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.arange.default/prim__Constant"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    literal {
+      shape {
+        element_type: S64
+        dimensions: 1
+        layout {
+          minor_to_major: 0
+        }
+        is_dynamic_dimension: false
+      }
+      s64s: 0
+    }
+    id: 43
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "reshape.44"
+    opcode: "reshape"
+    shape {
+      element_type: S64
+      dimensions: 1
+      dimensions: 1
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__as_strided"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.unsqueeze.default/aten__as_strided"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    id: 44
+    operand_ids: 43
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "broadcast.45"
+    opcode: "broadcast"
+    shape {
+      element_type: S64
+      dimensions: 1
+      dimensions: 1
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__expand"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.index.Tensor/aten__expand"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    dimensions: 0
+    dimensions: 1
+    id: 45
+    operand_ids: 44
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "reshape.46"
+    opcode: "reshape"
+    shape {
+      element_type: S64
+      dimensions: 1
+      layout {
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__expand"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.index.Tensor/aten__expand"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    id: 46
+    operand_ids: 45
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "broadcast.47"
+    opcode: "broadcast"
+    shape {
+      element_type: S64
+      dimensions: 1
+      dimensions: 8
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__expand"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.index.Tensor/aten__expand"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    dimensions: 0
+    id: 47
+    operand_ids: 46
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "xlaconst4"
+    opcode: "constant"
+    shape {
+      element_type: S64
+      layout {
+      }
+    }
+    metadata {
+      op_type: "xla__device_data"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.index.Tensor/xla__device_data"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    literal {
+      shape {
+        element_type: S64
+        layout {
+        }
+      }
+      s64s: 1
+    }
+    id: 48
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "reshape.49"
+    opcode: "reshape"
+    shape {
+      element_type: S64
+      dimensions: 1
+      dimensions: 1
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__expand"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.index.Tensor/aten__expand"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    id: 49
+    operand_ids: 48
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "broadcast.50"
+    opcode: "broadcast"
+    shape {
+      element_type: S64
+      dimensions: 1
+      dimensions: 1
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__expand"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.index.Tensor/aten__expand"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    dimensions: 0
+    dimensions: 1
+    id: 50
+    operand_ids: 49
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "reshape.51"
+    opcode: "reshape"
+    shape {
+      element_type: S64
+      dimensions: 1
+      layout {
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__expand"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.index.Tensor/aten__expand"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    id: 51
+    operand_ids: 50
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "broadcast.52"
+    opcode: "broadcast"
+    shape {
+      element_type: S64
+      dimensions: 1
+      dimensions: 8
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__expand"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.index.Tensor/aten__expand"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    dimensions: 0
+    id: 52
+    operand_ids: 51
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "add.53"
+    opcode: "add"
+    shape {
+      element_type: S64
+      dimensions: 1
+      dimensions: 8
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__add"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.index.Tensor/aten__add"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    id: 53
+    operand_ids: 47
+    operand_ids: 52
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "xlaconst5"
+    opcode: "constant"
+    shape {
+      element_type: S64
+      layout {
+      }
+    }
+    metadata {
+      op_type: "xla__device_data"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.index.Tensor/xla__device_data"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    literal {
+      shape {
+        element_type: S64
+        layout {
+        }
+      }
+      s64s: 0
+    }
+    id: 54
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "broadcast.55"
+    opcode: "broadcast"
+    shape {
+      element_type: S64
+      dimensions: 1
+      dimensions: 8
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__lt"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.index.Tensor/aten__lt"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    id: 55
+    operand_ids: 54
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "compare.56"
+    opcode: "compare"
+    shape {
+      element_type: PRED
+      dimensions: 1
+      dimensions: 8
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__lt"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.index.Tensor/aten__lt"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    id: 56
+    operand_ids: 47
+    operand_ids: 55
+    comparison_direction: "LT"
+    frontend_attributes {
+    }
+    comparison_type: "SIGNED"
+  }
+  instructions {
+    name: "select.57"
+    opcode: "select"
+    shape {
+      element_type: S64
+      dimensions: 1
+      dimensions: 8
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__where"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.index.Tensor/aten__where"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    id: 57
+    operand_ids: 56
+    operand_ids: 53
+    operand_ids: 47
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "reshape.58"
+    opcode: "reshape"
+    shape {
+      element_type: S64
+      dimensions: 1
+      dimensions: 8
+      dimensions: 1
+      layout {
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__stack"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.index.Tensor/aten__stack"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    id: 58
+    operand_ids: 57
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "reshape.59"
+    opcode: "reshape"
+    shape {
+      element_type: S64
+      dimensions: 1
+      dimensions: 8
+      dimensions: 1
+      layout {
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__stack"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.index.Tensor/aten__stack"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    id: 59
+    operand_ids: 42
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "concatenate.60"
+    opcode: "concatenate"
+    shape {
+      element_type: S64
+      dimensions: 1
+      dimensions: 8
+      dimensions: 2
+      layout {
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__stack"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.index.Tensor/aten__stack"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    dimensions: 2
+    id: 60
+    operand_ids: 58
+    operand_ids: 59
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "convert.61"
+    opcode: "convert"
+    shape {
+      element_type: F32
+      dimensions: 1
+      dimensions: 128
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "xla__cast"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/RouterTopK[.1][1]/apply_activation_fn[0]/aten._to_copy.default/xla__cast"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch_neuronx/experimental/profiler/v2_x/custom_op_name.py"
+      source_line: 603
+      stack_frame_id: 22
+    }
+    id: 61
+    operand_ids: 22
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "constant.62"
+    opcode: "constant"
+    shape {
+      element_type: F32
+      layout {
+      }
+    }
+    metadata {
+      op_type: "aten__softmax"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/RouterTopK[.1][1]/apply_activation_fn[0]/aten._softmax.default/aten__softmax"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch_neuronx/experimental/profiler/v2_x/custom_op_name.py"
+      source_line: 603
+      stack_frame_id: 22
+    }
+    literal {
+      shape {
+        element_type: F32
+        layout {
+        }
+      }
+      f32s: -inf
+    }
+    id: 62
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "reduce.67"
+    opcode: "reduce"
+    shape {
+      element_type: F32
+      dimensions: 1
+      layout {
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__softmax"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/RouterTopK[.1][1]/apply_activation_fn[0]/aten._softmax.default/aten__softmax"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch_neuronx/experimental/profiler/v2_x/custom_op_name.py"
+      source_line: 603
+      stack_frame_id: 22
+    }
+    dimensions: 1
+    id: 67
+    operand_ids: 61
+    operand_ids: 62
+    called_computation_ids: 63
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "broadcast.68"
+    opcode: "broadcast"
+    shape {
+      element_type: F32
+      dimensions: 1
+      dimensions: 128
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__softmax"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/RouterTopK[.1][1]/apply_activation_fn[0]/aten._softmax.default/aten__softmax"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch_neuronx/experimental/profiler/v2_x/custom_op_name.py"
+      source_line: 603
+      stack_frame_id: 22
+    }
+    dimensions: 0
+    id: 68
+    operand_ids: 67
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "subtract.69"
+    opcode: "subtract"
+    shape {
+      element_type: F32
+      dimensions: 1
+      dimensions: 128
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__softmax"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/RouterTopK[.1][1]/apply_activation_fn[0]/aten._softmax.default/aten__softmax"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch_neuronx/experimental/profiler/v2_x/custom_op_name.py"
+      source_line: 603
+      stack_frame_id: 22
+    }
+    id: 69
+    operand_ids: 61
+    operand_ids: 68
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "exponential.70"
+    opcode: "exponential"
+    shape {
+      element_type: F32
+      dimensions: 1
+      dimensions: 128
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__softmax"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/RouterTopK[.1][1]/apply_activation_fn[0]/aten._softmax.default/aten__softmax"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch_neuronx/experimental/profiler/v2_x/custom_op_name.py"
+      source_line: 603
+      stack_frame_id: 22
+    }
+    id: 70
+    operand_ids: 69
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "constant.71"
+    opcode: "constant"
+    shape {
+      element_type: F32
+      layout {
+      }
+    }
+    metadata {
+      op_type: "aten__softmax"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/RouterTopK[.1][1]/apply_activation_fn[0]/aten._softmax.default/aten__softmax"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch_neuronx/experimental/profiler/v2_x/custom_op_name.py"
+      source_line: 603
+      stack_frame_id: 22
+    }
+    literal {
+      shape {
+        element_type: F32
+        layout {
+        }
+      }
+      f32s: 0.0
+    }
+    id: 71
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "reduce.76"
+    opcode: "reduce"
+    shape {
+      element_type: F32
+      dimensions: 1
+      layout {
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__softmax"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/RouterTopK[.1][1]/apply_activation_fn[0]/aten._softmax.default/aten__softmax"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch_neuronx/experimental/profiler/v2_x/custom_op_name.py"
+      source_line: 603
+      stack_frame_id: 22
+    }
+    dimensions: 1
+    id: 76
+    operand_ids: 70
+    operand_ids: 71
+    called_computation_ids: 72
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "broadcast.77"
+    opcode: "broadcast"
+    shape {
+      element_type: F32
+      dimensions: 1
+      dimensions: 128
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__softmax"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/RouterTopK[.1][1]/apply_activation_fn[0]/aten._softmax.default/aten__softmax"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch_neuronx/experimental/profiler/v2_x/custom_op_name.py"
+      source_line: 603
+      stack_frame_id: 22
+    }
+    dimensions: 0
+    id: 77
+    operand_ids: 76
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "divide.78"
+    opcode: "divide"
+    shape {
+      element_type: F32
+      dimensions: 1
+      dimensions: 128
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__softmax"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/RouterTopK[.1][1]/apply_activation_fn[0]/aten._softmax.default/aten__softmax"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch_neuronx/experimental/profiler/v2_x/custom_op_name.py"
+      source_line: 603
+      stack_frame_id: 22
+    }
+    id: 78
+    operand_ids: 70
+    operand_ids: 77
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "convert.79"
+    opcode: "convert"
+    shape {
+      element_type: BF16
+      dimensions: 1
+      dimensions: 128
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "xla__cast"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/RouterTopK[.1][1]/aten._to_copy.default/xla__cast"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1775
+      stack_frame_id: 20
+    }
+    id: 79
+    operand_ids: 78
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "gather.80"
+    opcode: "gather"
+    shape {
+      element_type: BF16
+      dimensions: 1
+      dimensions: 8
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__index"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.index.Tensor/aten__index"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    gather_dimension_numbers {
+      collapsed_slice_dims: 0
+      collapsed_slice_dims: 1
+      start_index_map: 0
+      start_index_map: 1
+      index_vector_dim: 2
+    }
+    gather_slice_sizes: 1
+    gather_slice_sizes: 1
+    id: 80
+    operand_ids: 79
+    operand_ids: 60
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "abs.81"
+    opcode: "abs"
+    shape {
+      element_type: BF16
+      dimensions: 1
+      dimensions: 8
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__abs"
+      op_name: "aten__norm.1/aten__abs"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch_neuronx/experimental/profiler/v2_x/custom_op_name.py"
+      source_line: 603
+      stack_frame_id: 30
+    }
+    id: 81
+    operand_ids: 80
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "constant.82"
+    opcode: "constant"
+    shape {
+      element_type: BF16
+      layout {
+      }
+    }
+    metadata {
+      op_type: "aten__sum"
+      op_name: "aten__norm.1/aten__sum"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch_neuronx/experimental/profiler/v2_x/custom_op_name.py"
+      source_line: 603
+      stack_frame_id: 30
+    }
+    literal {
+      shape {
+        element_type: BF16
+        layout {
+        }
+      }
+      bf16s: "\000\000"
+    }
+    id: 82
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "reduce.88"
+    opcode: "reduce"
+    shape {
+      element_type: BF16
+      dimensions: 1
+      layout {
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__sum"
+      op_name: "aten__norm.1/aten__sum"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch_neuronx/experimental/profiler/v2_x/custom_op_name.py"
+      source_line: 603
+      stack_frame_id: 30
+    }
+    dimensions: 1
+    id: 88
+    operand_ids: 81
+    operand_ids: 82
+    called_computation_ids: 84
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "reshape.89"
+    opcode: "reshape"
+    shape {
+      element_type: BF16
+      dimensions: 1
+      dimensions: 1
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__sum"
+      op_name: "aten__norm.1/aten__sum"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch_neuronx/experimental/profiler/v2_x/custom_op_name.py"
+      source_line: 603
+      stack_frame_id: 30
+    }
+    id: 89
+    operand_ids: 88
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "broadcast.90"
+    opcode: "broadcast"
+    shape {
+      element_type: BF16
+      dimensions: 1
+      dimensions: 1
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__clamp"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.clamp_min.default/aten__clamp"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch_neuronx/experimental/profiler/v2_x/custom_op_name.py"
+      source_line: 603
+      stack_frame_id: 18
+    }
+    id: 90
+    operand_ids: 2
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "broadcast.91"
+    opcode: "broadcast"
+    shape {
+      element_type: BF16
+      dimensions: 1
+      dimensions: 1
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__clamp"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.clamp_min.default/aten__clamp"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch_neuronx/experimental/profiler/v2_x/custom_op_name.py"
+      source_line: 603
+      stack_frame_id: 18
+    }
+    id: 91
+    operand_ids: 1
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "clamp.92"
+    opcode: "clamp"
+    shape {
+      element_type: BF16
+      dimensions: 1
+      dimensions: 1
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__clamp"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.clamp_min.default/aten__clamp"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch_neuronx/experimental/profiler/v2_x/custom_op_name.py"
+      source_line: 603
+      stack_frame_id: 18
+    }
+    id: 92
+    operand_ids: 90
+    operand_ids: 89
+    operand_ids: 91
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "broadcast.93"
+    opcode: "broadcast"
+    shape {
+      element_type: BF16
+      dimensions: 1
+      dimensions: 1
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__expand"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.expand.default/aten__expand"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch_neuronx/experimental/profiler/v2_x/custom_op_name.py"
+      source_line: 603
+      stack_frame_id: 18
+    }
+    dimensions: 0
+    dimensions: 1
+    id: 93
+    operand_ids: 92
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "reshape.94"
+    opcode: "reshape"
+    shape {
+      element_type: BF16
+      dimensions: 1
+      layout {
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__expand"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.expand.default/aten__expand"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch_neuronx/experimental/profiler/v2_x/custom_op_name.py"
+      source_line: 603
+      stack_frame_id: 18
+    }
+    id: 94
+    operand_ids: 93
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "broadcast.95"
+    opcode: "broadcast"
+    shape {
+      element_type: BF16
+      dimensions: 1
+      dimensions: 8
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__expand"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.expand.default/aten__expand"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch_neuronx/experimental/profiler/v2_x/custom_op_name.py"
+      source_line: 603
+      stack_frame_id: 18
+    }
+    dimensions: 0
+    id: 95
+    operand_ids: 94
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "divide.96"
+    opcode: "divide"
+    shape {
+      element_type: BF16
+      dimensions: 1
+      dimensions: 8
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__div"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.div.Tensor/aten__div"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch_neuronx/experimental/profiler/v2_x/custom_op_name.py"
+      source_line: 603
+      stack_frame_id: 18
+    }
+    id: 96
+    operand_ids: 80
+    operand_ids: 95
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "reshape.97"
+    opcode: "reshape"
+    shape {
+      element_type: BF16
+      dimensions: 8
+      layout {
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__view"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.unsqueeze.default/aten__view"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    id: 97
+    operand_ids: 96
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "reshape.98"
+    opcode: "reshape"
+    shape {
+      element_type: BF16
+      dimensions: 8
+      dimensions: 1
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__as_strided"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.unsqueeze.default/aten__as_strided"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    id: 98
+    operand_ids: 97
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "convert.99"
+    opcode: "convert"
+    shape {
+      element_type: F32
+      dimensions: 8
+      dimensions: 1
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "xla__cast"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.mul.Tensor/xla__cast"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    id: 99
+    operand_ids: 98
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "reshape.100"
+    opcode: "reshape"
+    shape {
+      element_type: S64
+      dimensions: 8
+      layout {
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__view"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.select.int/aten__view"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    id: 100
+    operand_ids: 32
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "xlaconst6"
+    opcode: "constant"
+    shape {
+      element_type: S64
+      layout {
+      }
+    }
+    metadata {
+      op_type: "xla__device_data"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/ExpertFusedRowParallelLinear[.1][1]/aten.index.Tensor/xla__device_data"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    literal {
+      shape {
+        element_type: S64
+        layout {
+        }
+      }
+      s64s: 128
+    }
+    id: 101
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "reshape.102"
+    opcode: "reshape"
+    shape {
+      element_type: S64
+      dimensions: 1
+      layout {
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__expand"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/ExpertFusedRowParallelLinear[.1][1]/aten.index.Tensor/aten__expand"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    id: 102
+    operand_ids: 101
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "broadcast.103"
+    opcode: "broadcast"
+    shape {
+      element_type: S64
+      dimensions: 1
+      layout {
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__expand"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/ExpertFusedRowParallelLinear[.1][1]/aten.index.Tensor/aten__expand"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    dimensions: 0
+    id: 103
+    operand_ids: 102
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "reshape.104"
+    opcode: "reshape"
+    shape {
+      element_type: S64
+      layout {
+      }
+    }
+    metadata {
+      op_type: "aten__expand"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/ExpertFusedRowParallelLinear[.1][1]/aten.index.Tensor/aten__expand"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    id: 104
+    operand_ids: 103
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "broadcast.105"
+    opcode: "broadcast"
+    shape {
+      element_type: S64
+      dimensions: 8
+      layout {
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__expand"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/ExpertFusedRowParallelLinear[.1][1]/aten.index.Tensor/aten__expand"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    id: 105
+    operand_ids: 104
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "add.106"
+    opcode: "add"
+    shape {
+      element_type: S64
+      dimensions: 8
+      layout {
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__add"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/ExpertFusedRowParallelLinear[.1][1]/aten.index.Tensor/aten__add"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    id: 106
+    operand_ids: 100
+    operand_ids: 105
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "xlaconst7"
+    opcode: "constant"
+    shape {
+      element_type: S64
+      layout {
+      }
+    }
+    metadata {
+      op_type: "xla__device_data"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/ExpertFusedRowParallelLinear[.1][1]/aten.index.Tensor/xla__device_data"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    literal {
+      shape {
+        element_type: S64
+        layout {
+        }
+      }
+      s64s: 0
+    }
+    id: 107
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "broadcast.108"
+    opcode: "broadcast"
+    shape {
+      element_type: S64
+      dimensions: 8
+      layout {
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__lt"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/ExpertFusedRowParallelLinear[.1][1]/aten.index.Tensor/aten__lt"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    id: 108
+    operand_ids: 107
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "compare.109"
+    opcode: "compare"
+    shape {
+      element_type: PRED
+      dimensions: 8
+      layout {
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__lt"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/ExpertFusedRowParallelLinear[.1][1]/aten.index.Tensor/aten__lt"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    id: 109
+    operand_ids: 100
+    operand_ids: 108
+    comparison_direction: "LT"
+    frontend_attributes {
+    }
+    comparison_type: "SIGNED"
+  }
+  instructions {
+    name: "select.110"
+    opcode: "select"
+    shape {
+      element_type: S64
+      dimensions: 8
+      layout {
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__where"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/ExpertFusedRowParallelLinear[.1][1]/aten.index.Tensor/aten__where"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    id: 110
+    operand_ids: 109
+    operand_ids: 106
+    operand_ids: 100
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "reshape.111"
+    opcode: "reshape"
+    shape {
+      element_type: S64
+      dimensions: 8
+      dimensions: 1
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__stack"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/ExpertFusedRowParallelLinear[.1][1]/aten.index.Tensor/aten__stack"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    id: 111
+    operand_ids: 110
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "concatenate.112"
+    opcode: "concatenate"
+    shape {
+      element_type: S64
+      dimensions: 8
+      dimensions: 1
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__stack"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/ExpertFusedRowParallelLinear[.1][1]/aten.index.Tensor/aten__stack"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    dimensions: 1
+    id: 112
+    operand_ids: 111
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "p3"
+    opcode: "parameter"
+    shape {
+      element_type: BF16
+      dimensions: 128
+      dimensions: 192
+      dimensions: 2048
+      layout {
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "xla__device_data"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/ExpertFusedRowParallelLinear[.1][1]/aten.index.Tensor/xla__device_data"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    parameter_number: 3
+    id: 113
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "gather.114"
+    opcode: "gather"
+    shape {
+      element_type: BF16
+      dimensions: 8
+      dimensions: 192
+      dimensions: 2048
+      layout {
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__index"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/ExpertFusedRowParallelLinear[.1][1]/aten.index.Tensor/aten__index"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    gather_dimension_numbers {
+      offset_dims: 1
+      offset_dims: 2
+      collapsed_slice_dims: 0
+      start_index_map: 0
+      index_vector_dim: 1
+    }
+    gather_slice_sizes: 1
+    gather_slice_sizes: 192
+    gather_slice_sizes: 2048
+    id: 114
+    operand_ids: 113
+    operand_ids: 112
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "xlaconst8"
+    opcode: "constant"
+    shape {
+      element_type: BF16
+      layout {
+      }
+    }
+    metadata {
+      op_type: "xla__device_data"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/_activation/aten.add.Tensor/xla__device_data"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    literal {
+      shape {
+        element_type: BF16
+        layout {
+        }
+      }
+      bf16s: "\200?"
+    }
+    id: 115
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "xlaconst9"
+    opcode: "constant"
+    shape {
+      element_type: BF16
+      layout {
+      }
+    }
+    metadata {
+      op_type: "xla__device_data"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/_activation/aten.add.Tensor/xla__device_data"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    literal {
+      shape {
+        element_type: BF16
+        layout {
+        }
+      }
+      bf16s: "\000\000"
+    }
+    id: 116
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "xlaconst10"
+    opcode: "constant"
+    shape {
+      element_type: S64
+      layout {
+      }
+    }
+    metadata {
+      op_type: "xla__device_data"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/ExpertFusedColumnParallelLinear[.1][1]/aten.index.Tensor/xla__device_data"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    literal {
+      shape {
+        element_type: S64
+        layout {
+        }
+      }
+      s64s: 128
+    }
+    id: 117
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "reshape.118"
+    opcode: "reshape"
+    shape {
+      element_type: S64
+      dimensions: 1
+      layout {
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__expand"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/ExpertFusedColumnParallelLinear[.1][1]/aten.index.Tensor/aten__expand"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    id: 118
+    operand_ids: 117
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "broadcast.119"
+    opcode: "broadcast"
+    shape {
+      element_type: S64
+      dimensions: 1
+      layout {
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__expand"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/ExpertFusedColumnParallelLinear[.1][1]/aten.index.Tensor/aten__expand"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    dimensions: 0
+    id: 119
+    operand_ids: 118
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "reshape.120"
+    opcode: "reshape"
+    shape {
+      element_type: S64
+      layout {
+      }
+    }
+    metadata {
+      op_type: "aten__expand"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/ExpertFusedColumnParallelLinear[.1][1]/aten.index.Tensor/aten__expand"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    id: 120
+    operand_ids: 119
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "broadcast.121"
+    opcode: "broadcast"
+    shape {
+      element_type: S64
+      dimensions: 8
+      layout {
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__expand"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/ExpertFusedColumnParallelLinear[.1][1]/aten.index.Tensor/aten__expand"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    id: 121
+    operand_ids: 120
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "add.122"
+    opcode: "add"
+    shape {
+      element_type: S64
+      dimensions: 8
+      layout {
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__add"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/ExpertFusedColumnParallelLinear[.1][1]/aten.index.Tensor/aten__add"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    id: 122
+    operand_ids: 100
+    operand_ids: 121
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "xlaconst11"
+    opcode: "constant"
+    shape {
+      element_type: S64
+      layout {
+      }
+    }
+    metadata {
+      op_type: "xla__device_data"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/ExpertFusedColumnParallelLinear[.1][1]/aten.index.Tensor/xla__device_data"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    literal {
+      shape {
+        element_type: S64
+        layout {
+        }
+      }
+      s64s: 0
+    }
+    id: 123
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "broadcast.124"
+    opcode: "broadcast"
+    shape {
+      element_type: S64
+      dimensions: 8
+      layout {
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__lt"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/ExpertFusedColumnParallelLinear[.1][1]/aten.index.Tensor/aten__lt"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    id: 124
+    operand_ids: 123
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "compare.125"
+    opcode: "compare"
+    shape {
+      element_type: PRED
+      dimensions: 8
+      layout {
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__lt"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/ExpertFusedColumnParallelLinear[.1][1]/aten.index.Tensor/aten__lt"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    id: 125
+    operand_ids: 100
+    operand_ids: 124
+    comparison_direction: "LT"
+    frontend_attributes {
+    }
+    comparison_type: "SIGNED"
+  }
+  instructions {
+    name: "select.126"
+    opcode: "select"
+    shape {
+      element_type: S64
+      dimensions: 8
+      layout {
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__where"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/ExpertFusedColumnParallelLinear[.1][1]/aten.index.Tensor/aten__where"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    id: 126
+    operand_ids: 125
+    operand_ids: 122
+    operand_ids: 100
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "reshape.127"
+    opcode: "reshape"
+    shape {
+      element_type: S64
+      dimensions: 8
+      dimensions: 1
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__stack"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/ExpertFusedColumnParallelLinear[.1][1]/aten.index.Tensor/aten__stack"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    id: 127
+    operand_ids: 126
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "concatenate.128"
+    opcode: "concatenate"
+    shape {
+      element_type: S64
+      dimensions: 8
+      dimensions: 1
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__stack"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/ExpertFusedColumnParallelLinear[.1][1]/aten.index.Tensor/aten__stack"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    dimensions: 1
+    id: 128
+    operand_ids: 127
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "p4"
+    opcode: "parameter"
+    shape {
+      element_type: BF16
+      dimensions: 128
+      dimensions: 2048
+      dimensions: 384
+      layout {
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "xla__device_data"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/ExpertFusedColumnParallelLinear[.1][1]/aten.index.Tensor/xla__device_data"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    parameter_number: 4
+    id: 129
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "gather.130"
+    opcode: "gather"
+    shape {
+      element_type: BF16
+      dimensions: 8
+      dimensions: 2048
+      dimensions: 384
+      layout {
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__index"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/ExpertFusedColumnParallelLinear[.1][1]/aten.index.Tensor/aten__index"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    gather_dimension_numbers {
+      offset_dims: 1
+      offset_dims: 2
+      collapsed_slice_dims: 0
+      start_index_map: 0
+      index_vector_dim: 1
+    }
+    gather_slice_sizes: 1
+    gather_slice_sizes: 2048
+    gather_slice_sizes: 384
+    id: 130
+    operand_ids: 129
+    operand_ids: 128
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "reshape.131"
+    opcode: "reshape"
+    shape {
+      element_type: BF16
+      dimensions: 1
+      dimensions: 2048
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__view"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/ExpertFusedColumnParallelLinear[.1][1]/copy_to_tensor_model_parallel_region/aten.view.default/aten__view"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 33
+    }
+    id: 131
+    operand_ids: 18
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "reshape.132"
+    opcode: "reshape"
+    shape {
+      element_type: BF16
+      dimensions: 2048
+      layout {
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__view"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/ExpertFusedColumnParallelLinear[.1][1]/copy_to_tensor_model_parallel_region/aten.view.default/aten__view"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 33
+    }
+    id: 132
+    operand_ids: 131
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "reshape.133"
+    opcode: "reshape"
+    shape {
+      element_type: BF16
+      dimensions: 1
+      dimensions: 2048
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__as_strided"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/ExpertFusedColumnParallelLinear[.1][1]/copy_to_tensor_model_parallel_region/aten.view.default/aten__as_strided"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 33
+    }
+    id: 133
+    operand_ids: 132
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "reshape.134"
+    opcode: "reshape"
+    shape {
+      element_type: BF16
+      dimensions: 1
+      dimensions: 1
+      dimensions: 2048
+      layout {
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__as_strided"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/ExpertFusedColumnParallelLinear[.1][1]/copy_to_tensor_model_parallel_region/aten.view.default/aten__as_strided"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 33
+    }
+    id: 134
+    operand_ids: 133
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "reshape.135"
+    opcode: "reshape"
+    shape {
+      element_type: BF16
+      dimensions: 1
+      dimensions: 1
+      dimensions: 1
+      dimensions: 2048
+      layout {
+        minor_to_major: 3
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__view"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/ExpertFusedColumnParallelLinear[.1][1]/copy_to_tensor_model_parallel_region/aten.view.default/aten__view"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 33
+    }
+    id: 135
+    operand_ids: 134
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "constant.140"
+    opcode: "constant"
+    shape {
+      element_type: BF16
+      layout {
+      }
+    }
+    metadata {
+      op_type: "aten__einsum"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/_activation/aten.mul.Tensor/aten__einsum"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    literal {
+      shape {
+        element_type: BF16
+        layout {
+        }
+      }
+      bf16s: "\000\000"
+    }
+    id: 140
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "reduce.145"
+    opcode: "reduce"
+    shape {
+      element_type: BF16
+      dimensions: 1
+      dimensions: 1
+      dimensions: 2048
+      layout {
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__einsum"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/_activation/aten.mul.Tensor/aten__einsum"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    dimensions: 0
+    id: 145
+    operand_ids: 135
+    operand_ids: 140
+    called_computation_ids: 141
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "dot.146"
+    opcode: "dot"
+    shape {
+      element_type: BF16
+      dimensions: 1
+      dimensions: 1
+      dimensions: 8
+      dimensions: 384
+      layout {
+        minor_to_major: 3
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__einsum"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/_activation/aten.mul.Tensor/aten__einsum"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    dot_dimension_numbers {
+      lhs_contracting_dimensions: 2
+      rhs_contracting_dimensions: 1
+    }
+    id: 146
+    operand_ids: 145
+    operand_ids: 130
+    precision_config {
+      operand_precision: DEFAULT
+      operand_precision: DEFAULT
+    }
+    frontend_attributes {
+      map {
+        key: "grad_x"
+        value: "false"
+      }
+      map {
+        key: "grad_y"
+        value: "false"
+      }
+    }
+  }
+  instructions {
+    name: "transpose.147"
+    opcode: "transpose"
+    shape {
+      element_type: BF16
+      dimensions: 8
+      dimensions: 1
+      dimensions: 1
+      dimensions: 384
+      layout {
+        minor_to_major: 3
+        minor_to_major: 0
+        minor_to_major: 2
+        minor_to_major: 1
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__einsum"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/_activation/aten.mul.Tensor/aten__einsum"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    dimensions: 2
+    dimensions: 0
+    dimensions: 1
+    dimensions: 3
+    id: 147
+    operand_ids: 146
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "slice.148"
+    opcode: "slice"
+    shape {
+      element_type: BF16
+      dimensions: 8
+      dimensions: 1
+      dimensions: 1
+      dimensions: 192
+      layout {
+        minor_to_major: 3
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "xla__select"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/_activation/aten.add.Tensor/xla__select"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    slice_dimensions {
+      limit: 8
+      stride: 1
+    }
+    slice_dimensions {
+      limit: 1
+      stride: 1
+    }
+    slice_dimensions {
+      limit: 1
+      stride: 1
+    }
+    slice_dimensions {
+      start: 192
+      limit: 384
+      stride: 1
+    }
+    id: 148
+    operand_ids: 147
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "multiply.149"
+    opcode: "multiply"
+    shape {
+      element_type: BF16
+      layout {
+      }
+    }
+    metadata {
+      op_type: "aten__add"
+      op_name: "aten__add.3/aten__add"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    id: 149
+    operand_ids: 116
+    operand_ids: 115
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "broadcast.150"
+    opcode: "broadcast"
+    shape {
+      element_type: BF16
+      dimensions: 8
+      dimensions: 1
+      dimensions: 1
+      dimensions: 192
+      layout {
+        minor_to_major: 3
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__add"
+      op_name: "aten__add.3/aten__add"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    id: 150
+    operand_ids: 149
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "add.151"
+    opcode: "add"
+    shape {
+      element_type: BF16
+      dimensions: 8
+      dimensions: 1
+      dimensions: 1
+      dimensions: 192
+      layout {
+        minor_to_major: 3
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__add"
+      op_name: "aten__add.3/aten__add"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    id: 151
+    operand_ids: 148
+    operand_ids: 150
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "convert.152"
+    opcode: "convert"
+    shape {
+      element_type: F32
+      dimensions: 8
+      dimensions: 1
+      dimensions: 1
+      dimensions: 192
+      layout {
+        minor_to_major: 3
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "xla__cast"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/_activation/aten.mul.Tensor/xla__cast"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    id: 152
+    operand_ids: 151
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "xlaconst12"
+    opcode: "constant"
+    shape {
+      element_type: F32
+      layout {
+      }
+    }
+    metadata {
+      op_type: "xla__device_data"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/_activation/aten.mul.Tensor/xla__device_data"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    literal {
+      shape {
+        element_type: F32
+        layout {
+        }
+      }
+      f32s: 1.0
+    }
+    id: 153
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "slice.154"
+    opcode: "slice"
+    shape {
+      element_type: BF16
+      dimensions: 8
+      dimensions: 1
+      dimensions: 1
+      dimensions: 192
+      layout {
+        minor_to_major: 3
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "xla__select"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/_activation/aten.mul.Tensor/xla__select"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    slice_dimensions {
+      limit: 8
+      stride: 1
+    }
+    slice_dimensions {
+      limit: 1
+      stride: 1
+    }
+    slice_dimensions {
+      limit: 1
+      stride: 1
+    }
+    slice_dimensions {
+      limit: 192
+      stride: 1
+    }
+    id: 154
+    operand_ids: 147
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "convert.155"
+    opcode: "convert"
+    shape {
+      element_type: F32
+      dimensions: 8
+      dimensions: 1
+      dimensions: 1
+      dimensions: 192
+      layout {
+        minor_to_major: 3
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "xla__cast"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/_activation/aten.mul.Tensor/xla__cast"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    id: 155
+    operand_ids: 154
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "broadcast.156"
+    opcode: "broadcast"
+    shape {
+      element_type: F32
+      dimensions: 8
+      dimensions: 1
+      dimensions: 1
+      dimensions: 192
+      layout {
+        minor_to_major: 3
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__mul"
+      op_name: "aten__mul.2/aten__mul"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    id: 156
+    operand_ids: 153
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "multiply.157"
+    opcode: "multiply"
+    shape {
+      element_type: F32
+      dimensions: 8
+      dimensions: 1
+      dimensions: 1
+      dimensions: 192
+      layout {
+        minor_to_major: 3
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__mul"
+      op_name: "aten__mul.2/aten__mul"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    id: 157
+    operand_ids: 155
+    operand_ids: 156
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "convert.158"
+    opcode: "convert"
+    shape {
+      element_type: BF16
+      dimensions: 8
+      dimensions: 1
+      dimensions: 1
+      dimensions: 192
+      layout {
+        minor_to_major: 3
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "xla__cast"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/_activation/aten.mul.Tensor/xla__cast"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    id: 158
+    operand_ids: 157
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "call.165"
+    opcode: "call"
+    shape {
+      element_type: BF16
+      dimensions: 8
+      dimensions: 1
+      dimensions: 1
+      dimensions: 192
+      layout {
+        minor_to_major: 3
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "xla___op_SiluForwardImpl"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/_activation/aten.mul.Tensor/xla___op_SiluForwardImpl"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    id: 165
+    operand_ids: 158
+    called_computation_ids: 162
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "convert.166"
+    opcode: "convert"
+    shape {
+      element_type: F32
+      dimensions: 8
+      dimensions: 1
+      dimensions: 1
+      dimensions: 192
+      layout {
+        minor_to_major: 3
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "xla__cast"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/_activation/aten.mul.Tensor/xla__cast"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    id: 166
+    operand_ids: 165
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "multiply.167"
+    opcode: "multiply"
+    shape {
+      element_type: F32
+      dimensions: 8
+      dimensions: 1
+      dimensions: 1
+      dimensions: 192
+      layout {
+        minor_to_major: 3
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__mul"
+      op_name: "aten__mul.4/aten__mul"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    id: 167
+    operand_ids: 166
+    operand_ids: 152
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "convert.168"
+    opcode: "convert"
+    shape {
+      element_type: BF16
+      dimensions: 8
+      dimensions: 1
+      dimensions: 1
+      dimensions: 192
+      layout {
+        minor_to_major: 3
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "xla__cast"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/_activation/aten.mul.Tensor/xla__cast"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+      source_line: 617
+      stack_frame_id: 31
+    }
+    id: 168
+    operand_ids: 167
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "dot.169"
+    opcode: "dot"
+    shape {
+      element_type: BF16
+      dimensions: 8
+      dimensions: 1
+      dimensions: 1
+      dimensions: 2048
+      layout {
+        minor_to_major: 3
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__einsum"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/aten.squeeze.dim/aten__einsum"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch_neuronx/experimental/profiler/v2_x/custom_op_name.py"
+      source_line: 603
+      stack_frame_id: 30
+    }
+    dot_dimension_numbers {
+      lhs_contracting_dimensions: 3
+      rhs_contracting_dimensions: 1
+      lhs_batch_dimensions: 0
+      rhs_batch_dimensions: 0
+    }
+    id: 169
+    operand_ids: 168
+    operand_ids: 114
+    precision_config {
+      operand_precision: DEFAULT
+      operand_precision: DEFAULT
+    }
+    frontend_attributes {
+      map {
+        key: "grad_x"
+        value: "false"
+      }
+      map {
+        key: "grad_y"
+        value: "false"
+      }
+    }
+  }
+  instructions {
+    name: "transpose.170"
+    opcode: "transpose"
+    shape {
+      element_type: BF16
+      dimensions: 8
+      dimensions: 1
+      dimensions: 1
+      dimensions: 2048
+      layout {
+        minor_to_major: 3
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__einsum"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/Experts[.1][1]/aten.squeeze.dim/aten__einsum"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch_neuronx/experimental/profiler/v2_x/custom_op_name.py"
+      source_line: 603
+      stack_frame_id: 30
+    }
+    dimensions: 0
+    dimensions: 1
+    dimensions: 2
+    dimensions: 3
+    id: 170
+    operand_ids: 169
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "reshape.171"
+    opcode: "reshape"
+    shape {
+      element_type: BF16
+      dimensions: 8
+      dimensions: 1
+      dimensions: 2048
+      layout {
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__as_strided"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.squeeze.dim/aten__as_strided"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    id: 171
+    operand_ids: 170
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "reshape.172"
+    opcode: "reshape"
+    shape {
+      element_type: BF16
+      dimensions: 8
+      dimensions: 2048
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__as_strided"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.squeeze.dim/aten__as_strided"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    id: 172
+    operand_ids: 171
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "convert.173"
+    opcode: "convert"
+    shape {
+      element_type: F32
+      dimensions: 8
+      dimensions: 2048
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "xla__cast"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.mul.Tensor/xla__cast"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    id: 173
+    operand_ids: 172
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "reshape.174"
+    opcode: "reshape"
+    shape {
+      element_type: F32
+      dimensions: 8
+      layout {
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__mul"
+      op_name: "aten__mul.5/aten__mul"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    id: 174
+    operand_ids: 99
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "broadcast.175"
+    opcode: "broadcast"
+    shape {
+      element_type: F32
+      dimensions: 8
+      dimensions: 2048
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__mul"
+      op_name: "aten__mul.5/aten__mul"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    dimensions: 0
+    id: 175
+    operand_ids: 174
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "multiply.176"
+    opcode: "multiply"
+    shape {
+      element_type: F32
+      dimensions: 8
+      dimensions: 2048
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__mul"
+      op_name: "aten__mul.5/aten__mul"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    id: 176
+    operand_ids: 173
+    operand_ids: 175
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "convert.177"
+    opcode: "convert"
+    shape {
+      element_type: BF16
+      dimensions: 8
+      dimensions: 2048
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "xla__cast"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.mul.Tensor/xla__cast"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    id: 177
+    operand_ids: 176
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "constant.178"
+    opcode: "constant"
+    shape {
+      element_type: BF16
+      layout {
+      }
+    }
+    metadata {
+      op_type: "aten__sum"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.sum.dim_IntList/aten__sum"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    literal {
+      shape {
+        element_type: BF16
+        layout {
+        }
+      }
+      bf16s: "\000\000"
+    }
+    id: 178
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "reduce.184"
+    opcode: "reduce"
+    shape {
+      element_type: BF16
+      dimensions: 2048
+      layout {
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__sum"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.sum.dim_IntList/aten__sum"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    dimensions: 0
+    id: 184
+    operand_ids: 177
+    operand_ids: 178
+    called_computation_ids: 180
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "reshape.185"
+    opcode: "reshape"
+    shape {
+      element_type: BF16
+      dimensions: 1
+      dimensions: 2048
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__stack"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.stack.default/aten__stack"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    id: 185
+    operand_ids: 184
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "concatenate.186"
+    opcode: "concatenate"
+    shape {
+      element_type: BF16
+      dimensions: 1
+      dimensions: 2048
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__stack"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/ExpertMLPsV2[.1][1]/forward_selective_loading[1]/aten.stack.default/aten__stack"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+      source_line: 1786
+      stack_frame_id: 17
+    }
+    dimensions: 0
+    id: 186
+    operand_ids: 185
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "reshape.187"
+    opcode: "reshape"
+    shape {
+      element_type: BF16
+      dimensions: 1
+      dimensions: 1
+      dimensions: 2048
+      layout {
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    metadata {
+      op_type: "aten__view"
+      op_name: "RefMoEModule[.1]/MoE[.1][1]/_forward_compute_bound/reduce_from_tensor_model_parallel_region/aten.view.default/aten__view"
+      source_file: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/model.py"
+      source_line: 243
+      stack_frame_id: 34
+    }
+    id: 187
+    operand_ids: 186
+    frontend_attributes {
+    }
+  }
+  instructions {
+    name: "tuple.188"
+    opcode: "tuple"
+    shape {
+      element_type: TUPLE
+      tuple_shapes {
+        element_type: BF16
+        dimensions: 1
+        dimensions: 1
+        dimensions: 2048
+        layout {
+          minor_to_major: 2
+          minor_to_major: 1
+          minor_to_major: 0
+        }
+        is_dynamic_dimension: false
+        is_dynamic_dimension: false
+        is_dynamic_dimension: false
+      }
+    }
+    metadata {
+    }
+    id: 188
+    operand_ids: 187
+    frontend_attributes {
+    }
+  }
+  program_shape {
+    parameters {
+      element_type: BF16
+      dimensions: 1
+      dimensions: 1
+      dimensions: 2048
+      layout {
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    parameters {
+      element_type: BF16
+      dimensions: 128
+      dimensions: 2048
+      layout {
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    parameters {
+      element_type: BF16
+      dimensions: 2048
+      layout {
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+    }
+    parameters {
+      element_type: BF16
+      dimensions: 128
+      dimensions: 192
+      dimensions: 2048
+      layout {
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    parameters {
+      element_type: BF16
+      dimensions: 128
+      dimensions: 2048
+      dimensions: 384
+      layout {
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+    result {
+      element_type: TUPLE
+      tuple_shapes {
+        element_type: BF16
+        dimensions: 1
+        dimensions: 1
+        dimensions: 2048
+        layout {
+          minor_to_major: 2
+          minor_to_major: 1
+          minor_to_major: 0
+        }
+        is_dynamic_dimension: false
+        is_dynamic_dimension: false
+        is_dynamic_dimension: false
+      }
+    }
+    parameter_names: "p0"
+    parameter_names: "p1"
+    parameter_names: "p2"
+    parameter_names: "p3"
+    parameter_names: "p4"
+  }
+  id: 189
+  root_id: 188
+}
+host_program_shape {
+  parameters {
+    element_type: BF16
+    dimensions: 1
+    dimensions: 1
+    dimensions: 2048
+    layout {
+      minor_to_major: 2
+      minor_to_major: 1
+      minor_to_major: 0
+    }
+    is_dynamic_dimension: false
+    is_dynamic_dimension: false
+    is_dynamic_dimension: false
+  }
+  parameters {
+    element_type: BF16
+    dimensions: 128
+    dimensions: 2048
+    layout {
+      minor_to_major: 1
+      minor_to_major: 0
+    }
+    is_dynamic_dimension: false
+    is_dynamic_dimension: false
+  }
+  parameters {
+    element_type: BF16
+    dimensions: 2048
+    layout {
+      minor_to_major: 0
+    }
+    is_dynamic_dimension: false
+  }
+  parameters {
+    element_type: BF16
+    dimensions: 128
+    dimensions: 192
+    dimensions: 2048
+    layout {
+      minor_to_major: 2
+      minor_to_major: 1
+      minor_to_major: 0
+    }
+    is_dynamic_dimension: false
+    is_dynamic_dimension: false
+    is_dynamic_dimension: false
+  }
+  parameters {
+    element_type: BF16
+    dimensions: 128
+    dimensions: 2048
+    dimensions: 384
+    layout {
+      minor_to_major: 2
+      minor_to_major: 1
+      minor_to_major: 0
+    }
+    is_dynamic_dimension: false
+    is_dynamic_dimension: false
+    is_dynamic_dimension: false
+  }
+  result {
+    element_type: TUPLE
+    tuple_shapes {
+      element_type: BF16
+      dimensions: 1
+      dimensions: 1
+      dimensions: 2048
+      layout {
+        minor_to_major: 2
+        minor_to_major: 1
+        minor_to_major: 0
+      }
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+      is_dynamic_dimension: false
+    }
+  }
+  parameter_names: "p0"
+  parameter_names: "p1"
+  parameter_names: "p2"
+  parameter_names: "p3"
+  parameter_names: "p4"
+}
+id: 189
+entry_computation_id: 189
+stack_frame_index {
+  file_names: "<stdin>"
+  file_names: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed_inference/utils/testing.py"
+  file_names: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/trace/model_builder.py"
+  file_names: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch_neuronx/xla_impl/trace.py"
+  file_names: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch_neuronx/xla_impl/hlo_conversion.py"
+  file_names: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch/nn/modules/module.py"
+  file_names: "/home/ubuntu/nki-moe/tests/test_v30c_vs_nxdi_trn3.py"
+  file_names: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/torch_neuronx/experimental/profiler/v2_x/custom_op_name.py"
+  file_names: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/model.py"
+  file_names: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/routing.py"
+  file_names: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/expert_mlps_v2.py"
+  function_names: "<module>"
+  function_names: "build_module"
+  function_names: "trace"
+  function_names: "_generate_hlo"
+  function_names: "generate_hlo"
+  function_names: "xla_trace"
+  function_names: "_xla_trace"
+  function_names: "_wrapped_call_impl"
+  function_names: "_call_impl"
+  function_names: "forward"
+  function_names: "torch_hierarchy_wrapper"
+  function_names: "_forward_compute_bound"
+  function_names: "forward_selective_loading"
+  file_locations {
+    file_name_id: 1
+    function_name_id: 1
+    line: 12
+  }
+  file_locations {
+    file_name_id: 2
+    function_name_id: 2
+    line: 264
+  }
+  file_locations {
+    file_name_id: 3
+    function_name_id: 3
+    line: 576
+  }
+  file_locations {
+    file_name_id: 3
+    function_name_id: 4
+    line: 904
+  }
+  file_locations {
+    file_name_id: 4
+    function_name_id: 5
+    line: 460
+  }
+  file_locations {
+    file_name_id: 5
+    function_name_id: 6
+    line: 601
+  }
+  file_locations {
+    file_name_id: 5
+    function_name_id: 7
+    line: 387
+  }
+  file_locations {
+    file_name_id: 6
+    function_name_id: 8
+    line: 1775
+  }
+  file_locations {
+    file_name_id: 6
+    function_name_id: 9
+    line: 1786
+  }
+  file_locations {
+    file_name_id: 7
+    function_name_id: 10
+    line: 150
+  }
+  file_locations {
+    file_name_id: 8
+    function_name_id: 11
+    line: 603
+  }
+  file_locations {
+    file_name_id: 9
+    function_name_id: 10
+    line: 303
+  }
+  file_locations {
+    file_name_id: 9
+    function_name_id: 12
+    line: 212
+  }
+  file_locations {
+    file_name_id: 9
+    function_name_id: 12
+    line: 204
+  }
+  file_locations {
+    file_name_id: 10
+    function_name_id: 10
+    line: 194
+  }
+  file_locations {
+    file_name_id: 7
+    function_name_id: 10
+    line: 149
+  }
+  file_locations {
+    file_name_id: 9
+    function_name_id: 12
+    line: 208
+  }
+  file_locations {
+    file_name_id: 11
+    function_name_id: 10
+    line: 1483
+  }
+  file_locations {
+    file_name_id: 11
+    function_name_id: 13
+    line: 617
+  }
+  file_locations {
+    file_name_id: 9
+    function_name_id: 12
+    line: 243
+  }
+  stack_frames {
+    file_location_id: 1
+  }
+  stack_frames {
+    file_location_id: 2
+    parent_frame_id: 1
+  }
+  stack_frames {
+    file_location_id: 3
+    parent_frame_id: 2
+  }
+  stack_frames {
+    file_location_id: 4
+    parent_frame_id: 3
+  }
+  stack_frames {
+    file_location_id: 5
+    parent_frame_id: 4
+  }
+  stack_frames {
+    file_location_id: 6
+    parent_frame_id: 5
+  }
+  stack_frames {
+    file_location_id: 7
+    parent_frame_id: 6
+  }
+  stack_frames {
+    file_location_id: 8
+    parent_frame_id: 7
+  }
+  stack_frames {
+    file_location_id: 9
+    parent_frame_id: 8
+  }
+  stack_frames {
+    file_location_id: 10
+    parent_frame_id: 9
+  }
+  stack_frames {
+    file_location_id: 8
+    parent_frame_id: 10
+  }
+  stack_frames {
+    file_location_id: 9
+    parent_frame_id: 11
+  }
+  stack_frames {
+    file_location_id: 11
+    parent_frame_id: 12
+  }
+  stack_frames {
+    file_location_id: 12
+    parent_frame_id: 13
+  }
+  stack_frames {
+    file_location_id: 13
+    parent_frame_id: 14
+  }
+  stack_frames {
+    file_location_id: 8
+    parent_frame_id: 15
+  }
+  stack_frames {
+    file_location_id: 9
+    parent_frame_id: 16
+  }
+  stack_frames {
+    file_location_id: 11
+    parent_frame_id: 17
+  }
+  stack_frames {
+    file_location_id: 14
+    parent_frame_id: 14
+  }
+  stack_frames {
+    file_location_id: 8
+    parent_frame_id: 19
+  }
+  stack_frames {
+    file_location_id: 9
+    parent_frame_id: 20
+  }
+  stack_frames {
+    file_location_id: 11
+    parent_frame_id: 21
+  }
+  stack_frames {
+    file_location_id: 15
+    parent_frame_id: 22
+  }
+  stack_frames {
+    file_location_id: 11
+    parent_frame_id: 23
+  }
+  stack_frames {
+    file_location_id: 16
+    parent_frame_id: 9
+  }
+  stack_frames {
+    file_location_id: 8
+    parent_frame_id: 25
+  }
+  stack_frames {
+    file_location_id: 9
+    parent_frame_id: 26
+  }
+  stack_frames {
+    file_location_id: 17
+    parent_frame_id: 14
+  }
+  stack_frames {
+    file_location_id: 18
+    parent_frame_id: 18
+  }
+  stack_frames {
+    file_location_id: 11
+    parent_frame_id: 29
+  }
+  stack_frames {
+    file_location_id: 19
+    parent_frame_id: 30
+  }
+  stack_frames {
+    file_location_id: 8
+    parent_frame_id: 31
+  }
+  stack_frames {
+    file_location_id: 9
+    parent_frame_id: 32
+  }
+  stack_frames {
+    file_location_id: 20
+    parent_frame_id: 14
+  }
+}
+frontend_attributes {
+  map {
+    key: "transposable_weight_idx"
+    value: "1,2,3,4"
+  }
+}

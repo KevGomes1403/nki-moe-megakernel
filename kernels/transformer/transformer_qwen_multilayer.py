@@ -232,7 +232,7 @@ def _multilayer_body(
         Wq_cur = tuple(Wq_cur)
         Wo_cur = tuple(Wo_cur)
         Router_cur = sbm.alloc_stack(
-            (PMAX, ROUTER_BATCH, E), nl.float32, name=f"Router_L{layer_idx}"
+            (PMAX, ROUTER_BATCH, E), dtype, name=f"Router_L{layer_idx}"
         )
 
         # HBM → SBUF loads for this layer's weights. No explicit "prefetch":
@@ -326,7 +326,7 @@ def _multilayer_body(
         )
 
         sbm.close_scope()
-        sbm.set_auto_alloc(False)
+        sbm.set_auto_alloc(True)
 
         # Residual add #1: bf16 add into bf16 residual
         nisa.tensor_tensor(dst=residual_sb, data1=residual_sb,
@@ -365,7 +365,7 @@ def _multilayer_body(
         # Free all sbm allocs from the MoE block
         while sbm.heap:
             sbm.pop_heap()
-        sbm.set_auto_alloc(False)
+        sbm.set_auto_alloc(True)
 
         # Residual add #2: bf16 add into bf16 residual
         nisa.tensor_tensor(dst=residual_sb, data1=residual_sb,

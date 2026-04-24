@@ -167,20 +167,24 @@ def _qwen3_moe_sbuf_in_sbuf_out_hoisted(
     rmsnorm_sq = sbm.alloc_stack((_PMAX, H_free * T), nl.float32, buffer=nl.sbuf, name="rmsnorm_sq")
     nisa.activation(rmsnorm_sq[...], op=nl.square, data=rmsnorm_out[...])
 
+    # Within-partition reduce of the H_free free-dim tiles: [PMAX, H_free*T] → [PMAX, T]
     rmsnorm_reduced = sbm.alloc_stack((_PMAX, T), nl.float32, buffer=nl.sbuf, name="rmsnorm_reduced")
     nisa.tensor_reduce(rmsnorm_reduced[0:_PMAX, 0:T], nl.add, rmsnorm_sq[0:_PMAX, 0:H_free * T], axis=1)
 
-    sum_reduced_sb = sbm.alloc_stack((1, T), nl.float32, buffer=nl.sbuf, name="sum_reduced_sb")
-    nisa.tensor_partition_reduce(dst=sum_reduced_sb[0:1, 0:T], data=rmsnorm_reduced[0:_PMAX, 0:T], op=nl.add)
-
-    norm_sum_sb = sbm.alloc_stack((_PMAX, T), nl.float32, buffer=nl.sbuf, name="norm_sum_sb")
-    nisa.tensor_copy(dst=norm_sum_sb[0:1, 0:T], src=sum_reduced_sb[0:1, 0:T])
-    for g in nl.static_range(4):
-        nisa.nc_stream_shuffle(
-            dst=norm_sum_sb[nl.ds(g * 32, 32), 0:T],
-            src=norm_sum_sb[0:1, 0:T],
-            shuffle_mask=[0] * 32,
-        )
+    # Cross-partition reduce via reduce-as-MATMUL with an all-ones [PMAX, PMAX] stationary
+    # operand. Matches AwsNeuronRmsNorm's HLO lowering (nxdi_moe.md §10.8: "LDWEIGHTS +
+    # MATMUL × 4 (reduce-as-matmul for the 2048-dim sum)") and nkilib's reference
+    # _process_rmsnorm_tile — Tensor-engine fp32 PSUM accumulator, result broadcast to all
+    # PMAX partitions in one matmul (stationary[p, i] = 1 → dst[i, t] = Σ_p moving[p, t]).
+    # Feeds PSUM directly into the subsequent rsqrt activation for bit-identical rounding.
+    mm_ones = sbm.alloc_stack((_PMAX, _PMAX), nl.float32, buffer=nl.sbuf, name="rmsnorm_mm_ones")
+    nisa.memset(mm_ones, value=1.0)
+    final_reduced_psum = nl.ndarray((_PMAX, T), dtype=nl.float32, buffer=nl.psum)
+    nisa.nc_matmul(
+        dst=final_reduced_psum[0:_PMAX, 0:T],
+        stationary=mm_ones[0:_PMAX, 0:_PMAX],
+        moving=rmsnorm_reduced[0:_PMAX, 0:T],
+    )
 
     eps_sb = sbm.alloc_stack((_PMAX, 1), nl.float32, buffer=nl.sbuf, name="eps_sb")
     nisa.memset(eps_sb, value=_EPS)
@@ -188,7 +192,7 @@ def _qwen3_moe_sbuf_in_sbuf_out_hoisted(
     nisa.activation(
         norm_factor_sb[0:_PMAX, 0:T],
         op=nl.rsqrt,
-        data=norm_sum_sb[0:_PMAX, 0:T],
+        data=final_reduced_psum[0:_PMAX, 0:T],
         scale=1.0 / H,
         bias=eps_sb[0:_PMAX, :],
     )
@@ -294,22 +298,22 @@ def _qwen3_moe_sbuf_in_sbuf_out_hoisted(
     inv_sum_exp = sbm.alloc_stack((T, 1), nl.float32, buffer=nl.sbuf, name="inv_sum_exp")
     nisa.activation(inv_sum_exp[0:T, 0:1], op=nl.reciprocal, data=sum_exp[0:T, 0:1])
 
-    # NxDI selects top-K on fp32 router_logits (routing.py:204
-    # `_, expert_index = torch.topk(router_logits, self.top_k)`), NOT on softmax
-    # probs. max8+nc_find_index8 over probs aliases under fp32 softmax ties /
-    # tail underflows (nc_find_index8 returns "first occurrence"), dropping
-    # experts on weight seeds where two logits round to equal probs.
-    top8_logits = sbm.alloc_heap((T, K), nl.float32, buffer=nl.sbuf, name="top8_logits")
-    nisa.max8(dst=top8_logits[0:T, 0:K], src=logits_sb[0:T, 0:E])
+    # NxDI takes top-K on bf16 router logits before the fp32 softmax chain.
+    top8_logits_bf16 = sbm.alloc_heap((T, K), dtype, buffer=nl.sbuf, name="top8_logits_bf16")
+    nisa.max8(dst=top8_logits_bf16[0:T, 0:K], src=logits_bf16[0:T, 0:E])
 
     top8_idx = sbm.alloc_heap((T, K), nl.uint32, buffer=nl.sbuf, name="top8_idx")
-    nisa.nc_find_index8(dst=top8_idx[0:T, 0:K], data=logits_sb[0:T, 0:E], vals=top8_logits[0:T, 0:K])
+    nisa.nc_find_index8(dst=top8_idx[0:T, 0:K], data=logits_bf16[0:T, 0:E], vals=top8_logits_bf16[0:T, 0:K])
+
+    top8_logits = sbm.alloc_stack((T, K), nl.float32, buffer=nl.sbuf, name="top8_logits")
+    nisa.activation(top8_logits[0:T, 0:K], op=nl.copy, data=top8_logits_bf16[0:T, 0:K])
 
     # Recover softmax values at top-K indices via softmax identity:
     #   softmax(l)[i] = exp(l_i - max_l) / sum_j exp(l_j - max_l)
-    # Reuses max_logit and inv_sum_exp already computed above. Equivalent to
-    # gather(softmax_probs, top8_idx) but avoids materializing the full
-    # [T, E] probs tensor.
+    # Reuses max_logit and inv_sum_exp already computed above. Because top8_logits
+    # were selected from bf16 logits and then upcast here, this matches
+    # gather(bf16(softmax(fp32(logits_bf16))), top8_idx) without materializing the
+    # full [T, E] probs tensor.
     top8_centered = sbm.alloc_stack((T, K), nl.float32, buffer=nl.sbuf, name="top8_centered")
     nisa.tensor_scalar(
         top8_centered[0:T, 0:K], data=top8_logits[0:T, 0:K],
@@ -338,10 +342,8 @@ def _qwen3_moe_sbuf_in_sbuf_out_hoisted(
     # -----------------------------------------------------------------------
     sbm.open_scope(name="expert_loop_outer")
 
-    # output_temp: fp32 accumulator. HLO shows reference's torch.sum(bf16_tensor, dim=0) lowers
-    # to a bf16 reduce.503 that the Neuron compiler implements with fp32-internal accumulation
-    # (flags: --enable-mixed-precision-accumulation, --accumulate-on-alu-dtype) and a single
-    # bf16 round at the end. Matching that = fp32 accumulator + one final bf16 cast at Stage 5.
+    # Keep the running accumulator in fp32 storage, but round back through bf16
+    # after each expert add so the visible arithmetic matches the HLO's bf16 reduce.
     output_temp = sbm.alloc_stack((_PMAX, H_free_shard, T), nl.float32, buffer=nl.sbuf, name="output_temp")
 
     for t in nl.static_range(T):
@@ -431,13 +433,22 @@ def _qwen3_moe_sbuf_in_sbuf_out_hoisted(
             )
 
         # Match reference F.normalize (qwen.py path → expert_mlps_v2.py:606 → HLO divide.415 bf16).
-        # Reference: bf16 norm (reduce.407) then bf16 divide — Neuron lowers bf16 divide to fp32
-        # internal division with a single bf16 round at the output.
+        # The HLO clamps the bf16 reduction sum to bf16(1e-12) before dividing.
         sum_topk = sbm.alloc_stack((T, 1), dtype, buffer=nl.sbuf, name=f"sum_topk_t{t}")
         nisa.tensor_reduce(sum_topk[0:T, 0:1], nl.add, top8_vals_bf16[0:T, 0:K], axis=1)
 
+        eps_topk = sbm.alloc_stack((T, 1), dtype, buffer=nl.sbuf, name=f"eps_topk_t{t}")
+        nisa.memset(eps_topk, value=1e-12)
+        sum_topk_clamped = sbm.alloc_stack((T, 1), dtype, buffer=nl.sbuf, name=f"sum_topk_clamped_t{t}")
+        nisa.tensor_tensor(
+            sum_topk_clamped[0:T, 0:1],
+            sum_topk[0:T, 0:1],
+            eps_topk[0:T, 0:1],
+            nl.maximum,
+        )
+
         inv_sum_topk = sbm.alloc_stack((T, 1), nl.float32, buffer=nl.sbuf, name=f"inv_sum_topk_t{t}")
-        nisa.activation(inv_sum_topk[0:T, 0:1], op=nl.reciprocal, data=sum_topk[0:T, 0:1])
+        nisa.activation(inv_sum_topk[0:T, 0:1], op=nl.reciprocal, data=sum_topk_clamped[0:T, 0:1])
 
         # bf16 data × fp32 scalar → bf16 (single bf16 round at dst, matches reference's bf16 divide).
         norm_weights = sbm.alloc_stack((T, K), dtype, buffer=nl.sbuf, name=f"norm_weights_t{t}")
@@ -448,6 +459,7 @@ def _qwen3_moe_sbuf_in_sbuf_out_hoisted(
 
         if _KERN_TRACE and prg_id == 0:
             nl.device_print(f"[KERN] sum_topk_bf16 t{t}", sum_topk[0:T, 0:1])
+            nl.device_print(f"[KERN] sum_topk_clamped_bf16 t{t}", sum_topk_clamped[0:T, 0:1])
             nl.device_print(f"[KERN] norm_weights (post L1-norm) t{t}", norm_weights[0:T, 0:K])
 
         # Cast to fp32 for broadcast (tensor_scalar requires fp32 operand0).
@@ -546,16 +558,20 @@ def _qwen3_moe_sbuf_in_sbuf_out_hoisted(
 
             sbm.open_scope(name=f"w0_expert_{k}_t{t}")
 
-            # Plan C: SiLU and gate×up in bf16
-            silu_res = sbm.alloc_stack((_PMAX, I_tiles), dtype, buffer=nl.sbuf, name=f"silu_res_w0k{k}_t{t}")
-            nisa.activation(silu_res, op=nl.silu, data=gu_full_bf16_w0[0:_PMAX, gu_base:gu_base + I_tiles])
+            silu_res_bf16 = sbm.alloc_stack((_PMAX, I_tiles), dtype, buffer=nl.sbuf, name=f"silu_res_bf16_w0k{k}_t{t}")
+            nisa.activation(silu_res_bf16, op=nl.silu, data=gu_full_bf16_w0[0:_PMAX, gu_base:gu_base + I_tiles])
 
-            up_sb = sbm.alloc_stack((_PMAX, I_tiles), dtype, buffer=nl.sbuf, name=f"up_sb_w0k{k}_t{t}")
-            nisa.activation(up_sb, op=nl.copy, data=gu_full_bf16_w0[0:_PMAX, gu_base + I_tiles:gu_base + 2 * I_tiles])
+            silu_res = sbm.alloc_stack((_PMAX, I_tiles), nl.float32, buffer=nl.sbuf, name=f"silu_res_w0k{k}_t{t}")
+            nisa.activation(silu_res, op=nl.copy, data=silu_res_bf16)
 
-            # Plan C: bf16 gate × up → bf16 (eliminates inter_f32 + cast)
+            up_f32 = sbm.alloc_stack((_PMAX, I_tiles), nl.float32, buffer=nl.sbuf, name=f"up_f32_w0k{k}_t{t}")
+            nisa.activation(up_f32, op=nl.copy, data=gu_full_bf16_w0[0:_PMAX, gu_base + I_tiles:gu_base + 2 * I_tiles])
+
+            inter_f32 = sbm.alloc_stack((_PMAX, I_tiles), nl.float32, buffer=nl.sbuf, name=f"inter_f32_w0k{k}_t{t}")
+            nisa.tensor_tensor(inter_f32, silu_res, up_f32, nl.multiply)
+
             inter_bf16 = sbm.alloc_stack((_PMAX, I_tiles), dtype, buffer=nl.sbuf, name=f"inter_bf16_w0k{k}_t{t}")
-            nisa.tensor_tensor(inter_bf16, silu_res, up_sb, nl.multiply)
+            nisa.activation(inter_bf16, op=nl.copy, data=inter_f32)
 
             # Down matmul
             for h1_out in nl.affine_range(H_free_shard):
@@ -571,11 +587,8 @@ def _qwen3_moe_sbuf_in_sbuf_out_hoisted(
                 )
 
             # F2: match NxDI HLO expert chain (dot.169 → convert.173 → multiply.176 →
-            # convert.177 → reduce.184): down_proj stores bf16, upcast to fp32, fp32
-            # multiply by fp32 aff, bf16-round the scaled product, then fp32-internal
-            # reduce across 8 experts to bf16. Our kernel's fp32 PSUM has to materialize
-            # both bf16 rounds — F2a (down_psum → bf16 → fp32) and F2b (scaled fp32 →
-            # bf16 → fp32 for accumulate).
+            # convert.177 → reduce.184): down_proj stores bf16, the affinity multiply is
+            # fp32 with a bf16 result, and the top-k accumulation happens in bf16.
             down_result_bf16 = sbm.alloc_stack((_PMAX, H_free_shard), dtype, buffer=nl.sbuf, name=f"down_result_bf16_w0k{k}_t{t}")
             nisa.activation(
                 down_result_bf16,
@@ -594,10 +607,6 @@ def _qwen3_moe_sbuf_in_sbuf_out_hoisted(
                 operand0=aff_bcast[0:_PMAX, k:k + 1],  # wave 0: global k = k (0-3)
             )
 
-            # Upcast bf16 → fp32 for the fp32-internal reduce (reduce.184).
-            down_result_scaled = sbm.alloc_stack((_PMAX, H_free_shard), nl.float32, buffer=nl.sbuf, name=f"down_result_scaled_w0k{k}_t{t}")
-            nisa.activation(down_result_scaled, op=nl.copy, data=down_result_scaled_bf16)
-
             if _KERN_TRACE and prg_id == 0 and k == 0:
                 nl.device_print(
                     f"[KERN] wave0 expert0 down_psum[:8, :8] fp32",
@@ -611,11 +620,14 @@ def _qwen3_moe_sbuf_in_sbuf_out_hoisted(
                     f"[KERN] wave0 expert0 down_result_scaled_bf16[:8, :8] (after x aff, bf16)",
                     down_result_scaled_bf16[0:8, 0:8],
                 )
-                nl.device_print(
-                    f"[KERN] wave0 expert0 down_result_scaled[:8, :8] (upcast to fp32 for reduce)",
-                    down_result_scaled[0:8, 0:8],
-                )
 
+            # Per nxdi_moe.md §10.3 / §10.10.2: %reduce.503 is a one-shot fp32-PSUM
+            # reduce with a single bf16 rounding on the final store. Each expert's bf16
+            # contribution (down_result_scaled_bf16) is up-cast to fp32 and accumulated
+            # across all 8 experts in fp32; the final bf16 rounding happens once in
+            # Stage 5. Do NOT round to bf16 between expert additions.
+            down_result_scaled = sbm.alloc_stack((_PMAX, H_free_shard), nl.float32, buffer=nl.sbuf, name=f"down_result_scaled_w0k{k}_t{t}")
+            nisa.activation(down_result_scaled, op=nl.copy, data=down_result_scaled_bf16)
             if k == 0:
                 nisa.tensor_copy(
                     dst=output_temp[0:_PMAX, 0:H_free_shard, t:t + 1],
@@ -754,16 +766,20 @@ def _qwen3_moe_sbuf_in_sbuf_out_hoisted(
 
             sbm.open_scope(name=f"w1_expert_{k}_t{t}")
 
-            # Plan C: SiLU and gate×up in bf16
-            silu_res = sbm.alloc_stack((_PMAX, I_tiles), dtype, buffer=nl.sbuf, name=f"silu_res_w1k{k}_t{t}")
-            nisa.activation(silu_res, op=nl.silu, data=gu_full_bf16_w1[0:_PMAX, gu_base:gu_base + I_tiles])
+            silu_res_bf16 = sbm.alloc_stack((_PMAX, I_tiles), dtype, buffer=nl.sbuf, name=f"silu_res_bf16_w1k{k}_t{t}")
+            nisa.activation(silu_res_bf16, op=nl.silu, data=gu_full_bf16_w1[0:_PMAX, gu_base:gu_base + I_tiles])
 
-            up_sb = sbm.alloc_stack((_PMAX, I_tiles), dtype, buffer=nl.sbuf, name=f"up_sb_w1k{k}_t{t}")
-            nisa.activation(up_sb, op=nl.copy, data=gu_full_bf16_w1[0:_PMAX, gu_base + I_tiles:gu_base + 2 * I_tiles])
+            silu_res = sbm.alloc_stack((_PMAX, I_tiles), nl.float32, buffer=nl.sbuf, name=f"silu_res_w1k{k}_t{t}")
+            nisa.activation(silu_res, op=nl.copy, data=silu_res_bf16)
 
-            # Plan C: bf16 gate × up → bf16 (eliminates inter_f32 + cast)
+            up_f32 = sbm.alloc_stack((_PMAX, I_tiles), nl.float32, buffer=nl.sbuf, name=f"up_f32_w1k{k}_t{t}")
+            nisa.activation(up_f32, op=nl.copy, data=gu_full_bf16_w1[0:_PMAX, gu_base + I_tiles:gu_base + 2 * I_tiles])
+
+            inter_f32 = sbm.alloc_stack((_PMAX, I_tiles), nl.float32, buffer=nl.sbuf, name=f"inter_f32_w1k{k}_t{t}")
+            nisa.tensor_tensor(inter_f32, silu_res, up_f32, nl.multiply)
+
             inter_bf16 = sbm.alloc_stack((_PMAX, I_tiles), dtype, buffer=nl.sbuf, name=f"inter_bf16_w1k{k}_t{t}")
-            nisa.tensor_tensor(inter_bf16, silu_res, up_sb, nl.multiply)
+            nisa.activation(inter_bf16, op=nl.copy, data=inter_f32)
 
             # Down matmul
             for h1_out in nl.affine_range(H_free_shard):
@@ -779,7 +795,7 @@ def _qwen3_moe_sbuf_in_sbuf_out_hoisted(
                 )
 
             # F2: bf16 round after down_proj + bf16 round after scale multiply,
-            # then upcast to fp32 for the reduce (see wave 0).
+            # then accumulate those bf16 contributions into the token output.
             down_result_bf16 = sbm.alloc_stack((_PMAX, H_free_shard), dtype, buffer=nl.sbuf, name=f"down_result_bf16_w1k{k}_t{t}")
             nisa.activation(
                 down_result_bf16,
@@ -793,10 +809,11 @@ def _qwen3_moe_sbuf_in_sbuf_out_hoisted(
                 op0=nl.multiply,
                 operand0=aff_bcast[0:_PMAX, kk:kk + 1],  # wave 1: global k = kk (4-7)
             )
+            # Per nxdi_moe.md §10.3 / §10.10.2: one-shot fp32-PSUM reduce across all
+            # 8 experts with a single bf16 rounding on final store (done in Stage 5).
+            # No intermediate bf16 rounding between expert additions.
             down_result_scaled = sbm.alloc_stack((_PMAX, H_free_shard), nl.float32, buffer=nl.sbuf, name=f"down_result_scaled_w1k{k}_t{t}")
             nisa.activation(down_result_scaled, op=nl.copy, data=down_result_scaled_bf16)
-
-            # Always accumulate (output_temp already initialized by wave 0)
             nisa.tensor_tensor(
                 dst=output_temp[0:_PMAX, 0:H_free_shard, t:t + 1],
                 data1=output_temp[0:_PMAX, 0:H_free_shard, t:t + 1],
@@ -813,14 +830,14 @@ def _qwen3_moe_sbuf_in_sbuf_out_hoisted(
     # Free heap in reverse order of allocation
     sbm.pop_heap()  # top8_vals_bf16
     sbm.pop_heap()  # top8_idx
-    sbm.pop_heap()  # top8_logits
+    sbm.pop_heap()  # top8_logits_bf16
     sbm.pop_heap()  # rmsnorm_normed_bf16
 
     # -----------------------------------------------------------------------
-    # Stage 5: Cast fp32→bf16, store to SBUF in column-major layout (no transpose)
+    # Stage 5: Cast fp32 accumulator to bf16 and store to SBUF in column-major layout
     # -----------------------------------------------------------------------
     # output_temp [PMAX, H_free_shard, T] fp32 is already column-major (partition-first).
-    # Reshape to [PMAX, H_free_shard*T] and cast fp32→bf16.
+    # Reshape to [PMAX, H_free_shard*T] and cast to bf16.
     sbm.open_scope(name="store")
     out_sb = sbm.alloc_stack((_PMAX, H_free_shard * T), dtype, buffer=nl.sbuf, name="out_sb")
     nisa.activation(
@@ -832,7 +849,7 @@ def _qwen3_moe_sbuf_in_sbuf_out_hoisted(
         # output_temp [PMAX=128, H_free_shard=8, T=1] fp32. On prg_id=0, H indices are
         # prg_id*H_shard..(prg_id+1)*H_shard = 0..1024. So col-major (p, h1, t=0)
         # maps to H index h1*128 + p. Print [p=0..7, h1=0] = H indices 0..7.
-        nl.device_print("[KERN] output_temp[:8, h1=0] fp32 (accum before bf16)", output_temp[0:8, 0:1, 0:1])
+        nl.device_print("[KERN] output_temp[:8, h1=0] fp32 (accum after bf16 rounds)", output_temp[0:8, 0:1, 0:1])
         nl.device_print("[KERN] out_sb[:8, h1=0] bf16 (final)", out_sb[0:8, 0:1])
     sbm.close_scope()  # store
 
@@ -986,6 +1003,7 @@ def make_config() -> Qwen3MoeInferenceConfig:
         seq_len=S,
         flash_decoding_enabled=False,
         logical_nc_config=LNC,
+        enable_bucketing=True,
         moe_fused_nki_kernel_enabled=False,
         qkv_kernel_enabled=False,
         attn_kernel_enabled=False,
@@ -997,7 +1015,6 @@ def make_config() -> Qwen3MoeInferenceConfig:
         neuron_config,
         load_config=load_pretrained_config(MODEL_PATH),
     )
-    cfg.intermediate_size = cfg.moe_intermediate_size // 4  # 768 // 4 = 192
     return cfg
 
 
@@ -1033,10 +1050,35 @@ def _rmsnorm_reference_like(hidden_2d: torch.Tensor, gamma_1d: torch.Tensor) -> 
     return normed.to(torch.bfloat16).to(torch.float32)
 
 
-def _topk_softmax_weights(router_logits_f32: torch.Tensor, topk_idx: torch.Tensor) -> torch.Tensor:
-    probs = torch.softmax(router_logits_f32, dim=-1)
-    vals = torch.gather(probs, dim=-1, index=topk_idx)
-    return vals / vals.sum(dim=-1, keepdim=True)
+def _nxdi_topk_routing(router_logits_bf16: torch.Tensor):
+    topk_logits_bf16, topk_idx = torch.topk(router_logits_bf16, k=_K, dim=-1)
+    probs_bf16 = torch.softmax(router_logits_bf16.to(torch.float32), dim=-1).to(torch.bfloat16)
+    topk_vals_bf16 = torch.gather(probs_bf16, dim=-1, index=topk_idx)
+    sum_topk_bf16 = topk_vals_bf16.abs().sum(dim=-1, keepdim=True).to(torch.bfloat16)
+    sum_topk_bf16 = torch.maximum(
+        sum_topk_bf16,
+        torch.full_like(sum_topk_bf16, 1e-12, dtype=torch.bfloat16),
+    )
+    norm_weights_bf16 = (
+        topk_vals_bf16.to(torch.float32) * sum_topk_bf16.to(torch.float32).reciprocal()
+    ).to(torch.bfloat16)
+    return {
+        "topk_logits_bf16": topk_logits_bf16,
+        "topk_idx": topk_idx,
+        "topk_vals_bf16": topk_vals_bf16,
+        "norm_weights_bf16": norm_weights_bf16,
+    }
+
+
+def _bf16_reduce_sum(contribs_bf16: list[torch.Tensor]) -> torch.Tensor:
+    # Per nxdi_moe.md §10.3 / §10.10.2: HLO's AddComputation at %reduce.503 lowers
+    # to a Tensor-engine reduce-as-matmul with fp32 PSUM and a single bf16 rounding
+    # at the end. Match that by up-casting each per-expert bf16 contribution to fp32,
+    # summing in fp32 across all experts, and rounding to bf16 once.
+    acc_f32 = contribs_bf16[0].to(torch.float32)
+    for contrib in contribs_bf16[1:]:
+        acc_f32 = acc_f32 + contrib.to(torch.float32)
+    return acc_f32.to(torch.bfloat16)
 
 
 def _trace_reference_like(
@@ -1049,32 +1091,37 @@ def _trace_reference_like(
     """
     Reference-side stage trace.
 
-    Uses the intended high-level NxDI semantics:
-    bf16 RMSNorm output, fp32 router logits/softmax, top-k on fp32 logits,
-    fp32 normalized top-k weights.
+    Uses the HLO contract from tests/nxdi_moe.md:
+    bf16-rounded router logits, top-k on bf16 logits, bf16-renormalized affinities,
+    fp32 gate/up combine with a bf16 round before down-proj, and bf16 top-k reduce.
     """
     hidden_2d = hidden.reshape(-1, _H)
     gamma_1d = gamma.reshape(_H)
 
     rmsnorm_out = _rmsnorm_reference_like(hidden_2d, gamma_1d)
-    router_logits = rmsnorm_out @ router_w.to(torch.float32)
-    topk_vals, topk_idx = torch.topk(router_logits, k=_K, dim=-1)
-    topk_weights = _topk_softmax_weights(router_logits, topk_idx)
+    router_logits_psum = rmsnorm_out @ router_w.to(torch.float32)
+    router_logits_bf16 = router_logits_psum.to(torch.bfloat16)
+    router_logits = router_logits_bf16.to(torch.float32)
+    routing = _nxdi_topk_routing(router_logits_bf16)
+    topk_idx = routing["topk_idx"]
+    topk_weights = routing["norm_weights_bf16"].to(torch.float32)
 
     expert_details = []
-    expert_contribs = []
+    expert_contribs_bf16 = []
     for k in range(_K):
         expert_id = int(topk_idx[0, k].item())
         gu_psum = rmsnorm_out @ gate_up[expert_id].to(torch.float32)
         gu = gu_psum.to(torch.bfloat16).to(torch.float32)
         gate = gu[:, :_I]
         up = gu[:, _I:]
-        silu_gate = torch.nn.functional.silu(gate).to(torch.bfloat16).to(torch.float32)
-        inter = (silu_gate.to(torch.bfloat16) * up.to(torch.bfloat16)).to(torch.float32)
+        silu_gate = torch.nn.functional.silu(gate.to(torch.bfloat16)).to(torch.float32)
+        inter_bf16 = (silu_gate * up.to(torch.float32)).to(torch.bfloat16)
+        inter = inter_bf16.to(torch.float32)
         down_psum = inter @ down[expert_id].to(torch.float32)
         down_out = down_psum.to(torch.bfloat16).to(torch.float32)
-        scaled = down_out * topk_weights[:, k : k + 1]
-        expert_contribs.append(scaled)
+        scaled_bf16 = (down_out * topk_weights[:, k : k + 1]).to(torch.bfloat16)
+        scaled = scaled_bf16.to(torch.float32)
+        expert_contribs_bf16.append(scaled_bf16)
         expert_details.append(
             {
                 "expert_id": expert_id,
@@ -1090,11 +1137,13 @@ def _trace_reference_like(
             }
         )
 
-    out = torch.stack(expert_contribs, dim=0).sum(dim=0).to(torch.bfloat16).reshape_as(hidden)
+    out = _bf16_reduce_sum(expert_contribs_bf16).reshape_as(hidden)
     return {
         "rmsnorm_out": rmsnorm_out.reshape_as(hidden).to(torch.bfloat16),
+        "router_logits_psum": router_logits_psum,
+        "router_logits_bf16": router_logits_bf16,
         "router_logits": router_logits,
-        "topk_logits": topk_vals,
+        "topk_logits": routing["topk_logits_bf16"].to(torch.float32),
         "topk_idx": topk_idx,
         "topk_weights": topk_weights,
         "expert_details": expert_details,
@@ -1112,9 +1161,8 @@ def _trace_kernel_like(
     """
     Kernel-side stage trace.
 
-    Mirrors the current v30c math contract closely enough to localize routing bugs:
-    bf16 RMSNorm output, router logits rounded fp32->bf16->fp32 before top-k,
-    top-k weights reconstructed from rounded logits, bf16 top-k renorm.
+    Mirrors the HLO contract from tests/nxdi_moe.md closely enough to localize
+    routing and expert-math drift.
     """
     hidden_2d = hidden.reshape(-1, _H)
     gamma_1d = gamma.reshape(_H)
@@ -1123,18 +1171,12 @@ def _trace_kernel_like(
     router_logits_psum = rmsnorm_out @ router_w.to(torch.float32)
     router_logits_bf16 = router_logits_psum.to(torch.bfloat16)
     router_logits = router_logits_bf16.to(torch.float32)
-
-    topk_logits, topk_idx = torch.topk(router_logits, k=_K, dim=-1)
-    max_logit = router_logits.max(dim=-1, keepdim=True).values
-    inv_sum_exp = 1.0 / torch.exp(router_logits - max_logit).sum(dim=-1, keepdim=True)
-    topk_vals = torch.exp(topk_logits - max_logit) * inv_sum_exp
-    topk_vals_bf16 = topk_vals.to(torch.bfloat16)
-    sum_topk_bf16 = topk_vals_bf16.sum(dim=-1, keepdim=True).to(torch.bfloat16)
-    norm_weights = (topk_vals_bf16.to(torch.float32) * sum_topk_bf16.to(torch.float32).reciprocal()).to(torch.bfloat16)
-    norm_weights_f32 = norm_weights.to(torch.float32)
+    routing = _nxdi_topk_routing(router_logits_bf16)
+    topk_idx = routing["topk_idx"]
+    norm_weights_f32 = routing["norm_weights_bf16"].to(torch.float32)
 
     expert_details = []
-    expert_contribs = []
+    expert_contribs_bf16 = []
     for k in range(_K):
         expert_id = int(topk_idx[0, k].item())
         gu_psum = rmsnorm_out @ gate_up[expert_id].to(torch.float32)
@@ -1142,11 +1184,13 @@ def _trace_kernel_like(
         gate_part = gu_bf16[:, :_I]
         up_part = gu_bf16[:, _I:]
         silu_res = torch.nn.functional.silu(gate_part.to(torch.bfloat16)).to(torch.float32)
-        inter_bf16 = (silu_res.to(torch.bfloat16) * up_part.to(torch.bfloat16)).to(torch.float32)
-        down_psum = inter_bf16 @ down[expert_id].to(torch.float32)
+        inter_bf16 = (silu_res * up_part.to(torch.float32)).to(torch.bfloat16)
+        inter = inter_bf16.to(torch.float32)
+        down_psum = inter @ down[expert_id].to(torch.float32)
         down_result_bf16 = down_psum.to(torch.bfloat16).to(torch.float32)
-        scaled_bf16 = (down_result_bf16 * norm_weights_f32[:, k : k + 1]).to(torch.bfloat16).to(torch.float32)
-        expert_contribs.append(scaled_bf16)
+        scaled_bf16 = (down_result_bf16 * norm_weights_f32[:, k : k + 1]).to(torch.bfloat16)
+        scaled = scaled_bf16.to(torch.float32)
+        expert_contribs_bf16.append(scaled_bf16)
         expert_details.append(
             {
                 "expert_id": expert_id,
@@ -1155,22 +1199,22 @@ def _trace_kernel_like(
                 "gate": gate_part,
                 "up": up_part,
                 "silu_gate": silu_res,
-                "inter": inter_bf16,
+                "inter": inter,
                 "down_psum": down_psum,
                 "down_bf16": down_result_bf16,
-                "scaled": scaled_bf16,
+                "scaled": scaled,
             }
         )
 
-    out = torch.stack(expert_contribs, dim=0).sum(dim=0).to(torch.bfloat16).reshape_as(hidden)
+    out = _bf16_reduce_sum(expert_contribs_bf16).reshape_as(hidden)
     return {
         "rmsnorm_out": rmsnorm_out.reshape_as(hidden).to(torch.bfloat16),
         "router_logits_psum": router_logits_psum,
         "router_logits_bf16": router_logits_bf16,
         "router_logits": router_logits,
-        "topk_logits": topk_logits,
+        "topk_logits": routing["topk_logits_bf16"].to(torch.float32),
         "topk_idx": topk_idx,
-        "topk_vals_pre_norm": topk_vals_bf16,
+        "topk_vals_pre_norm": routing["topk_vals_bf16"],
         "topk_weights": norm_weights_f32,
         "expert_details": expert_details,
         "out": out,
@@ -1571,8 +1615,9 @@ def main():
 
     cfg = make_config()
     print(
-        f"Config: H={cfg.hidden_size} E={cfg.num_experts} I={cfg.moe_intermediate_size} "
-        f"K={cfg.num_experts_per_tok} B={B} S={S} TP=1 LNC={LNC}",
+        f"Config: H={cfg.hidden_size} E={cfg.num_experts} I={cfg.intermediate_size} "
+        f"K={cfg.num_experts_per_tok} B={B} S={S} TP={cfg.neuron_config.tp_degree} "
+        f"moe_tp={cfg.neuron_config.moe_tp_degree} LNC={LNC}",
         flush=True,
     )
     print(f"weight_scale={args.weight_scale}  n_samples: {args.n_samples}  |  NKI_PRECISE_FP=1 (bf16)", flush=True)
@@ -1591,7 +1636,7 @@ def main():
                 "weight_scale": args.weight_scale,
                 "_weight_store": weight_store,
             },
-            tp_degree=1,
+            tp_degree=cfg.neuron_config.tp_degree,
             logical_nc_config=LNC,
             compiler_args=COMPILER_ARGS,
             compiler_workdir=os.path.join(workdir, "ref_workdir"),

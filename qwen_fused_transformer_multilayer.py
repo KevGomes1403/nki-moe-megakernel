@@ -213,7 +213,7 @@ def convert_qwen3_moe_hf_to_neuron_state_dict(neuron_state_dict, config):
         )
 
         neuron_state_dict[f"layers.{l}.mlp.router.linear_router.weight"] = (
-            neuron_state_dict[f"layers.{l}.mlp.gate.weight"].detach().clone().to(torch.float32)
+            neuron_state_dict[f"layers.{l}.mlp.gate.weight"].detach().clone()
         )
         del neuron_state_dict[f"layers.{l}.mlp.gate.weight"]
 

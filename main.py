@@ -31,7 +31,7 @@ from test import parse_prompts, parse_prompt_data
 
 BENCHMARK_REPORT_FILENAME = "benchmark_report.json"
 
-_DEBUG_TENSOR_NAMES = ["attn_out", "kv_k", "kv_v", "final_hidden_states"]
+_DEBUG_TENSOR_NAMES = ["attn_out", "kv_k", "kv_v", "post_attention_layernorm", "final_hidden_states"]
 
 def make_debug_dump_hook(save_path="debug_tensors.pt", tkg_save_path="debug_dump_tkg.pt"):
     """
@@ -101,7 +101,8 @@ def parse_args():
             "qwen_with_nkilib_moe_tkg (or qwen_nkilib_moe_tkg/qwen_nkilib), "
             "qwen_complete (or qwen_fused_moe_attn_tkg/qwen_full_tkg), "
             "qwen_fused_transformer_multilayer (or qwen_multilayer/qwen_megakernel/qwen_full_fused): 48-layer fused TKG megakernel, "
-            "qwen_baseline_quant (or qwen_quant/qwen_fp8): offline blockwise FP8 expert quantization."
+            "qwen_baseline_quant (or qwen_quant/qwen_fp8): offline blockwise FP8 expert quantization, "
+            "qwen_with_v30c (or qwen_v30c): _v30c_moe_raw fused MoE kernel for TKG."
         ),
     )
     parser.add_argument("--enable-nki", action="store_true")
@@ -246,6 +247,11 @@ def parse_args():
     parser.add_argument("--debug-dump-path", type=str, default="debug_tensors.pt",
                         help="Path for the debug .pt file (default: debug_tensors.pt)")
 
+    # HLO dump
+    parser.add_argument("--dump-hlo", action="store_true",
+                        help="Compile with HLO metadata (debug=True) and print HLO file paths after compilation. "
+                             "HLO binaries land in /tmp/nxd_model/ by default; set BASE_COMPILE_WORK_DIR to override.")
+
     return parser.parse_args()
 
 
@@ -273,6 +279,7 @@ def prepare_inference(model_cls, args, compiled_model_path=None, skip_compile=No
     # Pop debug flags before they reach MoENeuronConfig (not valid kwargs there).
     debug_dump = config_kwargs.pop("debug_dump", False)
     config_kwargs.pop("debug_dump_path", None)
+    dump_hlo = config_kwargs.pop("dump_hlo", False)
 
     if args.on_device_sampling:
         config_kwargs["on_device_sampling_config"] = OnDeviceSamplingConfig(**config_kwargs)
@@ -284,7 +291,7 @@ def prepare_inference(model_cls, args, compiled_model_path=None, skip_compile=No
                 config_kwargs["on_device_sampling_config"] = OnDeviceSamplingConfig(
                     do_sample=True, top_k=20, top_p=0.95, temperature=0.6
                 )
-            config_kwargs["tensor_capture_config"] = TensorCaptureConfig(max_intermediate_tensors=4)
+            config_kwargs["tensor_capture_config"] = TensorCaptureConfig(max_intermediate_tensors=5)
         else:
             print("WARNING: --debug-dump with --skip-compile=True only works if the loaded model "
                   "was compiled with --debug-dump. Tensor capture will be silently empty otherwise.")
@@ -296,7 +303,7 @@ def prepare_inference(model_cls, args, compiled_model_path=None, skip_compile=No
         neuron_config, load_config=load_pretrained_config(args.model_path)
     )
 
-    config.num_hidden_layers = 1  # debug: single-layer mode using only layer 0 weights
+    # config.num_hidden_layers = 1  # debug: single-layer mode using only layer 0 weights
 
     model = model_cls(args.model_path, config)
 
@@ -309,11 +316,21 @@ def prepare_inference(model_cls, args, compiled_model_path=None, skip_compile=No
         # to do, add save sharded checkpoint here
         compiling_start_time = time.monotonic()
         print("\nCompiling and saving model...")
-        model.compile(_compiled_model_path, debug=False)
+        model.compile(_compiled_model_path, debug=dump_hlo)
 
         compiling_end_time = time.monotonic()
         total_compiling_time = compiling_end_time - compiling_start_time
         print(f"Compiling and tracing time: {total_compiling_time} seconds")
+
+        if dump_hlo:
+            work_dir = os.environ.get("BASE_COMPILE_WORK_DIR", "/tmp/nxd_model")
+            print(f"\nHLO files (binary protobuf) are under: {work_dir}")
+            for subdir in ["context_encoding_model", "token_generation_model"]:
+                d = os.path.join(work_dir, subdir, "_tp0_bk0")
+                if os.path.isdir(d):
+                    files = [f for f in os.listdir(d) if "hlo_module" in f.lower() or f.endswith(".hlo")]
+                    for f in files:
+                        print(f"  {os.path.join(d, f)}")
 
     # Load compiled model to Neuron.
     print("\nLoading model to Neuron...")
@@ -792,6 +809,9 @@ def resolve_qwen_module_name(qwen_name: str, enable_nki: bool) -> str:
         "qwen_nxd_attn_moe_kernel": "qwen_nxd_attn_moe_kernel",
         "qwen_nxd_attn": "qwen_nxd_attn_moe_kernel",
         "qwen_moe_kernel_only": "qwen_nxd_attn_moe_kernel",
+        # _v30c_moe_raw fused MoE TKG kernel; CTE uses standard path.
+        "qwen_with_v30c": "qwen_with_v30c_moe",
+        "qwen_v30c": "qwen_with_v30c_moe",
     }
 
     normalized = qwen_name.strip()
