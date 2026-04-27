@@ -51,8 +51,8 @@ from neuronx_distributed_inference.utils.testing import build_module, validate_a
 from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm
 from neuronx_distributed_inference.modules.moe_v2 import initialize_moe_module
 
+from kernels.moe_fused_tkg.moe_fused_nki import moe_fused_tkg
 from qwen import Qwen3MoeInferenceConfig
-from test_v30c_simulate import _v30c_moe_raw
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -183,7 +183,7 @@ class KernelMoEModule(nn.Module):
                 for p in self.mlp.parameters():
                     if p.is_floating_point():
                         p.mul_(weight_scale)
-        self._moe_jit = nki.jit(_v30c_moe_raw)
+        self._moe_jit = nki.jit(moe_fused_tkg)
         # Capture bf16 CPU copies of all kernel weight tensors on the first real
         # instantiation (not AOT-mode meta-tensor re-instantiations).
         if (
@@ -435,7 +435,7 @@ def main():
     parser.add_argument(
         "--weight-scales",
         type=lambda s: [float(x) for x in s.split(",")],
-        default=[2.0, 3.0],
+        default=[2.0],
         metavar="W1,W2,...",
         help="Comma-separated weight scale factors",
     )

@@ -1,555 +1,338 @@
-# HLO
-1. Configuration (from neuron_config.json) 
-                                                                                                                                                               
-  ┌──────────────────────────────────────────────────────────┬─────────────────────────────────────────────────────────────────────────────────────────────┐   
-  │                           Key                            │                                            Value                                            │ 
-  ├──────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────┤   
-  │ Model                                                    │ Qwen3‑30B‑A3B (num_experts=128, num_experts_per_tok=8, hidden_size=2048,                    │ 
-  │                                                          │ moe_intermediate_size=768, num_hidden_layers=48)                                            │ 
-  ├──────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────┤   
-  │ Storage dtype                                            │ bfloat16 (all weights), overrides_torch_dtype=True                                          │   
-  ├──────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────┤   
-  │ Parallelism                                              │ tp_degree=4, ep_degree=1, sp=False, lnc=2, world_size=4; TKG bucket 128                     │   
-  ├──────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────┤ 
-  │ Per‑TP shard                                             │ I_TP = 768/4 = 192 intermediate units per rank                                              │   
-  ├──────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────┤   
-  │ Router                                                   │ act_fn="softmax", configured dtype=fp32 but weight is stored bf16 (compiled tensor in HLO   │   
-  │                                                          │ is bf16), softmax executed in fp32                                                          │   
-  ├──────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────┤   
-  │ normalize_top_k_affinities                               │ True → F.normalize(x, p=1, dim=1, eps=1e-12)                                                │ 
-  ├──────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────┤   
-  │ moe_fused_nki_kernel_enabled                             │ None (false) → NOT the TKG fused kernel. Token generation goes through                      │   
-  │                                                          │ MoE._forward_compute_bound → ExpertMLPsV2.forward_selective_loading                         │ 
-  ├──────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────┤   
-  │ glu_type="glu", hidden_act="silu",                       │                                                                                             │
-  │ hidden_act_scaling_factor=1.0, hidden_act_bias=0.0, no   │                                                                                             │   
-  │ gate/up clamp                                            │                                                                                             │
-  ├──────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────┤   
-  │                                                          │ -O1 --enable-saturate-infinity --enable-mixed-precision-accumulation --auto-cast=none,      │
-  │ Compiler flags                                           │ tensorizer: --enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2,                    │   
-  │                                                          │ vector_dynamic_offsets DGE                                                                  │
-  └──────────────────────────────────────────────────────────┴─────────────────────────────────────────────────────────────────────────────────────────────┘   
-                                                                  
-  Consequence: every dot instruction in the HLO has precision_config=[DEFAULT, DEFAULT], but because of --enable-mixed-precision-accumulation all bf16 matmul  
-  PSUMs are FP32 internally with the final store cast to the stated output dtype.
-                                                                                                                                                               
-  2. MoE dispatch path                                            
+# How NxDI Qwen3-MoE Token-Gen Executes RMSNorm + MoE on Trainium3
 
-  For token generation (seq_len == 1, T=1, top_k=8):                                                                                                           
-  - MoE.forward is called with residual=None → _forward_compute_bound.
-  - rmsnorm on the MoE module is None (because init_tkg_module=False). Post‑attention RMSNorm is therefore applied outside the MoE module by                   
-  NeuronQwen3MoeDecoderLayer.                                                                                                               
-  - sequence_parallel_enabled=False so no scatter / gather on hidden states.                                                                                   
-  - ep_enabled=False and token_shuffle_group_size=1.                        
-  - In ExpertMLPsV2.forward: perc_experts_loaded = T·top_k / E = 8/128 = 0.0625 < DEFAULT_SELECTIVE_LOADING_THRESHOLD, so the runtime calls                    
-  forward_selective_loading.                                                                                                                                   
-                                                                                                                                                               
-  The HLO op_names confirm this: …/MoE[.49][1]/_forward_compute_bound/ExpertMLPsV2[.49][1]/forward_selective_loading/….                                        
-                                                                                                                                                               
-  3. Tensor inputs/outputs of the MoE block                       
-                                                                                                                                                               
-  - Input (to mlp(...)): bf16[1,1,2048] = post‑attention hidden states (already normalized).                                                                   
-  - Output (from mlp(...)): bf16[1,1,2048], identical on all 4 TP ranks after the all‑reduce.
-  - Residual add (hidden_states = residual + mlp_output) happens in the decoder wrapper, not in the kernel.                                                    
-                                                                                                                                                               
-  The post_attention_layernorm that feeds the MoE:                                                                                                             
-  %325 = bf16[1,1,2048] add(%17, attn_output)                    # post-attn residual                                                                          
-  %326 = f32  convert(%325)                                      # bf16 → fp32                                                                                 
-  %336 = f32  AwsNeuronRmsNorm(%326, weight_bf16, eps=1e-6_f32)  # backend_config="2" (dim=-1 on 2048)                                                         
-  %337 = bf16 convert(%336)                                      # fp32 → bf16 → MoE input                                                                     
-                                                                                                                                                               
-  4. Shard‑local expert weights (per TP rank, bf16)                                                                                                            
-                                                                                                                                                               
-  Identified by parameter shape and layout from convert_qwen3_moe_hf_to_neuron_state_dict:                                                                     
-                                                                                                                                                               
-  ┌───────────────────────────────────────────────┬──────────────────────┬──────────────────────────────────────────────────────────────────────┐              
-  │                     Param                     │      HLO shape       │                                Layout                                │
-  ├───────────────────────────────────────────────┼──────────────────────┼──────────────────────────────────────────────────────────────────────┤              
-  │ router.linear_router.weight (%319)            │ bf16[128, 2048]      │ [E, H], replicated across TP ranks                                   │
-  ├───────────────────────────────────────────────┼──────────────────────┼──────────────────────────────────────────────────────────────────────┤
-  │ expert_mlps.mlp_op.gate_up_proj.weight (%448) │ bf16[128, 2048, 384] │ [E, H, 2·I_TP]: gate in positions [0:192], up in positions [192:384] │              
-  ├───────────────────────────────────────────────┼──────────────────────┼──────────────────────────────────────────────────────────────────────┤              
-  │ expert_mlps.mlp_op.down_proj.weight (%432)    │ bf16[128, 192, 2048] │ [E, I_TP, H]                                                         │              
-  └───────────────────────────────────────────────┴──────────────────────┴──────────────────────────────────────────────────────────────────────┘              
-                                                                  
-  5. Exact per‑op sequence (with precisions)                                                                                                                   
-                                                                  
-  All HLO instruction ids below are layer 0. Later layers repeat the same structure.                                                                           
-                                                                  
-  5a. Router projection — bf16 matmul                                                                                                                          
-                                                                  
-  %338 = bf16[1,2048] reshape(%337)                                  # hidden states (post-LN)                                                                 
-  %320 = bf16[2048,128] transpose(%319)                              # router weight Wᵣᵀ                                                                       
-  %339 = bf16[1,128] dot(%338, %320)                                 # router_logits; fp32 PSUM, bf16 store                                                    
-                                                                     # contract: lhs=[1], rhs=[0]                                                              
-  %341 = bf16[1,128] reshape(%339)                                   # flat (T=1, E=128)                                                                       
-  - No bias.                                                                                                                                                   
-  - Same on every TP rank (weight is replicated), so router_logits are identical across ranks — this guarantees consistent top‑k and affinities globally.      
-                                                                                                                                                               
-  5b. Top‑K — custom call on bf16 logits                                                                                                                       
-                                                                                                                                                               
-  %348 = (bf16[1,8], u32[1,8]) CustomCall(AwsNeuronTopK, backend_config="8")(%341)                                                                             
-  %350 = u32[1,8] get-tuple-element(%348)   # indices (the top_k values are discarded)                                                                         
-  %351 = s64[1,8] convert(%350)             # cast to int64 for downstream gathers                                                                             
-  - The top‑k values (bf16) are not used — only the indices.                                                                                                   
-  - Top‑k is taken on bf16 router logits (pre‑softmax), matching torch.topk(router_logits, top_k) in RouterTopK.forward.                                       
-                                                                                                                                                               
-  5c. Softmax over all 128 logits — FP32                                                                                                                       
-                                                                                                                                                               
-  apply_activation_fn requests dtype=torch.float64; Trainium downgrades to FP32, so the actual silicon computation is fp32:                                    
-                                                                                                                                                               
-  %380 = f32[1,128] convert(%341)                          # bf16 logits → fp32                                                                                
-  %386 = f32[1]     reduce(%380, -inf, dims=[1], MAX)      # max for stability                                                                                 
-  %388 = f32[1,128] subtract(%380, bcast(%386))                                                                                                                
-  %389 = f32[1,128] exponential(%388)                                                                                                                          
-  %395 = f32[1]     reduce(%389, 0.0, dims=[1], ADD)                                                                                                           
-  %397 = f32[1,128] divide(%389, bcast(%395))              # softmax probs                                                                                     
-  %398 = bf16[1,128] convert(%397)                         # cast to bf16 before gather                                                                        
+Source profile: `output/baseline/1776976164165154117/138311351493953_vnc_0.ntff` against `output/baseline/1776976164165154117/neff_138311351493953_vnc_2.neff` (model `token_generation_model/_tp0_bk2/model.MODULE_069222236a5ea438f22b+e91e8f48.neff`, instance `trn3.3xlarge`, TP=4, batch-bucket = 2 tokens).
 
-  NOTE (confirmed via NTFF): in the compiled graph these five HLO ops are fused into a single custom-call
-  on %convert.380 with op_type="aten__softmax". The hardware realisation uses a dedicated Scalar+Vector
-  engine sequence (ACT_TABLE_LOAD → TENSOR_REDUCE(MAX) → ACTIVATE COPY(scale/bias) → ACTIVATE EXP →
-  TENSOR_REDUCE(SUM) → RECIPROCAL → ACTIVATE COPY(scale/bias)). All arithmetic is fp32 in the
-  activation/vector pipelines. See Section 10.2 for the exact trace.
-                                                                                                                                                               
-  5d. Gather top‑k softmax affinities — bf16                                                                                                                   
-                                                                                                                                                               
-  Builds 2‑D gather indices (batch_idx, topk_pos) and gathers the bf16 softmax output:                                                                         
-                                                                  
-  %379 = s64[1,8,2] concatenate(%377, %378)                # [batch_idx, expert_idx] per top-k                                                                 
-  %399 = bf16[1,8] gather(%398, %379)                      # chosen_expert_affinities                                                                          
-                                                                                                                                                               
-  5e. L1 normalization of chosen affinities — bf16 (this matters for bit accuracy)                                                                             
-                                                                                                                                                               
-  This is F.normalize(x, p=1.0, dim=1, eps=1e-12), executed entirely in bf16:                                                                                  
-                                                                  
-  %400 = bf16[1,8] abs(%399)                                                                                                                                   
-  %407 = bf16[1]   reduce(%400, 0, dims=[1], ADD)          # bf16 accumulator!                                                                                 
-  %411 = bf16[1,1] clamp(min=%318, val=%408, max=%317)                                                                                                         
-         where %318 = 0x2B8D ≈ 1.001e-12  (bf16 of default eps=1e-12)                                                                                          
-               %317 = 0x7F80 = +Inf        (no upper bound)                                                                                                    
-  %415 = bf16[1,8] divide(%399, broadcast(%411))           # normalized chosen_expert_affinities                                                               
-                                                                                                                                                               
-  Take note: the reduction is AddComputation.403 which is bf16 add, not FP32. Summing 8 bf16 values in bf16 is a non‑associative source of drift.              
-                                                                                                                                                               
-  After normalization, the 8 scalars are cast to FP32 for later use:                                                                                           
-  %418 = f32[8,1] convert(%417=bf16[8,1] reshape(%415))           
-                                                                                                                                                               
-  5f. Gather per‑expert weight slabs                                                                                                                           
-                                                                                                                                                               
-  forward_selective_loading reads only the 8 chosen experts' weights from HBM (per rank):                                                                      
-                                                                                                                                                               
-  %431 = s64[8,1] concatenate(top_k_indices)               # after negative-index canonicalization                                                             
-  %433 = bf16[8, 192, 2048] gather(%432=down_proj, %431)   # down_proj for 8 experts                                                                           
-  %449 = bf16[8, 2048, 384] gather(%448=gate_up,  %431)    # gate_up_proj for 8 experts                                                                        
-  - slice_sizes=[1, 192, 2048] (down), [1, 2048, 384] (gate_up). Each gather pulls exactly the 8 chosen expert slabs from the 128 stored experts.              
-                                                                                                                                                               
-  5g. Gate/Up projection — bf16 matmul with fp32 PSUM                                                                                                          
-                                                                                                                                                               
-  %464 = bf16[1,1,2048] reduce(%454 = bf16[1,1,1,2048], 0, dims=[0], ADD)   # identity (reducing dim=1)
-  %465 = bf16[1,1,8,384] dot(%464, %449)                                     # contract: lhs=[2], rhs=[1]                                                      
-  %466 = bf16[8,1,1,384] transpose(%465)                                     # move expert axis to front                                                       
-  - Shape math: [1,1,2048] · [8,2048,384] → [1,1,8,384]. LHS is broadcast (no batch dim); each expert receives the same hidden vector.                         
-  - bf16 × bf16 → bf16, with FP32 accumulator (mixed‑precision flag).                                                                                          
-                                                                                                                                                               
-  5h. Activation (GLU + SiLU) — sliced, cast‑heavy                                                                                                             
-                                                                                                                                                               
-  Mapping to Experts._activation, with scaling_factor=1.0, bias=0.0:                                                                                           
-                                                                                                                                                               
-  # gate = x[..., 0:192], up = x[..., 192:384]   (torch.chunk order)                                                                                           
-                                                                                                                                                               
-  # UP path (up + bias, bias=0):                                                                                                                               
-  %467 = bf16[8,1,1,192] slice(%466, last_dim=[192:384])        # UP                                                                                           
-  %468 = bf16[] multiply(%435=0.0_bf16, %434=1.0_bf16)          # = 0.0 (compile-time folded bias expression)                                                  
-  %470 = bf16[8,1,1,192] add(%467, broadcast(%468))             # up + 0  (still a real bf16 add in HLO)                                                       
-  %471 = f32[8,1,1,192] convert(%470)                           # → fp32                                                                                       
-                                                                                                                                                               
-  # GATE path (scaling_factor * gate, scaling=1.0):                                                                                                            
-  %473 = bf16[8,1,1,192] slice(%466, last_dim=[0:192])          # GATE                                                                                         
-  %474 = f32[8,1,1,192] convert(%473)                           # → fp32                                                                                       
-  %476 = f32[8,1,1,192] multiply(%474, broadcast(%472=1.0_f32)) # gate * 1.0                                                                                   
-  %477 = bf16[8,1,1,192] convert(%476)                          # → bf16 for the SiLU custom call                                                              
-                                                                                                                                                               
-  # SiLU:                                                                                                                                                      
-  %484 = bf16[8,1,1,192] CustomCall(AwsNeuronSilu)(%477)        # silu in bf16                                                                                 
-                                                                                                                                                               
-  # Combine (silu(gate) * up) in fp32:                                                                                                                         
-  %485 = f32[8,1,1,192] convert(%484)                           # silu → fp32                                                                                  
-  %486 = f32[8,1,1,192] multiply(%485, %471)                    # silu(gate) * up  (fp32)                                                                      
-  %487 = bf16[8,1,1,192] convert(%486)                          # → bf16 for down_proj input                                                                   
-  Key precisions:                                                                                                                                              
-  - The bias add and the slicing happen in bf16.                                                                                                               
-  - The scale×gate multiply happens in fp32 (because hidden_act_scaling_factor lowers as an fp32 constant), but the result is cast to bf16 before the SiLU.    
-  - SiLU is the AwsNeuronSilu custom op on bf16 inputs; its internal math is bf16 (NeuronCore activation engine on bf16; for bit accuracy you should match the 
-  ACT‑engine SiLU on bf16, not an fp32 reference).                                                                                                             
-  - The gate×up combine is fp32; the product is rounded to bf16 before down_proj.                                                                              
-                                                                                                                                                               
-  5i. Down projection — bf16 batched matmul                                                                                                                    
-                                                                                                                                                               
-  %488 = bf16[8,1,1,2048] dot(%487, %433)                                                                                                                      
-           lhs_contract=[3], rhs_contract=[1], lhs_batch=[0], rhs_batch=[0]                                                                                    
-  - [8,1,1,192] · [8,192,2048] → [8,1,1,2048]: batched over the expert dim, contract on I_TP=192.                                                              
-  - bf16 × bf16 → bf16, FP32 accumulator.                                                                                                                      
-                                                                                                                                                               
-  5j. Per‑expert weighting and sum‑reduce over top‑k — bf16 reduction!                                                                                         
-                                                                                                                                                               
-  %491 = bf16[8,2048] reshape(%490)
-  %492 = f32[8,2048]  convert(%491)                      # → fp32                                                                                              
-  %493 = f32[8]       reshape(%418)                      # normalized chosen affinities (fp32)                                                                 
-  %495 = f32[8,2048]  multiply(%492, broadcast(%493))    # per-expert output * affinity, fp32                                                                  
-  %496 = bf16[8,2048] convert(%495)                      # round to bf16                                                                                       
-  %497 = bf16[] constant(0.0)                                                                                                                                  
-  %503 = bf16[2048]   reduce(%496, %497, dims=[0], AddComputation.499)                                                                                         
-  Two very important bit‑accuracy facts here:                                                                                                                  
-  1. The affinity modulation out_e * a_e is done in FP32 (convert up, multiply, then convert back to bf16).                                                    
-  2. The top‑k reduction sum_{e in top_k} (AddComputation.499 = bf16 add at the HLO level) is physically
-     implemented as reduce‑as‑MATMUL on the Tensor engine — i.e. a matmul against an all-ones vector with
-     an FP32 PSUM accumulator, with the final value rounded to bf16 once on store. Effective semantics:
-       out[h] = bf16( Σ_{e=0..7} fp32( wz_bf16[e, h] ) )
-     not a stepwise bf16 accumulator. Match this in your kernel with a single fp32-accumulated reduction
-     rounded once at the end — do NOT fold left/right in bf16 and do NOT keep the running sum in fp32
-     across iterations without matching the rounding semantics of a one-shot reduction. See Section 10.3
-     for the hardware evidence (`%reduce.503` lowers to TENSOR_REDUCE + MATMUL with acc_flags=3).
-
-  This is a correction to the earlier HLO-only reading, which suggested a literal bf16 sequential sum.
-                                                                                                                                                               
-  5k. TP all‑reduce — bf16                                                                                                                                     
-                                                                                                                                                               
-  %515 = (bf16[1,1,2048], bf16[]) all-reduce(%513=moe_output_bf16, token_bf16)
-         replica_groups=[[0,1,2,3]], constrain_layout=true, channel_id=0                                                                                       
-         computation = AddComputation.509 (bf16 add)                                                                                                           
-  - Reduce op is bf16 sum across the 4 TP ranks.                                                                                                               
-  - Because disable_numeric_cc_token=True, the fused numeric compensator token that openxla sometimes attaches is disabled. The (data, token) tuple output is  
-  still present, but the %514 token is effectively unused for numerics. Don't try to use it to "fix" reduction error.                                          
-  - After all‑reduce, %516 = bf16[1,1,2048] is reshaped and added to the pre‑MoE residual in the decoder wrapper.                                              
-                                                                                                                 
-  6. End‑to‑end summary (per layer, TKG, per TP rank)                                                                                                          
-                                                                                                                                                               
-  Let x ∈ bf16^H, H=2048, I_TP=192, E=128, k=8. Pseudocode matched to the HLO:                                                                                 
-                                                                                                                                                               
-  # --- post_attention_layernorm (outside mlp) ---                                                                                                             
-  xf = fp32(x)                                                                                                                                                 
-  n  = RMSNorm_custom(xf, weight_bf16, eps=1e-6_f32)    # internal math fp32
-  h  = bf16(n)                                          # MoE input                                                                                            
-                                                                  
-  # --- Router ---                                                                                                                                             
-  logits_bf16 = h @ Wr          ; Wr: bf16[2048,128]    # fp32 PSUM, bf16 result
-  topk_vals_bf16_UNUSED, idx_u32 = AwsNeuronTopK(logits_bf16, k=8)                                                                                             
-  idx_s64 = s64(idx_u32)                                                                                                                                       
-                                                                                                                                                               
-  # --- Softmax (full, fp32) ---                                                                                                                               
-  logits_f32 = fp32(logits_bf16)                                                                                                                               
-  m          = max(logits_f32, dim=-1, keepdim=True)              
-  p_f32      = exp(logits_f32 - m) / sum(exp(logits_f32 - m), dim=-1, keepdim=True)                                                                            
-  p_bf16     = bf16(p_f32)                                                                                                                                     
-                                                                                                                                                               
-  # --- Gather top-k affinities and L1-normalize (all bf16) ---                                                                                                
-  a_bf16     = gather(p_bf16, idx_s64)                    # bf16[k]                                                                                            
-  s          = clamp(sum_bf16(|a_bf16|), min=bf16(1e-12), max=+inf)   # bf16 accumulator                                                                       
-  a_norm_bf16= a_bf16 / s                                                                                                                                      
-  a_norm_f32 = fp32(a_norm_bf16)                          # kept as fp32 for the final weighting                                                               
-                                                                                                                                                               
-  # --- Selective weight load (bf16) ---                                                                                                                       
-  Wgu = gather(gate_up_proj, idx_s64)    ; Wgu: bf16[k, H, 2*I_TP=384]  # [gate|up]                                                                            
-  Wdn = gather(down_proj,    idx_s64)    ; Wdn: bf16[k, I_TP, H]                                                                                               
-                                                                                                                                                               
-  # --- Fused gate/up projection ---                                                                                                                           
-  y = h @ Wgu                             ; y:   bf16[1,1,k,384]   # fp32 PSUM                                                                                 
-  y = transpose(y)                        ; y:   bf16[k,1,1,384]                                                                                               
-  gate = y[..., 0:192]   ; up = y[..., 192:384]                      # bf16 each                                                                               
-                                                                                                                                                               
-  # --- GLU activation (precision schedule exactly as emitted) ---                                                                                             
-  up_plus_b   = bf16( up + bf16(0.0) )                               # bias add happens in bf16                                                                
-  up_f32      = fp32(up_plus_b)                                                                                                                                
-  gate_scaled = bf16( fp32(gate) * fp32(1.0) )                       # scaling in fp32, round to bf16
-  silu_bf16   = AwsNeuronSilu(gate_scaled)                           # bf16 custom call                                                                        
-  act_bf16    = bf16( fp32(silu_bf16) * up_f32 )                     # combine in fp32, round to bf16                                                          
-                                                                                                                                                               
-  # --- Down projection ---                                                                                                                                    
-  z_bf16 = batched_matmul(act_bf16, Wdn)      ; z: bf16[k,1,1,H]     # fp32 PSUM                                                                               
-  z_bf16 = reshape(z_bf16)                    ; z: bf16[k, H]                                                                                                  
-                                                                                                                                                               
-  # --- Expert-weighted sum over top-k (bit-sensitive) ---                                                                                                     
-  z_f32   = fp32(z_bf16)                                                                                                                                       
-  wz_f32  = z_f32 * a_norm_f32[:, None]                              # fp32 multiply                                                                           
-  wz_bf16 = bf16(wz_f32)                                             # round each per-expert row to bf16                                                       
-  out_bf16 = bf16( sum_f32( fp32(wz_bf16), dim=0 ) )                 # one-shot fp32 reduce, round once
-                                                                     # (HW: TENSOR_REDUCE + MATMUL fp32 PSUM)
-                                                                                                                                                               
-  # --- TP all-reduce (bf16 add) ---                                                                                                                           
-  out_bf16 = all_reduce_bf16_sum(out_bf16, group=[0,1,2,3])          # bf16 sum across 4 ranks                                                                 
-  # Residual add + next layer...                                                                                                                               
-                                                                                                                                                               
-  7. Bit‑accuracy checklist for your kernel                                                                                                                    
-                                                                                                                                                               
-  To match this compiled graph bit‑exactly when using the same rank’s shard of weights:                                                                        
-  
-  1. Router must be computed as bf16 @ bf16 with fp32 accumulator and bf16 store. Do not promote the router weight to fp32 even though router_config.dtype says
-   so — the HLO parameter is bf16.                                                                                                                           
-  2. Top‑k is taken on bf16 pre‑softmax logits. Do not apply softmax before topk.                                                                              
-  3. Softmax is fp32 (not fp64, and not bf16). Use the max‑subtract stabilization exactly as emitted. Cast result to bf16 before gather.                       
-  4. L1 normalization of the top‑k affinities is entirely bf16 with eps ≈ bf16(1e-12) = 0x2B8D. Sum of 8 bf16 values uses bf16 accumulator. Do not reorder or  
-  promote.                                                                                                                                                     
-  5. After normalization, the affinities are held as fp32 for the final per‑expert multiply. Emit the bf16 → fp32 cast explicitly.                             
-  6. GLU activation must follow the exact cast schedule:                                                                                                       
-    - UP path: bf16 add bias(=0) → fp32.                                                                                                                       
-    - GATE path: fp32 multiply scale(=1) → bf16 → AwsNeuronSilu → fp32.                                                                                        
-    - Combine: fp32 × fp32 → bf16.                                                                                                                             
-  The bias and scaling constants fold to 0.0 and 1.0 respectively for Qwen3‑MoE, but the casts remain and change rounding.                                     
-  7. SiLU must be the bf16 AwsNeuronSilu custom op. An fp32 silu will produce drift. On hardware this is the activation engine's bf16 SiLU.                    
-  8. Down proj: bf16 batched dot (lhs_batch=[0], rhs_batch=[0]) with fp32 PSUM.                                                                                
-  9. Per‑expert weighting is fp32 → round each per-expert row to bf16. The top‑k sum is then done on the
-  Tensor engine as a reduce‑as‑matmul with FP32 PSUM and a single bf16 rounding on store. i.e.:
-       wz_bf16[e] = bf16( fp32(z_bf16[e]) * a_f32[e] )
-       out_bf16   = bf16( Σ_e fp32(wz_bf16[e]) )
-  Do NOT replace the rounding‑then‑reduce with a fused fp32 mul-accumulate; the per-expert bf16 rounding
-  happens before the reduction and is load-bearing. Do NOT implement the top-k sum as a stepwise bf16
-  accumulator either — it is a one-shot fp32-accumulated reduce.
-  10. All‑reduce across the 4 TP ranks is a bf16 sum with replica_groups [[0,1,2,3]], constrain_layout=True, channel_id=0, and disable_numeric_cc_token=True   
-  (so the numeric‑compensator token is off; don't add one).                                                                                                    
-  11. Weight slab gather is exactly gather(gate_up, idx) and gather(down, idx) of slice_sizes [1, 2048, 384] and [1, 192, 2048] respectively — same gather   
-  pattern on every rank; differences come only from the rank's weight shard.                                                                                   
-  12. post_attention_layernorm is not inside the MoE module for this config — it is applied by the decoder wrapper: bf16 → fp32 → AwsNeuronRmsNorm(fp32,     
-  weight=bf16, eps=1e-6_f32) → bf16. Eps is an fp32 constant; weight is bf16 and the multiply happens inside the custom op at fp32 precision (then cast to fp32
-   output, then bf16 by the outer convert).                                                                                                                  
-                                                                                                                                                               
-  8. Files / ops to mirror                                                                                                                                     
-  
-  - MoE._forward_compute_bound — driver (no rmsnorm, no shared experts, no SP, no EP, no token shuffle).                                                       
-  - ExpertMLPsV2.forward_selective_loading — top-k-indexed Experts(...) invocation (T=1).                                                                    
-  - Experts.forward / Experts._activation (glu_type=GLU, silu, scaling=1, bias=0).                                                                             
-  - RouterTopK.forward → RouterBase.get_router_logits (bf16) + apply_activation_fn (fp64 requested → fp32 on device) + torch.topk on bf16 logits.              
-  - nn.Linear of router: weight [E,H], stored bf16, replicated across TP.                                                                                      
-  - RMSNorm: torch_neuronx.xla_impl.ops.RmsNorm → AwsNeuronRmsNorm(input_f32, weight_bf16, eps_f32, dim=-1), wrapped by CustomRMSNorm for the bf16↔fp32 dance. 
-                                                                                                                                                               
-  If you reproduce the above op sequence with exactly these dtypes, casts, reduction orders, and custom‑op choices on the same weight shards, your kernel      
-  output will match the compiled graph bit‑for‑bit at the MoE boundary on every TP rank.            
+This is the layout the compiler chose for the **baseline** (non-NKI) NxDI lowering of Qwen3-MoE on NeuronCore-v3. All numbers below were taken directly from `neuron-profile view --output-format json` and `neuron-profile show-session`, and constants (eps, scales, memsets) were decoded from the operand strings of individual instructions.
 
 ---
 
-# NEFF/NTFF (hardware execution)
-
-Ground-truth mapping of the MoE HLO ops to actual hardware instructions, derived from the compiled NEFF
-and runtime NTFF (`neuron-profile view --output-format json`). Evidence pulled from:
-
-- NEFF: `output/.../neff_138311351493953_vnc_2.neff`
-  (corresponds to `baseline_compiler_dir/token_generation_model/_tp0_bk2/`).
-- NTFF: `output/.../138311351493953_vnc_0.ntff` (NC 4 of an LNC=2 pair).
-
-All counts/times below are for **one decoder layer's MoE section on one NC** (`MoE[.49][97]`). Layer 0
-appears in the compiled module under identifier `[.49]` (subsequent layers are [.50], [.51], ...).
-1,859 hardware instructions live inside this MoE block on a single NC.
-
-Aggregate profile context:
-- instance_type = trn3.3xlarge, LNC=2 (sg00=NC4, sg01=NC5).
-- total_time = 13.24 ms; MFU=0.08%; MBU=10.4% (bandwidth-bound, as expected for TKG).
-- HBM read 1.61 GB, write 7.17 MB across the whole model step.
-- 99 CC ops total (1 BARRIER + 98 bf16 AllReduces of 2048 elements each).
-
-## 10.1 HLO → hardware-op map per MoE layer (one NC)
-
-| HLO op (attribution)                      | Engine(s)        | Hardware opcodes                                                          |  Count |   Active |     HBM read |
-|-------------------------------------------|------------------|---------------------------------------------------------------------------|-------:|---------:|-------------:|
-| `%dot.9`  = router matmul `h @ Wrᵀ`       | Tensor           | LDWEIGHTS ×32, MATMUL ×32                                                 |     74 |  8.77 μs |    1024 KB   |
-| `%custom-call.444` = AwsNeuronTopK        | Vector           | MAX8 ×2, MATCH_VALUE_LOAD ×2, FIND_INDEX8 ×2 (+ 4 Sync/DMA)               |     10 |  2.84 μs |        —     |
-| `%custom-call = ...(%convert.380)` = softmax (compiler-fused) | Scalar + Vector | ACT_TABLE_LOAD, TENSOR_REDUCE ×2, ACTIVATE COPY(scale/bias) ×2, ACTIVATE EXP, RECIPROCAL (+ sync/DMA) | 14 | 4.41 μs | 0.5 KB |
-| `%gather.399` = top-k gather of softmax probs | GpSimd       | LOAD_MASK_SELECT, POOL_BUFFER_LOAD, STREAM_SHUFFLE, GATHER, DMA_DIRECT2D  |      6 |  1.26 μs |     0.2 KB   |
-| `%add.441/357`, `%select.445/361` = neg-index canonicalization | GpSimd | TENSOR_TENSOR, COPY, COPY_PREDICATED, COPY_PREDICATED_SCALAR          |    ~22 |  ~3.8 μs |        —     |
-| `%clamp.0` = F.normalize clamp (ε=1e-12)  | Scalar           | TENSOR_SCALAR                                                             |      1 |  0.17 μs |        —     |
-| `%divide.415` = L1 normalize (a / Σ|a|)   | Vector + Scalar  | RECIPROCAL, ACTIVATE                                                      |      2 |  0.48 μs |        —     |
-| `%gather.449` = gather(gate_up_proj, idx) | GpSimd + DMA     | ALU_OP ×40, TENSOR_LOAD ×16, MOVE ×16, **DMA_DIRECT2D ×16**               |     89 |  9.47 μs | **12,288 KB (12 MB)** |
-| `%gather.433` = gather(down_proj, idx)    | GpSimd + DMA     | ALU_OP ×40, TENSOR_LOAD ×16, MOVE ×16, **DMA_DIRECT2D ×16**               |     88 |  8.19 μs | **6,144 KB (6 MB)**   |
-| `%dot.10` = gate_up matmul                | Tensor           | LDWEIGHTS ×512, MATMUL ×512 (tile 128×96; acc_flags {0:472, 1:20, 2:20})  |  1,024 | 156.8 μs |        —     |
-| `%custom-call.445` = AwsNeuronSilu        | Scalar + Vector  | ACT_TABLE_LOAD ×2, ACTIVATE act_fn=SILU ×2, TENSOR_TENSOR ×2              |      6 |  3.36 μs |        —     |
-| `%dot.11` = down_proj matmul              | Tensor           | LDWEIGHTS ×256, MATMUL ×256 (tile 96×128; acc_flags=3 everywhere)         |    517 | 65.9 μs  |        —     |
-| `%reduce.503` = top-k bf16 sum (dim=0)    | Tensor + Vector  | TENSOR_REDUCE + LDWEIGHTS + **MATMUL (transpose_mode=ENABLED)** + COPY + DMA_DIRECT2D | 5 | 1.28 μs | — |
-| `%all-reduce.515` = TP all-reduce (bf16)  | GpSimd trigger → CC-cores | WRITE (GpSimd) + EVENT_SEMAPHOREs; data movement on CC-cores     |      1 | 0.23 μs trigger / **9.15 μs CC** | 4 KB |
-
-Per-engine active time within one MoE layer on one NC (span ≈ 204 μs; engines run concurrently):
-
-| Engine   | Instructions | Active time |
-|----------|-------------:|------------:|
-| Tensor   |        1,606 |    230.7 μs |
-| GpSimd   |          192 |     19.2 μs |
-| Scalar   |           25 |      9.1 μs |
-| Vector   |           26 |      4.8 μs |
-| Sync     |           10 |      3.1 μs |
-
-## 10.2 Softmax is fused to a single custom-call on hardware
-
-HLO has five element-wise ops (max / sub / exp / sum / div), but the compiled graph collapses them into
-one custom-call tagged `op_type="aten__softmax"`. The hardware sequence, in timestamp order for
-`%custom-call = custom-call(%convert.380)`:
+## 1. Reference graph (per decoder layer)
 
 ```
-[Scalar] ACT_TABLE_LOAD                           # load EXP LUT
-[Sync ] DMA_DIRECT2D  × 2                         # stage
-[Vector] TENSOR_REDUCE                            # MAX over 128 lanes
-[Scalar] ACTIVATE act_fn="COPY(scale/bias enabled)"  # subtract max  (bias = −max)
-[Scalar] ACTIVATE act_fn="EXP"                    # exp via LUT
-[Vector] TENSOR_REDUCE                            # SUM
-[Vector] RECIPROCAL                               # 1 / sum
-[Scalar] ACTIVATE act_fn="COPY(scale/bias enabled)"  # multiply by 1/sum
+hidden_states (bf16, replicated across TP)
+  └─ post_attention_layernorm   (CustomRMSNorm, eps=1e-6)            <-- AwsNeuronRmsNorm
+       │
+       ▼
+  router (TP-replicated, dense Linear, weight stored in fp32)
+       │
+       ▼  router_logits  (fp32, NOT cast back to bf16 here)
+       │
+       ├──► softmax over E=128                                       <-- AwsNeuronSoftmax
+       │       │
+       │       ▼  expert_affinities (cast to bf16 at end)
+       │
+       └──► topk(router_logits, k=8)                                 <-- AwsNeuronTopK
+                │
+                ▼   expert_index (int32/long), top-k logit values unused
+       gather expert_affinities[t, expert_index[t]]                  -> chosen_expert_affinities (bf16)
+       F.normalize(chosen_expert_affinities, p=1, dim=1, eps=1e-12)  -> normalized weights (bf16)
+
+  per token t (T loop, T = 2 in this NEFF):
+       gate_up = ExpertFusedColumnParallelLinear[selective load]( hidden_states[t], expert_index[t] )
+                  --> (top_k=8, 1, 2*I/TP)   [I=768, TP=4 → 2*I/TP = 384]
+       gate, up = chunk(gate_up, 2, dim=-1)                           # (8,1,192) each
+       activated = SiLU(gate) * up                                    # bf16
+       down = ExpertFusedRowParallelLinear[selective load]( activated, expert_index[t] )  
+                  --> partial (top_k=8, 1, H)  [H=2048]
+       weighted = sum_over_topk( down * chosen_expert_affinities[t].unsqueeze(1) )  -> (H,)
+  output = stack(weighted, dim=0)                                     -> (T, H)
+
+  cross_replica_sum AllReduce across TP=4   <-- final all-reduce only here
+  residual add
 ```
 
-Everything is fp32 internally (input is `%convert.380 = fp32(bf16 logits)`). There are no intermediate
-bf16 tensors you can hook into — reproduce the end-to-end fp32 fused softmax, then cast to bf16.
+The MoE.forward chosen path is `forward_selective_loading` (because this is token-gen, T=2 is small). That is the per-token Python loop you can read in `expert_mlps_v2.py:595`.
 
-## 10.3 Top-k bf16 reduce is actually reduce-as-matmul with fp32 PSUM
+Top-k indices are computed from **raw fp32 router_logits**, not from the softmax output (`routing.py:204`). `apply_activation_fn` is computed in fp64 in the eager source, but XLA→Neuron lowers it to a single `AwsNeuronSoftmax` custom-call that operates on bf16 with fp32 accumulators (see §3.2).
 
-`%reduce.503 = bf16[2048] reduce(bf16[8,2048], init=0, dims=[0], AddComputation.499)` lowers to a
-Tensor-engine MATMUL:
+Logical per-TP-rank shapes are H=2048, I=768, E=128, top_k=8, TP=4, T=2 (`bk2`). There is still no expert-parallelism in this NEFF, but the compiled physical execution is **not** single-core per TP rank: it uses LNC=2 virtual-core sharding inside each logical TP rank.
 
-```
-operands: S[5] (Tensor)++@complete transpose_mode=ENABLED acc_flags=3 psum_zero=2048
-          src=bfloat16@...  dst=...  128*16
-```
+### 1.1 LNC=2 physical placement and sharding
 
-`transpose_mode=ENABLED` + an implicit all-ones right-hand operand makes the 8-wide reduce into a
-matmul that **accumulates in FP32 PSUM** and stores the final bf16 value in a single tile.
-This matters for bit-accuracy: treat the top-k sum as one-shot `bf16( Σ_{e} fp32(wz[e]) )`, not as a
-chain of bf16 adds, and not as an fp32 sum that skips the per-expert bf16 rounding (that rounding is
-done by the preceding `%convert.496`, which is the `fp32 * fp32 → bf16` store of the affinity-modulated
-expert outputs before this reduce).
+The NEFF header reports:
 
-## 10.4 TopK = hardware primitive, not softmax-then-sort
+| Field | Value |
+|---|---:|
+| `number_of_neuroncores_per_lnc` | `2` |
+| `number_of_logical_neuroncores` | `1` |
+| `number_of_cc_participants` | `4` |
+| enabled features | includes `virtual-core`, `dge`, `hw-dge` |
 
-`AwsNeuronTopK` has no fp32 path. On the Vector engine:
+The token-gen NTFF has two physical subgraphs for this one logical core:
 
-```
-[Vector] MAX8          — dedicated 8-way max primitive
-[Vector] MATCH_VALUE_LOAD
-[Vector] FIND_INDEX8   — extracts the u32 indices of the 8 max bf16 values
-(×2 rounds to cover the 128-lane dim)
-```
+| subgraph | physical core | LNC | trace count | tensor instr | gpsimd instr |
+|---|---:|---:|---:|---:|---:|
+| `sg00` | `ND0 NC4` | `0` | `243330` | `67147` | `42011` |
+| `sg01` | `ND0 NC5` | `0` | `237376` | `66652` | `41833` |
 
-Input is bf16 router logits, output is (bf16 values, u32 indices). The bf16 values are discarded. This
-is deterministic for a given bf16 input; replace with the same primitive in your kernel (do not sort
-fp32 softmax probs).
+This means the compiler is using two physical NeuronCores as one virtual/logical core. The MoE work is **sharded**, not replicated in full:
 
-## 10.5 SiLU is the activation engine's LUT-based bf16 SILU
+- MoE-attributed instruction counts are balanced across the pair: `sg00=103134`, `sg01=101886`.
+- For a representative layer (`NeuronQwen3MoeDecoderLayer[.49]`), router and expert matmuls appear on both subgraphs with the same HLO names but different SBUF/PSUM addresses.
+- The large matmuls are split across output/channel tiles. Examples for layer 49:
 
-`AwsNeuronSilu` under `%custom-call.445 = custom-call(%slice.473)` with
-`op_type="xla___op_SiluForwardImpl"`:
+| HLO | Meaning | `sg00` | `sg01` | Logical total |
+|---|---|---:|---:|---:|
+| `%dot.9` | router linear | 16 MATMUL | 16 MATMUL | 32 MATMUL |
+| `%dot.10` | gate/up projection | 256 MATMUL | 256 MATMUL | 512 MATMUL |
+| `%dot.11` | down projection | 128 MATMUL | 128 MATMUL | 256 MATMUL |
 
-```
-[Scalar] ACT_TABLE_LOAD                 # load SILU LUT (sigmoid table + x·sigmoid(x) fused)
-[Scalar] ACTIVATE act_fn="SILU"         # hardware SILU via LUT
-[Vector] TENSOR_TENSOR                  # outer fp32 combine, rounded to bf16 per HLO %487
-```
+The `channels=96` SiLU/multiply instructions on both `sg00` and `sg01` are the clearest sign of physical sharding: the logical per-TP intermediate is `I/TP = 192`, and each physical core handles one 96-wide shard. This is why the same logical HLO can appear on both subgraphs without meaning the full MoE is duplicated on both cores.
 
-Input is bf16, output is bf16. ACT-engine internals use an fp32 LUT but the rounded-to-bf16 store is
-deterministic — your reference SILU must match the LUT, not a Python `silu(x.float()).to(bfloat16)`.
+The split is asymmetric for scalar/vector post-processing:
 
-## 10.6 Expert weight gather = vector-dynamic-offset DGE DMA (GpSimd → HBM → SBUF)
+- `sg00` carries the full softmax custom-call for the router affinities.
+- top-k appears on both subgraphs, so both physical shards have the selected expert indices needed for local expert weight gathers.
+- the visible top-k weighted-sum reduction and the MoE TP all-reduce trigger are mostly attributed to `sg00`.
 
-`%gather.449` (gate_up slab) lowers to 16 PSEUDO_DMA_DIRECT2D instructions issued on GpSimd, with the
-HBM source address computed on-the-fly from a register table written by `ALU_OP MULTIPLY`:
+I did **not** find explicit physical-core `sendrecv` operations between `sg00` and `sg01`. The attributed instruction table has no `SEND`, `RECV`, `SENDRECV`, `send_recv`, `receive`, `DGE`-named instruction, `IMCPY`, or `PSEUDO_DMA_*` opcodes/operands, and the raw CC trace exposes `TPB_TRIGGER`, `DMA_ADVANCE`, semaphores, and `ALGO_MESH_*` events rather than send/recv-named events. The cross-core exchange needed by virtual-core execution is therefore compiler-managed and not represented as an explicit sendrecv collective in this profile.
 
-```
-ALU_OP:   op=MULTIPLY dtype=int32  src0=$R[61] src1=786432  dst=$R[60]      # idx × per-expert-bytes
-DMA_DIRECT2D:
-  compiler_opcode = PSEUDO_DMA_DIRECT2D     dge_op = DIRECT2D
-  src_elem_size   = 6144                    dst_elem_size = 6144
-  src_pattern     = [6144,1][128,1]         → 128 rows × 6144 bytes = 768 KB per DMA
-  dst_pattern     = [262144,1][128,1]
-  src_table_offset_reg = $R[61]             ← vector_dynamic_offsets DGE
-  src_table_index      = 24
-  dst_addr_imm         = 0x802000017220     (SBUF)
-  hbm_read_bytes  = 786432                  sbuf_write_bytes = 786432
+The explicit collectives are TP collectives: the NEFF has `number_of_cc_participants=4`, and the MoE collectives are `xla__cross_replica_sum` under `MoE/.../reduce_from_tensor_model_parallel_region`. There are 48 unique MoE all-reduce HLOs and 48 attention all-reduce HLOs in this token-gen graph.
+
+---
+
+## 2. RMSNorm (`CustomRMSNorm`) — instruction-by-instruction
+
+Framework wrapper (`neuronx_distributed_inference/modules/custom_calls.py:8`):
+
+```python
+def forward(self, hidden_states):                # hidden_states: bf16
+    original_dtype = hidden_states.dtype
+    hidden_states = hidden_states.to(torch.float32)        # _to_copy upcast
+    result = RmsNorm.apply(hidden_states, self.weight, eps=1e-6, dim=-1)
+    return result.to(original_dtype)             # cast back to bf16
 ```
 
-- 786,432 bytes = 2048 × 192 × 2 = one expert's gate_up slab-half.
-- 16 DMAs × 768 KB = 12 MB = 8 experts × 2048 × 384 × 2 bytes ✓ (matches HLO `slice_sizes`).
-- Source: HBM; Destination: SBUF. Issued by GpSimd engine; data moves on DMA queues.
+The `_to_copy` upcast is fused away by the compiler. In SBUF, **x is held in bf16** and engines read it as bf16; the upcast happens implicitly inside the engine MAC.
 
-`%gather.433` (down_proj) is analogous: 16 DMAs × 384 KB = 6 MB.
+Decoded constants in the operand strings (verified by hex):
 
-Tiny gathers (`%gather.399`, picking 8 bf16 softmax probs by index) use a different GpSimd path
-(`LOAD_MASK_SELECT + POOL_BUFFER_LOAD + STREAM_SHUFFLE + GATHER`), not DGE, because the payload is
-small.
+| memset/imm value | hex / float | meaning |
+|---|---|---|
+| `1065353216`        | `0x3F800000` = `1.0f`               | all-ones weight vector for the partition-reduce matmul |
+| `897988541`         | `0x358637BD` ≈ `9.9999999747e-7`    | `eps = 1e-6` (config `rms_norm_eps`) |
+| `scale = 0.000488`  | `1/2048` exactly (bf16 == fp32 here) | `1/H`, where `H = 2048` is the **full** hidden size |
 
-## 10.7 TP AllReduce
+The exact instruction sequence emitted **per CustomRMSNorm op** (single tile, channels=128, partition lanes = 128):
 
-From `cc_ops`:
+| # | engine | opcode | dtype path | role |
+|---|---|---|---|---|
+| 1 | Vector | `MEMSET`            | fp32 ← 1.0     | initialise the all-ones partition-reduce weight (128 lanes) |
+| 2 | Vector | `MEMSET`            | fp32 ← 1e-6    | stage `eps` for the rsqrt bias |
+| 3 | Scalar | `TENSOR_TENSOR MULTIPLY` | fp32 = fp32(γ) * bf16(x) | precompute `γ·x` (kept in fp32 in SBUF), used as multiplicand in step 8. **γ is held in fp32 SBUF**, the cast `bf16→fp32` happens once at load. |
+| 4 | Scalar | `ACTIVATE SQUARE`   | fp32 = SQUARE(bf16(x)) | per-partition squares of x. `bias_ptr=fp16@…`, `scale=1.0`, `imm=0` ⇒ `out = (1.0·x + 0)^2 + 0`. |
+| 5 | Vector | `TENSOR_REDUCE ADD dim=X` | fp32 ← Σ fp32 squares (along free axis) | within-partition sum of x² (16 elements per lane: 2048 / 128 = 16). |
+| 6 | Tensor | `LDWEIGHTS` + `MATMUL` (`fp32_mode=LOW_HIGH`, `acc_flags=1`, `psum_zero=2048`) | fp32 ← Σ across 128 lanes | cross-partition sum **using the matmul-with-ones trick**, fp32 emulated. The 1×128 partial sums are matmul'd by a 128-vector of `1.0f` to produce a single scalar broadcast back to all 128 lanes via PSUM. |
+| 7 | Tensor | `LDWEIGHTS` + `MATMUL` (`fp32_mode=HIGH`, `acc_flags=2`) | fp32 += high-half product | second matmul of the two-pass FP32 emulation: lane sums are split into bf16 LOW/HIGH halves; each half is multiplied by the all-ones bf16 weight and accumulated in PSUM. **Order matters**: LOW first (`acc_flags=1`, zero+accum), HIGH second (`acc_flags=2`, accum). |
+| 8 | Scalar | `ACTIVATE RECIPROCAL_SQRT` (`scale=1/2048`, `bias_ptr=fp32(1e-6)`) | fp32 ← `rsqrt(scale·sum + bias)` | computes `1/sqrt(mean(x²)+eps)`. **Fused** order: `rsqrt(s·x + b)`, where `s = 1/H = 1/2048` and `b = 1e-6`. Result kept in PSUM. |
+| 9 | Scalar | `ACTIVATE COPY` (`scale=[psum_addr]`, `imm=0`) | bf16 ← cast(fp32(γ·x) · rsqrt) | Multiplies the precomputed `γ·x` (step 3, fp32) by the per-token `rsqrt` (per‑partition scale loaded from PSUM `0x2000800`) and casts the result down to bf16 in one engine pass. |
+| 10 | Scalar | `COPY` int32 | bf16 lane shuffle | output reformat / strided write to consumer SBUF tile. |
+
+### What you must replicate, bit-exactly, for an RMSNorm kernel
+
+1. **Square the bf16 input directly.** `square = x^2` is computed by `ACTIVATE SQUARE` consuming bf16 and producing fp32. `(bf16(x))^2 → fp32` is exact (no rounding because `bf16→fp32` is bit-extension and fp32 holds the product exactly for x²).
+2. **Within-partition reduction:** plain fp32 `TENSOR_REDUCE ADD` along the free axis. Order is left-to-right within the engine; for K=16 elements per lane, this is a single one-shot reduce, so no associativity ambiguity at this stage.
+3. **Cross-partition reduction:** **fp32 emulated matmul** with an all-ones vector, `LOW` then `HIGH`. Do **not** use a Vector-engine partition reduction (it would lose precision). The compiler is explicit about this — both `MATMUL` ops have `fp32_mode=LOW_HIGH` and write to the same PSUM offset.
+4. **Mean and rsqrt are fused:** `rsqrt(scale·sum + eps)` with `scale = 1.0f/H` (exact bf16, exact fp32) and `eps = 1.0e-6` (`0x358637BD`). Do not compute `mean = sum * (1/H)` in a separate step then add eps — the engine fuses it via the `bias_ptr`/`scale` operands of `ACTIVATE RECIPROCAL_SQRT`.
+5. **Final scale-and-cast is one op:** `out = bf16( (γ·x_fp32) * rsqrt_fp32 )` is one `ACTIVATE COPY` whose runtime `scale` operand is loaded from PSUM (`scale=[0x2000800]`). γ is loaded into SBUF as fp32 once.
+6. **γ load:** even though HF stores `Qwen3MoeRMSNorm.weight` as bf16, the compiler upcasts to fp32 at load time; the multiply in step 3 takes `src0=fp32` from SBUF address `0x3ff00`. If your kernel reads γ as bf16 and casts inside, you'll match — the `bf16→fp32` cast is bit-extension.
+
+### Things that are **not** done
+- No `mean(x²)` then `+ eps` then `rsqrt` in three separate ops. The compiler fuses to `rsqrt(scale·x + b)` (1 instruction).
+- No use of `RECIPROCAL` followed by `SQRT`. Always `RECIPROCAL_SQRT`.
+- No promotion of γ during `MULTIPLY` — γ is **already** fp32 in SBUF.
+
+---
+
+## 3. MoE — exact precision and op chain
+
+### 3.1 Router linear (`get_router_logits`)
+
+Module: `RouterTopK` over a `Linear` of shape `(num_experts=128, hidden_size=2048)`. **`router_config.dtype = torch.float32` is forced** in `Qwen3MoeInferenceConfig` (line 263 of `modeling_qwen3_moe.py`), so the weight is stored fp32 on the host. In this token-gen NEFF, the router matmul produces the full 128-logit row on each logical TP rank; the profiler shows 128-wide tensor tiles and no pre-softmax router AllReduce.
+
+What happens on hardware (per decoder layer, `bk2` token bucket):
+
+- LDWEIGHTS: `bfloat16@…[partition,free,K] 128*128`  — the fp32 weight is fed to the tensor engine in **bf16** halves (no `fp32_mode=LOW_HIGH` is set; native bf16 matmul to fp32 PSUM).
+- MATMUL: `src=bf16(hidden), dst=fp32(PSUM), psum_zero=2048, acc_flags=1` for the first K-tile, then `acc_flags=0` for subsequent K-tiles. The logical layer has **32 LDWEIGHTS+MATMUL pairs** for the `bk2` bucket, split as 16 on `sg00` and 16 on `sg01`.
+- The PSUM result (fp32) is consumed directly by the softmax custom-call without rounding to bf16 first — the HLO chain after this matmul is `convert.X` (fp32 → bf16) then the softmax custom-call. That `convert` is fused into the next op's source dtype.
+
+Bit-exact recipe for a fused router NKI kernel:
+- Multiply `bf16(hidden_states) × bf16(router_weight_T)` with **fp32 PSUM accumulation**.
+- K dimension reduces along partition + free; the compiler chose a single 128-partition × 128-free tile and stationary-weight semantics (`tag_weight_mode=WEIGHT_ONLY`).
+- Do **not** apply fp32 LOW_HIGH emulation on the router matmul (the compiler did not). The router weight is bf16 from the engine’s view.
+- After the matmul, the next consumer (softmax) reads the fp32 PSUM directly, but the topk consumer reads the same value (cast to bf16). If your kernel persists `router_logits` to SBUF for both consumers, **persist as bf16 once** — that is what the compiler does (see `convert.380` and `reshape.341` in the HLO names).
+
+### 3.2 Softmax (`apply_activation_fn`, `AwsNeuronSoftmax`)
+
+Source code says `F.softmax(weights, dim=1, dtype=torch.float64)`. Lowered to a single custom-call `xla___op_SoftmaxForwardImpl_custom-call`. Sequence on hardware (one decoder layer):
+
+| # | engine | opcode | dtype | role |
+|---|---|---|---|---|
+| 1 | (DMA) | `ACT_TABLE_LOAD table_sel=2` | — | load EXP lookup table |
+| 2 | DMA | `DMA_DIRECT2D` | bf16 | bring router_logits tile into SBUF (twice — one per `nd` half) |
+| 3 | Vector | `TENSOR_REDUCE op=MAX dim=X` | bf16 → fp32 | per-row max |
+| 4 | Scalar | `ACTIVATE COPY scale=-1.0` | fp32 → fp32 | negate max ⇒ `-m` |
+| 5 | Scalar | `ACTIVATE EXP bias_ptr=fp32(-m), scale=1.0` | bf16 → fp32 | `exp(scale·x + bias) = exp(x − m)` per element |
+| 6 | Vector | `TENSOR_REDUCE op=ADD dim=X` | fp32 → fp32 | denominator `Z = Σ exp` |
+| 7 | Vector | `RECIPROCAL` | fp32 → fp32 | `1/Z` |
+| 8 | Scalar | `ACTIVATE COPY scale=[1/Z]` (next ACTIVATE) | fp32 → bf16 | multiply each `exp(...)` by `1/Z` and cast to bf16 |
+
+So although the eager Python is fp64, **on Neuron softmax is bf16 input → fp32 internal → bf16 output**. The intermediate `exp` is fp32 (kept in SBUF at `0x1804948`, 128 fp32 elements per partition). Subtracting the max is done by computing `−m` (a single `ACTIVATE COPY scale=-1`) and then folding `exp(x + (-m))` via the `bias_ptr` operand of `ACTIVATE EXP`.
+
+Bit-exact recipe:
+- One row max (bf16 → fp32), negate, fuse into EXP via `bias_ptr` of the activate.
+- Single fp32 reduction over the **full E=128** router row. There is no pre-softmax router AllReduce in this trace; `convert.380` is the bf16 cast of the full router logits before the softmax custom-call.
+- One `RECIPROCAL` into a per-row scalar; final ACTIVATE multiplies and casts to bf16.
+
+### 3.3 TopK (`AwsNeuronTopK`, k=8)
+
+Per the profile, this uses the dedicated topk hardware ops:
 
 ```
-operation     = AllReduce
-algorithm     = Mesh                          (not Ring / not Tree)
-replica_group = [[0, 1, 2, 3]]
-dtype         = bf16
-num_elements  = 2048
-input_size    = 4096 bytes (bf16 × 2048)
-output_size   = 4096 bytes
-trigger_engine= GpSimd                        (a single WRITE on GpSimd fires it)
-duration      = ~9.15 μs  (one MoE AR)
+MAX8           src=bf16,    dst=bf16   (8 winners by value, per row, 1 round)
+MATCH_VALUE_LOAD                       (set up for index search)
+FIND_INDEX8    src=bf16,    dst=uint32 (8 indices matching the 8 max values)
 ```
 
-On the Tensor/Vector/Scalar engines the AR appears only as a single `WRITE` (GpSimd) plus semaphore
-events; the actual network traffic runs on the CC-cores. With
-`--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2`, the MoE AllReduce on layer N overlaps
-the next layer's attention/matmul work: verified by tracing the first MoE AR (trigger at t=231,604 ns)
-— within the next 20 μs, **334 of 363** Tensor-engine instructions belong to layer 50 (and only 14 to
-layer 49 itself). `cc_op_active_time_percent = 5.86%` across the whole model, i.e. most CC time is
-hidden behind compute.
+The compiler emits two pairs `(MAX8, MATCH_VALUE_LOAD, FIND_INDEX8)` per layer: one for each token in the bk2 batch. Inputs are **bf16 router_logits** (note: top-k is over the bf16 cast of the router logits, **not** over softmax outputs — confirms `routing.py:204`).
 
-## 10.8 RMSNorm (context — applied outside the MoE module)
+For a bit‑exact kernel, you must call `MAX8` / `FIND_INDEX8` on the **bf16-rounded router logits**, not on fp32. If you keep router_logits in fp32 in your kernel for use by softmax, cast a bf16 copy before calling top-k — otherwise tie-break behaviour and rounding will diverge. (Qwen3’s router is fp32 in HF, but the casted bf16 is what’s used for top-k selection on hardware.)
 
-Both `input_layernorm` and `post_attention_layernorm` (CustomRMSNorm[.194] and [.197]) lower to the
-same Scalar+Vector+Tensor sequence on hardware:
+### 3.4 Selective expert load + gather
 
-```
-[Scalar] ACTIVATE act_fn="SQUARE"                 # x²
-[Vector] TENSOR_REDUCE                            # Σ x²
-[Tensor] LDWEIGHTS + MATMUL   × 4 (reduce-as-matmul for the 2048-dim sum)
-[Vector] MEMSET   × 4                             # PSUM clears
-[Scalar] ACTIVATE act_fn="RECIPROCAL_SQRT"        # 1 / √(mean_sq + ε)
-[Scalar] ACTIVATE act_fn="COPY(scale/bias enabled)"  # × (1/rms)
-[Vector] TENSOR_TENSOR                            # × weight (bf16)
-```
+For each of the 8 chosen experts per token, NxDI's `forward_selective_loading` does an HBM gather of just that expert's gate/up and down weight tiles, using the topk indices. In the trace this shows up as a chain of GpSimd `GATHER`, `STREAM_SHUFFLE`, `POOL_BUFFER_LOAD`, `LOAD_MASK_SELECT`, `DMA_DIRECT2D`. The expert indices are first translated through `aten.index.Tensor` (gather) → `aten__add_add` → `aten__where_select` (predicated copy) to map global `expert_index` to the local TP shard's slot.
 
-Internal precision is fp32 across the ACTIVATE path; the ε is an fp32 constant (1e-6); the weight is
-bf16 and the multiply happens at fp32 before the final bf16 store. Front the custom call by `bf16 →
-fp32` and follow it by `fp32 → bf16` exactly as in the HLO.
+The expert weights live in HBM laid out as `(E_local, hidden, 2*I_local)` for gate_up_proj and `(E_local, I_local, hidden)` for down_proj, both bf16. There is no quantization of expert weights here.
 
-## 10.9 Wall-time budget on one NC per MoE layer (engines concurrent)
+### 3.5 Fused gate_up matmul (`ExpertFusedColumnParallelLinear`, _activation)
+
+HLO: `%dot.X = dot(%reshape.X, %gather.X)`. Shapes (per token, per chosen expert):
 
 ```
-Tensor engine active   : ~230 μs   (gate_up 157 + down 66 + router 9 + reduce 1 + small)
-DMA active (expert W)  :  ~18 μs   (12 MB gate_up + 6 MB down, HBM→SBUF via DGE)
-GpSimd                 :  ~19 μs   (index canonicalization + DMA descriptor writes)
-Scalar  (ACTIVATE LUTs):   ~9 μs   (softmax EXP + silu + rms COPY/RECIP_SQRT)
-Vector                 :   ~5 μs   (reductions, TENSOR_TENSOR, MAX8/FIND_INDEX8, RECIPROCAL)
-Sync                   :   ~3 μs
-CC   (AllReduce)       :   ~9 μs   (fully overlapped with the next layer's compute)
-Wall span (one NC)     :  ~204 μs
+input:  (1, H=2048)            bf16
+weight: (H=2048, 2*I/TP = 384) bf16   <-- gathered for that expert
+output: (1, 384)               fp32 PSUM
 ```
 
-The Tensor engine's matmuls (gate_up + down_proj ≈ 223 μs) are the wall. The expert-weight DMA
-(~18 μs) finishes long before the matmuls do, so pure DMA optimisations will not shorten the critical
-path unless you also shorten the matmul time.
+512 LDWEIGHTS+MATMUL pairs per decoder layer per logical TP rank, split across the LNC=2 physical-core pair as 256 on `sg00` and 256 on `sg01`. With `T=2`, top_k=8, that is 2·8 = 16 expert matmuls per layer across the logical rank. Tile: **128 partition × 96 free**, and each physical core handles a 96-wide shard of the logical `I/TP = 192` gate or up half. `acc_flags=1` zeros PSUM at the start of K and `acc_flags=0` continues; native bf16 matmul to fp32 PSUM (no fp32 emulation).
 
-## 10.10 Corrections to the earlier HLO-only reading
+Then split: `gate, up = chunk(...)`. The split is **purely by SBUF address arithmetic** — no real data movement; the activation custom-call just reads the gate half from `slice.X` of the matmul output.
 
-1. **Softmax.** HLO shows 5 separate ops; the hardware executes a single fused softmax custom-call
-   (Section 10.2). Reference implementations must be end-to-end fp32 fused, with bf16 rounding only on
-   the final store.
+### 3.6 SiLU + gating (`xla___op_SiluForwardImpl_custom-call`, then mul)
 
-2. **Top-k bf16 sum (`%reduce.503`).** HLO's AddComputation.499 (bf16 add) lowers to a
-   Tensor-engine reduce-as-matmul with FP32 PSUM and a single bf16 rounding (Section 10.3). The
-   earlier checklist's "bf16 accumulator" is not literal — reproduce `bf16(Σ fp32(wz_bf16[e]))`, not a
-   stepwise bf16 fold.
+```
+ACT_TABLE_LOAD                    (SiLU LUT)
+ACTIVATE      SiLU(gate_fp32) -> bf16 SBUF
+TENSOR_TENSOR MULTIPLY            bf16 × bf16 -> bf16   (silu(gate) * up)
+```
 
-3. **AwsNeuronTopK.** Dedicated Vector-engine hardware primitives (MAX8/FIND_INDEX8), not a
-   sort-based path (Section 10.4).
+For Qwen3-MoE, `_glu = True`, `_glu_type = GLU` (default), `hidden_act_scaling_factor = 1.0`, `hidden_act_bias = 0`, no `gate_clamp`, no `up_clamp` — so `_activation` reduces to **`silu(gate) * up`** (no SwiGLU re-multiplication, no clamps). This matches `experts.py:227`:
+```python
+return self._activation_fn(self.hidden_act_scaling_factor * gate) * (up + self.hidden_act_bias)
+```
+with the scaling factor and bias being identity values.
 
-4. **Expert weight gather.** Lowers to PSEUDO_DMA_DIRECT2D with `src_table_offset_reg` =
-   vector-dynamic-offset DGE (Section 10.6), issued by GpSimd. Not a generic on-chip gather and not
-   pre-materialised.
+Bit-exact recipe:
+1. Read gate from PSUM (fp32) into the activate engine, apply `ACTIVATE SiLU` with the standard SiLU LUT (`activation_fn = silu`). Output **bf16**.
+2. Do not re-cast gate to bf16 then back — the compiler does fp32-PSUM → bf16 in one ACTIVATE.
+3. Multiply the bf16 silu(gate) by the bf16 up (which itself came from the same matmul output PSUM, cast to bf16 the same way). The MULTIPLY is `TENSOR_TENSOR op=MULTIPLY` with bf16 inputs and bf16 output.
 
-5. **TP AllReduce.** Algorithm is Mesh across [[0,1,2,3]], bf16, 2048-element payload (Section 10.7).
-   Already overlaps with the next layer's compute thanks to `--enable-ccop-compute-overlap`.
+### 3.7 Down projection (`ExpertFusedRowParallelLinear`)
 
-Everything else in the HLO analysis (router bf16 matmul, affinity softmax→gather→clamp→divide chain,
-GLU cast schedule, down_proj batched-over-experts matmul, fp32 affinity modulation with bf16 rounding,
-decoder-wrapper residual add) is confirmed by the profile.
+HLO: `%dot.X = dot(%reshape.X, %gather.X)` for the down weight. Shapes (per token, per chosen expert):
+
+```
+input:  (1, I/TP = 192)    bf16   (output of silu(gate)*up)
+weight: (I/TP=192, H=2048) bf16   gathered for that expert
+output: (1, H=2048)        fp32 PSUM   <-- partial, before TP all-reduce
+```
+
+256 LDWEIGHTS+MATMUL pairs per decoder layer per logical TP rank, split as 128 on `sg00` and 128 on `sg01`. Tile **96 partition × 128 free**, `acc_flags=3 psum_zero=2048` — i.e. each per-output-tile matmul zeroes PSUM and accumulates. Native bf16 matmul to fp32 PSUM. The PSUM bank addresses (`0x2003800`, `0x2003804`, `0x2003808`, … on `sg00`; different corresponding PSUM addresses on `sg01`) increment by 4 bytes per matmul: each matmul writes to a different free-dim tile of the output, accumulating K through the free dim of the input.
+
+This is partial output; the TP all-reduce comes last (§3.9).
+
+### 3.8 Routing-weight normalization and per-token expert weighted sum
+
+Computed as:
+```
+chosen_expert_affinities = expert_affinities[t, expert_index[t]]    # (top_k=8,) bf16
+denom = clamp(min=1e-12, sum_bf16(chosen_expert_affinities)*)       # fp32 internally
+weight = chosen_expert_affinities / denom                           # bf16 (F.normalize p=1)
+output_t = Σ_k  down_partial[k] * weight[k]                         # (H,)
+```
+
+In the trace, the order is:
+
+| Op | Engine | What it is |
+|---|---|---|
+| `aten.index.Tensor / gather`     | GpSimd `GATHER`   | gather affinities at top-k positions |
+| `aten.sum.dim_IntList / reduce.X` | Scalar `TENSOR_REDUCE op=ADD dim=X` | sum across top-k (8 elements) into fp32 |
+| `aten.clamp_min`                  | Vector `TENSOR_SCALAR ops=MAX,MIN` | `clamp_min(sum, 1e-12)`; the `imm` is the **bf16-rounded** value of `1e-12` ≈ `1.0018653e-12` (`F.normalize`'s default eps) |
+| `aten.div.Tensor`                 | Vector `RECIPROCAL` then `ACTIVATE COPY scale=[recip]` | compute `1/denom` once (fp32) then scale the gathered weights to bf16 |
+| `forward_selective_loading[…]/aten.sum.dim_IntList` (the **second** sum) | Vector `TENSOR_REDUCE op=ADD dim=X` (top-k=8 → 1) **+** Tensor `MATMUL transpose_mode=ENABLED` (cross-partition all-ones reduce) **+** `COPY` (fp32→bf16 cast) | weighted sum of the 8 down_proj partials, finally cast to bf16 |
+
+Two important subtleties:
+- `clamp_min` uses `imm = 1.0018653e-12` which is exactly `bf16(1e-12)` cast back to fp32. **Use the bf16-rounded constant**, not a literal `1e-12`. (Default `eps` of `torch.nn.functional.normalize` is `1e-12`; the compiler rounds the constant through bf16 because `clamp` fuses with bf16 inputs.)
+- The "sum" of a `(top_k=8, H/128_partitions)` tile is implemented as **(a)** within-partition reduce over `top_k` then **(b)** matmul-with-ones for the partition-axis reduce — same trick used in RMSNorm. This is necessary because the H=2048 output is laid across the 128 partition lanes (16 elements per lane), so a clean reduction over the lane axis is implemented as a transposed matmul against a vector of ones (`transpose_mode=ENABLED`). Importantly, the cast to bf16 happens **after** the matmul reduce — the topk weighted sum is accumulated in fp32 PSUM, then cast.
+
+### 3.9 All-reduce (`reduce_from_tensor_model_parallel_region`)
+
+Single TP AllReduce per decoder layer for the stacked `bk2` MoE output, after the per-token weighted sums are written to bf16 SBUF. HLO: `%all-reduce.X = all-reduce(%reshape.X, %get-tuple-element.X)`. CC core executes this; the compiler observed `disable_numeric_cc_token=True` (set by `Qwen3MoeInferenceConfig` line 269) so the **collective receive does not include the spurious extra add/multiply** that the default openxla CC token path would inject. This matters for bit-exactness: with `disable_numeric_cc_token=True`, AllReduce is a plain elementwise sum — the receiving side's residual chain sees the unaltered AllReduce result.
+
+This is a TP=4 collective, not a visible LNC-local two-way reduction. In the profile, the all-reduce trigger is mostly attributed to `sg00`, while both `sg00` and `sg01` contribute physical-core shards of the MoE matmul work before that point.
+
+---
+
+## 4. End-to-end accumulation order (what to honour bit-for-bit)
+
+1. **Pre-norm residual stream is bf16.** Everything entering the MoE block, including the residual that flows around it, is bf16.
+2. **RMSNorm:** all squaring, summing, mean, eps, rsqrt are **fp32**, with cross-partition reduction via the **all-ones LOW_HIGH matmul trick**. Output is **bf16**.
+3. **Router matmul:** bf16 hidden × bf16 router_weight → **fp32 PSUM**; cast to bf16 once for use by softmax & topk.
+4. **Softmax:** subtract-max in fp32, EXP in fp32 (bf16 input), Σ in fp32, ÷Σ via fp32 reciprocal, final cast to **bf16**.
+5. **TopK** is over the bf16 router_logits, not over softmax probabilities.
+6. **Affinity normalization (`F.normalize`):** Σ in fp32, `clamp_min(_, bf16(1e-12))`, `1/(...)` in fp32, multiply each top‑k affinity by the reciprocal, cast result to bf16.
+7. **Expert MLP:** bf16 inputs, bf16 weights, **fp32 PSUM accumulation** in both gate_up and down. Activations between matmuls are **bf16**: silu(gate_fp32→bf16) × up_bf16 → bf16.
+8. **Top-k weighted reduction:** `down_partial_fp32` (still in PSUM) × `weight_bf16`, summed across top‑k in fp32, cross-partition reduced via the matmul-with-ones, cast to bf16.
+9. **AllReduce** in bf16 across TP=4, plain sum (`disable_numeric_cc_token=True`). 
+10. Residual add (bf16 + bf16 → bf16) in the post-MoE residual.
+
+Anything done in a different order (e.g. casting router_logits to bf16 before softmax instead of letting the softmax ingest bf16 from a `convert`, or casting the topk-weighted sum to bf16 **before** the cross-partition reduce instead of after) **will produce a different bf16 result** even though it should be mathematically equivalent.
+
+---
+
+## 5. Key constants (decoded from `MEMSET`/`imm` operands)
+
+| Name | Where | Bit pattern | Value | Notes |
+|---|---|---|---|---|
+| `rms_norm_eps` | RMSNorm | `0x358637BD` | `9.999999974…e-7` (fp32) | from `config.rms_norm_eps = 1e-6` |
+| `rms_inv_H` | RMSNorm activate scale | `1/2048` exactly | bf16 == fp32 here | hidden = 2048 |
+| `ones_for_reduce` | RMSNorm + per-token weighted sum | `0x3F800000` | `1.0f` | weight vector for partition-reduce matmul |
+| `normalize_eps` | F.normalize p=1 | bf16-rounded `1e-12` ≈ `1.001865e-12` | clamp_min imm | default eps of `F.normalize` |
+| `softmax max-negate scale` | Softmax | `-1.0f` | activate scale | turns `m` into `-m` for fused EXP bias |
+| `disable_numeric_cc_token` | AllReduce | bool=True | — | `Qwen3MoeInferenceConfig` line 269; AllReduce is a plain sum |
+
+---
+
+## 6. Practical guidance for a bit-exact NKI kernel
+
+1. **Match the engine that produces each value.** SQUARE, EXP, RECIPROCAL_SQRT, RECIPROCAL must come from the Activate/Vector engine ops — not from emulated `x*x`, `2^(x*ln2_e)`, etc. Their outputs round in subtly different ways.
+2. **Don’t flatten cross-partition reductions to Vector-engine adds.** The compiler intentionally uses Tensor-engine matmul-with-ones (with FP32 LOW_HIGH for RMSNorm; native bf16 for the topk weighted sum). A bf16 partition reduce on the Vector engine **will not match** a fp32-emulated partition reduce.
+3. **Pin γ as fp32 in SBUF.** Even though HF stores it bf16. The MULTIPLY in step 3 of RMSNorm reads `src0=fp32`. If your kernel feeds bf16 γ, the result is still bit-identical because `bf16→fp32` is bit-extension, but you must cast γ once before the multiply, not let bf16 γ flow through a `TENSOR_TENSOR` MULTIPLY with bf16 src0.
+4. **Use the bf16-rounded `1e-12` constant** in `F.normalize`, not the fp32 literal. (`bits = (struct.unpack('I', struct.pack('f', 1e-12))[0] + 0x8000) & 0xFFFF0000`.)
+5. **Cast router logits to bf16 once, share the bf16 copy with both softmax and topk.** Calling top-k on fp32 router_logits will diverge on tie-prone tokens.
+6. **Keep PSUM live across the topk-weighted sum.** Down-proj partials must remain in fp32 PSUM (or be reloaded as fp32 from a fp32 SBUF copy) when multiplied by the bf16 affinity weight; cast to bf16 only after the cross-partition matmul reduce. Casting to bf16 between down-proj and weighted sum changes the result.
+7. **Skip the CC token numeric tweak.** The compiler set `disable_numeric_cc_token=True`. AllReduce is a plain elementwise sum; do not insert any extra `+0` or `*1` on the receive side as some openxla paths do.
+8. **Activation flags are part of the answer.** `acc_flags=1` (zero+accum), `acc_flags=2` (accum HIGH after LOW), `acc_flags=3` (zero+accum, single phase), `psum_zero=2048` — these encode whether PSUM is reset and whether you are in the LOW or HIGH half of a fp32-emulated matmul. If your NKI kernel uses `nl.matmul(... , psum_acc=...)` with the wrong combination, a single decoder layer can drift by 1‑2 bf16 ulps and compound.
+
+---
+
+## 7. One-shot per-layer summary (what to fuse together for a kernel)
+
+If you want a single fused kernel for the post-attention residual MoE block, the natural fuse boundaries the compiler implies are:
+
+- **Block A (RMSNorm):** SBUF in: residual_bf16 + γ_fp32. SBUF out: norm_bf16. Internals: SQUARE, within-partition reduce, fp32 matmul-with-ones cross-partition reduce, fused `rsqrt(scale·x+eps)`, fused multiply-cast.
+- **Block B (Router + Softmax + TopK):** SBUF in: norm_bf16 + router_w_bf16. PSUM out (fp32) → bf16 SBUF for both consumers. Softmax uses the bf16 copy; TopK uses the same bf16 copy.
+- **Block C (per-token expert loop, T=2):** for each `t`: HBM gather of expert tiles (gate_up + down) for the 8 chosen experts; gate_up matmul (bf16×bf16→fp32 PSUM); SiLU(gate)·up (bf16); down matmul (bf16×bf16→fp32 PSUM, accumulated across the input intermediate axis). Multiply by bf16 affinity weight, fp32 reduce across top‑k (within-partition vector reduce), fp32 matmul-with-ones cross‑partition reduce, cast to bf16.
+- **Block D (AllReduce + residual add):** plain bf16 AllReduce → bf16 add.
+
+That mirrors the existing `kernels/moe_fused_tkg/moe_fused_nki.py` factoring; the constants and op orderings above are the ones to honour to obtain bit-exact agreement with the baseline NEFF.

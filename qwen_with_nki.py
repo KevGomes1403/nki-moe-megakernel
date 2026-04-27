@@ -1,17 +1,18 @@
 # coding=utf-8
 """
-Qwen3 MoE model using _v30c_moe_raw for MoE during token generation.
+Qwen3 MoE model using the experts_hbm NKI kernel for the expert MLPs during TKG.
 
 CTE path (past_key_value is None):
-    Standard post_attention_layernorm + MoE via initialize_moe_module.
+    Standard post_attention_layernorm + MoE via initialize_moe_module
+    (identical to qwen.py).
 
 TKG path (past_key_value is not None):
-    MoE: _v30c_moe_raw — fused RMSNorm + Router + TopK(8) + Expert MLPs.
-    RMSNorm is fused inside the kernel; hidden_states enter pre-norm.
+    RMSNorm + Router(TopK=8) come from NxDI modules — used exactly as in
+    qwen.py (post_attention_layernorm + self.mlp.router). Only the expert
+    MLPs are replaced by the experts_hbm NKI kernel
+    (kernels/moe_fused_tkg/experts_nki.py).
 
 Weight layouts (same as native state dict after convert_qwen3_moe_hf_to_neuron_state_dict):
-    gamma      : post_attention_layernorm.weight  [H=2048]       → unsqueeze → [1, H]
-    router_w   : mlp.router.linear_router.weight  [E=128, H]     → .T → [H, E]
     gate_up_w  : mlp.expert_mlps.mlp_op.gate_up_proj.weight      [E, H, 2*I=384]
     down_w     : mlp.expert_mlps.mlp_op.down_proj.weight          [E, I=192, H]
 """
@@ -76,7 +77,9 @@ _flash_fwd_call = nki_jit()(attention_isa_kernel)
 import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests"))
-from test_v30c_simulate import _v30c_moe_raw  # noqa: E402
+# from test_v30c_simulate import _v30c_moe_raw  # noqa: E402
+
+from kernels.moe_fused_tkg.experts_nki import experts_hbm
 
 torch.manual_seed(0)
 
@@ -343,14 +346,17 @@ class NeuronQwen3MoEAttention(NeuronAttentionBase):
 
 class NeuronQwen3MoeDecoderLayerV30c(nn.Module):
     """
-    Decoder layer identical to qwen.py except the TKG MoE path uses _v30c_moe_raw.
+    Decoder layer identical to qwen.py except the TKG path replaces only
+    the expert MLPs with the experts_hbm NKI kernel. RMSNorm and the
+    router/top-K come from NxDI exactly as in qwen.py.
 
     CTE (past_key_value is None):
         post_attention_layernorm → standard mlp forward.
 
     TKG (past_key_value is not None):
-        _v30c_moe_raw[LNC=2] — fuses RMSNorm + Router + TopK + Expert MLPs.
-        Weights extracted from post_attention_layernorm and mlp modules.
+        post_attention_layernorm (NxDI CustomRMSNorm) →
+        self.mlp.router (NxDI RouterTopK) → gather top-K affinities →
+        experts_hbm[LNC=2] (NKI) → TP all-reduce.
     """
 
     def __init__(self, config: Qwen3MoeInferenceConfig, layer_idx: int):
@@ -372,8 +378,8 @@ class NeuronQwen3MoeDecoderLayerV30c(nn.Module):
         # are available for the v30c kernel.
         self.mlp = initialize_moe_module(config=config)
 
-        # Compiled v30c kernel; called with grid [_LNC] during TKG.
-        self._moe_v30c_jit = nki.jit(_v30c_moe_raw)
+        # experts_hbm is already @nki.jit decorated; called with grid [_LNC] during TKG.
+        self._experts_tkg = experts_hbm
 
         self.qkv_kernel_enabled = config.neuron_config.qkv_kernel_enabled
         self.sequence_parallel_enabled = config.neuron_config.sequence_parallel_enabled
@@ -417,22 +423,34 @@ class NeuronQwen3MoeDecoderLayerV30c(nn.Module):
         # MoE
         residual = hidden_states
         if past_key_value is not None:
-            # TKG: v30c fuses RMSNorm inside; pass pre-norm hidden_states.
-            # gamma : [1, H]   — post_attention_layernorm scale
-            # router_w : [H, E] — linear_router.weight transposed
-            # gate_up_w : [E, H, 2*I]
-            # down_w    : [E, I, H]
-            gamma     = self.post_attention_layernorm.weight.unsqueeze(0)
-            router_w  = self.mlp.router.linear_router.weight.T.contiguous()
+            # TKG: RMSNorm + Router via NxDI (exactly as qwen.py runs them
+            # through self.mlp); only the expert MLPs are replaced by the
+            # experts_hbm NKI kernel.
+            norm_hidden = self.post_attention_layernorm(hidden_states)
+
+            # NxDI RouterTopK: returns (router_logits, expert_affinities, expert_index)
+            # expert_affinities: [T, E] in hidden dtype (bf16); expert_index: [T, K] long.
+            _, expert_affinities, expert_index = self.mlp.router(norm_hidden)
+
+            # Gather UNnormalized top-K affinities; experts_hbm L1-normalizes
+            # internally to match NxDI's F.normalize(p=1) on chosen affinities.
+            top_k_vals = expert_affinities.gather(1, expert_index).to(norm_hidden.dtype)
+            top_k_idx  = expert_index.to(torch.int32)
+
             gate_up_w = self.mlp.expert_mlps.mlp_op.gate_up_proj.weight
             down_w    = self.mlp.expert_mlps.mlp_op.down_proj.weight
 
             # Reshape [B, 1, H] → [T, H] for the kernel (T = B for TKG seq_len=1)
-            orig_shape = hidden_states.shape
-            inp_2d = hidden_states.reshape(-1, _MOE_H)
-            out_2d = self._moe_v30c_jit[_LNC](inp_2d, gamma, router_w, gate_up_w, down_w)
-            # TP all-reduce across ranks [0, 1, 2, 3]: each rank holds a partial
-            # sum over its I shard; sum across the TP group to get the full output.
+            orig_shape = norm_hidden.shape
+            inp_2d = norm_hidden.reshape(-1, _MOE_H)
+            top_k_idx_2d  = top_k_idx.reshape(-1, top_k_idx.shape[-1])
+            top_k_vals_2d = top_k_vals.reshape(-1, top_k_vals.shape[-1])
+
+            out_2d = self._experts_tkg[_LNC](
+                inp_2d, top_k_idx_2d, top_k_vals_2d, gate_up_w, down_w
+            )
+            # TP all-reduce across ranks: each rank holds a partial sum over
+            # its intermediate shard; sum across the TP group for full output.
             out_2d = reduce_from_tensor_model_parallel_region(out_2d)
             hidden_states = out_2d.reshape(orig_shape)
         else:

@@ -1,14 +1,20 @@
 # coding=utf-8
-""" Qwen3 MOE model for NXD inference. This is a re-implementation of the NxDI source code for Qwen3 MOE, provided here for easy kernel development."""
+"""
+Qwen3 MoE model using _v30c_moe_raw for MoE during token generation.
 
-import torch
+CTE path (past_key_value is None):
+    Standard post_attention_layernorm + MoE via initialize_moe_module.
 
-from transformers import AutoTokenizer, GenerationConfig
-from neuronx_distributed_inference.utils.hf_adapter import HuggingFaceGenerationAdapter, load_pretrained_config
-from neuronx_distributed_inference.models.config import MoENeuronConfig, OnDeviceSamplingConfig
-from neuronx_distributed_inference.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeInferenceConfig
+TKG path (past_key_value is not None):
+    MoE: _v30c_moe_raw — fused RMSNorm + Router + TopK(8) + Expert MLPs.
+    RMSNorm is fused inside the kernel; hidden_states enter pre-norm.
 
-torch.manual_seed(0)
+Weight layouts (same as native state dict after convert_qwen3_moe_hf_to_neuron_state_dict):
+    gamma      : post_attention_layernorm.weight  [H=2048]       → unsqueeze → [1, H]
+    router_w   : mlp.router.linear_router.weight  [E=128, H]     → .T → [H, E]
+    gate_up_w  : mlp.expert_mlps.mlp_op.gate_up_proj.weight      [E, H, 2*I=384]
+    down_w     : mlp.expert_mlps.mlp_op.down_proj.weight          [E, I=192, H]
+"""
 
 import gc
 import warnings
@@ -16,13 +22,44 @@ from typing import List, Optional, Tuple, Union, Dict, Any
 
 import torch
 import math
+from torch import nn
 
+import nki
+
+from transformers import AutoTokenizer, GenerationConfig, Qwen3MoeForCausalLM
+from transformers.generation import SampleDecoderOnlyOutput, SampleEncoderDecoderOutput
+from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeRMSNorm
+
+from neuronx_distributed.parallel_layers import parallel_state
+from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, ParallelEmbedding
+from neuronx_distributed.parallel_layers.mappings import reduce_from_tensor_model_parallel_region
+from neuronx_distributed.utils import cpu_mode
+from torch_neuronx.xla_impl.ops import nki_jit
+
+from neuronx_distributed_inference.models.config import (
+    InferenceConfig,
+    MoENeuronConfig,
+    MOE_TKG_MK_INTERMEDIATE_PER_TP,
+    OnDeviceSamplingConfig,
+)
+from neuronx_distributed_inference.models.layer_boundary_marker import (
+    ModuleMarkerEndWrapper,
+    ModuleMarkerStartWrapper,
+)
 from neuronx_distributed_inference.models.model_base import NeuronBaseForCausalLM, NeuronBaseModel
+from neuronx_distributed_inference.models.model_wrapper import (
+    CONTEXT_ENCODING_MODEL_TAG,
+    TOKEN_GENERATION_MODEL_TAG,
+)
 from neuronx_distributed_inference.modules.attention.gqa import GQA
+from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
+from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
 from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm
-
-# Import our custom NKI RMSNorm
-from nki_custom_rmsnorm import NKIRMSNorm
+from neuronx_distributed_inference.modules.moe_v2 import initialize_moe_module
+from neuronx_distributed_inference.utils.hf_adapter import (
+    HuggingFaceGenerationAdapter,
+    load_pretrained_config,
+)
 
 # Try except for the compatibility with older compiler version
 try:
@@ -30,45 +67,39 @@ try:
 except ImportError:
     from neuronxcc.nki.kernels.attention import attention_isa_kernel
 
-from neuronx_distributed.parallel_layers import parallel_state
-from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, ParallelEmbedding
-from neuronx_distributed.utils import cpu_mode
-from torch import nn
-from torch_neuronx.xla_impl.ops import nki_jit
-from transformers import Qwen3MoeForCausalLM
-from transformers.generation import SampleDecoderOnlyOutput, SampleEncoderDecoderOutput
-from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeRMSNorm
-
-from neuronx_distributed_inference.models.config import InferenceConfig, MoENeuronConfig, SHARD_ON_INTERMEDIATE_DIMENTION_PER_TP, MOE_TKG_MK_INTERMEDIATE_PER_TP
-from neuronx_distributed_inference.models.model_wrapper import CONTEXT_ENCODING_MODEL_TAG, TOKEN_GENERATION_MODEL_TAG
-from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
-from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
-from neuronx_distributed_inference.modules.moe_v2 import initialize_moe_module
-from neuronx_distributed_inference.models.layer_boundary_marker import (
-    ModuleMarkerEndWrapper,
-    ModuleMarkerStartWrapper,
-)
-
 _flash_fwd_call = nki_jit()(attention_isa_kernel)
 
-SampleOutput = Union[SampleEncoderDecoderOutput, SampleDecoderOnlyOutput]
+# Import v30c kernel from the test file.
+# Note: test_v30c_simulate.py sets NEURON_PLATFORM_TARGET_OVERRIDE and
+# NEURON_LOGICAL_NC_CONFIG at import time; those env vars are acceptable for
+# this development model.
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests"))
+# from test_v30c_simulate import _v30c_moe_raw  # noqa: E402
 
+from kernels.moe_fused_tkg.moe_fused_nki import moe_fused_tkg
+
+torch.manual_seed(0)
+
+SampleOutput = Union[SampleEncoderDecoderOutput, SampleDecoderOnlyOutput]
 GQA_SHARDING_STRATEGY = GQA.REPLICATE_TO_TP_DEGREE
 
+# LNC=2 grid for v30c kernel on trn3
+_LNC = 2
+# Hidden dimension for Qwen3-30B-A3B at TP=4 (must match _H in test_v30c_simulate.py)
+_MOE_H = 2048
 
-# Get the modules_to_not_convert from the neuron configs
+
+# ---------------------------------------------------------------------------
+# State dict helpers — identical to qwen.py
+# ---------------------------------------------------------------------------
+
 def get_modules_to_not_convert(neuron_config: MoENeuronConfig):
     return getattr(neuron_config, "modules_to_not_convert", None)
 
 
 def _helper_concat_and_delete_qkv(qwen_state_dict: Dict[str, Any], layer_num: int, attr: str):
-    """
-    Helper function to concatenate and delete QKV attributes for fusedqkv (weight or scale).
-    Args:
-        qwen_state_dict: The state dictionary containing model weights
-        layer_num: The index of the layer to process
-        attr: The attribute to process ('weight' or 'scale')
-    """
     qwen_state_dict[f"layers.{layer_num}.self_attn.Wqkv.{attr}"] = torch.cat(
         [
             qwen_state_dict[f"layers.{layer_num}.self_attn.q_proj.{attr}"],
@@ -82,9 +113,6 @@ def _helper_concat_and_delete_qkv(qwen_state_dict: Dict[str, Any], layer_num: in
 
 
 def convert_state_dict_to_fused_qkv(qwen_state_dict: Dict[str, Any], cfg: InferenceConfig):
-    """
-    This function concats the qkv weights and scales to a Wqkv weight and scale for fusedqkv, and deletes the qkv weights.
-    """
     mods_to_not_conv = get_modules_to_not_convert(cfg.neuron_config)
     if mods_to_not_conv is None:
         mods_to_not_conv = []
@@ -97,7 +125,6 @@ def convert_state_dict_to_fused_qkv(qwen_state_dict: Dict[str, Any], cfg: Infere
             _helper_concat_and_delete_qkv(qwen_state_dict, l, "scale")
 
     gc.collect()
-
     return qwen_state_dict
 
 
@@ -114,44 +141,34 @@ def maybe_dequantize_layer(neuron_state_dict, config):
             scaled_layer = fp8_layer.to(torch.float32) * scales_expanded.to(torch.float32)
             neuron_state_dict[fp8_layer_name] = scaled_layer.to(config.neuron_config.torch_dtype)
 
-    # delete scale layers
     for scale_layer in scale_layers:
         del neuron_state_dict[scale_layer]
 
 
 def convert_qwen3_moe_hf_to_neuron_state_dict(neuron_state_dict, config):
-    """
-    Helper function which converts the huggingface checkpoints to state dictionary compatible with the stucture of the neuron MoE model.
-    """
     assert config.neuron_config.glu_mlp is True, "Only GLU MLP is supported"
 
-    # dequantize layers if needed
     maybe_dequantize_layer(neuron_state_dict, config)
 
-    # to facilitate rank usage in base model
     neuron_state_dict["rank_util.rank"] = torch.arange(
         0, config.neuron_config.tp_degree, dtype=torch.int32
     )
 
     for l in range(config.num_hidden_layers):  # noqa: E741
-        # To facilitate rank usage in attention
         neuron_state_dict[f"layers.{l}.self_attn.rank_util.rank"] = torch.arange(
             0, config.neuron_config.tp_degree, dtype=torch.int32
         )
 
-        # Rename the q_norm, k_norm names
         neuron_state_dict[f"layers.{l}.self_attn.k_layernorm.weight"] = (
             neuron_state_dict[f"layers.{l}.self_attn.k_norm.weight"].detach().clone()
         )
         del neuron_state_dict[f"layers.{l}.self_attn.k_norm.weight"]
 
-        # Rename the q_norm, k_norm names
         neuron_state_dict[f"layers.{l}.self_attn.q_layernorm.weight"] = (
             neuron_state_dict[f"layers.{l}.self_attn.q_norm.weight"].detach().clone()
         )
         del neuron_state_dict[f"layers.{l}.self_attn.q_norm.weight"]
 
-        # Copy router weights
         neuron_state_dict[f"layers.{l}.mlp.router.linear_router.weight"] = (
             neuron_state_dict[f"layers.{l}.mlp.gate.weight"].detach().clone()
         )
@@ -163,7 +180,6 @@ def convert_qwen3_moe_hf_to_neuron_state_dict(neuron_state_dict, config):
         device = neuron_state_dict[f"layers.{l}.mlp.experts.0.gate_proj.weight"].device
         dtype = neuron_state_dict[f"layers.{l}.mlp.experts.0.gate_proj.weight"].dtype
 
-        # copy the MLP parameters
         gate_up_proj = torch.empty(
             config.num_experts,
             hidden_size,
@@ -172,7 +188,6 @@ def convert_qwen3_moe_hf_to_neuron_state_dict(neuron_state_dict, config):
             device=device,
         )
         for e in range(config.num_experts):
-            # Copy gate_proj and up_proj after concatenation
             gate_proj_weights = (
                 neuron_state_dict[f"layers.{l}.mlp.experts.{e}.gate_proj.weight"]
                 .T.detach()
@@ -195,11 +210,9 @@ def convert_qwen3_moe_hf_to_neuron_state_dict(neuron_state_dict, config):
             del neuron_state_dict[f"layers.{l}.mlp.experts.{e}.gate_proj.weight"]
             del neuron_state_dict[f"layers.{l}.mlp.experts.{e}.up_proj.weight"]
 
-        # padding gate_up_proj on intermediate size
         pad_size = getattr(config, "moe_intermediate_pad_size", 0)
         if pad_size > 0:
             gate_up_proj = gate_up_proj.reshape(config.num_experts, hidden_size, 2, -1)
-            # padding right on gate_up_proj: (num_experts, hidden_size, 2, intermediate_size)
             gate_up_proj = torch.nn.functional.pad(gate_up_proj, (0, pad_size))
             gate_up_proj = gate_up_proj.reshape(config.num_experts, hidden_size, -1)
         neuron_state_dict[f"layers.{l}.mlp.expert_mlps.mlp_op.gate_up_proj.weight"] = gate_up_proj
@@ -212,7 +225,6 @@ def convert_qwen3_moe_hf_to_neuron_state_dict(neuron_state_dict, config):
             device=device,
         )
         for e in range(config.num_experts):
-            # Copy down_proj
             down_proj_weights = (
                 neuron_state_dict[f"layers.{l}.mlp.experts.{e}.down_proj.weight"]
                 .T.detach()
@@ -222,9 +234,7 @@ def convert_qwen3_moe_hf_to_neuron_state_dict(neuron_state_dict, config):
             down_proj_slice.copy_(down_proj_weights)
             del neuron_state_dict[f"layers.{l}.mlp.experts.{e}.down_proj.weight"]
 
-        # padding down_proj on intermediate size
         if pad_size > 0:
-            # padding bottom on down_proj: (num_experts, intermediate_size, hidden_size)
             down_proj = torch.nn.functional.pad(down_proj, (0, 0, 0, pad_size))
         neuron_state_dict[f"layers.{l}.mlp.expert_mlps.mlp_op.down_proj.weight"] = down_proj
 
@@ -236,59 +246,38 @@ def convert_qwen3_moe_hf_to_neuron_state_dict(neuron_state_dict, config):
     return neuron_state_dict
 
 
+# ---------------------------------------------------------------------------
+# Config — identical to qwen.py
+# ---------------------------------------------------------------------------
+
 def get_rmsnorm_cls():
-    # Initialize to the appropriate implementation of RMSNorm
-    # If infer on NXD with NKI -> Use the custom NKI RMSNorm 
-    # If infer on CPU -> HF_RMSNorm (NKI kernels don't work on CPU)
-    if cpu_mode():
-        return Qwen3MoeRMSNorm
-    else:
-        print("Using NKI-accelerated RMSNorm")
-        return NKIRMSNorm
+    return Qwen3MoeRMSNorm if cpu_mode() else CustomRMSNorm
 
 
 class Qwen3MoeInferenceConfig(InferenceConfig):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Qwen3-MoE config has `num_experts` instead of `num_local_experts`
-        # We need to add `num_local_experts` as it is expected by `initialize_moe_module`
         self.num_local_experts = self.num_experts
-        # Qwen3-MoE has no shared experts
         self.n_shared_experts = 0
-        # ExpertMLPsV2 reads moe_intermediate from config.intermediate_size
-
-        # check whether need to pad intermediate size
         self.maybe_pad_intermediate()
-
-        # enable moe_fused_nki_kernel
         self.enable_moe_fused_nki_kernel()
-
         self.intermediate_size = self.moe_intermediate_size
-        # We need router dtype to be FP32 for accuracy
         self.neuron_config.router_config.dtype = torch.float32
-        # HF uses softmax (non-configurable) act for Qwen3-MoE
         self.neuron_config.router_config.act_fn = "softmax"
-        # Set DISABLE_NUMERIC_CC_TOKEN=1 for Qwen3 MoE as a workaround
-        # for the extra add/multiple in all-gather/reduce-scatter CC ops
-        # https://github.com/pytorch/xla/pull/3825 (openxla PR https://github.com/openxla/xla/pull/7677 not accepted)
         self.neuron_config.disable_numeric_cc_token = True
-        # Qwen3 normalizes top k affinities
         self.neuron_config.normalize_top_k_affinities = True
 
     def maybe_pad_intermediate(self):
         moe_tp_degree = self.neuron_config.moe_tp_degree
         I_TP = self.moe_intermediate_size // moe_tp_degree
         if getattr(self.neuron_config.blockwise_matmul_config, "use_shard_on_intermediate_dynamic_while", False):
-            # If shard-on-I enabled, check the intermediate size per tp is divisible by SHARD_ON_INTERMEDIATE_DIMENTION_PER_TP
-            if I_TP % SHARD_ON_INTERMEDIATE_DIMENTION_PER_TP != 0:
-                padded_moe_intermediate_size = math.ceil(I_TP / SHARD_ON_INTERMEDIATE_DIMENTION_PER_TP) * SHARD_ON_INTERMEDIATE_DIMENTION_PER_TP * moe_tp_degree
+            if I_TP % MOE_TKG_MK_INTERMEDIATE_PER_TP != 0:
+                padded_moe_intermediate_size = math.ceil(I_TP / MOE_TKG_MK_INTERMEDIATE_PER_TP) * MOE_TKG_MK_INTERMEDIATE_PER_TP * moe_tp_degree
                 self.moe_intermediate_pad_size = max(padded_moe_intermediate_size - self.moe_intermediate_size, 0)
-                # set moe_intermediate_size to padded size
                 self.moe_intermediate_size = padded_moe_intermediate_size
 
     def enable_moe_fused_nki_kernel(self):
         I_TP = self.moe_intermediate_size // self.neuron_config.moe_tp_degree
-        # if moe_fused_nki_kernel_enabled is enabled and the intermeidiate_size_per_tp is divisible by MOE_TKG_MK_INTERMEDIATE_PER_TP
         if getattr(self.neuron_config, "moe_fused_nki_kernel_enabled", False) and I_TP % MOE_TKG_MK_INTERMEDIATE_PER_TP == 0:
             self.moe_fused_nki_kernel_enabled = True
 
@@ -317,6 +306,10 @@ class Qwen3MoeInferenceConfig(InferenceConfig):
         return MoENeuronConfig
 
 
+# ---------------------------------------------------------------------------
+# Attention — identical to qwen.py
+# ---------------------------------------------------------------------------
+
 class NeuronQwen3MoEAttention(NeuronAttentionBase):
     def __init__(self, config: Qwen3MoeInferenceConfig):
         rotary_emb = RotaryEmbedding(
@@ -333,11 +326,9 @@ class NeuronQwen3MoEAttention(NeuronAttentionBase):
             head_dim=config.head_dim,
             rotary_emb=rotary_emb,
             rms_norm_eps=config.rms_norm_eps,
-            # qk_norm in the base class is different from Qwen3RMSNorm
             use_qk_norm=False,
         )
 
-        # Override q_layernorm and k_layernorm with RMSNorm
         self.q_layernorm = get_rmsnorm_cls()(self.head_dim, self.rms_norm_eps)
         self.k_layernorm = get_rmsnorm_cls()(self.head_dim, self.rms_norm_eps)
 
@@ -348,16 +339,26 @@ class NeuronQwen3MoEAttention(NeuronAttentionBase):
             )
 
 
-class NeuronQwen3MoeDecoderLayer(nn.Module):
+# ---------------------------------------------------------------------------
+# Decoder layer — uses _v30c_moe_raw for TKG MoE
+# ---------------------------------------------------------------------------
+
+class NeuronQwen3MoeDecoderLayerV30c(nn.Module):
     """
-    Just replace the attention with the NXD version, and MLP with the NXD version
+    Decoder layer identical to qwen.py except the TKG MoE path uses _v30c_moe_raw.
+
+    CTE (past_key_value is None):
+        post_attention_layernorm → standard mlp forward.
+
+    TKG (past_key_value is not None):
+        _v30c_moe_raw[LNC=2] — fuses RMSNorm + Router + TopK + Expert MLPs.
+        Weights extracted from post_attention_layernorm and mlp modules.
     """
 
     def __init__(self, config: Qwen3MoeInferenceConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = NeuronQwen3MoEAttention(config=config)
-        self.moe_fused_nki_kernel_enabled = getattr(config, "moe_fused_nki_kernel_enabled", False)
 
         self.input_layernorm = get_rmsnorm_cls()(
             config.hidden_size,
@@ -368,14 +369,13 @@ class NeuronQwen3MoeDecoderLayer(nn.Module):
             eps=config.rms_norm_eps,
         )
 
-        if self.moe_fused_nki_kernel_enabled:
-            self.mlp = initialize_moe_module(
-                config=config, rmsnorm=self.post_attention_layernorm, init_tkg_module=True
-            )
-        else:
-            self.mlp = initialize_moe_module(
-                config=config,
-            )
+        # Standard MoE module (init_tkg_module=False) so weight paths
+        # mlp.router.linear_router.weight and mlp.expert_mlps.mlp_op.{gate_up,down}_proj.weight
+        # are available for the v30c kernel.
+        self.mlp = initialize_moe_module(config=config)
+
+        # Compiled v30c kernel; called with grid [_LNC] during TKG.
+        self._moe_tkg = nki.jit(moe_fused_tkg)
 
         self.qkv_kernel_enabled = config.neuron_config.qkv_kernel_enabled
         self.sequence_parallel_enabled = config.neuron_config.sequence_parallel_enabled
@@ -391,16 +391,6 @@ class NeuronQwen3MoeDecoderLayer(nn.Module):
         padding_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
-        """
-        Args:
-            hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
-            attention_mask (`torch.FloatTensor`, *optional*):
-                attention mask of size `(batch_size, sequence_length)` if flash attention is used or `(batch_size, 1,
-                query_sequence_length, key_sequence_length)` if default attention is used.
-            position_ids (`torch.FloatTensor`, *optional*):
-                position ids of size `(batch_size, sequence_length)`.
-            past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
-        """
         if "padding_mask" in kwargs:
             warnings.warn(
                 "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
@@ -409,8 +399,6 @@ class NeuronQwen3MoeDecoderLayer(nn.Module):
         residual = hidden_states
 
         qkv_fused_rmsnorm = None
-        # We wrap input_layernorm/self_attn/post_attention_layernorm with module markers start/end
-        # as a hint for compiler's modular-flow to avoid layer boundries in-between decoder layer components
         hidden_states = ModuleMarkerStartWrapper()(hidden_states)
         if self.input_layernorm:
             if self.qkv_kernel_enabled and self.qkv_kernel_fused_rmsnorm:
@@ -418,7 +406,6 @@ class NeuronQwen3MoeDecoderLayer(nn.Module):
             else:
                 hidden_states = self.input_layernorm(hidden_states)
 
-        # Self Attention
         hidden_states, present_key_value, cos_cache, sin_cache = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -431,23 +418,43 @@ class NeuronQwen3MoeDecoderLayer(nn.Module):
 
         # MoE
         residual = hidden_states
-        if not self.moe_fused_nki_kernel_enabled:
+        if past_key_value is not None:
+            # TKG: v30c fuses RMSNorm inside; pass pre-norm hidden_states.
+            # gamma : [1, H]   — post_attention_layernorm scale
+            # router_w : [H, E] — linear_router.weight transposed
+            # gate_up_w : [E, H, 2*I]
+            # down_w    : [E, I, H]
+            gamma     = self.post_attention_layernorm.weight.unsqueeze(0)
+            router_w  = self.mlp.router.linear_router.weight.T.contiguous()
+            gate_up_w = self.mlp.expert_mlps.mlp_op.gate_up_proj.weight
+            down_w    = self.mlp.expert_mlps.mlp_op.down_proj.weight
+
+            # Reshape [B, 1, H] → [T, H] for the kernel (T = B for TKG seq_len=1)
+            orig_shape = hidden_states.shape
+            inp_2d = hidden_states.reshape(-1, _MOE_H)
+            out_2d = self._moe_tkg[_LNC](inp_2d, gamma, router_w, gate_up_w, down_w)
+            # TP all-reduce across ranks [0, 1, 2, 3]: each rank holds a partial
+            # sum over its I shard; sum across the TP group to get the full output.
+            out_2d = reduce_from_tensor_model_parallel_region(out_2d)
+            hidden_states = out_2d.reshape(orig_shape)
+        else:
+            # CTE: standard layernorm + MoE forward
             hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states, padding_mask)[0]
+            hidden_states = self.mlp(hidden_states, padding_mask)[0]
+
         hidden_states = residual + hidden_states
 
-        # End module marker
         hidden_states = ModuleMarkerEndWrapper()(hidden_states)
         outputs = (hidden_states, present_key_value, cos_cache, sin_cache, None)
-
         return outputs
 
 
-class NeuronQwen3MoeModel(NeuronBaseModel):
-    """
-    NeuronQwen3MoeModel extends the Qwen3MoeModel to be traceable.
-    The forward function of this class is traced.
-    """
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+
+class NeuronQwen3MoeModelV30c(NeuronBaseModel):
+    """NeuronQwen3MoeModel using _v30c_moe_raw for TKG MoE."""
 
     def setup_attr_for_model(self, config: Qwen3MoeInferenceConfig):
         self.on_device_sampling = config.neuron_config.on_device_sampling_config is not None
@@ -471,7 +478,7 @@ class NeuronQwen3MoeModel(NeuronBaseModel):
         )
         self.layers = nn.ModuleList(
             [
-                NeuronQwen3MoeDecoderLayer(config, layer_idx)
+                NeuronQwen3MoeDecoderLayerV30c(config, layer_idx)
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
@@ -484,12 +491,14 @@ class NeuronQwen3MoeModel(NeuronBaseModel):
         )
 
 
-class NeuronQwen3MoeForCausalLM(NeuronBaseForCausalLM):
-    """
-    This class can be used as Qwen3MoeForCausalLM
-    """
+# ---------------------------------------------------------------------------
+# CausalLM wrapper
+# ---------------------------------------------------------------------------
 
-    _model_cls = NeuronQwen3MoeModel
+class NeuronQwen3MoeForCausalLMV30c(NeuronBaseForCausalLM):
+    """Qwen3 MoE model using _v30c_moe_raw for TKG MoE."""
+
+    _model_cls = NeuronQwen3MoeModelV30c
 
     @staticmethod
     def load_hf_model(model_path, **kwargs):
@@ -503,51 +512,42 @@ class NeuronQwen3MoeForCausalLM(NeuronBaseForCausalLM):
     def convert_hf_to_neuron_state_dict(state_dict: dict, config: Qwen3MoeInferenceConfig) -> dict:
         return convert_qwen3_moe_hf_to_neuron_state_dict(state_dict, config)
 
-    # Wraps NeuronBaseForCausalLM.enable_context_encoding() to add compile_tag.
     def enable_context_encoding(self):
         self.compile_tag = CONTEXT_ENCODING_MODEL_TAG
         super().enable_context_encoding()
 
-    # Wraps NeuronBaseForCausalLM.enable_token_generation() to add compile_tag.
     def enable_token_generation(self):
         self.compile_tag = TOKEN_GENERATION_MODEL_TAG
         super().enable_token_generation()
 
     def get_compiler_args(self):
-        # Set compiler optimization level based on model tag
         if self.compile_tag == CONTEXT_ENCODING_MODEL_TAG:
             optimization_level = "-O1"
         elif self.compile_tag == TOKEN_GENERATION_MODEL_TAG:
-            # Disable Modular flow for TKG graph with EP enabled as it causes perf degradation
             optimization_level = "-O3" if self.neuron_config.moe_ep_degree > 1 else "-O1"
         compiler_args = f"--enable-saturate-infinity --enable-mixed-precision-accumulation --model-type transformer {optimization_level}"
-        # Add flags for cc-overlap
         compiler_args += (
             " --tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2'"
         )
         compiler_args += " --auto-cast=none"
-        # Enable vector-offset DGE
         compiler_args += " --internal-enable-dge-levels vector_dynamic_offsets"
         compiler_args += " --internal-hlo2tensorizer-options='--verify-hlo=true'"
         if self.neuron_config.scratchpad_page_size:
             compiler_args += (
                 f" --hbm-scratchpad-page-size={self.neuron_config.scratchpad_page_size} "
             )
-
-        if self.neuron_config.attn_block_tkg_nki_kernel_enabled:
-            assert (
-                self.neuron_config.attn_block_tkg_nki_kernel_cascaded_attention
-            ), "If using attn_block_tkg_nki_kernel_enabled for Qwen3MoE you must also use attn_block_tkg_nki_kernel_cascaded_attention"
-            # Enabled RMSNorm pre-RoPE in the Attn TKG MK
-            self.neuron_config.pre_rope_rmsnorm = True
-            # When enabling the Cascaded Attn TKG MK we will run over 5 million instructions on E2E
-            compiler_args += " --internal-max-instruction-limit=15000000"
-
         return compiler_args
 
 
-def generate(skip_compile=False):
-    # Initialize configs and tokenizer.
+# Alias expected by main.py (always loads qwen.NeuronQwen3MoeForCausalLM).
+NeuronQwen3MoeForCausalLM = NeuronQwen3MoeForCausalLMV30c
+
+
+# ---------------------------------------------------------------------------
+# Example entrypoint
+# ---------------------------------------------------------------------------
+
+def generate(model_path, traced_model_path, skip_compile=False):
     generation_config = GenerationConfig.from_pretrained(model_path)
 
     if not skip_compile:
@@ -558,37 +558,32 @@ def generate(skip_compile=False):
             seq_len=1024,
             on_device_sampling_config=OnDeviceSamplingConfig(do_sample=True, temperature=0.6, top_k=20, top_p=0.95),
             enable_bucketing=False,
-            flash_decoding_enabled=False
+            flash_decoding_enabled=False,
         )
         config = Qwen3MoeInferenceConfig(
             neuron_config,
             load_config=load_pretrained_config(model_path),
-        )        
+        )
         tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side="right")
         tokenizer.pad_token = tokenizer.eos_token
-        # Compile and save model.
         print("\nCompiling and saving model...")
-        model = NeuronQwen3MoeForCausalLM(model_path, config)
+        model = NeuronQwen3MoeForCausalLMV30c(model_path, config)
         model.compile(traced_model_path)
         tokenizer.save_pretrained(traced_model_path)
 
-    # Load from compiled checkpoint.
     print("\nLoading model from compiled checkpoint...")
-    model = NeuronQwen3MoeForCausalLM(traced_model_path)
+    model = NeuronQwen3MoeForCausalLMV30c(traced_model_path)
     model.load(traced_model_path)
     tokenizer = AutoTokenizer.from_pretrained(traced_model_path)
 
-    # Generate outputs.
     print("\nGenerating outputs...")
     prompt = "Give me a short introduction to large language models."
-    messages = [
-        {"role": "user", "content": prompt}
-    ]
+    messages = [{"role": "user", "content": prompt}]
     text = tokenizer.apply_chat_template(
         messages,
         tokenize=False,
         add_generation_prompt=True,
-        enable_thinking=True # Switches between thinking and non-thinking modes. Default is True.
+        enable_thinking=True,
     )
     inputs = tokenizer([text], padding=True, return_tensors="pt")
     generation_model = HuggingFaceGenerationAdapter(model)
@@ -602,4 +597,3 @@ def generate(skip_compile=False):
     print("Generated outputs:")
     for i, output_token in enumerate(output_tokens):
         print(f"Output {i}: {output_token}")
-

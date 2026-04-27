@@ -614,8 +614,15 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm_hoisted_weights(
     # Active score: k_rope_bf16.T @ q_bf16 → [1, GQA] (fp32-accumulated matmul matches ref MPA)
     score_act_1_psum = nl.zeros((1, GQA), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_matmul(score_act_1_psum, stationary=k_rope_bf16, moving=q_bf16)
+    # spec §0.4 / §2 Step 7b: explicit CONVERT F32 PSUM → BF16 at PE boundary
+    score_act_1_bf16 = sbm.alloc_stack((1, GQA), nl.bfloat16, name="score_act_1_bf16")
+    nisa.tensor_copy(score_act_1_bf16, score_act_1_psum)
+    # spec §2 Step 7b: scale in BF16
+    score_act_1_scaled_bf16 = sbm.alloc_stack((1, GQA), nl.bfloat16, name="score_act_1_scaled_bf16")
+    nisa.tensor_scalar(score_act_1_scaled_bf16, score_act_1_bf16, op0=nl.multiply, operand0=INV_SQRT_D)
+    # spec §5.5: immediate upcast to F32 before broadcast/mask
     score_act_1_sb = sbm.alloc_stack((1, GQA), nl.float32, name="score_act_1_sb")
-    nisa.tensor_copy(score_act_1_sb, score_act_1_psum)
+    nisa.tensor_copy(score_act_1_sb, score_act_1_scaled_bf16)
     # Broadcast [1, GQA] → [PMAX, GQA] via transpose-replicate (matches neg_max broadcast pattern)
     score_act_g_psum = nl.ndarray((GQA, 1), nl.float32, buffer=nl.psum)
     nisa.nc_transpose(score_act_g_psum, score_act_1_sb)
@@ -625,12 +632,6 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm_hoisted_weights(
     nisa.nc_transpose(score_active_psum, score_act_g_sb.ap([[1, GQA], [0, PMAX]], offset=0))
     score_active = sbm.alloc_stack((PMAX, GQA), nl.float32, name="score_active")
     nisa.tensor_copy(score_active, score_active_psum)
-    # R2: apply softmax scale (1/sqrt(d)) in bf16 post-matmul, folded into the existing
-    # bf16 round-trip. Mirrors baseline: `score = matmul(Q, K) / sqrt(128)` where the
-    # divide produces a bf16 result.
-    score_active_scaled_bf16 = sbm.alloc_stack((PMAX, GQA), nl.bfloat16, name="score_active_scaled_bf16")
-    nisa.tensor_scalar(score_active_scaled_bf16, score_active, op0=nl.multiply, operand0=INV_SQRT_D)
-    nisa.tensor_copy(score_active, score_active_scaled_bf16)
 
     position_ids_2d = position_ids.reshape((B, 1))
     pos_f32 = sbm.alloc_stack((1, 1), nl.float32, name="pos_f32")
@@ -678,7 +679,8 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm_hoisted_weights(
         nisa.tensor_scalar(clamped, relu_delta, op0=nl.minimum, operand0=1.0)
 
         mask_tile_f32 = sbm.alloc_stack((PMAX, 1), nl.float32, name=f"mask_tile_f32_{s_t}")
-        nisa.tensor_scalar(mask_tile_f32, clamped, op0=nl.multiply, operand0=-1e9)
+        # spec §5.5: mask sentinel is torch.finfo(torch.float32).min ≈ -3.4028235e38
+        nisa.tensor_scalar(mask_tile_f32, clamped, op0=nl.multiply, operand0=-3.4028234663852886e38)
 
         mask_gqa_pre_psum_T = nl.ndarray((GQA, PMAX), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_transpose(mask_gqa_pre_psum_T, mask_tile_f32.ap([[1, PMAX], [0, GQA]], offset=0))
@@ -719,11 +721,14 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm_hoisted_weights(
 
         score_psum = nl.zeros((PMAX, GQA), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_matmul(score_psum, stationary=k_cache_tiles[s_t], moving=q_bf16)
-        score_sb = sbm.alloc_stack((PMAX, GQA), nl.float32, name=f"score_sb_{s_t}")
-        nisa.tensor_copy(score_sb, score_psum)
-        # R2: apply softmax scale in bf16 post-matmul, folded into the existing bf16 round-trip.
+        # spec §0.4 / §2 Step 7a: explicit CONVERT F32 PSUM → BF16 at PE boundary
+        score_bf16 = sbm.alloc_stack((PMAX, GQA), nl.bfloat16, name=f"score_bf16_{s_t}")
+        nisa.tensor_copy(score_bf16, score_psum)
+        # spec §2 Step 7a: scale in BF16 (`prior_scores_bf16 * softmax_scale`)
         score_scaled_bf16 = sbm.alloc_stack((PMAX, GQA), nl.bfloat16, name=f"score_scaled_bf16_{s_t}")
-        nisa.tensor_scalar(score_scaled_bf16, score_sb, op0=nl.multiply, operand0=INV_SQRT_D)
+        nisa.tensor_scalar(score_scaled_bf16, score_bf16, op0=nl.multiply, operand0=INV_SQRT_D)
+        # spec §5.5: immediate upcast to F32 before mask
+        score_sb = sbm.alloc_stack((PMAX, GQA), nl.float32, name=f"score_sb_{s_t}")
         nisa.tensor_copy(score_sb, score_scaled_bf16)
 
         mask_gqa = mask_gqa_tiles[s_t]
@@ -800,11 +805,9 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm_hoisted_weights(
     nisa.tensor_copy(exp_active_gqa, score_act_exp_T_sb[0:GQA, 0:1])
     nisa.tensor_tensor(sum_acc_gqa, sum_acc_gqa, exp_active_gqa, op=nl.add)
 
-    # ---- Reciprocal of denom: rsqrt² without +1e-9 eps ----
-    rsqrt_sum_gqa = sbm.alloc_stack((GQA, 1), nl.float32, name="rsqrt_sum_gqa")
-    nisa.activation(rsqrt_sum_gqa, op=nl.rsqrt, data=sum_acc_gqa)
+    # ---- Reciprocal of denom: Vector RECIPROCAL (matches HLO `divide` BIR lowering, spec §0.2/§5.6) ----
     inv_denom_gqa = sbm.alloc_stack((GQA, 1), nl.float32, name="inv_denom_gqa")
-    nisa.tensor_tensor(inv_denom_gqa, rsqrt_sum_gqa, rsqrt_sum_gqa, op=nl.multiply)
+    nisa.reciprocal(inv_denom_gqa, sum_acc_gqa)
 
     # Broadcast inv_denom_gqa [GQA, 1] → [PMAX, GQA] (same pattern as neg_max broadcast)
     inv_denom_psum = nl.ndarray((PMAX, GQA), dtype=nl.float32, buffer=nl.psum)
@@ -852,13 +855,20 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm_hoisted_weights(
     v_act_packed_bf16 = sbm.alloc_stack((PMAX, GQA), nl.bfloat16, name="v_act_packed_bf16")
     nisa.tensor_copy(v_act_packed_bf16, v_act_packed)
 
-    # bf16 * bf16 → fp32 accumulation (tensor_tensor with bf16 inputs, fp32 dst)
+    # spec §2 Step 9 / §5.7: prior matmul output is BF16 — CONVERT F32 sum → BF16
+    attn_prior_bf16 = sbm.alloc_stack((PMAX, GQA), nl.bfloat16, name="attn_prior_bf16")
+    nisa.tensor_copy(attn_prior_bf16, v_acc)
+
+    # bf16 * bf16 → fp32 (matches PE F32 PSUM for the active matmul)
     v_act_weighted_fp32 = sbm.alloc_stack((PMAX, GQA), nl.float32, name="v_act_weighted_fp32")
     nisa.tensor_tensor(v_act_weighted_fp32, v_act_packed_bf16, softmax_act_bf16, op=nl.multiply)
-    nisa.tensor_tensor(v_acc, v_acc, v_act_weighted_fp32, op=nl.add)
 
-    # Final cast to bf16 for attn_out
-    nisa.tensor_copy(attn_out, v_acc)
+    # spec §2 Step 9 / §5.7: active matmul output is BF16 — CONVERT F32 → BF16
+    attn_active_bf16 = sbm.alloc_stack((PMAX, GQA), nl.bfloat16, name="attn_active_bf16")
+    nisa.tensor_copy(attn_active_bf16, v_act_weighted_fp32)
+
+    # spec §2 Step 9: attn_output = attn_prior + attn_active in BF16
+    nisa.tensor_tensor(attn_out, attn_prior_bf16, attn_active_bf16, op=nl.add)
 
     sbm.close_scope()  # pass2
 
