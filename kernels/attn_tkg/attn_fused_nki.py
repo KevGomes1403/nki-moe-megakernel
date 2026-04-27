@@ -1,61 +1,26 @@
 """
-Debug copy of kernels.attn_tkg.agents.v14d_kv_norm_hoisted_weights.
+Qwen3 token-generation fused attention NKI kernel.
 
-Edit this file first when iterating on the simulator or hardware tests under
-tests/attn/.
+This is the productionized v14d debug kernel matched against the compiled NxDI
+Qwen baseline on trn3/LNC=2.  It fuses pre-attention RMSNorm, Q/K/V projection,
+Q/K RMSNorm, RoPE, flash-decode attention, output projection, and in-place KV
+cache updates for the local TP shard.
 
-Original kernel header:
-v14d_kv_norm_hoisted_weights: v14c_kv_norm_hoisted plus weight-prefetch kwargs.
+Calling conventions:
+  - Back-compat mode: when weight SBUF kwargs are None, weights are loaded from HBM.
+  - Hoisted mode: caller-provided Wk/Wv/Wq/Wo SBUF tensors are consumed directly.
 
-Key difference over v14c:
-  Four large weight matrices — Wk, Wv, Wq (per owned head), and Wo (per owned head) —
-  can now be passed in as already-loaded bf16 SBUF tensors.  When a weight kwarg is not
-  None, the corresponding sbm.alloc_stack + nisa.dma_copy calls are skipped and the
-  caller-owned tensor is used directly.
-
-  This is the building block for the multi-layer megakernel: call once outside the layer
-  loop for layer-invariant weights (Wk, Wv are shared across layers in some designs), or
-  stack across layers and feed the pre-loaded slices to each layer call, eliminating
-  redundant HBM→SBUF DMAs for weights that don't change.
-
-Calling conventions
--------------------
-  - Back-compat mode (all weight kwargs = None): identical to v14c — alloc + DMA happens
-    inside the function via sbm.alloc_stack + nisa.dma_copy.
-  - Hoisted mode (some or all weight kwargs provided): caller is responsible for keeping
-    the tensors live.  v14d will NOT pop (close_scope) / free them.
-
-New kwargs (all default None)
------------------------------
-  wk_sb        : [PMAX, NH*d]           bf16 SBUF — skip Wk alloc+DMA when given
-  wv_sb        : [PMAX, NH*d]           bf16 SBUF — skip Wv alloc+DMA when given
-  wq_heads_sb  : list of len(owned_heads) [PMAX, NH*d] bf16 — skip Wq load loop when given
-  wo_heads_sb  : list of len(owned_heads) [PMAX, H_wo] bf16 — skip Wo alloc+DMA loop when given
-
-  Caller must order wq_heads_sb[i] / wo_heads_sb[i] to correspond to global head
-  owned_heads[i] as computed internally from prg_id.
-
-SBUF allocation
----------------
-  All internal allocations still go through the caller-supplied sbm (SbufManager in
-  manual/auto mode).  When the caller passes a pre-loaded tensor it must also have been
-  allocated from the same sbm instance (or a compatible one).
+Caller-owned hoisted tensors must remain live for the duration of this call and
+must be allocated from the same SbufManager.
 """
 
-import math
 import nki.language as nl
 import nki.isa as nisa
 
 PMAX = 128
 F_MAX = 512
 EPS = 1e-6
-INV_SQRT_D = float(1.0 / math.sqrt(128.0))
 SOFTMAX_SCALE_BF16 = 0.08837890625
-PSUM_BANK_SIZE = 2048
-DEBUG_RETURN_COS = False
-DEBUG_RETURN_K = False
-DEBUG_RETURN_QSCORES = False
-DEBUG_RETURN_ATTN = False
 
 # Captured from the compiled NxDI RotaryEmbedding path on trn3/LNC=2.  The
 # baseline computes inv_freq on device, and several lanes differ by a few fp32
@@ -291,15 +256,6 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm_hoisted_weights(
     cos_f32 = nl.cos(rope_angle)
     sin_f32 = nl.sin(rope_angle)
 
-    if DEBUG_RETURN_COS:
-        debug_cols = H_wo // PMAX
-        if out_sb is None:
-            out_sb = sbm.alloc_stack((PMAX, debug_cols), nl.bfloat16, name="out_sb_debug_cos")
-        nisa.memset(out_sb, value=0.0)
-        nisa.tensor_copy(out_sb[0:PMAX, 0:1], cos_f32)
-        nisa.tensor_copy(out_sb[0:PMAX, 1:2], sin_f32)
-        return out_sb
-
     # =========================================================================
     # h_all: shell allocated at attn_outer, filled by pre_attn_norm
     # =========================================================================
@@ -419,18 +375,12 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm_hoisted_weights(
     # =========================================================================
     # Persistent tensors at attn_outer level
     # =========================================================================
-    k_rope = sbm.alloc_stack((PMAX, B), nl.float32, name="k_rope")
     k_rope_bf16 = sbm.alloc_stack((PMAX, B), nl.bfloat16, name="k_rope_bf16")
     k_rope_T_sb = sbm.alloc_stack((B, PMAX), nl.bfloat16, name="k_rope_T_sb")
     v_active = sbm.alloc_stack((PMAX, B), nl.float32, name="v_active")
     v_T_sb = sbm.alloc_stack((B, PMAX), nl.bfloat16, name="v_T_sb")
     q_bf16 = sbm.alloc_stack((PMAX, GQA), nl.bfloat16, name="q_bf16")
 
-    k_rope_bf16_f32 = sbm.alloc_stack((PMAX, B), nl.float32, name="k_rope_bf16_f32")
-    v_from_bf16 = sbm.alloc_stack((PMAX, B), nl.float32, name="v_from_bf16")
-    if DEBUG_RETURN_QSCORES:
-        q_pre_rope_dbg = sbm.alloc_stack((PMAX, GQA), nl.bfloat16, name="q_pre_rope_dbg")
-        q_raw_dbg = sbm.alloc_stack((PMAX, GQA), nl.bfloat16, name="q_raw_dbg")
 
     # Wo allocation — conditionally skip when caller-provided wo_heads_sb
     wo_sbuf = [None] * HQ_TP_CONST
@@ -496,21 +446,9 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm_hoisted_weights(
     k_rope_f32 = sbm.alloc_stack((PMAX, B), nl.float32, name="k_rope_f32")
     nisa.tensor_tensor(k_rope_f32, k_cos, k_sin_part, op=nl.add)
     nisa.tensor_copy(k_rope_bf16, k_rope_f32)
-    nisa.tensor_copy(k_rope, k_rope_bf16)
     k_rope_T_psum = nl.ndarray((B, PMAX), dtype=nl.bfloat16, buffer=nl.psum)
     nisa.nc_transpose(k_rope_T_psum, k_rope_bf16)
     nisa.tensor_copy(k_rope_T_sb, k_rope_T_psum)
-    nisa.tensor_copy(k_rope_bf16_f32, k_rope_bf16)
-
-    if DEBUG_RETURN_K:
-        debug_cols = H_wo // PMAX
-        if out_sb is None:
-            out_sb = sbm.alloc_stack((PMAX, debug_cols), nl.bfloat16, name="out_sb_debug_k")
-        nisa.memset(out_sb, value=0.0)
-        nisa.tensor_copy(out_sb[0:PMAX, 0:1], k_normed2_bf16)
-        nisa.tensor_copy(out_sb[0:PMAX, 1:2], k_rope_bf16)
-        sbm.close_scope()  # kv_proj
-        return out_sb
 
     # V projection
     v_psum = nl.zeros((PMAX, B), dtype=nl.float32, buffer=nl.psum)
@@ -540,7 +478,6 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm_hoisted_weights(
     v_T_psum = nl.ndarray((B, PMAX), dtype=nl.bfloat16, buffer=nl.psum)
     nisa.nc_transpose(v_T_psum, v_bf16)
     nisa.tensor_copy(v_T_sb, v_T_psum)
-    nisa.tensor_copy(v_from_bf16, v_bf16)
 
     sbm.close_scope()  # kv_proj
 
@@ -568,8 +505,6 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm_hoisted_weights(
     for i in range(len(owned_heads)):
         q_h = owned_heads[i]
         nisa.tensor_copy(q_packed_f32[0:PMAX, q_h:q_h + 1], q_psums[i])
-    if DEBUG_RETURN_QSCORES:
-        nisa.tensor_copy(q_raw_dbg, q_packed_f32)
 
     # Q RMSNorm — library ISA sequence (H=128=d, H_free=GQA)
     # First, broadcast qnw_sb [PMAX,1] → [PMAX,GQA] (needed before gamma multiply)
@@ -607,8 +542,6 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm_hoisted_weights(
     q_normed2_bf16 = sbm.alloc_stack((PMAX, GQA), nl.bfloat16, name="q_normed2_bf16")
     nisa.tensor_copy(q_normed2_bf16, q_normed2)
     nisa.tensor_copy(q_normed2, q_normed2_bf16)
-    if DEBUG_RETURN_QSCORES:
-        nisa.tensor_copy(q_pre_rope_dbg, q_normed2_bf16)
 
     # Q RoPE — bf16 inputs, fp32 multiply-add, one bf16 output round.
     cos_gqa_psum_T = nl.ndarray((GQA, PMAX), dtype=nl.float32, buffer=nl.psum)
@@ -802,34 +735,6 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm_hoisted_weights(
 
         saved_scores.append(score_sb_masked)
 
-    if DEBUG_RETURN_QSCORES:
-        debug_head = 2
-        debug_cols = H_wo // PMAX
-        if out_sb is None:
-            out_sb = sbm.alloc_stack((PMAX, debug_cols), nl.bfloat16, name="out_sb_debug_qscores")
-        nisa.memset(out_sb, value=0.0)
-        if n_prgs == 1 or (debug_head < 4 and prg_id == 0) or (debug_head >= 4 and prg_id == 1):
-            nisa.tensor_copy(out_sb[0:PMAX, 0:1], q_pre_rope_dbg[0:PMAX, debug_head:debug_head + 1])
-            nisa.tensor_copy(out_sb[0:PMAX, 1:2], q_bf16[0:PMAX, debug_head:debug_head + 1])
-            nisa.tensor_copy(out_sb[0:PMAX, 2:3], saved_scores[0][0:PMAX, debug_head:debug_head + 1])
-            nisa.tensor_copy(out_sb[0:PMAX, 3:4], score_active[0:PMAX, debug_head:debug_head + 1])
-            nisa.tensor_copy(out_sb[0:PMAX, 4:5], q_raw_dbg[0:PMAX, debug_head:debug_head + 1])
-        if n_prgs > 1:
-            peer_id = 1 - prg_id
-            dbg_peer = sbm.alloc_stack((PMAX, debug_cols), nl.bfloat16, name="dbg_qscores_peer")
-            nisa.sendrecv(
-                src=out_sb,
-                dst=dbg_peer,
-                send_to_rank=peer_id,
-                recv_from_rank=peer_id,
-                pipe_id=0,
-            )
-            if (debug_head < 4 and prg_id == 1) or (debug_head >= 4 and prg_id == 0):
-                nisa.tensor_copy(out_sb, dbg_peer)
-        sbm.close_scope()  # pass1_active
-        sbm.close_scope()  # kv_hoist
-        return out_sb
-
     neg_max_g1 = sbm.alloc_stack((GQA, 1), nl.float32, name="neg_max_g1")
     nisa.tensor_scalar(neg_max_g1, global_max_g1, op0=nl.multiply, operand0=-1.0)
 
@@ -950,31 +855,6 @@ def qwen3_attn_tkg_fused_oproj_v13bc_kv_norm_hoisted_weights(
     attn_out_f32 = sbm.alloc_stack((PMAX, GQA), nl.float32, name="attn_out_f32")
     nisa.tensor_tensor(attn_out_f32, v_acc, attn_active_bf16, op=nl.add)
     nisa.tensor_copy(attn_out, attn_out_f32)
-
-    if DEBUG_RETURN_ATTN:
-        debug_cols = H_wo // PMAX
-        if out_sb is None:
-            out_sb = sbm.alloc_stack((PMAX, debug_cols), nl.bfloat16, name="out_sb_debug_attn")
-        nisa.memset(out_sb, value=0.0)
-        if n_prgs == 1 or prg_id == 0:
-            nisa.tensor_copy(out_sb[0:PMAX, 0:1], v_acc[0:PMAX, 0:1])
-            nisa.tensor_copy(out_sb[0:PMAX, 1:2], attn_active_bf16[0:PMAX, 0:1])
-            nisa.tensor_copy(out_sb[0:PMAX, 2:3], attn_out[0:PMAX, 0:1])
-        if n_prgs > 1:
-            peer_id = 1 - prg_id
-            dbg_peer = sbm.alloc_stack((PMAX, debug_cols), nl.bfloat16, name="dbg_attn_peer")
-            nisa.sendrecv(
-                src=out_sb,
-                dst=dbg_peer,
-                send_to_rank=peer_id,
-                recv_from_rank=peer_id,
-                pipe_id=0,
-            )
-            nisa.tensor_tensor(out_sb, out_sb, dbg_peer, op=nl.add)
-        sbm.close_scope()  # pass2
-        sbm.close_scope()  # pass1_active
-        sbm.close_scope()  # kv_hoist
-        return out_sb
 
     sbm.close_scope()  # pass2
 

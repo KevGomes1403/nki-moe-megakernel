@@ -66,6 +66,58 @@
 - **Explicit `convert` HLO op:** F32 → BF16 appears as a top-level HLO `convert` between the matmul and the next op (entry computation has 1881 `convert` ops total).
 - **For bit-exact reproduction:** A NKI matmul must use F32 PSUM accumulation with explicit BF16 conversion at the read-out, NOT a BF16 accumulator.
 
+### 0.5 Artifact Pass: `138311351493953_vnc_0.ntff` / `neff_138311351493953_vnc_2.neff` (2026-04-27)
+
+This pass uses the requested source profile:
+
+```
+NTFF: output/baseline/1776976164165154117/138311351493953_vnc_0.ntff
+NEFF: output/baseline/1776976164165154117/neff_138311351493953_vnc_2.neff
+JSON export: /tmp/nxdi_attn_138311351493953_vnc0.json
+```
+
+#### LNC / virtual-core execution
+
+The NEFF is a virtual-core compile:
+- `number_of_neuroncores_per_lnc = 2`
+- `number_of_logical_neuroncores = 1`
+- `enabled_features` includes `virtual-core` and `v3-2x-4x-dve-perf-mode`
+- `number_of_cc_participants = 4`, matching TP=4 collectives, not TP*LNC
+
+Runtime `model_info` has two physical NC subgraphs under that one logical NC:
+
+| Subgraph | Physical NC | Source-attributed instructions | Notes |
+|----------|-------------|--------------------------------|-------|
+| `sg00` | ND0 NC4 | 123,488 | 512 MiB shared scratchpad |
+| `sg01` | ND0 NC5 | 118,418 | 512 MiB shared scratchpad |
+
+Attention HLOs are duplicated across the two subgraphs. For a steady-state layer (`NeuronQwen3MoEAttention[.50]`), the split is exactly 428 instructions on `sg00` and 428 on `sg01`; the same HLO names appear on both subgraphs with matching tile counts. The first attention module (`.49`) has extra RoPE table-generation/source-attribution noise (6,883 instructions, split 3,451/3,432), so layers `.50` through `.96` are cleaner representatives of normal per-layer TKG attention.
+
+The profile does not expose a named "batch axis" sharding annotation, but the NEFF node table shows per-item cache tensors shaped `[1 1 640 128]` and two scalar `[1 1]` token-position style inputs for the `bk2` model. Combined with the duplicated per-HLO execution and the absence of cross-subgraph attention collectives, the practical execution model is: the batch bucket is split into two independent physical-NC work items inside the LNC. Do not combine softmax denominators, QK partial sums, or `attn @ V` partial sums across `sg00`/`sg01` for a single token. Match one subgraph's local reduction order; the other subgraph runs the same sequence for the other bucket item.
+
+All recorded CC ops are TP collectives on `sg00` with replica group `[[0, 1, 2, 3]]`: 96 BF16 `AllReduce(num_elements=2048)` ops, plus the embedding/final `AllGather`s. There is no attention-softmax LNC collective.
+
+#### Steady TKG attention lowering (`NeuronQwen3MoEAttention[.50]`)
+
+Representative per-subgraph lowering:
+
+| Stage | HLO examples | Device lowering / bit-exact note |
+|-------|--------------|----------------------------------|
+| Q projection | `%dot.12` | 64 `128*128` PE matmul tiles per subgraph. BF16 inputs, F32 PSUM, copied to FP32 SBUF before downstream attention prep. |
+| K/V projections | `%dot.14`, `%dot.17` | 8 `128*128` PE matmul tiles per subgraph for each projection. BF16 inputs, F32 PSUM, copied to FP32 SBUF. Later Q/K/V values consumed by score/output matmuls are BF16 after the norm/RoPE/cache path. |
+| Prior QK scores | `%dot.13` | 5 `128*128` PE matmul tiles per subgraph for the 640-token cache bucket. The scale is applied in the Scalar epilogue as `scale=0.088379`, and the scaled scores are stored as BF16. |
+| Active QK score | `%dot.15` | 1 `128*1` PE matmul tile per subgraph. Same Scalar scale `0.088379`, stored as BF16. |
+| Mask | `%select.689` | Lowered to `COPY_PREDICATED_SCALAR` on the BF16 score buffer before the softmax reductions. |
+| Prior max | `%reduce.697` | Vector `TENSOR_REDUCE op=MAX dim=X`, BF16 source, FP32 destination. For non-speculative TKG there is no active-score reduce; `manual_softmax` compares `max(prior)` directly with the singleton `active_scores`. |
+| Exp | `%exponential.734`, `%exponential.749` | One `ACT_TABLE_LOAD` per subgraph before the first exp, then Scalar `ACTIVATE EXP` for active and prior. |
+| Prior exp sum | `%reduce.756` | Lowered to Tensor/TensorMatrix, not Vector reduce: 10 `LDWEIGHTS` + 10 `MATMUL 128*1` instructions per subgraph. This PE reduction order is part of the bit-exact behavior. |
+| Prior divide | `%divide.778` | 4 `LOAD_MASK_SELECT` + 4 `STREAM_SHUFFLE` + 1 `RECIPROCAL` + 1 Vector multiply per subgraph. The multiply consumes FP32 numerator/reciprocal and writes BF16 softmax-prior. |
+| Active softmax and `active @ V` | `%multiply.202` | The singleton active branch is not materialized as a separate BF16 softmax tensor plus PE matmul. The compiler scales `V_active` directly by the scalar active softmax and writes a BF16 active contribution. |
+| Prior `softmax @ V` + active add | `%dot.16` | 5 `128*128` PE matmul tiles per subgraph. The epilogue fuses the add with the active contribution: `src0=fp32` prior PSUM, `src1=bfloat16` active contribution, `dst=bfloat16`. Do not round prior `attn_prior` to BF16 before adding active if trying to match this lowering. |
+| Output projection | `%dot.19` | 65 `128*128` PE matmul tiles per subgraph, then Scalar `CAST` FP32 -> BF16. The TP BF16 all-reduce is recorded as a CC op on `sg00`. |
+
+This refines the earlier logical recipe: HLO still expresses `manual_softmax`, but the codegen for this artifact performs several numerically relevant fusions. In particular, the prior softmax denominator is a PE `128*1` reduction, active softmax is folded into the active-value scaling, and the final prior/active attention-output add is fused into the prior-output epilogue.
+
 ---
 
 ## 1. Model Configuration & Tensor Sharding
@@ -666,10 +718,10 @@ To match the HLO output bit-for-bit in an NKI fused attention kernel, the follow
 - [ ] **Final output cast:** BF16 (no FP32 residual)
 
 ### 5.2 QKV Projection
-- [ ] **Weight accumulation:** BF16 (no FP32 accumulator; PE uses F32 internally but output CONVERTS to BF16)
+- [ ] **Weight accumulation:** BF16 inputs with F32 PSUM accumulation on the PE. Match the observed epilogue/cast point for the artifact, not just the logical dot shape.
 - [ ] **No bias:** Fused weights as three separate matmuls in HLO; no bias addition
 - [ ] **QKV shape:** Q=[1,1,1024], K=[1,1,128], V=[1,1,128] (8×128, 1×128, 1×128 per-head)
-- [ ] **Output dtype:** BF16 after CONVERT from PE
+- [ ] **Output dtype:** The 2026-04-27 artifact copies Q/K/V projection PSUM to FP32 SBUF before downstream attention prep; later Q/K/V values consumed by score/output matmuls are BF16 after norm/RoPE/cache handling.
 
 ### 5.3 RoPE
 - [ ] **cos/sin dtype:** BF16 (computed in FP32 via table lookup, cast to BF16 before use)
@@ -685,26 +737,26 @@ To match the HLO output bit-for-bit in an NKI fused attention kernel, the follow
 
 ### 5.5 Attention Score Computation
 - [ ] **QK matmul:** Execute in BF16 (both inputs BF16)
-- [ ] **Scale factor:** 1/sqrt(128) ≈ 0.08838 (as float or immediate multiply)
+- [ ] **Scale factor:** 1/sqrt(128) as the observed Scalar epilogue constant `scale=0.088379`
 - [ ] **Scale order:** `(Q @ K^T) * scale` (not `Q_scaled @ K^T`; both equivalent for bit-exactness)
-- [ ] **Immediate upcast:** `prior_scores.to(torch.float32)` and `active_scores.to(torch.float32)` **immediately after matmul, before masking**
-- [ ] **Mask dtype:** FP32 (boolean mask applied to FP32 scores)
-- [ ] **Mask value:** torch.finfo(torch.float32).min (≈ -3.4e38) for invalid positions
+- [ ] **Score storage before softmax:** The artifact stores scaled prior/active scores as BF16; softmax reductions consume those BF16 values and produce FP32 reduction results. Do not assume a fully materialized FP32 score tensor before the mask.
+- [ ] **Mask dtype:** Boolean mask applied to the score buffer before the softmax reduction path.
+- [ ] **Mask value:** `torch.finfo(prior_scores.dtype).min`; in this artifact the score buffer is BF16 at the `where`, so use the BF16 minimum value before the softmax reduction path.
 
 ### 5.6 Softmax (Plain HLO; Hardware-LUT exp & Reciprocal divide)
 - [ ] **HLO is plain log-sum-exp** — softmax is NOT a custom-call. Implement explicit `max → subtract → exp → sum → divide`, all in F32.
 - [ ] **`exp` precision:** Use NKI `nl.exp` — it lowers to the same Scalar-engine LUT path (`ACT_TABLE_LOAD` + `ACTIVATE`) as the compiler-emitted ops. Hand-rolled polynomial exp will diverge.
 - [ ] **`divide` precision:** Use NKI's divide (lowers to RECIPROCAL + multiply) — matches the BIR-level lowering. Note: hardware reciprocal is not full f32 precision; this is the same loss the compiler accepts.
-- [ ] **Reduction order:** max(dim=-1) **independently** for prior and active, then `maximum(max_prior, max_active)` — not a single fused reduce
+- [ ] **Reduction order:** non-speculative TKG computes `max(prior)` and then `maximum(max_prior, active_scores)` directly; `max(active)` only appears for speculation/prefix-caching where active length can exceed 1.
 - [ ] **Exp stabilization:** `exp(scores - global_max)` — both prior and active subtract the same global max
-- [ ] **Denominator:** `sum(exp_prior, dim=-1) + sum(exp_active, dim=-1)` (separate sums, then add) — a single fused sum across both will differ
-- [ ] **Final cast:** `softmax_prior.to(BF16)`, `softmax_active.to(BF16)` **before attention @ V matmul**
-- [ ] **All intermediate ops in F32** (max, subtract, exp, sum, divide) — verified from HLO `Shape.element_type=11`
+- [ ] **Denominator:** logical HLO is `sum(exp_prior, dim=-1) + sum(exp_active, dim=-1)`, but this artifact lowers the prior sum to PE `128*1` reductions and folds the singleton active branch into later scaling.
+- [ ] **Final cast/materialization:** Prior softmax is written BF16 before `attn_prior @ V_prior`; in this non-spec artifact the singleton active softmax is folded into active-value scaling rather than materialized as a separate tensor.
+- [ ] **Logical intermediate dtype:** HLO softmax intermediates are F32 after conversion, but this codegen may fuse conversion into reductions/epilogues and read BF16 score storage directly.
 
 ### 5.7 Attention Output Matmul
 - [ ] **Weights dtype:** BF16 (both softmax and V values)
-- [ ] **Matmul accumulation:** BF16 (PE F32 → CONVERT to BF16 output)
-- [ ] **Output dtype:** BF16 after prior + active addition
+- [ ] **Matmul accumulation:** Prior branch uses BF16 inputs with F32 PE PSUM; singleton active branch is a scalar scale of BF16 `V_active`.
+- [ ] **Output dtype:** BF16 after prior + active addition. In the 2026-04-27 artifact, the active singleton contribution is BF16 and the prior PE epilogue adds FP32 prior PSUM + BF16 active contribution before writing BF16.
 
 ### 5.8 Output Projection
 - [ ] **Weight matrix:** [1024, 2048] per rank (RowParallelLinear; gathered to full hidden_size after all-reduce)
@@ -714,8 +766,8 @@ To match the HLO output bit-for-bit in an NKI fused attention kernel, the follow
 
 ### 5.9 Reduction Order & Associativity
 - [ ] **No reorder-associative reductions:** All reductions must match the HLO order exactly
-- [ ] **Softmax max:** max(prior), max(active), then max(those two)—not all three at once
-- [ ] **Softmax sum (if manual):** sum(exp_prior) and sum(exp_active) computed independently, then added
+- [ ] **Softmax max:** for non-spec TKG, max(prior), then max with the singleton active score; do not introduce an active reduce unless speculation/prefix-caching is enabled.
+- [ ] **Softmax sum (if manual):** preserve the prior PE reduction order observed in the artifact; the singleton active term may be folded into the scalar active-value scale.
 - [ ] **No fusion that changes order:** e.g., don't fuse max and exp into a single operation
 
 ### 5.10 Data Movement
@@ -729,6 +781,10 @@ To match the HLO output bit-for-bit in an NKI fused attention kernel, the follow
 - [ ] **PE output before CONVERT:** F32 (from PSUM)
 - [ ] **CONVERT step:** Explicit F32 → BF16 conversion (one output per matmul)
 - [ ] **Do NOT skip the CONVERT:** The hardware has this step; omitting it will cause bit divergence
+
+### 5.12 LNC=2 Virtual-Core Behavior
+- [ ] **Match per-subgraph reductions:** For `bk2` on this NEFF, `sg00` and `sg01` execute independent token/bucket work. Do not split one token's QK, softmax denominator, or `attn @ V` accumulation across the two physical NCs unless you also match the compiler's virtual-core partitioning.
+- [ ] **TP collectives remain TP=4:** The attention output projection all-reduce is BF16 over replica group `[[0, 1, 2, 3]]`; LNC physical NCs are not extra TP participants.
 
 ---
 
@@ -744,10 +800,10 @@ To match the HLO output bit-for-bit in an NKI fused attention kernel, the follow
 ### 6.2 Softmax Implementation (Critical Correction)
 
 **Original assumption:** Manual softmax with Python-level exp and divide.  
-**HLO Reality:** Custom-call kernel with:
+**Device lowering reality:** Plain HLO softmax ops lowered to:
 - **Exponential:** Lookup-table approximation (ACT_TABLE_LOAD), not true exp
 - **Divide:** Reciprocal-based (RECIPROCAL + multiply), not true divide  
-**Impact on NKI:** Bit-exact reproduction REQUIRES matching the LUT precision. A naive `math.exp()` will diverge from the softmax weights. Conversely, if you implement manual softmax, you cannot claim bit-exactness against the hardware; the best you can do is "numerically equivalent within LUT precision bounds."
+**Impact on NKI:** Bit-exact reproduction REQUIRES matching the LUT/reciprocal precision and the artifact's reduction/fusion points. A naive CPU-style `math.exp()` or a different denominator reduction will diverge from the softmax weights.
 
 ### 6.3 Accumulator Precision (--enable-mixed-precision-accumulation)
 
@@ -811,13 +867,13 @@ The only attention-path custom-call is `AwsNeuronRmsNorm` (193 instances). Softm
 
 1. **Follow the 10-step execution order:** Input RMSNorm (custom-call) → QKV (3 separate matmuls, F32 PSUM accum) → QK RMSNorm (custom-call) → RoPE (table lookup) → KV cache scatter → GQA broadcast → prior QK^T → active QK^T → softmax (plain HLO max/exp/sum/divide in F32, hardware-LUT exp, hardware-RECIPROCAL divide) → attention @ V → reshape → o_proj → all-reduce.
 
-2. **Match all dtype transitions:** BF16 ↔ F32 at exact points: at custom-call RMSNorm boundary; after QK matmul → upcast scores to F32; after softmax → cast weights back to BF16 before attn @ V. The HLO contains 1881 `convert` ops — implement them as explicit casts.
+2. **Match all dtype transitions:** BF16 ↔ F32 at exact points: at custom-call RMSNorm boundaries; after QK score matmul the artifact scales into BF16 score storage, then softmax reductions produce FP32 reduction results; prior softmax weights are written BF16 before `attn @ V`. The HLO contains 1881 `convert` ops, but codegen may fuse the convert into reductions or matmul epilogues.
 
 3. **PE accumulator precision:** F32 accumulation in PSUM, explicit CONVERT to BF16 output (NOT a BF16 accumulator).
 
-4. **Softmax:** Plain log-sum-exp on F32 — `max(prior)`, `max(active)`, `maximum(...)`, `subtract`, `exp`, `reduce_sum`, `divide`. Use `nl.exp` (Scalar LUT) and `nl.reciprocal` (Vector) to match the compiler's BIR lowering of the HLO ops.
+4. **Softmax:** Plain log-sum-exp on F32 in HLO. For non-speculative TKG the max path is `max(prior)` then `maximum(max_prior, active_scores)`; the artifact lowers prior exp-sum to PE `128*1` reductions and folds the singleton active branch into active-value scaling. Use `nl.exp` (Scalar LUT) and reciprocal/multiply lowering compatible with the compiler path.
 
-5. **No reordering of separable reductions:** Per-rank prior/active reductions are *independent* in the HLO (separate `reduce` ops) — fusing them into one combined reduce will give different bf16-arithmetic results.
+5. **No reordering of separable reductions:** Preserve the prior-cache reduction order and the singleton active path. A single combined prior+active reduce will not match this artifact.
 
 6. **RMSNorm:** Use `nl.rms_norm` (or hand-rolled with `nl.rsqrt` on the Scalar engine) — matches the device path of `AwsNeuronRmsNorm` custom-call.
 
@@ -831,10 +887,14 @@ The only attention-path custom-call is `AwsNeuronRmsNorm` (193 instances). Softm
 
 10. **GQA repeat_kv:** Implement as logical reshape + broadcast, no dtype conversion.
 
+11. **LNC=2:** Match one physical-NC subgraph's local order for one token/bucket item; do not introduce cross-LNC softmax or attention-output reductions.
+
 ---
 
-**Document Version:** 2.0  
-**Last Updated:** 2026-04-25  
-**Verification:** Ground-truth from HLO proto (1395 computations, 17,624 entry instructions) + profile JSON (237,885 timestamped device instructions, layer .49)  
-**Status:** Ready for NKI kernel implementation — validated against compiler output, not Python source.
+**Document Version:** 2.1
 
+**Last Updated:** 2026-04-27
+
+**Verification:** Ground-truth from HLO proto (1395 computations, 17,624 entry instructions) + profile JSON (`/tmp/nxdi_attn_138311351493953_vnc0.json`, 241,906 source-attributed device instructions across `sg00`/`sg01`)
+
+**Status:** Ready for NKI kernel implementation — validated against compiler output, not Python source.

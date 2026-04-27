@@ -22,6 +22,7 @@ Run:
 """
 
 import argparse
+import contextlib
 import os
 import sys
 import tempfile
@@ -238,6 +239,57 @@ def _percentile(values, q):
     return float(np.percentile(np.asarray(values, dtype=np.float64), q)) if values else float("nan")
 
 
+def _bf16_bits(t: torch.Tensor) -> str:
+    return f"0x{int(t.detach().cpu().view(torch.int16).item()) & 0xffff:04x}"
+
+
+def _print_failure_details(
+    sample_idx: int,
+    combo: tuple,
+    hidden: torch.Tensor,
+    top8_idx: torch.Tensor,
+    top8_vals: torch.Tensor,
+    kernel_out: torch.Tensor,
+    nxdi_out: torch.Tensor,
+    max_coords: int = 8,
+) -> None:
+    kernel_cpu = kernel_out.detach().cpu()
+    nxdi_cpu = nxdi_out.detach().cpu()
+    abs_diff = (kernel_cpu.float() - nxdi_cpu.float()).abs()
+    failing = torch.nonzero(abs_diff > 1.0e-5, as_tuple=False)
+    flat_order = torch.argsort(abs_diff.flatten(), descending=True)
+
+    print(
+        f"\n  STRICT FAILURE sample={sample_idx} combo={combo} "
+        f"num_coords={failing.shape[0]} max_abs={abs_diff.max().item():.6g}",
+        flush=True,
+    )
+    print(f"    top8_idx={top8_idx.detach().cpu().tolist()}", flush=True)
+    print(f"    top8_vals={top8_vals.detach().cpu().float().tolist()}", flush=True)
+
+    shown = 0
+    for flat_idx in flat_order.tolist():
+        if shown >= max_coords:
+            break
+        t = flat_idx // kernel_cpu.shape[1]
+        h = flat_idx % kernel_cpu.shape[1]
+        err = abs_diff[t, h].item()
+        if err <= 1.0e-5:
+            break
+        k_val = kernel_cpu[t, h]
+        n_val = nxdi_cpu[t, h]
+        print(
+            "    "
+            f"coord=(t={t}, h={h}) "
+            f"kernel={float(k_val): .8g} {_bf16_bits(k_val)} "
+            f"nxdi={float(n_val): .8g} {_bf16_bits(n_val)} "
+            f"diff={float((k_val.float() - n_val.float()).item()):+.8g} "
+            f"hidden={float(hidden.detach().cpu()[t, h]): .8g} {_bf16_bits(hidden.detach().cpu()[t, h])}",
+            flush=True,
+        )
+        shown += 1
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=42)
@@ -245,6 +297,12 @@ def main():
     parser.add_argument("--n-samples", type=int, default=2048)
     parser.add_argument("--weight-scales", type=lambda s: [float(x) for x in s.split(",")], default=[2.0])
     parser.add_argument("--loose-fail-threshold", type=float, default=0.01)
+    parser.add_argument("--strict-fail-threshold", type=float, default=None)
+    parser.add_argument("--dump-failures", type=int, default=0)
+    parser.add_argument("--workdir", type=str, default=None)
+    parser.add_argument("--keep-workdir", action="store_true")
+    parser.add_argument("--ref-compiler-args", type=str, default=None)
+    parser.add_argument("--kernel-compiler-args", type=str, default=None)
     args = parser.parse_args()
 
     cfg = make_config()
@@ -263,7 +321,16 @@ def main():
     ]
 
     aggregate_stats = []
-    with tempfile.TemporaryDirectory(prefix="experts_vs_nxdi_") as workdir:
+    if args.workdir:
+        os.makedirs(args.workdir, exist_ok=True)
+        workdir_cm = contextlib.nullcontext(args.workdir)
+    elif args.keep_workdir:
+        workdir_cm = contextlib.nullcontext(tempfile.mkdtemp(prefix="experts_vs_nxdi_"))
+    else:
+        workdir_cm = tempfile.TemporaryDirectory(prefix="experts_vs_nxdi_")
+
+    with workdir_cm as workdir:
+        print(f"Compiler workdir: {workdir}", flush=True)
         for ws in args.weight_scales:
             ws_tag = f"ws{ws:g}"
             print(f"\n{'=' * 65}\n  weight_scale={ws:g}\n{'=' * 65}", flush=True)
@@ -276,7 +343,7 @@ def main():
                 module_init_kwargs={"config": cfg, "seed": args.seed, "weight_scale": ws, "_weight_store": ref_weight_store},
                 tp_degree=cfg.neuron_config.tp_degree,
                 logical_nc_config=LNC,
-                compiler_args=COMPILER_ARGS,
+                compiler_args=args.ref_compiler_args or COMPILER_ARGS,
                 compiler_workdir=os.path.join(workdir, f"ref_workdir_{ws_tag}"),
             )
             print("RefExpertsModule compile PASS\n", flush=True)
@@ -289,7 +356,7 @@ def main():
                 module_init_kwargs={"config": cfg, "seed": args.seed, "weight_scale": ws, "_weight_store": kern_weight_store},
                 tp_degree=cfg.neuron_config.tp_degree,
                 logical_nc_config=LNC,
-                compiler_args=COMPILER_ARGS,
+                compiler_args=args.kernel_compiler_args or COMPILER_ARGS,
                 compiler_workdir=os.path.join(workdir, f"kern_workdir_{ws_tag}"),
             )
             print("KernelExpertsModule compile PASS\n", flush=True)
@@ -304,6 +371,7 @@ def main():
 
             print("\nValidating sample by sample (ref_traced vs kernel expected)...", flush=True)
             scale_stats = []
+            dumped_failures = 0
             for i, ((hidden, top8_idx, top8_vals), expected) in enumerate(zip(inputs_list, expected_list)):
                 actual = ref_traced(hidden, top8_idx, top8_vals)
                 stats = _sample_stats(expected, actual)
@@ -313,6 +381,9 @@ def main():
                 stats["combo"] = combos_list[i]
                 stats["weight_scale"] = ws
                 scale_stats.append(stats)
+                if not stats["pass_strict"] and dumped_failures < args.dump_failures:
+                    _print_failure_details(i, combos_list[i], hidden, top8_idx, top8_vals, expected, actual)
+                    dumped_failures += 1
                 if (i + 1) % 256 == 0 or i == len(inputs_list) - 1:
                     print(f"    validated {i + 1:4d} / {len(inputs_list)} samples", flush=True)
 
@@ -346,8 +417,16 @@ def main():
             aggregate_stats.extend(scale_stats)
 
     total = len(aggregate_stats)
+    strict_fail = sum(1 for s in aggregate_stats if not s["pass_strict"])
+    strict_fail_rate = strict_fail / total if total > 0 else 0.0
     loose_fail = sum(1 for s in aggregate_stats if not s["pass_loose"])
     loose_fail_rate = loose_fail / total if total > 0 else 0.0
+    print(f"\n  Strict fail rate: {100.0 * strict_fail_rate:.3f}%", flush=True)
+    if args.strict_fail_threshold is not None and strict_fail_rate > args.strict_fail_threshold:
+        raise AssertionError(
+            f"strict fail rate {100.0 * strict_fail_rate:.3f}% exceeds gate "
+            f"{100.0 * args.strict_fail_threshold:.2f}%"
+        )
     print(f"\n  Loose-tolerance fail rate: {100.0 * loose_fail_rate:.3f}%  "
           f"(gate: {100.0 * args.loose_fail_threshold:.2f}%)", flush=True)
     if loose_fail_rate > args.loose_fail_threshold:

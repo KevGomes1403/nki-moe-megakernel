@@ -64,6 +64,18 @@ def _experts_sbuf_in_sbuf_out(
     # bf16 once.
     out_sb = sbm.alloc_stack((_PMAX, T, 4, 4), dtype, buffer=nl.sbuf, name="out_sb")
     if debug:
+        debug_gate_f32 = sbm.alloc_heap(
+            (_GU_P, T * _K), nl.float32, buffer=nl.sbuf, name="debug_gate_f32"
+        )
+        debug_up_f32 = sbm.alloc_heap(
+            (_GU_P, T * _K), nl.float32, buffer=nl.sbuf, name="debug_up_f32"
+        )
+        debug_inter_bf16 = sbm.alloc_heap(
+            (_GU_P, T * _K), dtype, buffer=nl.sbuf, name="debug_inter_bf16"
+        )
+        debug_down_f32 = sbm.alloc_heap(
+            (_PMAX, H_free * T * _K), nl.float32, buffer=nl.sbuf, name="debug_down_f32"
+        )
         debug_weighted_f32 = sbm.alloc_heap(
             (_PMAX, H_free * T, _K), nl.float32, buffer=nl.sbuf, name="debug_weighted_f32"
         )
@@ -246,6 +258,18 @@ def _experts_sbuf_in_sbuf_out(
 
             sbm.open_scope(name=f"w0_expert_{k}_t{t}")
 
+            if debug:
+                nisa.activation(
+                    debug_gate_f32[0:_GU_P, t * _K + k:t * _K + k + 1],
+                    op=nl.copy,
+                    data=gate_up_psum[0:_GU_P, gu_base + i_lnc:gu_base + i_lnc + 1],
+                )
+                nisa.activation(
+                    debug_up_f32[0:_GU_P, t * _K + k:t * _K + k + 1],
+                    op=nl.copy,
+                    data=gate_up_psum[0:_GU_P, gu_base + I_tiles + i_lnc:gu_base + I_tiles + i_lnc + 1],
+                )
+
             silu_res_bf16 = sbm.alloc_stack((_GU_P, 1), dtype, buffer=nl.sbuf, name=f"silu_res_bf16_w0k{k}_t{t}")
             nisa.activation(
                 silu_res_bf16,
@@ -260,6 +284,11 @@ def _experts_sbuf_in_sbuf_out(
                 gate_up_psum[0:_GU_P, gu_base + I_tiles + i_lnc:gu_base + I_tiles + i_lnc + 1],
                 nl.multiply,
             )
+            if debug:
+                nisa.tensor_copy(
+                    dst=debug_inter_bf16[0:_GU_P, t * _K + k:t * _K + k + 1],
+                    src=inter_bf16,
+                )
 
             # Down matmul: each LNC computes one 96-wide I shard. The local
             # partial stays fp32 through weighting; LNC reduction happens after
@@ -284,6 +313,11 @@ def _experts_sbuf_in_sbuf_out(
                 op=nl.copy,
                 data=down_psum[0:_PMAX, d_base:d_base + H_free],
             )
+            if debug:
+                nisa.tensor_copy(
+                    dst=debug_down_f32[0:_PMAX, nl.ds((t * _K + k) * H_free, H_free)],
+                    src=down_result_f32,
+                )
             down_peer_f32 = sbm.alloc_stack((_PMAX, H_free), nl.float32, buffer=nl.sbuf, name=f"down_peer_f32_w0k{k}_t{t}")
             nisa.sendrecv(
                 src=down_result_f32,
@@ -395,6 +429,18 @@ def _experts_sbuf_in_sbuf_out(
 
             sbm.open_scope(name=f"w1_expert_{k}_t{t}")
 
+            if debug:
+                nisa.activation(
+                    debug_gate_f32[0:_GU_P, t * _K + kk:t * _K + kk + 1],
+                    op=nl.copy,
+                    data=gate_up_psum[0:_GU_P, gu_base + i_lnc:gu_base + i_lnc + 1],
+                )
+                nisa.activation(
+                    debug_up_f32[0:_GU_P, t * _K + kk:t * _K + kk + 1],
+                    op=nl.copy,
+                    data=gate_up_psum[0:_GU_P, gu_base + I_tiles + i_lnc:gu_base + I_tiles + i_lnc + 1],
+                )
+
             silu_res_bf16 = sbm.alloc_stack((_GU_P, 1), dtype, buffer=nl.sbuf, name=f"silu_res_bf16_w1k{k}_t{t}")
             nisa.activation(
                 silu_res_bf16,
@@ -409,6 +455,11 @@ def _experts_sbuf_in_sbuf_out(
                 gate_up_psum[0:_GU_P, gu_base + I_tiles + i_lnc:gu_base + I_tiles + i_lnc + 1],
                 nl.multiply,
             )
+            if debug:
+                nisa.tensor_copy(
+                    dst=debug_inter_bf16[0:_GU_P, t * _K + kk:t * _K + kk + 1],
+                    src=inter_bf16,
+                )
 
             for h1_out in nl.affine_range(H_free):
                 if i_lnc == 0:
@@ -430,6 +481,11 @@ def _experts_sbuf_in_sbuf_out(
                 op=nl.copy,
                 data=down_psum[0:_PMAX, d_base:d_base + H_free],
             )
+            if debug:
+                nisa.tensor_copy(
+                    dst=debug_down_f32[0:_PMAX, nl.ds((t * _K + kk) * H_free, H_free)],
+                    src=down_result_f32,
+                )
             down_peer_f32 = sbm.alloc_stack((_PMAX, H_free), nl.float32, buffer=nl.sbuf, name=f"down_peer_f32_w1k{k}_t{t}")
             nisa.sendrecv(
                 src=down_result_f32,
@@ -478,7 +534,7 @@ def _experts_sbuf_in_sbuf_out(
     sbm.close_scope()  # expert_loop_outer
 
     if debug:
-        return out_sb, debug_weighted_f32
+        return out_sb, debug_gate_f32, debug_up_f32, debug_inter_bf16, debug_down_f32, debug_weighted_f32
     return out_sb  # [PMAX, T, 4, 4] bf16 — full H, column-major
 
 
@@ -560,6 +616,7 @@ def experts_debug_hbm(inp_normed, top8_idx_in, top8_vals_in, gate_up_w, down_w):
     sbm    = SbufManager(0, nl.tile_size.total_available_sbuf_size, use_auto_alloc=True)
     T      = inp_normed.shape[0]
     H_free = _H_FREE
+    i_lnc  = nl.program_id(0)
 
     inp_2d          = inp_normed.reshape((T, _H))
     inp_2d_hbm_flat = inp_2d.reshape((H_free * T, _PMAX))
@@ -577,12 +634,16 @@ def experts_debug_hbm(inp_normed, top8_idx_in, top8_vals_in, gate_up_w, down_w):
     top8_vals_bf16 = sbm.alloc_heap((T, _K), inp_normed.dtype, buffer=nl.sbuf, name="top8_vals_bf16")
     nisa.dma_copy(dst=top8_vals_bf16[0:T, 0:_K], src=top8_vals_in[0:T, 0:_K])
 
-    out_sb, debug_weighted_f32 = _experts_sbuf_in_sbuf_out(
+    out_sb, debug_gate_f32, debug_up_f32, debug_inter_bf16, debug_down_f32, debug_weighted_f32 = _experts_sbuf_in_sbuf_out(
         rmsnorm_normed_bf16, top8_idx, top8_vals_bf16,
         inp_normed.dtype, T, gate_up_w, down_w, sbm=sbm, debug=True,
     )
 
     output = nl.ndarray((T, _H), dtype=inp_normed.dtype, buffer=nl.shared_hbm)
+    debug_gate = nl.ndarray((_I, T * _K), dtype=nl.float32, buffer=nl.shared_hbm)
+    debug_up = nl.ndarray((_I, T * _K), dtype=nl.float32, buffer=nl.shared_hbm)
+    debug_inter = nl.ndarray((_I, T * _K), dtype=inp_normed.dtype, buffer=nl.shared_hbm)
+    debug_down = nl.ndarray((_PMAX, H_free * T * _K), dtype=nl.float32, buffer=nl.shared_hbm)
     debug_weighted = nl.ndarray((_PMAX, H_free * T * _K), dtype=nl.float32, buffer=nl.shared_hbm)
 
     sbm.open_scope(name="store_hbm")
@@ -607,16 +668,36 @@ def experts_debug_hbm(inp_normed, top8_idx_in, top8_vals_in, gate_up_w, down_w):
     for t in nl.static_range(T):
         for k in nl.static_range(_K):
             nisa.dma_copy(
+                dst=debug_gate[nl.ds(i_lnc * _GU_P, _GU_P), t * _K + k:t * _K + k + 1],
+                src=debug_gate_f32[0:_GU_P, t * _K + k:t * _K + k + 1],
+            )
+            nisa.dma_copy(
+                dst=debug_up[nl.ds(i_lnc * _GU_P, _GU_P), t * _K + k:t * _K + k + 1],
+                src=debug_up_f32[0:_GU_P, t * _K + k:t * _K + k + 1],
+            )
+            nisa.dma_copy(
+                dst=debug_inter[nl.ds(i_lnc * _GU_P, _GU_P), t * _K + k:t * _K + k + 1],
+                src=debug_inter_bf16[0:_GU_P, t * _K + k:t * _K + k + 1],
+            )
+            nisa.dma_copy(
+                dst=debug_down[0:_PMAX, nl.ds((t * _K + k) * H_free, H_free)],
+                src=debug_down_f32[0:_PMAX, nl.ds((t * _K + k) * H_free, H_free)],
+            )
+            nisa.dma_copy(
                 dst=debug_weighted[0:_PMAX, nl.ds((t * _K + k) * H_free, H_free)],
                 src=debug_weighted_f32[0:_PMAX, nl.ds(t * H_free, H_free), k],
             )
     sbm.close_scope()  # store_hbm
 
     sbm.pop_heap()  # debug_weighted_f32
+    sbm.pop_heap()  # debug_down_f32
+    sbm.pop_heap()  # debug_inter_bf16
+    sbm.pop_heap()  # debug_up_f32
+    sbm.pop_heap()  # debug_gate_f32
     sbm.pop_heap()  # top8_vals_bf16
     sbm.pop_heap()  # top8_idx
     sbm.pop_heap()  # rmsnorm_normed_bf16
 
     sbm.close_scope()  # inp_load
 
-    return output, debug_weighted
+    return output, debug_gate, debug_up, debug_inter, debug_down, debug_weighted

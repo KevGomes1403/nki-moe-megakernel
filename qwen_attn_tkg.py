@@ -17,7 +17,7 @@ from torch import nn
 
 from qwen import *  # noqa: F401,F403 - re-export the baseline qwen.py surface.
 
-from kernels.attn_tkg.agents.v14d_kv_norm_hoisted_weights import (
+from kernels.attn_tkg.attn_fused_nki import (
     PMAX as V14D_PMAX,
     qwen3_attn_tkg_fused_oproj_v13bc_kv_norm_hoisted_weights,
 )

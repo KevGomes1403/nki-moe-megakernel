@@ -34,7 +34,6 @@ from common import (
     H,
     LNC,
     S,
-    TP_DEGREE,
     KernelAttnModule,
     RefAttnModule,
     build_rotary_emb,
@@ -50,6 +49,12 @@ from common import (
 )
 import torch
 
+TEST_TP_DEGREE = 1
+# v14d is a per-shard kernel. Model that shard directly instead of relying on
+# NxDI TP checkpoint sharding in this standalone test.
+LOCAL_Q_HEADS = 8
+LOCAL_KV_HEADS = 1
+
 
 def _fmt_pct(n: int, total: int) -> str:
     if total == 0:
@@ -64,6 +69,28 @@ def _print_weight_diffs(ref_weight_store, kern_weight_store) -> None:
         print(f"  {key:<22} max_abs_diff={max_abs:.6g}", flush=True)
     if any(value != 0.0 for value in diffs.values()):
         raise AssertionError("reference and kernel modules did not initialize identically")
+
+
+def make_tp1_config():
+    cfg = make_config()
+    cfg.neuron_config.tp_degree = TEST_TP_DEGREE
+    cfg.num_attention_heads = LOCAL_Q_HEADS
+    cfg.num_key_value_heads = LOCAL_KV_HEADS
+    return cfg
+
+
+def _with_full_ref_cache(ref_outputs, K_cache, V_cache, position_ids):
+    hidden_out, K_new, V_new = ref_outputs
+    bsz, n_kv, _, d = K_cache.shape
+    K_new = K_new.reshape(bsz, n_kv, 1, d).to(K_cache.device)
+    V_new = V_new.reshape(bsz, n_kv, 1, d).to(V_cache.device)
+    cache_idx = position_ids.to(torch.long).reshape(bsz, 1, 1, 1)
+    cache_idx = cache_idx.expand(bsz, n_kv, 1, d)
+    return (
+        hidden_out,
+        K_cache.scatter(2, cache_idx, K_new),
+        V_cache.scatter(2, cache_idx, V_new),
+    )
 
 
 def main() -> None:
@@ -95,11 +122,11 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    cfg = make_config()
+    cfg = make_tp1_config()
     rotary_emb = build_rotary_emb(cfg)
     print(
         f"Config: H={H} d={D} Hq={cfg.num_attention_heads} Hkv={cfg.num_key_value_heads} "
-        f"S={S} TP={TP_DEGREE} LNC={LNC}",
+        f"S={S} TP={TEST_TP_DEGREE} LNC={LNC}",
         flush=True,
     )
     print(f"weight_scales={args.weight_scales}  n_samples/scale={args.n_samples}", flush=True)
@@ -134,7 +161,7 @@ def main() -> None:
                     "weight_scale": weight_scale,
                     "_weight_store": ref_weight_store,
                 },
-                tp_degree=TP_DEGREE,
+                tp_degree=TEST_TP_DEGREE,
                 logical_nc_config=LNC,
                 compiler_args=COMPILER_ARGS,
                 compiler_workdir=os.path.join(workdir, f"ref_{scale_tag}"),
@@ -152,7 +179,7 @@ def main() -> None:
                     "weight_scale": weight_scale,
                     "_weight_store": kern_weight_store,
                 },
-                tp_degree=TP_DEGREE,
+                tp_degree=TEST_TP_DEGREE,
                 logical_nc_config=LNC,
                 compiler_args=COMPILER_ARGS,
                 compiler_workdir=os.path.join(workdir, f"kern_{scale_tag}"),
@@ -168,13 +195,14 @@ def main() -> None:
 
             for case in cases:
                 hidden, ref_mask, kern_mask, position_ids, K_cache, V_cache = make_sample(case)
-                ref_outputs = ref_traced(
+                ref_outputs_token = ref_traced(
                     hidden,
                     ref_mask,
                     position_ids,
                     K_cache.clone(),
                     V_cache.clone(),
                 )
+                ref_outputs = _with_full_ref_cache(ref_outputs_token, K_cache, V_cache, position_ids)
                 kern_outputs = kern_traced(
                     hidden,
                     kern_mask,
