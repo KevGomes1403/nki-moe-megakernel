@@ -109,7 +109,8 @@ class RefRouterTopKModule(nn.Module):
     ):
         super().__init__()
         torch.manual_seed(seed)
-        self.router = initialize_moe_module(config, init_tkg_module=False).router
+        dtype = config.neuron_config.torch_dtype
+        self.router = initialize_moe_module(config, init_tkg_module=False).router.to(dtype)
         if weight_scale != 1.0:
             with torch.no_grad():
                 self.router.linear_router.weight.mul_(weight_scale)
@@ -132,7 +133,8 @@ class KernelRouterTopKModule(nn.Module):
     ):
         super().__init__()
         torch.manual_seed(seed)
-        self.router = initialize_moe_module(config, init_tkg_module=False).router
+        dtype = config.neuron_config.torch_dtype
+        self.router = initialize_moe_module(config, init_tkg_module=False).router.to(dtype)
         self.router_w = nn.Parameter(self.router.linear_router.weight.detach().T.clone())
         if weight_scale != 1.0:
             with torch.no_grad():
