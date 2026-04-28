@@ -48,8 +48,8 @@ from nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
 from nkilib.experimental.transformer.transformer_tkg import (
     _sb2sb_all_reduce_gather,
 )
-from kernels.attn_tkg.agents.v14d_kv_norm_hoisted_weights import qwen3_attn_tkg_fused_oproj_v13bc_kv_norm_hoisted_weights
-from kernels.moe_fused_tkg.versions.kernel_v30c_hoisted import _qwen3_moe_sbuf_in_sbuf_out_hoisted
+from kernels.attn_tkg.attn_fused_nki import qwen3_attn_tkg_fused_oproj_v13bc_kv_norm_hoisted_weights
+from kernels.moe_fused_tkg.moe_fused_nki import _qwen3_moe_sbuf_in_sbuf_out_hoisted
 
 H        = 2048
 H0       = 128

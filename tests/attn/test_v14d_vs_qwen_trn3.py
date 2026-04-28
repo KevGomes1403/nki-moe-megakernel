@@ -13,6 +13,7 @@ Run:
 """
 
 import argparse
+import contextlib
 import os
 import sys
 import tempfile
@@ -71,6 +72,21 @@ def _print_weight_diffs(ref_weight_store, kern_weight_store) -> None:
         raise AssertionError("reference and kernel modules did not initialize identically")
 
 
+def _max_attn_detail(kern_outputs, ref_outputs) -> str:
+    kern = kern_outputs[0].detach().cpu().float().reshape(-1)
+    ref = ref_outputs[0].detach().cpu().float().reshape(-1)
+    abs_diff = (kern - ref).abs()
+    idx = int(abs_diff.argmax().item())
+    rel = abs_diff / ref.abs().clamp_min(1e-12)
+    rel_idx = int(rel.argmax().item())
+    return (
+        f"out_idx={idx} kern={kern[idx].item():.8g} "
+        f"ref={ref[idx].item():.8g} diff={(kern[idx] - ref[idx]).item():.3e} "
+        f"rel_idx={rel_idx} rel={rel[rel_idx].item():.3e} "
+        f"rel_kern={kern[rel_idx].item():.8g} rel_ref={ref[rel_idx].item():.8g}"
+    )
+
+
 def make_tp1_config():
     cfg = make_config()
     cfg.neuron_config.tp_degree = TEST_TP_DEGREE
@@ -120,6 +136,48 @@ def main() -> None:
         action="store_true",
         help="Dump the first strict failure for each weight scale instead of only the first global one",
     )
+    parser.add_argument(
+        "--print-failures",
+        action="store_true",
+        help="Print every strict or loose failure, not just periodic progress samples",
+    )
+    parser.add_argument(
+        "--sample-indices",
+        type=lambda s: [int(x) for x in s.split(",") if x],
+        default=None,
+        metavar="I,J,...",
+        help="Run only the generated cases with these sample indices",
+    )
+    parser.add_argument(
+        "--identity-oproj",
+        action="store_true",
+        help="Replace o_proj with a test-only identity map to expose raw attention through hardware reference output",
+    )
+    parser.add_argument(
+        "--zero-v-proj",
+        action="store_true",
+        help="Test-only: zero the active V projection weights",
+    )
+    parser.add_argument(
+        "--probe-v-cache",
+        type=lambda s: tuple(int(x) for x in s.split(",")),
+        default=None,
+        metavar="SEQ,DIM",
+        help="Test-only: zero V_cache and set V_cache[0,0,SEQ,DIM] = 1",
+    )
+    parser.add_argument(
+        "--probe-v-cache-scan-dim",
+        type=int,
+        default=None,
+        metavar="DIM",
+        help="Test-only: scan SEQ=0..S-1 for one V_cache dimension",
+    )
+    parser.add_argument(
+        "--compiler-workdir",
+        default=None,
+        metavar="DIR",
+        help="Persist compiler artifacts under this directory instead of using a temporary directory",
+    )
     args = parser.parse_args()
 
     cfg = make_tp1_config()
@@ -143,7 +201,14 @@ def main() -> None:
     total_samples = 0
     global_first_strict_dumped = False
 
-    with tempfile.TemporaryDirectory(prefix="v14d_attn_vs_qwen_") as workdir:
+    workdir_ctx = (
+        contextlib.nullcontext(args.compiler_workdir)
+        if args.compiler_workdir is not None
+        else tempfile.TemporaryDirectory(prefix="v14d_attn_vs_qwen_")
+    )
+    with workdir_ctx as workdir:
+        if workdir is not None:
+            os.makedirs(workdir, exist_ok=True)
         for weight_scale in args.weight_scales:
             scale_tag = f"ws{weight_scale:g}"
             print(f"\n{'=' * 72}", flush=True)
@@ -159,6 +224,8 @@ def main() -> None:
                     "config": cfg,
                     "seed": args.seed,
                     "weight_scale": weight_scale,
+                    "identity_oproj": args.identity_oproj,
+                    "zero_v_proj": args.zero_v_proj,
                     "_weight_store": ref_weight_store,
                 },
                 tp_degree=TEST_TP_DEGREE,
@@ -177,6 +244,8 @@ def main() -> None:
                     "config": cfg,
                     "seed": args.seed,
                     "weight_scale": weight_scale,
+                    "identity_oproj": args.identity_oproj,
+                    "zero_v_proj": args.zero_v_proj,
                     "_weight_store": kern_weight_store,
                 },
                 tp_degree=TEST_TP_DEGREE,
@@ -189,36 +258,63 @@ def main() -> None:
             _print_weight_diffs(ref_weight_store, kern_weight_store)
 
             cases = generate_cases(args.n_samples)
+            if args.sample_indices is not None:
+                wanted = set(args.sample_indices)
+                cases = [case for case in cases if int(case["sample_idx"]) in wanted]
+                if not cases:
+                    raise AssertionError(f"no cases selected by --sample-indices={args.sample_indices}")
             strict_fail = 0
             loose_fail = 0
             first_scale_dumped = False
 
             for case in cases:
-                hidden, ref_mask, kern_mask, position_ids, K_cache, V_cache = make_sample(case)
-                ref_outputs_token = ref_traced(
-                    hidden,
-                    ref_mask,
-                    position_ids,
-                    K_cache.clone(),
-                    V_cache.clone(),
-                )
-                ref_outputs = _with_full_ref_cache(ref_outputs_token, K_cache, V_cache, position_ids)
-                kern_outputs = kern_traced(
-                    hidden,
-                    kern_mask,
-                    position_ids,
-                    K_cache.clone(),
-                    V_cache.clone(),
-                )
+                probe_items = [None]
+                if args.probe_v_cache is not None:
+                    probe_items = [args.probe_v_cache]
+                if args.probe_v_cache_scan_dim is not None:
+                    probe_items = [(seq, args.probe_v_cache_scan_dim) for seq in range(S)]
 
-                stats = compute_sample_stats(kern_outputs, ref_outputs)
-                pass_strict = outputs_close(kern_outputs, ref_outputs, atol=1e-5, rtol=0.0)
-                pass_loose = outputs_close(kern_outputs, ref_outputs, atol=1e-5, rtol=1e-2)
+                for probe_item in probe_items:
+                    hidden, ref_mask, kern_mask, position_ids, K_cache, V_cache = make_sample(case)
+                    if probe_item is not None:
+                        seq, dim = probe_item
+                        V_cache.zero_()
+                        V_cache[0, 0, seq, dim] = 1.0
+                    ref_outputs_token = ref_traced(
+                        hidden,
+                        ref_mask,
+                        position_ids,
+                        K_cache.clone(),
+                        V_cache.clone(),
+                    )
+                    ref_outputs = _with_full_ref_cache(ref_outputs_token, K_cache, V_cache, position_ids)
+                    kern_outputs = kern_traced(
+                        hidden,
+                        kern_mask,
+                        position_ids,
+                        K_cache.clone(),
+                        V_cache.clone(),
+                    )
 
-                if not pass_strict:
-                    strict_fail += 1
-                if not pass_loose:
-                    loose_fail += 1
+                    stats = compute_sample_stats(kern_outputs, ref_outputs)
+                    pass_strict = outputs_close(kern_outputs, ref_outputs, atol=1e-5, rtol=0.0)
+                    pass_loose = outputs_close(kern_outputs, ref_outputs, atol=1e-5, rtol=1e-2)
+
+                    if not pass_strict:
+                        strict_fail += 1
+                    if not pass_loose:
+                        loose_fail += 1
+                    if args.print_failures and (not pass_strict or not pass_loose):
+                        verdict = "FAIL" if not pass_loose else "STRICT"
+                        probe_text = "" if probe_item is None else f" probe={probe_item[0]},{probe_item[1]}"
+                        print(
+                            f"  {format_case(case)}{probe_text}  "
+                            f"attn={stats['attn_max_abs_err']:.3e} "
+                            f"K={stats['K_max_abs_err']:.3e} "
+                            f"V={stats['V_max_abs_err']:.3e} "
+                            f"{verdict}  {_max_attn_detail(kern_outputs, ref_outputs)}",
+                            flush=True,
+                        )
 
                 should_dump = (
                     (args.dump_first_strict_per_ws and not first_scale_dumped)

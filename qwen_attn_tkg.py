@@ -41,6 +41,17 @@ from nkilib.core.utils.allocator import create_auto_alloc_manager
 from nkilib.core.utils.logging import Logger
 
 
+class Qwen3V14DAttnNeuronConfig(MoENeuronConfig):
+    """Neuron config for the direct v14d token-generation attention path."""
+
+    def __init__(self, **kwargs):
+        # The local kernel updates K/V in place, so NxDI must skip its own
+        # Python-side KV cache update path.
+        kwargs["attn_tkg_nki_kernel_enabled"] = True
+        kwargs["attn_block_tkg_nki_kernel_cache_update"] = True
+        super().__init__(**kwargs)
+
+
 @nki.jit
 def _qwen3_attn_tkg_v14d_kernel(
     hidden_states: nl.ndarray,
@@ -56,7 +67,7 @@ def _qwen3_attn_tkg_v14d_kernel(
     cos: nl.ndarray,
     sin: nl.ndarray,
     position_ids: nl.ndarray,
-) -> nl.ndarray:
+) -> tuple[nl.ndarray, nl.ndarray, nl.ndarray]:
     """HBM-facing wrapper around the SBUF-resident v14d attention subkernel."""
 
     hidden_size = Wq.shape[1]
@@ -111,16 +122,25 @@ def _qwen3_attn_tkg_v14d_kernel(
         buffer=nl.shared_hbm,
         name="qwen_attn_tkg_v14d_out",
     )
-    nisa.dma_copy(
-        dst=out.reshape((out_hidden_size, 1)).ap(
-            pattern=[[1, V14D_PMAX], [V14D_PMAX, out_hidden_tiles]],
-            offset=0,
-        ),
-        src=out_sb,
-    )
+    out_flat = out.reshape((1, out_hidden_size))
+    for tile_idx in nl.affine_range(out_hidden_tiles):
+        out_tile_psum = nl.ndarray((1, V14D_PMAX), dtype=hidden_states.dtype, buffer=nl.psum)
+        nisa.nc_transpose(out_tile_psum, out_sb[0:V14D_PMAX, tile_idx:tile_idx + 1])
+        out_tile = sbm.alloc_stack(
+            (1, V14D_PMAX),
+            dtype=hidden_states.dtype,
+            buffer=nl.sbuf,
+            name=f"out_tile_{tile_idx}",
+        )
+        nisa.tensor_copy(out_tile, out_tile_psum)
+        nisa.dma_copy(
+            dst=out_flat[0:1, tile_idx * V14D_PMAX:(tile_idx + 1) * V14D_PMAX],
+            src=out_tile,
+            dge_mode=nisa.dge_mode.hwdge,
+        )
     sbm.close_scope()  # attn_outer scope intentionally left open by the subkernel.
     sbm.close_scope()  # qwen_attn_tkg_v14d_wrapper
-    return out
+    return out, K_cache, V_cache
 
 
 def _tile_transpose_v14d_weight(attn, weight: torch.Tensor, num_heads: int) -> torch.Tensor:
@@ -161,6 +181,20 @@ def _get_v14d_qkv_weights(attn):
         _tile_transpose_v14d_weight(attn, Wk, attn.num_key_value_heads),
         _tile_transpose_v14d_weight(attn, Wv, attn.num_key_value_heads),
     )
+
+
+def _get_v14d_o_weight(attn):
+    local_q_size = attn.num_heads * attn.head_dim
+    Wo = attn.get_o_proj().o_proj.weight.data
+    if Wo.shape[0] == attn.hidden_size:
+        Wo = Wo.transpose(0, 1)
+    assert Wo.shape[0] == local_q_size, (
+        f"v14d token-generation attention expects o_proj weight input dim {local_q_size}, got {Wo.shape}"
+    )
+    assert Wo.shape[1] == attn.hidden_size, (
+        f"v14d token-generation attention expects o_proj weight output dim {attn.hidden_size}, got {Wo.shape}"
+    )
+    return Wo.contiguous()
 
 
 def _get_v14d_rope(attn, hidden_states, rotary_position_ids, cos_cache, sin_cache):
@@ -223,7 +257,7 @@ def _attention_tkg_v14d(
     assert K_prior.shape[2] % V14D_PMAX == 0, "v14d token-generation attention expects 128-aligned KV buckets"
     assert K_prior.shape[-1] == V14D_PMAX and V_prior.shape[-1] == V14D_PMAX, "v14d token-generation attention expects head_dim=128 KV cache"
     Wq, Wk, Wv = _get_v14d_qkv_weights(attn)
-    Wo = attn.get_o_proj().o_proj.weight.data
+    Wo = _get_v14d_o_weight(attn)
     cos, sin, cos_cache, sin_cache = _get_v14d_rope(
         attn,
         hidden_states,
@@ -232,7 +266,7 @@ def _attention_tkg_v14d(
         sin_cache,
     )
 
-    attn_output = _qwen3_attn_tkg_v14d_kernel[attn.logical_nc_config](
+    attn_output, K_prior, V_prior = _qwen3_attn_tkg_v14d_kernel[attn.logical_nc_config](
         hidden_states=hidden_states.to(attn.torch_dtype),
         Wq=Wq,
         Wk=Wk,
@@ -284,7 +318,16 @@ class NeuronQwen3MoeDecoderLayer(nn.Module):
     def __init__(self, config: Qwen3MoeInferenceConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = NeuronQwen3MoEAttention(config=config)
+        # Keep the config-level TKG flags enabled so NxDI skips its own KV
+        # cache update path, but mask the block-TKG dispatch flag while
+        # constructing the baseline attention module to preserve the standard
+        # CTE o_proj path.
+        _saved_block_flag = config.neuron_config.attn_block_tkg_nki_kernel_enabled
+        config.neuron_config.attn_block_tkg_nki_kernel_enabled = False
+        try:
+            self.self_attn = NeuronQwen3MoEAttention(config=config)
+        finally:
+            config.neuron_config.attn_block_tkg_nki_kernel_enabled = _saved_block_flag
         self.moe_fused_nki_kernel_enabled = getattr(config, "moe_fused_nki_kernel_enabled", False)
 
         self.input_layernorm = get_rmsnorm_cls()(
@@ -349,10 +392,22 @@ class NeuronQwen3MoeDecoderLayer(nn.Module):
             if kwargs.get("get_kv_per_layer", False):
                 kv_mgr = kwargs.get("kv_mgr")
                 assert kv_mgr is not None, "v14d token-generation attention requires a KV cache manager"
-                tkg_past_key_value = kv_mgr._fetch_cache(
-                    idx=kwargs["idx"],
-                    kvcache_buffer=kwargs["kvcache_buffer"],
-                )
+                # Match NxDI's block-TKG path: first let the cache manager run
+                # its normal per-layer lookup, then pass the direct backing cache
+                # to the in-place NKI kernel.
+                kv_mgr.get_kv_by_layer_id(**kwargs)
+                if self.self_attn.dp_degree > 1:
+                    tkg_past_key_value = kv_mgr.get_kv_by_layer_id(
+                        idx=kwargs["idx"],
+                        kvcache_buffer=kwargs["kvcache_buffer"],
+                        seq_len=hidden_states.size(1),
+                        skip_slice=True,
+                    )
+                else:
+                    tkg_past_key_value = kv_mgr._fetch_cache(
+                        idx=kwargs["idx"],
+                        kvcache_buffer=kwargs["kvcache_buffer"],
+                    )
 
             if self.self_attn.neuron_config.apply_seq_ids_mask:
                 seq_ids = kwargs.get("seq_ids")
@@ -455,6 +510,10 @@ class NeuronQwen3MoeForCausalLM(NeuronBaseForCausalLM):
     @staticmethod
     def load_hf_model(model_path, **kwargs):
         return Qwen3MoeForCausalLM.from_pretrained(model_path, **kwargs)
+
+    @classmethod
+    def get_neuron_config_cls(cls):
+        return Qwen3V14DAttnNeuronConfig
 
     @classmethod
     def get_config_cls(cls):

@@ -35,10 +35,56 @@ LNC = 2
 TP_DEGREE = 4
 MOE_TP_DEGREE = 1
 
-DEFAULT_POSITIONS = [0, 1, 2, 63, 64, 127, 128, 255, 319, 511, 639]
+DEFAULT_POSITIONS = [
+    0,
+    1,
+    2,
+    3,
+    31,
+    32,
+    63,
+    64,
+    65,
+    126,
+    127,
+    128,
+    129,
+    191,
+    192,
+    255,
+    256,
+    319,
+    320,
+    383,
+    384,
+    511,
+    512,
+    638,
+    639,
+]
 DEFAULT_HIDDEN_SCALES = [0.1, 0.5, 1.0, 3.0]
 DEFAULT_CACHE_SCALES = [0.1, 1.0, 3.0]
 DEFAULT_DISTS = ["normal", "student-t5", "laplace"]
+DEFAULT_EDGE_CASES = [
+    {"tag": "zero_at_start", "position": 0, "hidden_scale": 0.0, "cache_scale": 0.0, "dist": "zeros"},
+    {"tag": "zero_at_last", "position": 639, "hidden_scale": 0.0, "cache_scale": 0.0, "dist": "zeros"},
+    {"tag": "constant_before_tile", "position": 127, "hidden_scale": 1.0, "cache_scale": 1.0, "dist": "constant"},
+    {"tag": "constant_on_tile", "position": 128, "hidden_scale": 1.0, "cache_scale": 1.0, "dist": "constant"},
+    {"tag": "constant_after_tile", "position": 129, "hidden_scale": 1.0, "cache_scale": 1.0, "dist": "constant"},
+    {"tag": "alternating_start", "position": 1, "hidden_scale": 3.0, "cache_scale": 3.0, "dist": "alternating"},
+    {"tag": "alternating_mid", "position": 320, "hidden_scale": 3.0, "cache_scale": 3.0, "dist": "alternating"},
+    {"tag": "alternating_last", "position": 639, "hidden_scale": 3.0, "cache_scale": 3.0, "dist": "alternating"},
+    {"tag": "sparse_spike_before_tile", "position": 127, "hidden_scale": 3.0, "cache_scale": 3.0, "dist": "sparse-spike"},
+    {"tag": "sparse_spike_after_tile", "position": 129, "hidden_scale": 3.0, "cache_scale": 3.0, "dist": "sparse-spike"},
+    {"tag": "sparse_spike_last", "position": 639, "hidden_scale": 3.0, "cache_scale": 3.0, "dist": "sparse-spike"},
+    {"tag": "tiny_uniform", "position": 512, "hidden_scale": 0.01, "cache_scale": 0.01, "dist": "uniform"},
+]
+DEFAULT_GRID_SAMPLE_COUNT = (
+    len(DEFAULT_POSITIONS)
+    * len(DEFAULT_HIDDEN_SCALES)
+    * len(DEFAULT_CACHE_SCALES)
+    * len(DEFAULT_DISTS)
+)
 
 COMPILER_ARGS = (
     "--enable-saturate-infinity --enable-mixed-precision-accumulation "
@@ -103,6 +149,21 @@ def _scale_module_params(module: nn.Module, weight_scale: float) -> None:
                 param.mul_(weight_scale)
 
 
+def _make_oproj_identity(attn: NeuronQwen3MoEAttention) -> None:
+    weight = attn.o_proj.o_proj.weight
+    with torch.no_grad():
+        weight.zero_()
+        rows, cols = weight.shape
+        n = min(rows, cols)
+        idx = torch.arange(n, device=weight.device)
+        weight[idx, idx] = 1.0
+
+
+def _zero_v_proj(attn: NeuronQwen3MoEAttention) -> None:
+    with torch.no_grad():
+        attn.qkv_proj.v_proj.weight.zero_()
+
+
 def capture_weight_store(input_layernorm: nn.Module, attn: NeuronQwen3MoEAttention) -> Dict[str, torch.Tensor]:
     return {
         "input_layernorm_weight": input_layernorm.weight.detach().bfloat16().cpu(),
@@ -151,6 +212,8 @@ class RefAttnModule(nn.Module):
         config: Qwen3MoeInferenceConfig,
         seed: int = 42,
         weight_scale: float = 1.0,
+        identity_oproj: bool = False,
+        zero_v_proj: bool = False,
         _weight_store: Dict[str, torch.Tensor] | None = None,
     ):
         super().__init__()
@@ -159,6 +222,10 @@ class RefAttnModule(nn.Module):
         self.input_layernorm = CustomRMSNorm(config.hidden_size, eps=config.rms_norm_eps).to(dtype)
         self.attn = NeuronQwen3MoEAttention(config).to(dtype)
         _scale_module_params(self, weight_scale)
+        if identity_oproj:
+            _make_oproj_identity(self.attn)
+        if zero_v_proj:
+            _zero_v_proj(self.attn)
         if _weight_store is not None and not _weight_store and self.input_layernorm.weight.device.type != "meta":
             _weight_store.update(capture_weight_store(self.input_layernorm, self.attn))
 
@@ -332,6 +399,8 @@ class KernelAttnModule(nn.Module):
         config: Qwen3MoeInferenceConfig,
         seed: int = 42,
         weight_scale: float = 1.0,
+        identity_oproj: bool = False,
+        zero_v_proj: bool = False,
         _weight_store: Dict[str, torch.Tensor] | None = None,
     ):
         super().__init__()
@@ -340,6 +409,10 @@ class KernelAttnModule(nn.Module):
         self.input_layernorm = CustomRMSNorm(config.hidden_size, eps=config.rms_norm_eps).to(dtype)
         self.attn = NeuronQwen3MoEAttention(config).to(dtype)
         _scale_module_params(self, weight_scale)
+        if identity_oproj:
+            _make_oproj_identity(self.attn)
+        if zero_v_proj:
+            _zero_v_proj(self.attn)
         self._attn_jit = nki.jit(_v14d_attn_raw)
         if _weight_store is not None and not _weight_store and self.input_layernorm.weight.device.type != "meta":
             _weight_store.update(capture_weight_store(self.input_layernorm, self.attn))
@@ -447,11 +520,21 @@ def generate_cases(
     hidden_scales: Sequence[float] = DEFAULT_HIDDEN_SCALES,
     cache_scales: Sequence[float] = DEFAULT_CACHE_SCALES,
     distributions: Sequence[str] = DEFAULT_DISTS,
+    include_edge_cases: bool = False,
 ) -> List[Dict[str, float | int | str]]:
     combos = list(product(positions, hidden_scales, cache_scales, distributions))
     cases = []
-    for i in range(n_samples):
-        pos, hidden_scale, cache_scale, dist = combos[i % len(combos)]
+    if n_samples <= 0:
+        indices = list(range(len(combos)))
+    elif n_samples >= len(combos):
+        indices = [i % len(combos) for i in range(n_samples)]
+    else:
+        # Spread short smoke sweeps across the whole grid so they still hit
+        # late positions and all major boundary regions.
+        indices = [(i * len(combos)) // n_samples for i in range(n_samples)]
+
+    for i, combo_idx in enumerate(indices):
+        pos, hidden_scale, cache_scale, dist = combos[combo_idx]
         cases.append(
             {
                 "sample_idx": i,
@@ -462,11 +545,35 @@ def generate_cases(
                 "dist": dist,
             }
         )
+    if include_edge_cases:
+        base_idx = len(cases)
+        for edge_idx, edge in enumerate(DEFAULT_EDGE_CASES):
+            edge_case = dict(edge)
+            edge_case["sample_idx"] = base_idx + edge_idx
+            edge_case["seed"] = 10_000 + edge_idx
+            cases.append(edge_case)
     return cases
 
 
 def _sample_dist(rng: np.random.Generator, shape: Tuple[int, ...], scale: float, dist: str) -> np.ndarray:
-    if dist == "normal":
+    if dist == "zeros":
+        values = np.zeros(shape, dtype=np.float32)
+    elif dist == "constant":
+        values = np.full(shape, scale, dtype=np.float32)
+        return values
+    elif dist == "alternating":
+        values = np.arange(math.prod(shape), dtype=np.int64).reshape(shape)
+        values = np.where((values % 2) == 0, 1.0, -1.0).astype(np.float32)
+    elif dist == "sparse-spike":
+        values = np.zeros(math.prod(shape), dtype=np.float32)
+        n_spikes = max(1, min(values.size, values.size // 257))
+        indices = rng.choice(values.size, size=n_spikes, replace=False)
+        signs = rng.choice(np.array([-1.0, 1.0], dtype=np.float32), size=n_spikes)
+        values[indices] = signs * 8.0
+        values = values.reshape(shape)
+    elif dist == "uniform":
+        values = rng.uniform(-math.sqrt(3.0), math.sqrt(3.0), size=shape)
+    elif dist == "normal":
         values = rng.standard_normal(shape)
     elif dist == "student-t5":
         df = 5.0
@@ -530,8 +637,10 @@ def outputs_close(
 
 
 def format_case(case: Dict[str, float | int | str]) -> str:
+    tag = case.get("tag")
+    tag_text = f" tag={tag}" if tag is not None else ""
     return (
-        f"sample={case['sample_idx']} pos={case['position']} "
+        f"sample={case['sample_idx']}{tag_text} pos={case['position']} "
         f"hscale={case['hidden_scale']} cscale={case['cache_scale']} dist={case['dist']}"
     )
 

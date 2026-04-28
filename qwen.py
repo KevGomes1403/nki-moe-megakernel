@@ -9,13 +9,13 @@ from neuronx_distributed_inference.models.config import MoENeuronConfig, OnDevic
 from neuronx_distributed_inference.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeInferenceConfig
 
 import os
-os.environ["NEURON_FRAMEWORK_DEBUG"] = "1"
-os.environ["XLA_IR_DEBUG"]= "1"
-os.environ["XLA_HLO_DEBUG"]= "1"
-os.environ["NEURON_RT_INSPECT_ENABLE"]= "1"
-os.environ["NEURON_RT_INSPECT_DEVICE_PROFILE"]= "1"
-os.environ["NEURON_RT_INSPECT_OUTPUT_DIR"]= "./output"
-os.environ["BASE_COMPILE_WORK_DIR"] = "./baseline_compiler_dir/"
+# os.environ["NEURON_FRAMEWORK_DEBUG"] = "1"
+# os.environ["XLA_IR_DEBUG"]= "1"
+# os.environ["XLA_HLO_DEBUG"]= "1"
+# os.environ["NEURON_RT_INSPECT_ENABLE"]= "1"
+# os.environ["NEURON_RT_INSPECT_DEVICE_PROFILE"]= "1"
+# os.environ["NEURON_RT_INSPECT_OUTPUT_DIR"]= "./output"
+# os.environ["BASE_COMPILE_WORK_DIR"] = "./baseline_compiler_dir/"
 torch.manual_seed(0)
 
 import gc
