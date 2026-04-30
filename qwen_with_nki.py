@@ -108,12 +108,12 @@ def _inject_qwen_forced_config_flags():
 _inject_qwen_forced_config_flags()
 
 import os
-os.environ["NEURON_FRAMEWORK_DEBUG"] = "1"
-os.environ["XLA_IR_DEBUG"]= "1"
-os.environ["XLA_HLO_DEBUG"]= "1"
-os.environ["NEURON_RT_INSPECT_ENABLE"]= "1"
-os.environ["NEURON_RT_INSPECT_DEVICE_PROFILE"]= "1"
-os.environ["NEURON_RT_INSPECT_OUTPUT_DIR"]= "./output"
+# os.environ["NEURON_FRAMEWORK_DEBUG"] = "1"
+# os.environ["XLA_IR_DEBUG"]= "1"
+# os.environ["XLA_HLO_DEBUG"]= "1"
+# os.environ["NEURON_RT_INSPECT_ENABLE"]= "1"
+# os.environ["NEURON_RT_INSPECT_DEVICE_PROFILE"]= "1"
+# os.environ["NEURON_RT_INSPECT_OUTPUT_DIR"]= "./output"
 # os.environ["BASE_COMPILE_WORK_DIR"] = "./baseline_compiler_dir/"
 torch.manual_seed(0)
 
@@ -478,6 +478,7 @@ def _qwen3_moe_sbuf_in_sbuf_out_custom_rms_nkilib(
         expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
         activation_fn=ActFnType.SiLU,
         output_dtype=dtype,
+        output_in_sbuf=True,
     )
 
 
@@ -555,8 +556,12 @@ def moe_fused_tkg(inp, gamma, router_w, gate_up_w, down_w, replica_groups=None):
         sbm=sbm,
     )
 
-    # MoE produces a TP-partial [T, H] HBM tensor (sum over this rank's experts only).
-    moe_out_hbm = _qwen3_moe_sbuf_in_sbuf_out_custom_rms_nkilib(
+    # MoE produces a TP-partial SBUF tensor (sum over this rank's experts only).
+    # output_in_sbuf=True returns shape == hidden_input.shape; for T=1 our
+    # expert_mlp_in is [PMAX, 1, H_FREE_SHARD], so moe_out_sb matches that.
+    # Layout is channel-interleaved: moe_out_sb[p, t, h1] holds the value at
+    # HBM-equivalent H position prg_id*H_SHARD + p*H_FREE_SHARD + h1.
+    moe_out_sb = _qwen3_moe_sbuf_in_sbuf_out_custom_rms_nkilib(
         rmsnorm_out,
         inp.dtype,
         T,
@@ -566,24 +571,17 @@ def moe_fused_tkg(inp, gamma, router_w, gate_up_w, down_w, replica_groups=None):
         sbm=sbm,
     )
 
-    # Load each LNC core's owned H_SHARD slice of the TP-partial MoE output
-    # and the residual (= pre-RMSNorm `inp`) into SBUF, in the same
-    # CHANNEL-INTERLEAVED layout the rest of this kernel runs in (matching
-    # nkilib's _rmsnorm_tkg / _moe_tkg internal convention — see rmsnorm_tkg
-    # docstring lines 79-86 for the pseudocode).
+    # Load each LNC core's owned H_SHARD slice of the residual (= pre-RMSNorm
+    # `inp`) into SBUF in the same CHANNEL-INTERLEAVED layout the MoE output
+    # uses (rmsnorm_tkg docstring lines 79-86 for the convention pseudocode).
     #
     # Layout: dst[p, t, h1] = HBM[t, prg_id*H_SHARD + p*H_FREE_SHARD + h1]
     #   → partition p indexes the HIGH bits within the shard (stride H_FREE_SHARD)
     #   → h1 indexes the LOW bits (stride 1)
-    # This is what _store_h_sharded_sbuf_output expects (its interleave_copy
-    # writes out_sb[p, t, h1] → HBM position prg_id*H_SHARD + p*H_FREE_SHARD + h1).
+    # _store_h_sharded_sbuf_output consumes this same convention.
     free_size = T * _H_FREE_SHARD
     inp_flat = inp.reshape((T * _H,))
-    moe_out_flat = moe_out_hbm.reshape((T * _H,))
 
-    moe_partial_sb = sbm.alloc_stack(
-        (_PMAX, free_size), inp.dtype, buffer=nl.sbuf, name="moe_partial_sb"
-    )
     residual_sb = sbm.alloc_stack(
         (_PMAX, free_size), inp.dtype, buffer=nl.sbuf, name="residual_sb"
     )
@@ -594,23 +592,23 @@ def moe_fused_tkg(inp, gamma, router_w, gate_up_w, down_w, replica_groups=None):
     h_load_pattern = [[_H_FREE_SHARD, _PMAX], [1, _H_FREE_SHARD], [_H, T]]
     h_load_offset = prg_id * _H_SHARD
     nisa.dma_copy(
-        dst=moe_partial_sb,
-        src=moe_out_flat.ap(pattern=h_load_pattern, offset=h_load_offset),
-        dge_mode=nisa.dge_mode.hwdge,
-    )
-    nisa.dma_copy(
         dst=residual_sb,
         src=inp_flat.ap(pattern=h_load_pattern, offset=h_load_offset),
         dge_mode=nisa.dge_mode.hwdge,
     )
 
     # AR across TP in SBUF: TP-partial → TP-summed. Same accumulation order as
-    # `reduce_from_tensor_model_parallel_region` (bf16 sum across TP).
+    # `reduce_from_tensor_model_parallel_region` (bf16 sum across TP). Reshape
+    # the [PMAX, T, H_FREE_SHARD] MoE output to 2D for the SBUF collective
+    # (nccl.all_reduce only accepts 2D SBUF tensors).
     ar_sb = nl.zeros(
         (_PMAX, free_size), dtype=inp.dtype, buffer=nl.sbuf, name="ar_sb"
     )
     nccl.all_reduce(
-        dsts=[ar_sb], srcs=[moe_partial_sb], op=nl.add, replica_group=rg,
+        dsts=[ar_sb],
+        srcs=[moe_out_sb.reshape((_PMAX, free_size))],
+        op=nl.add,
+        replica_group=rg,
     )
 
     # Residual add in SBUF: bf16 add, same op/dtype/order as the previous
