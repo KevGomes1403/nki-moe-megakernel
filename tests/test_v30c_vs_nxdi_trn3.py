@@ -4,15 +4,14 @@ test_v30c_vs_nxdi_trn3.py
 Verify qwen3_moe_fused_tkg_sbuf_io (v30c) matches NeuronQwen3MoeDecoderLayer's MoE —
 the exact class and calling convention used by qwen.py during token generation.
 
-Reference: NxDI MoE (init_tkg_module=False, pure PyTorch) with post_attention_layernorm
-  applied explicitly before the call — matching qwen.py's moe_fused_nki_kernel_enabled=False
-  code path (lines 427-429):
-      hidden_states = self.post_attention_layernorm(hidden_states)
+Reference: qwen.py's production token-generation MoE path with
+  moe_fused_nki_kernel_enabled=True and init_tkg_module=True:
+      self.mlp = initialize_moe_module(config, rmsnorm=post_attention_layernorm,
+                                       init_tkg_module=True)
       hidden_states = self.mlp(hidden_states, padding_mask)[0]
 
-Kernel: v30c wrapper where RMSNorm is fused inside the kernel, matching the
-  moe_fused_nki_kernel_enabled=True path where norm is passed to initialize_moe_module
-  and not applied by the decoder layer.
+Kernel: local moe_fused_tkg wrapper with the same TKG module weights and fused
+  post_attention_layernorm inside the NKI kernel.
 
 Both modules are seeded identically (manual_seed(42)) so weights are identical.
 
@@ -38,6 +37,8 @@ sys.path.insert(0, _HERE)
 
 import argparse
 import tempfile
+from contextlib import nullcontext
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -51,7 +52,7 @@ from neuronx_distributed_inference.utils.testing import build_module, validate_a
 from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm
 from neuronx_distributed_inference.modules.moe_v2 import initialize_moe_module
 
-from kernels.moe_fused_tkg.moe_fused_nki import moe_fused_tkg
+from kernels.moe_fused_tkg.moe_fused_nki_nkilib import moe_fused_tkg
 from qwen import Qwen3MoeInferenceConfig
 
 # ---------------------------------------------------------------------------
@@ -93,8 +94,8 @@ def make_config() -> Qwen3MoeInferenceConfig:
         flash_decoding_enabled=False,
         logical_nc_config=LNC,
         enable_bucketing=True,
-        # Disable NxDI's internal TKG NKI kernel so the reference is pure PyTorch MoE.
-        moe_fused_nki_kernel_enabled=False,
+        # Match qwen.py/main.py production path for the TKG MoE megakernel.
+        moe_fused_nki_kernel_enabled=True,
         qkv_kernel_enabled=False,
         attn_kernel_enabled=False,
         mlp_kernel_enabled=False,
@@ -115,10 +116,28 @@ def make_config() -> Qwen3MoeInferenceConfig:
     return cfg
 
 
+def _contiguous_checkpoint_loader(checkpoint_path: str | os.PathLike) -> dict:
+    """Load a build_module checkpoint with all tensor values made contiguous.
+
+    NxDI's init_tkg_module=True path registers transposed TKG weights. Some of
+    those tensors can reach checkpoint preprocessing with non-contiguous strides,
+    and neuronx_distributed's duplicate-tensor scan currently flattens with
+    view(-1). Clone the loaded tensors here so the test exercises the TKG
+    baseline without tripping over checkpoint serialization/shared-storage details.
+    """
+    checkpoint = torch.load(Path(checkpoint_path), map_location="cpu")
+    return {
+        name: tensor.detach().contiguous().clone() if isinstance(tensor, torch.Tensor) else tensor
+        for name, tensor in checkpoint.items()
+        if ".moe_fused_tkg." not in name
+    }
+
+
 # ---------------------------------------------------------------------------
 # Reference module
-# Mirrors NeuronQwen3MoeDecoderLayer.forward() with moe_fused_nki_kernel_enabled=False:
-#   hidden_states = self.post_attention_layernorm(hidden_states)
+# Mirrors NeuronQwen3MoeDecoderLayer.forward() with moe_fused_nki_kernel_enabled=True:
+#   self.mlp = initialize_moe_module(config, rmsnorm=self.post_attention_layernorm,
+#                                    init_tkg_module=True)
 #   hidden_states = self.mlp(hidden_states, padding_mask)[0]
 # ---------------------------------------------------------------------------
 class RefMoEModule(nn.Module):
@@ -128,8 +147,10 @@ class RefMoEModule(nn.Module):
         torch.manual_seed(seed)
         self.post_attention_layernorm = CustomRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
-        ).to(dtype)
-        self.mlp = initialize_moe_module(config, init_tkg_module=False).to(dtype)
+        )
+        self.mlp = initialize_moe_module(
+            config, rmsnorm=self.post_attention_layernorm, init_tkg_module=True
+        )
         if weight_scale != 1.0:
             with torch.no_grad():
                 for p in self.parameters():
@@ -148,15 +169,15 @@ class RefMoEModule(nn.Module):
             and self.post_attention_layernorm.weight.device.type != "meta"
         ):
             with torch.no_grad():
-                _weight_store["gamma"]    = self.post_attention_layernorm.weight.unsqueeze(0).bfloat16().cpu()
-                _weight_store["router_w"] = self.mlp.router.linear_router.weight.T.contiguous().bfloat16().cpu()
-                _weight_store["gate_up"]  = self.mlp.expert_mlps.mlp_op.gate_up_proj.weight.bfloat16().cpu()
-                _weight_store["down"]     = self.mlp.expert_mlps.mlp_op.down_proj.weight.bfloat16().cpu()
+                _weight_store["gamma"]    = self.post_attention_layernorm.weight.unsqueeze(0).contiguous().cpu()
+                _weight_store["router_w"] = self.mlp.router.weight_T.contiguous().cpu()
+                _weight_store["gate_up"]  = self.mlp.expert_mlps.mlp_op.gate_up_proj.weight.contiguous().cpu()
+                _weight_store["down"]     = self.mlp.expert_mlps.mlp_op.down_proj.weight.contiguous().cpu()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # [B, 1, H] -> norm -> MoE -> [B, 1, H]
-        normed = self.post_attention_layernorm(hidden_states)
-        return self.mlp(normed, None)[0]
+        # Production enabled path passes pre-norm hidden states into MoEFusedTKG;
+        # the TKG module owns post_attention_layernorm and fuses it into the kernel.
+        return self.mlp(hidden_states, None)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -173,14 +194,13 @@ class KernelMoEModule(nn.Module):
         torch.manual_seed(seed)
         self.post_attention_layernorm = CustomRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
-        ).to(dtype)
-        self.mlp = initialize_moe_module(config, init_tkg_module=False).to(dtype)
+        )
+        self.mlp = initialize_moe_module(
+            config, rmsnorm=self.post_attention_layernorm, init_tkg_module=True
+        )
         if weight_scale != 1.0:
             with torch.no_grad():
-                for p in self.post_attention_layernorm.parameters():
-                    if p.is_floating_point():
-                        p.mul_(weight_scale)
-                for p in self.mlp.parameters():
+                for p in self.parameters():
                     if p.is_floating_point():
                         p.mul_(weight_scale)
         self._moe_jit = nki.jit(moe_fused_tkg)
@@ -192,17 +212,17 @@ class KernelMoEModule(nn.Module):
             and self.post_attention_layernorm.weight.device.type != "meta"
         ):
             with torch.no_grad():
-                _weight_store["gamma"]    = self.post_attention_layernorm.weight.unsqueeze(0).bfloat16().cpu()
-                _weight_store["router_w"] = self.mlp.router.linear_router.weight.T.contiguous().bfloat16().cpu()
-                _weight_store["gate_up"]  = self.mlp.expert_mlps.mlp_op.gate_up_proj.weight.bfloat16().cpu()
-                _weight_store["down"]     = self.mlp.expert_mlps.mlp_op.down_proj.weight.bfloat16().cpu()
+                _weight_store["gamma"]    = self.post_attention_layernorm.weight.unsqueeze(0).contiguous().cpu()
+                _weight_store["router_w"] = self.mlp.router.weight_T.contiguous().cpu()
+                _weight_store["gate_up"]  = self.mlp.expert_mlps.mlp_op.gate_up_proj.weight.contiguous().cpu()
+                _weight_store["down"]     = self.mlp.expert_mlps.mlp_op.down_proj.weight.contiguous().cpu()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Weight extraction
         # post_attention_layernorm.weight: [H]  -> [1, H]
         gamma    = self.post_attention_layernorm.weight.unsqueeze(0)
-        # router.linear_router is nn.Linear([H, E] stored as [E, H]); v30c wants [H, E]
-        router_w  = self.mlp.router.linear_router.weight.T.contiguous().to(self._dtype)
+        # Production TKG path uses RouterTopK.weight_T directly.
+        router_w  = self.mlp.router.weight_T.contiguous()
         # expert_mlps.mlp_op.gate_up_proj.weight: [E, H, 2*I]  (matches v30c gate_up_w)
         gate_up_w = self.mlp.expert_mlps.mlp_op.gate_up_proj.weight
         # expert_mlps.mlp_op.down_proj.weight:    [E, I, H]    (matches v30c down_w)
@@ -242,18 +262,40 @@ def _sample_hidden(rng: np.random.Generator, scale: float, dist: str) -> torch.T
     return torch.from_numpy((x * scale).astype(np.float32)).bfloat16()
 
 
-def make_inputs_and_expected(kern_traced, n_samples: int = 2048):
+def _parse_sample_indices(spec: str | None) -> list[int] | None:
+    if spec is None:
+        return None
+    indices: list[int] = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            lo_s, hi_s = part.split("-", 1)
+            lo = int(lo_s)
+            hi = int(hi_s)
+            if hi < lo:
+                raise ValueError(f"invalid sample range: {part}")
+            indices.extend(range(lo, hi + 1))
+        else:
+            indices.append(int(part))
+    return indices
+
+
+def make_inputs_and_expected(kern_traced, n_samples: int = 2048, sample_indices: list[int] | None = None):
     """Collect kernel outputs across the scale/distribution sweep.
 
     Cycles through all 5*3=15 combos and wraps around if n_samples exceeds that,
     with a unique seed per sample (200+i) so each sample is a fresh draw.
     """
     combos = [(s, d) for s in _SCALES for d in _DISTRIBUTIONS]
+    sample_ids = sample_indices if sample_indices is not None else list(range(n_samples))
 
     inputs_list   = []
     expected_list = []
     combos_list   = []
-    for i in range(n_samples):
+    sample_ids_list = []
+    for pos, i in enumerate(sample_ids):
         scale, dist = combos[i % len(combos)]
         rng = np.random.default_rng(200 + i)
         hidden = _sample_hidden(rng, scale, dist)
@@ -263,10 +305,15 @@ def make_inputs_and_expected(kern_traced, n_samples: int = 2048):
         inputs_list.append((hidden,))
         expected_list.append(out)
         combos_list.append((scale, dist))
-        if i % 64 == 0 or i == n_samples - 1:
-            print(f"  collected sample {i:4d} / {n_samples}  scale={scale:<4}  dist={dist}", flush=True)
+        sample_ids_list.append(i)
+        if pos % 64 == 0 or pos == len(sample_ids) - 1:
+            print(
+                f"  collected sample {i:4d} ({pos + 1:4d} / {len(sample_ids)})  "
+                f"scale={scale:<4}  dist={dist}",
+                flush=True,
+            )
 
-    return inputs_list, expected_list, combos_list
+    return inputs_list, expected_list, combos_list, sample_ids_list
 
 
 # ---------------------------------------------------------------------------
@@ -339,6 +386,7 @@ def _dump_failure_sample(
     sample_stats: dict,
     tag: str,
 ) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(dump_path)), exist_ok=True)
     torch.save(
         {
             "input":        hidden.cpu(),
@@ -446,16 +494,34 @@ def main():
         help="Samples per weight-scale (cycled through 5 scales x 3 distributions = 15 combos)",
     )
     parser.add_argument(
+        "--sample-indices",
+        default=None,
+        metavar="I,J,K-L",
+        help="Run only specific global sample indices, preserving full-sweep seeds/combos.",
+    )
+    parser.add_argument(
         "--dump-dir",
         default=".",
         metavar="DIR",
         help="Directory to write failure dump files (default: current dir)",
     )
     parser.add_argument(
+        "--compiler-workdir",
+        default=None,
+        metavar="DIR",
+        help="Directory to retain compiler artifacts. Defaults to a temporary directory.",
+    )
+    parser.add_argument(
         "--loose-fail-threshold",
         type=float,
         default=0.01,
         help="Exit non-zero if loose-tolerance failure rate exceeds this fraction (default: 0.01 = 1%%)",
+    )
+    parser.add_argument(
+        "--strict-fail-threshold",
+        type=float,
+        default=0.0,
+        help="Exit non-zero if strict bit-exact failure rate exceeds this fraction (default: 0 = require bit exact).",
     )
     parser.add_argument(
         "--dump-first-strict-per-ws",
@@ -475,6 +541,7 @@ def main():
         help="After the sweep, dump the top-N loose failures by max_abs_err across all weight_scales.",
     )
     args = parser.parse_args()
+    sample_indices = _parse_sample_indices(args.sample_indices)
 
     cfg = make_config()
     print(
@@ -486,6 +553,8 @@ def main():
     print(f"Weight scales: {args.weight_scales}  n_samples/scale: {args.n_samples}  "
           f"(combos: {len(_SCALES)} scales x {len(_DISTRIBUTIONS)} distributions = {len(_SCALES) * len(_DISTRIBUTIONS)})",
           flush=True)
+    if sample_indices is not None:
+        print(f"Sample selector: {len(sample_indices)} explicit indices ({args.sample_indices})", flush=True)
 
     example_inputs = [(torch.zeros(B, 1, _H, dtype=torch.bfloat16),)]
 
@@ -495,7 +564,15 @@ def main():
     dump_records: list = []
     global_first_strict_dumped = False
 
-    with tempfile.TemporaryDirectory(prefix="v30c_vs_nxdi_") as workdir:
+    workdir_ctx = (
+        nullcontext(args.compiler_workdir)
+        if args.compiler_workdir is not None
+        else tempfile.TemporaryDirectory(prefix="v30c_vs_nxdi_")
+    )
+    with workdir_ctx as workdir:
+        if args.compiler_workdir is not None:
+            os.makedirs(workdir, exist_ok=True)
+            print(f"Compiler artifacts: {workdir}", flush=True)
         for ws in args.weight_scales:
             ws_tag = f"ws{ws:g}"
             print(f"\n{'=' * 65}", flush=True)
@@ -512,6 +589,7 @@ def main():
                 logical_nc_config=LNC,
                 compiler_args=COMPILER_ARGS,
                 compiler_workdir=os.path.join(workdir, f"ref_workdir_{ws_tag}"),
+                checkpoint_loader_fn=_contiguous_checkpoint_loader,
             )
             print("RefMoEModule compile PASS\n", flush=True)
 
@@ -525,6 +603,7 @@ def main():
                 logical_nc_config=LNC,
                 compiler_args=COMPILER_ARGS,
                 compiler_workdir=os.path.join(workdir, f"kern_workdir_{ws_tag}"),
+                checkpoint_loader_fn=_contiguous_checkpoint_loader,
             )
             print("KernelMoEModule compile PASS\n", flush=True)
 
@@ -537,8 +616,9 @@ def main():
             print("", flush=True)
 
             print("Collecting kernel outputs...", flush=True)
-            inputs_list, expected_list, combos_list = make_inputs_and_expected(
+            inputs_list, expected_list, combos_list, sample_ids_list = make_inputs_and_expected(
                 kern_traced, n_samples=args.n_samples,
+                sample_indices=sample_indices,
             )
 
             print("\nValidating sample by sample (ref_traced vs kernel expected), "
@@ -546,7 +626,7 @@ def main():
             scale_stats: list = []
             scale_first_strict_dumped = False
             scale_worst_loose = None
-            for i, ((hidden,), expected) in enumerate(zip(inputs_list, expected_list)):
+            for pos, (((hidden,), expected), i) in enumerate(zip(zip(inputs_list, expected_list), sample_ids_list)):
                 actual = ref_traced(hidden)
 
                 sample_stats = _compute_sample_stats(expected, actual)
@@ -561,7 +641,7 @@ def main():
                 )
                 sample_stats["weight_scale"] = ws
                 sample_stats["sample_idx"]   = i
-                sample_stats["combo"]        = combos_list[i]
+                sample_stats["combo"]        = combos_list[pos]
                 scale_stats.append(sample_stats)
 
                 if not sample_stats["pass_loose"]:
@@ -569,7 +649,7 @@ def main():
                         "weight_scale": ws,
                         "ws_tag": ws_tag,
                         "sample_idx": i,
-                        "combo": combos_list[i],
+                        "combo": combos_list[pos],
                         "hidden": hidden.cpu(),
                         "actual": actual.cpu(),
                         "expected": expected.cpu(),
@@ -601,21 +681,21 @@ def main():
                         args=args,
                         ws=ws,
                         i=i,
-                        combo=combos_list[i],
+                        combo=combos_list[pos],
                         sample_stats=sample_stats,
                         tag=tag,
                     )
                     scale_first_strict_dumped = True
                     global_first_strict_dumped = True
-                    scale, dist = combos_list[i]
+                    scale, dist = combos_list[pos]
                     print(f"\n  Dumped {tag}: sample {i} (scale={scale}, dist={dist})", flush=True)
                     print(f"    dump written to: {dump_path}", flush=True)
                     print(f"    Debug with simulator:", flush=True)
                     print(f"      NKI_PRECISE_FP=1 python tests/test_v30c_simulate.py --load-dump {dump_path}", flush=True)
                     print(f"  (continuing to collect full-sweep statistics...)\n", flush=True)
 
-                if (i + 1) % 256 == 0 or i == len(inputs_list) - 1:
-                    print(f"    validated {i + 1:4d} / {len(inputs_list)} samples", flush=True)
+                if (pos + 1) % 256 == 0 or pos == len(inputs_list) - 1:
+                    print(f"    validated {pos + 1:4d} / {len(inputs_list)} samples", flush=True)
 
             if args.dump_worst_loose_per_ws and scale_worst_loose is not None:
                 tag = "worst_loose"
@@ -726,8 +806,19 @@ def main():
             print(f"      NKI_PRECISE_FP=1 python tests/test_v30c_simulate.py --load-dump {dump_path}", flush=True)
 
     loose_fail_rate = loose_fail / total if total > 0 else 0.0
-    print(f"\n  Loose-tolerance fail rate: {100.0 * loose_fail_rate:.3f}%  "
+    strict_fail_rate = strict_fail / total if total > 0 else 0.0
+    print(f"\n  Strict fail rate: {100.0 * strict_fail_rate:.3f}%  "
+          f"(gate: {100.0 * args.strict_fail_threshold:.2f}%)", flush=True)
+    print(f"  Loose-tolerance fail rate: {100.0 * loose_fail_rate:.3f}%  "
           f"(gate: {100.0 * args.loose_fail_threshold:.2f}%)", flush=True)
+    if strict_fail_rate > args.strict_fail_threshold:
+        print(f"  OVERALL: FAIL — strict fail rate {100.0 * strict_fail_rate:.3f}% > "
+              f"{100.0 * args.strict_fail_threshold:.2f}% gate",
+              flush=True)
+        raise AssertionError(
+            f"strict fail rate {100.0 * strict_fail_rate:.3f}% exceeds gate "
+            f"{100.0 * args.strict_fail_threshold:.2f}%"
+        )
     if loose_fail_rate > args.loose_fail_threshold:
         print(f"  OVERALL: FAIL — loose-tol fail rate {100.0 * loose_fail_rate:.3f}% > "
               f"{100.0 * args.loose_fail_threshold:.2f}% gate",
@@ -736,7 +827,7 @@ def main():
             f"loose-tol fail rate {100.0 * loose_fail_rate:.3f}% exceeds gate "
             f"{100.0 * args.loose_fail_threshold:.2f}%"
         )
-    print(f"  OVERALL: PASS (loose-tol fail rate within gate)", flush=True)
+    print(f"  OVERALL: PASS (strict and loose fail rates within gates)", flush=True)
 
 
 if __name__ == "__main__":

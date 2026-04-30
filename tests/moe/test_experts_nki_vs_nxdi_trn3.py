@@ -26,6 +26,7 @@ import contextlib
 import os
 import sys
 import tempfile
+from pathlib import Path
 
 os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = "trn3"
 os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2"
@@ -76,7 +77,7 @@ def make_config() -> Qwen3MoeInferenceConfig:
         flash_decoding_enabled=False,
         logical_nc_config=LNC,
         enable_bucketing=True,
-        moe_fused_nki_kernel_enabled=False,
+        moe_fused_nki_kernel_enabled=True,
         qkv_kernel_enabled=False,
         attn_kernel_enabled=False,
         mlp_kernel_enabled=False,
@@ -94,6 +95,15 @@ def make_config() -> Qwen3MoeInferenceConfig:
     return cfg
 
 
+def _contiguous_checkpoint_loader(checkpoint_path: str | os.PathLike) -> dict:
+    checkpoint = torch.load(Path(checkpoint_path), map_location="cpu")
+    return {
+        name: tensor.detach().contiguous().clone() if isinstance(tensor, torch.Tensor) else tensor
+        for name, tensor in checkpoint.items()
+        if ".moe_fused_tkg." not in name
+    }
+
+
 def _capture_weights(module, store: dict) -> None:
     if store is None or store or module.mlp.expert_mlps.mlp_op.gate_up_proj.weight.device.type == "meta":
         return
@@ -107,7 +117,7 @@ class RefExpertsModule(nn.Module):
         super().__init__()
         dtype = config.neuron_config.torch_dtype
         torch.manual_seed(seed)
-        self.mlp = initialize_moe_module(config, init_tkg_module=False).to(dtype)
+        self.mlp = initialize_moe_module(config, init_tkg_module=True).to(dtype)
         if weight_scale != 1.0:
             with torch.no_grad():
                 for p in self.mlp.parameters():
@@ -130,7 +140,7 @@ class KernelExpertsModule(nn.Module):
         super().__init__()
         dtype = config.neuron_config.torch_dtype
         torch.manual_seed(seed)
-        self.mlp = initialize_moe_module(config, init_tkg_module=False).to(dtype)
+        self.mlp = initialize_moe_module(config, init_tkg_module=True).to(dtype)
         if weight_scale != 1.0:
             with torch.no_grad():
                 for p in self.mlp.parameters():
@@ -345,6 +355,7 @@ def main():
                 logical_nc_config=LNC,
                 compiler_args=args.ref_compiler_args or COMPILER_ARGS,
                 compiler_workdir=os.path.join(workdir, f"ref_workdir_{ws_tag}"),
+                checkpoint_loader_fn=_contiguous_checkpoint_loader,
             )
             print("RefExpertsModule compile PASS\n", flush=True)
 
@@ -358,6 +369,7 @@ def main():
                 logical_nc_config=LNC,
                 compiler_args=args.kernel_compiler_args or COMPILER_ARGS,
                 compiler_workdir=os.path.join(workdir, f"kern_workdir_{ws_tag}"),
+                checkpoint_loader_fn=_contiguous_checkpoint_loader,
             )
             print("KernelExpertsModule compile PASS\n", flush=True)
 

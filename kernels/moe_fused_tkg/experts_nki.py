@@ -11,15 +11,294 @@ _H       = 2048
 _E       = 128
 _K       = 8
 _I       = 192
+_I0      = 128
+_I1      = 64
 _I_TILES = 2
 _GU_FLAT = 2 * _I   # 384
 _H_FREE  = _H // _PMAX  # 16
+_H_FREE_SHARD = _H_FREE // 2
+_H_SHARD = _H // 2
 _GU_P    = 96
 _GU_LNC_FLAT = 2 * _GU_P  # local gate + up shards packed as 192
 _DOWN_P  = 96
 
 _K_WAVE = 4  # experts per wave (two waves cover top-K=8)
 _NORMALIZE_EPS_BF16 = 1.0018652574217413e-12  # bf16(1e-12) reinterpreted as fp32
+
+
+def _experts_sbuf_in_sbuf_out_hshard_exact(
+    rmsnorm_normed_bf16,
+    top8_idx,
+    top8_vals,
+    dtype,
+    T,
+    gate_up_w,
+    down_w,
+    sbm=None,
+    debug=False,
+):
+    """Baseline-compatible selective-expert path.
+
+    nkilib's TKG selective MoE shards the hidden dimension across LNC=2 for
+    gate/up, sums fp32 gate/up partials before activation, computes the down
+    projection for only the local H shard, and accumulates experts sequentially
+    in bf16. Keep that ordering here for bit-exactness to NxDI.
+    """
+    shard_id = nl.program_id(0)
+    peer_lnc = 1 - shard_id
+    h_free_start = shard_id * _H_FREE_SHARD
+    h_hbm_start = shard_id * _H_SHARD
+
+    sbm.open_scope(name="expert_loop_outer_exact")
+    out_sb = sbm.alloc_stack((_PMAX, T, _H_FREE_SHARD), dtype, buffer=nl.sbuf, name="out_sb")
+    nisa.memset(out_sb, value=0.0)
+
+    for t in nl.static_range(T):
+        sbm.open_scope(name=f"token_{t}")
+
+        aff_bcast = sbm.alloc_stack((_PMAX, _K), nl.float32, buffer=nl.sbuf, name=f"aff_bcast_t{t}")
+        nisa.memset(aff_bcast, value=0.0)
+        nisa.tensor_copy(dst=aff_bcast[0:1, 0:_K], src=top8_vals[t:t + 1, 0:_K])
+        for g in nl.static_range(4):
+            nisa.nc_stream_shuffle(
+                dst=aff_bcast[nl.ds(g * 32, 32), 0:_K],
+                src=aff_bcast[0:1, 0:_K],
+                shuffle_mask=[0] * 32,
+            )
+
+        output_temp = sbm.alloc_stack(
+            (_PMAX, _H_FREE_SHARD), dtype, buffer=nl.sbuf, name=f"output_temp_t{t}"
+        )
+
+        for k in nl.static_range(_K):
+            sbm.open_scope(name=f"expert_{k}_t{t}")
+            expert_id = top8_idx.ap(pattern=[[_K, 1], [1, 1]], offset=t * _K + k)
+
+            gate_w0 = sbm.alloc_stack(
+                (_PMAX, _H_FREE_SHARD, _I0), gate_up_w.dtype, buffer=nl.sbuf, name=f"gate_w0_k{k}_t{t}"
+            )
+            gate_w1 = sbm.alloc_stack(
+                (_PMAX, _H_FREE_SHARD, _I0), gate_up_w.dtype, buffer=nl.sbuf, name=f"gate_w1_k{k}_t{t}"
+            )
+            up_w0 = sbm.alloc_stack(
+                (_PMAX, _H_FREE_SHARD, _I0), gate_up_w.dtype, buffer=nl.sbuf, name=f"up_w0_k{k}_t{t}"
+            )
+            up_w1 = sbm.alloc_stack(
+                (_PMAX, _H_FREE_SHARD, _I0), gate_up_w.dtype, buffer=nl.sbuf, name=f"up_w1_k{k}_t{t}"
+            )
+
+            h_gate_base = h_hbm_start * _GU_FLAT
+            nisa.dma_copy(
+                dst=gate_w0[0:_PMAX, 0:_H_FREE_SHARD, 0:_I0],
+                src=gate_up_w.ap(
+                    pattern=[[_H_FREE_SHARD * _GU_FLAT, _PMAX], [_GU_FLAT, _H_FREE_SHARD], [1, _I0]],
+                    offset=h_gate_base,
+                    scalar_offset=expert_id,
+                    indirect_dim=0,
+                ),
+                dge_mode=0,
+            )
+            nisa.dma_copy(
+                dst=gate_w1[0:_PMAX, 0:_H_FREE_SHARD, 0:_I1],
+                src=gate_up_w.ap(
+                    pattern=[[_H_FREE_SHARD * _GU_FLAT, _PMAX], [_GU_FLAT, _H_FREE_SHARD], [1, _I1]],
+                    offset=h_gate_base + _I0,
+                    scalar_offset=expert_id,
+                    indirect_dim=0,
+                ),
+                dge_mode=0,
+            )
+            nisa.dma_copy(
+                dst=up_w0[0:_PMAX, 0:_H_FREE_SHARD, 0:_I0],
+                src=gate_up_w.ap(
+                    pattern=[[_H_FREE_SHARD * _GU_FLAT, _PMAX], [_GU_FLAT, _H_FREE_SHARD], [1, _I0]],
+                    offset=h_gate_base + _I,
+                    scalar_offset=expert_id,
+                    indirect_dim=0,
+                ),
+                dge_mode=0,
+            )
+            nisa.dma_copy(
+                dst=up_w1[0:_PMAX, 0:_H_FREE_SHARD, 0:_I1],
+                src=gate_up_w.ap(
+                    pattern=[[_H_FREE_SHARD * _GU_FLAT, _PMAX], [_GU_FLAT, _H_FREE_SHARD], [1, _I1]],
+                    offset=h_gate_base + _I + _I0,
+                    scalar_offset=expert_id,
+                    indirect_dim=0,
+                ),
+                dge_mode=0,
+            )
+
+            gate_psum0 = nl.ndarray((_PMAX, 1), dtype=nl.float32, buffer=nl.psum)
+            gate_psum1 = nl.ndarray((_PMAX, 1), dtype=nl.float32, buffer=nl.psum)
+            up_psum0 = nl.ndarray((_PMAX, 1), dtype=nl.float32, buffer=nl.psum)
+            up_psum1 = nl.ndarray((_PMAX, 1), dtype=nl.float32, buffer=nl.psum)
+
+            nisa.nc_matmul(
+                dst=gate_psum0[0:_I0, 0:1],
+                stationary=gate_w0[0:_PMAX, 0, 0:_I0],
+                moving=rmsnorm_normed_bf16[0:_PMAX, nl.ds((h_free_start + 0) * T + t, 1)],
+                accumulate=False,
+            )
+            nisa.nc_matmul(
+                dst=gate_psum1[0:_I1, 0:1],
+                stationary=gate_w1[0:_PMAX, 0, 0:_I1],
+                moving=rmsnorm_normed_bf16[0:_PMAX, nl.ds((h_free_start + 0) * T + t, 1)],
+                accumulate=False,
+            )
+            nisa.nc_matmul(
+                dst=up_psum0[0:_I0, 0:1],
+                stationary=up_w0[0:_PMAX, 0, 0:_I0],
+                moving=rmsnorm_normed_bf16[0:_PMAX, nl.ds((h_free_start + 0) * T + t, 1)],
+                accumulate=False,
+            )
+            nisa.nc_matmul(
+                dst=up_psum1[0:_I1, 0:1],
+                stationary=up_w1[0:_PMAX, 0, 0:_I1],
+                moving=rmsnorm_normed_bf16[0:_PMAX, nl.ds((h_free_start + 0) * T + t, 1)],
+                accumulate=False,
+            )
+            for h1 in nl.static_range(1, _H_FREE_SHARD):
+                nisa.nc_matmul(
+                    dst=gate_psum0[0:_I0, 0:1],
+                    stationary=gate_w0[0:_PMAX, h1, 0:_I0],
+                    moving=rmsnorm_normed_bf16[0:_PMAX, nl.ds((h_free_start + h1) * T + t, 1)],
+                    accumulate=True,
+                )
+                nisa.nc_matmul(
+                    dst=gate_psum1[0:_I1, 0:1],
+                    stationary=gate_w1[0:_PMAX, h1, 0:_I1],
+                    moving=rmsnorm_normed_bf16[0:_PMAX, nl.ds((h_free_start + h1) * T + t, 1)],
+                    accumulate=True,
+                )
+                nisa.nc_matmul(
+                    dst=up_psum0[0:_I0, 0:1],
+                    stationary=up_w0[0:_PMAX, h1, 0:_I0],
+                    moving=rmsnorm_normed_bf16[0:_PMAX, nl.ds((h_free_start + h1) * T + t, 1)],
+                    accumulate=True,
+                )
+                nisa.nc_matmul(
+                    dst=up_psum1[0:_I1, 0:1],
+                    stationary=up_w1[0:_PMAX, h1, 0:_I1],
+                    moving=rmsnorm_normed_bf16[0:_PMAX, nl.ds((h_free_start + h1) * T + t, 1)],
+                    accumulate=True,
+                )
+
+            gate_fp32 = sbm.alloc_stack((_PMAX, _I_TILES), nl.float32, buffer=nl.sbuf, name=f"gate_fp32_k{k}_t{t}")
+            up_fp32 = sbm.alloc_stack((_PMAX, _I_TILES), nl.float32, buffer=nl.sbuf, name=f"up_fp32_k{k}_t{t}")
+            nisa.memset(gate_fp32, value=0.0)
+            nisa.memset(up_fp32, value=0.0)
+            nisa.activation(gate_fp32[0:_I0, 0:1], op=nl.copy, data=gate_psum0[0:_I0, 0:1])
+            nisa.activation(gate_fp32[0:_I1, 1:2], op=nl.copy, data=gate_psum1[0:_I1, 0:1])
+            nisa.activation(up_fp32[0:_I0, 0:1], op=nl.copy, data=up_psum0[0:_I0, 0:1])
+            nisa.activation(up_fp32[0:_I1, 1:2], op=nl.copy, data=up_psum1[0:_I1, 0:1])
+
+            gate_up_recv = sbm.alloc_stack(
+                (_PMAX, _I_TILES), nl.float32, buffer=nl.sbuf, name=f"gate_up_recv_k{k}_t{t}"
+            )
+            nisa.sendrecv(
+                src=gate_fp32,
+                dst=gate_up_recv,
+                send_to_rank=peer_lnc,
+                recv_from_rank=peer_lnc,
+                pipe_id=t * _K * 2 + k * 2,
+            )
+            nisa.tensor_tensor(dst=gate_fp32, data1=gate_fp32, data2=gate_up_recv, op=nl.add)
+            nisa.sendrecv(
+                src=up_fp32,
+                dst=gate_up_recv,
+                send_to_rank=peer_lnc,
+                recv_from_rank=peer_lnc,
+                pipe_id=t * _K * 2 + k * 2 + 1,
+            )
+            nisa.tensor_tensor(dst=up_fp32, data1=up_fp32, data2=gate_up_recv, op=nl.add)
+
+            nisa.activation(dst=gate_fp32, op=nl.silu, data=gate_fp32)
+
+            inter_bf16 = sbm.alloc_stack((_PMAX, _I_TILES), dtype, buffer=nl.sbuf, name=f"inter_bf16_k{k}_t{t}")
+            nisa.memset(inter_bf16, value=0.0)
+            nisa.tensor_tensor(
+                dst=inter_bf16[0:_I0, 0:1],
+                data1=gate_fp32[0:_I0, 0:1],
+                data2=up_fp32[0:_I0, 0:1],
+                op=nl.multiply,
+            )
+            nisa.tensor_tensor(
+                dst=inter_bf16[0:_I1, 1:2],
+                data1=gate_fp32[0:_I1, 1:2],
+                data2=up_fp32[0:_I1, 1:2],
+                op=nl.multiply,
+            )
+
+            down_w0_tile = sbm.alloc_stack((_PMAX, _PMAX), down_w.dtype, buffer=nl.sbuf, name=f"down_w0_tile_k{k}_t{t}")
+            down_w1_tile = sbm.alloc_stack((_PMAX, _PMAX), down_w.dtype, buffer=nl.sbuf, name=f"down_w1_tile_k{k}_t{t}")
+            down_psum = nl.ndarray((_PMAX, _H_FREE_SHARD), dtype=nl.float32, buffer=nl.psum)
+            for h1_out in nl.static_range(_H_FREE_SHARD):
+                h_offset = h_hbm_start + h1_out
+                nisa.dma_copy(
+                    dst=down_w0_tile[0:_I0, 0:_PMAX],
+                    src=down_w.ap(
+                        pattern=[[_H, _I0], [_H_FREE_SHARD, _PMAX]],
+                        offset=h_offset,
+                        scalar_offset=expert_id,
+                        indirect_dim=0,
+                    ),
+                    dge_mode=0,
+                )
+                nisa.dma_copy(
+                    dst=down_w1_tile[0:_I1, 0:_PMAX],
+                    src=down_w.ap(
+                        pattern=[[_H, _I1], [_H_FREE_SHARD, _PMAX]],
+                        offset=_I0 * _H + h_offset,
+                        scalar_offset=expert_id,
+                        indirect_dim=0,
+                    ),
+                    dge_mode=0,
+                )
+                nisa.nc_matmul(
+                    dst=down_psum[0:_PMAX, h1_out:h1_out + 1],
+                    stationary=down_w0_tile[0:_I0, 0:_PMAX],
+                    moving=inter_bf16[0:_I0, 0:1],
+                    accumulate=False,
+                )
+                nisa.nc_matmul(
+                    dst=down_psum[0:_PMAX, h1_out:h1_out + 1],
+                    stationary=down_w1_tile[0:_I1, 0:_PMAX],
+                    moving=inter_bf16[0:_I1, 1:2],
+                    accumulate=True,
+                )
+
+            down_sb = sbm.alloc_stack((_PMAX, _H_FREE_SHARD), dtype, buffer=nl.sbuf, name=f"down_sb_k{k}_t{t}")
+            nisa.activation(down_sb, op=nl.copy, data=down_psum[0:_PMAX, 0:_H_FREE_SHARD])
+            nisa.tensor_scalar(
+                dst=down_sb,
+                data=down_sb,
+                op0=nl.multiply,
+                operand0=aff_bcast[0:_PMAX, k],
+            )
+
+            if k == 0:
+                nisa.tensor_copy(dst=output_temp[0:_PMAX, 0:_H_FREE_SHARD], src=down_sb)
+            else:
+                nisa.tensor_tensor(
+                    dst=output_temp[0:_PMAX, 0:_H_FREE_SHARD],
+                    data1=output_temp[0:_PMAX, 0:_H_FREE_SHARD],
+                    data2=down_sb,
+                    op=nl.add,
+                )
+
+            sbm.close_scope()
+
+        for h1 in nl.static_range(_H_FREE_SHARD):
+            nisa.tensor_copy(
+                dst=out_sb[0:_PMAX, t, h1:h1 + 1],
+                src=output_temp[0:_PMAX, h1:h1 + 1],
+            )
+
+        sbm.close_scope()
+
+    sbm.close_scope()
+    return out_sb
 
 
 def _experts_sbuf_in_sbuf_out(
@@ -39,7 +318,7 @@ def _experts_sbuf_in_sbuf_out(
     materialization, matching the reference compiler's sharded matmul.
 
     Op sequence mirrors NxDI HLO §5e–§5j of nxdi_moe.md:
-      - bf16 abs → fp32 sum → fp32 clamp(bf16(eps)) → fp32 reciprocal,
+      - bf16 abs → bf16 sum → bf16 clamp(bf16(eps)) → bf16 divide lowering,
         followed by a bf16 affinity store.
       - Gate/Up: full-H bf16 matmul, fp32 PSUM.
       - GLU: SiLU(gate_fp32 PSUM) → bf16, up_fp32 PSUM → bf16,
@@ -115,23 +394,19 @@ def _experts_sbuf_in_sbuf_out(
         abs_topk = sbm.alloc_stack((T, _K), dtype, buffer=nl.sbuf, name=f"abs_topk_t{t}")
         nisa.activation(abs_topk[0:T, 0:_K], op=nl.abs, data=top8_vals_bf16[0:T, 0:_K])
 
-        sum_topk = sbm.alloc_stack((T, 1), nl.float32, buffer=nl.sbuf, name=f"sum_topk_t{t}")
+        sum_topk = sbm.alloc_stack((T, 1), dtype, buffer=nl.sbuf, name=f"sum_topk_t{t}")
         nisa.tensor_reduce(sum_topk[0:T, 0:1], nl.add, abs_topk[0:T, 0:_K], axis=1)
 
-        sum_topk_bf16 = sbm.alloc_stack((T, 1), dtype, buffer=nl.sbuf, name=f"sum_topk_bf16_t{t}")
-        nisa.activation(sum_topk_bf16[0:T, 0:1], op=nl.copy, data=sum_topk[0:T, 0:1])
-
-        sum_topk_clamped = sbm.alloc_stack((T, 1), nl.float32, buffer=nl.sbuf, name=f"sum_topk_clamped_t{t}")
+        sum_topk_clamped = sbm.alloc_stack((T, 1), dtype, buffer=nl.sbuf, name=f"sum_topk_clamped_t{t}")
         nisa.tensor_scalar(
             sum_topk_clamped[0:T, 0:1],
-            data=sum_topk_bf16[0:T, 0:1],
+            data=sum_topk[0:T, 0:1],
             op0=nl.maximum,
             operand0=_NORMALIZE_EPS_BF16,
         )
 
-        # HW lowering of the bf16 divide is RECIPROCAL + ACTIVATE per nxdi_moe.md
-        # §3.8: bf16-rounded denominator, fp32 reciprocal, then a scaled copy
-        # with bf16 store.
+        # NKI requires activation scales to be fp32. The sum/clamp are still
+        # BF16-rounded to match the HLO divide denominator.
         inv_sum_topk = sbm.alloc_stack((T, 1), nl.float32, buffer=nl.sbuf, name=f"inv_sum_topk_t{t}")
         nisa.activation(inv_sum_topk[0:T, 0:1], op=nl.reciprocal, data=sum_topk_clamped[0:T, 0:1])
 
@@ -276,7 +551,6 @@ def _experts_sbuf_in_sbuf_out(
                 op=nl.silu,
                 data=gate_up_psum[0:_GU_P, gu_base + i_lnc:gu_base + i_lnc + 1],
             )
-
             inter_bf16 = sbm.alloc_stack((_GU_P, 1), dtype, buffer=nl.sbuf, name=f"inter_bf16_w0k{k}_t{t}")
             nisa.tensor_tensor(
                 inter_bf16,
@@ -326,12 +600,20 @@ def _experts_sbuf_in_sbuf_out(
                 recv_from_rank=peer_lnc,
                 pipe_id=t * _K + k,
             )
-            nisa.tensor_tensor(
-                dst=down_result_f32,
-                data1=down_result_f32,
-                data2=down_peer_f32[0:_PMAX, 0:H_free],
-                op=nl.add,
-            )
+            if i_lnc == 0:
+                nisa.tensor_tensor(
+                    dst=down_result_f32,
+                    data1=down_result_f32,
+                    data2=down_peer_f32[0:_PMAX, 0:H_free],
+                    op=nl.add,
+                )
+            else:
+                nisa.tensor_tensor(
+                    dst=down_result_f32,
+                    data1=down_peer_f32[0:_PMAX, 0:H_free],
+                    data2=down_result_f32,
+                    op=nl.add,
+                )
 
             nisa.tensor_copy(
                 dst=down_results_f32[0:_PMAX, 0:H_free, k:k + 1],
@@ -447,7 +729,6 @@ def _experts_sbuf_in_sbuf_out(
                 op=nl.silu,
                 data=gate_up_psum[0:_GU_P, gu_base + i_lnc:gu_base + i_lnc + 1],
             )
-
             inter_bf16 = sbm.alloc_stack((_GU_P, 1), dtype, buffer=nl.sbuf, name=f"inter_bf16_w1k{k}_t{t}")
             nisa.tensor_tensor(
                 inter_bf16,
@@ -494,12 +775,20 @@ def _experts_sbuf_in_sbuf_out(
                 recv_from_rank=peer_lnc,
                 pipe_id=t * _K + kk,
             )
-            nisa.tensor_tensor(
-                dst=down_result_f32,
-                data1=down_result_f32,
-                data2=down_peer_f32[0:_PMAX, 0:H_free],
-                op=nl.add,
-            )
+            if i_lnc == 0:
+                nisa.tensor_tensor(
+                    dst=down_result_f32,
+                    data1=down_result_f32,
+                    data2=down_peer_f32[0:_PMAX, 0:H_free],
+                    op=nl.add,
+                )
+            else:
+                nisa.tensor_tensor(
+                    dst=down_result_f32,
+                    data1=down_peer_f32[0:_PMAX, 0:H_free],
+                    data2=down_result_f32,
+                    op=nl.add,
+                )
 
             nisa.tensor_copy(
                 dst=down_results_f32[0:_PMAX, 0:H_free, kk:kk + 1],

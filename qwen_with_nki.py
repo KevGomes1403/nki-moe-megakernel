@@ -1,920 +1,945 @@
 # coding=utf-8
-"""Qwen3 MoE model with token generation routed through v14d Attn TKG stages.
-
-Everything outside the customized attention path follows the installed NxDI Qwen3
-MoE implementation. Context encoding uses the standard NxDI attention path; token
-generation uses local NKI kernels for pre-attention RMSNorm and QKV/RoPE/KV-write,
-then uses the baseline NxDI attention and output projection path.
-"""
-
-import warnings
-from typing import Optional, Tuple
-
-import nki
-import nki.isa as nisa
-import nki.language as nl
+""" Qwen3 MOE model for NXD inference. This is a re-implementation of the NxDI source code for Qwen3 MOE, provided here for easy kernel development."""
 import torch
-from torch import nn
 
-from transformers import AutoTokenizer, GenerationConfig, Qwen3MoeForCausalLM
-from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, ParallelEmbedding
-from neuronx_distributed.parallel_layers.mappings import (
-    gather_from_sequence_parallel_region,
-)
+from transformers import AutoTokenizer, GenerationConfig
+from neuronx_distributed.modules.moe.moe_configs import BlockwiseMatmulConfig
+from neuronx_distributed_inference.utils.hf_adapter import HuggingFaceGenerationAdapter, load_pretrained_config
 from neuronx_distributed_inference.models.config import MoENeuronConfig, OnDeviceSamplingConfig
+from neuronx_distributed_inference.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeInferenceConfig
+
+
+_QWEN_FORCED_CONFIG_FLAGS = {
+    "moe_fused_nki_kernel_enabled": True,
+    "qkv_nki_kernel_enabled": True,
+    "output_logits": True,
+    "async_mode": True,
+    "fused_qkv": True
+}
+
+
+_QWEN_FORCED_SAMPLING_FLAGS = {
+    "do_sample": False,
+    "top_k": 1,
+    "top_p": 1.0,
+    "temperature": 1.0,
+    "dynamic": False,
+    "top_k_kernel_enabled": False,
+}
+
+
+def _get_sampling_kwarg(kwargs, name, default):
+    value = kwargs.get(name, default)
+    return default if value is None else value
+
+
+def _force_qwen_greedy_on_device_sampling_config(config):
+    for flag, value in _QWEN_FORCED_SAMPLING_FLAGS.items():
+        setattr(config, flag, value)
+    return config
+
+
+def _make_qwen_forced_on_device_sampling_config(kwargs):
+    existing_config = kwargs.get("on_device_sampling_config")
+    if existing_config is not None:
+        return _force_qwen_greedy_on_device_sampling_config(existing_config)
+
+    sampling_kwargs = {
+        flag: _get_sampling_kwarg(kwargs, flag, value)
+        for flag, value in _QWEN_FORCED_SAMPLING_FLAGS.items()
+    }
+    global_topk = kwargs.get("global_topk")
+    if global_topk is not None:
+        sampling_kwargs["global_topk"] = global_topk
+    sampling_dp_degree = kwargs.get("sampling_dp_degree")
+    if sampling_dp_degree is not None:
+        sampling_kwargs["sampling_dp_degree"] = sampling_dp_degree
+    return _force_qwen_greedy_on_device_sampling_config(
+        OnDeviceSamplingConfig(**sampling_kwargs)
+    )
+
+
+def _make_qwen_forced_blockwise_matmul_config():
+    return BlockwiseMatmulConfig.from_kwargs(
+        use_torch_block_wise=False,
+        block_size=256,
+        logical_nc_config=2,
+        use_shard_on_block_dynamic_while=True,
+        block_sharding_strategy="PING_PONG",
+    )
+
+
+def _inject_qwen_forced_config_flags():
+    if getattr(MoENeuronConfig, "_qwen_forced_config_patch", False):
+        return
+
+    original_init = MoENeuronConfig.__init__
+
+    def patched_init(self, *args, **kwargs):
+        kwargs.update(_QWEN_FORCED_CONFIG_FLAGS)
+        kwargs["on_device_sampling_config"] = _make_qwen_forced_on_device_sampling_config(kwargs)
+        kwargs["blockwise_matmul_config"] = _make_qwen_forced_blockwise_matmul_config()
+        kwargs["disable_normalize_top_k_affinities"] = False
+
+        original_init(self, *args, **kwargs)
+
+        for flag, value in _QWEN_FORCED_CONFIG_FLAGS.items():
+            setattr(self, flag, value)
+        if self.on_device_sampling_config is None:
+            self.on_device_sampling_config = OnDeviceSamplingConfig(
+                do_sample=False,
+                top_k=1,
+                top_p=1.0,
+                temperature=1.0,
+                dynamic=False,
+                top_k_kernel_enabled=False,
+            )
+        else:
+            self.on_device_sampling_config = _force_qwen_greedy_on_device_sampling_config(
+                self.on_device_sampling_config
+            )
+        self.on_device_sampling = True
+
+    MoENeuronConfig.__init__ = patched_init
+    MoENeuronConfig._qwen_forced_config_patch = True
+    MoENeuronConfig._qwen_forced_original_init = original_init
+
+
+_inject_qwen_forced_config_flags()
+
+import os
+os.environ["NEURON_FRAMEWORK_DEBUG"] = "1"
+os.environ["XLA_IR_DEBUG"]= "1"
+os.environ["XLA_HLO_DEBUG"]= "1"
+os.environ["NEURON_RT_INSPECT_ENABLE"]= "1"
+os.environ["NEURON_RT_INSPECT_DEVICE_PROFILE"]= "1"
+os.environ["NEURON_RT_INSPECT_OUTPUT_DIR"]= "./output"
+# os.environ["BASE_COMPILE_WORK_DIR"] = "./baseline_compiler_dir/"
+torch.manual_seed(0)
+
+import gc
+import warnings
+from typing import List, Optional, Tuple, Union, Dict, Any
+
+import torch
+import math
+import nki
+
+from neuronx_distributed_inference.models.model_base import NeuronBaseForCausalLM, NeuronBaseModel
+from neuronx_distributed_inference.modules.attention.gqa import GQA
+from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm
+
+# Try except for the compatibility with older compiler version
+try:
+    from neuronxcc.nki._private_kernels.attention import attention_isa_kernel
+except ImportError:
+    from neuronxcc.nki.kernels.attention import attention_isa_kernel
+
+from neuronx_distributed.parallel_layers import mappings, parallel_state
+from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, ParallelEmbedding
+from neuronx_distributed.utils import cpu_mode
+from torch import nn
+from torch_neuronx.xla_impl.ops import nki_jit
+from transformers import Qwen3MoeForCausalLM
+from transformers.generation import SampleDecoderOnlyOutput, SampleEncoderDecoderOutput
+from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeRMSNorm
+
+from neuronx_distributed_inference.models.config import InferenceConfig, MoENeuronConfig, MOE_TKG_MK_INTERMEDIATE_PER_TP
+from neuronx_distributed_inference.models.model_wrapper import CONTEXT_ENCODING_MODEL_TAG, TOKEN_GENERATION_MODEL_TAG
+from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
+from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
+from neuronx_distributed_inference.modules.moe_v2 import initialize_moe_module
 from neuronx_distributed_inference.models.layer_boundary_marker import (
     ModuleMarkerEndWrapper,
     ModuleMarkerStartWrapper,
 )
-from neuronx_distributed_inference.models.model_base import NeuronBaseForCausalLM, NeuronBaseModel
-from neuronx_distributed_inference.models.model_wrapper import (
-    CONTEXT_ENCODING_MODEL_TAG,
-    TOKEN_GENERATION_MODEL_TAG,
+# from kernels.moe_fused_tkg.moe_fused_nki_nkilib import moe_fused_tkg
+
+# MoE NKI
+import nki.isa as nisa
+import nki.language as nl
+import nki.collectives as nccl
+from nkilib.core.moe.moe_tkg.moe_tkg import moe_tkg as _moe_tkg
+from nkilib.core.router_topk.router_topk import (
+    XSBLayout_tp2013__1,
+    router_topk as _router_topk,
 )
-from neuronx_distributed_inference.models.qwen3_moe.modeling_qwen3_moe import (
-    NeuronQwen3MoEAttention,
-    Qwen3MoeInferenceConfig,
-    convert_qwen3_moe_hf_to_neuron_state_dict,
-    get_rmsnorm_cls,
-)
-from neuronx_distributed_inference.modules.kvcache.kv_cache_manager import (
-    KV_CACHE_PAD_FOR_SEQ_IDS_MASKING,
-)
-from neuronx_distributed_inference.modules.moe_v2 import initialize_moe_module
-from neuronx_distributed_inference.utils.hf_adapter import (
-    HuggingFaceGenerationAdapter,
-    load_pretrained_config,
-)
-from nkilib.core.utils.allocator import create_auto_alloc_manager
-from nkilib.core.utils.logging import Logger
+from nkilib.core.subkernels.rmsnorm_tkg import rmsnorm_tkg as _rmsnorm_tkg
+from nkilib.core.utils.allocator import SbufManager
+from nkilib.core.utils.tensor_view import TensorView
+from nkilib.core.utils.common_types import ActFnType, ExpertAffinityScaleMode, RouterActFnType
+from nkilib.core.utils.interleave_copy import interleave_copy
 
 
-V14D_PMAX = 128
-V14D_EPS = 1e-6
-V14D_ROPE_INV_FREQ_VALUES = (
-    1, 0.80584216117858887, 0.64938163757324219, 0.52329909801483154,
-    0.42169651389122009, 0.33982083201408386, 0.2738419771194458, 0.22067341208457947,
-    0.17782793939113617, 0.14330126345157623, 0.11547819525003433, 0.093057207763195038,
-    0.074989423155784607, 0.060429640114307404, 0.048696752637624741, 0.03924189880490303,
-    0.03162277489900589, 0.025482967495918274, 0.020535251125693321, 0.016548171639442444,
-    0.013335213996469975, 0.010746078565716743, 0.0086596431210637093, 0.0069783059880137444,
-    0.0056234132498502731, 0.0045315837487578392, 0.0036517411936074495, 0.002942727180197835,
-    0.0023713738191872835, 0.0019109529675915837, 0.0015399265103042126, 0.0012409377377480268,
-    0.0010000000474974513, 0.00080584216630086303, 0.00064938160357996821, 0.00052329909522086382,
-    0.0004216965171508491, 0.00033982083550654352, 0.00027384195709601045, 0.00022067340614739805,
-    0.00017782794020604342, 0.00014330125122796744, 0.00011547820031410083, 9.305720595875755e-05,
-    7.4989424319937825e-05, 6.0429640143411234e-05, 4.8696751036914065e-05, 3.92418987757992e-05,
-    3.1622777896700427e-05, 2.5482968339929357e-05, 2.0535249859676696e-05, 1.6548170606256463e-05,
-    1.3335214134713169e-05, 1.0746078260126524e-05, 8.6596428445773199e-06, 6.978305918892147e-06,
-    5.6234134717669804e-06, 4.5315837269299664e-06, 3.6517412809189409e-06, 2.9427271783788456e-06,
-    2.3713737391517498e-06, 1.9109529603156261e-06, 1.5399265294036013e-06, 1.2409377632138785e-06,
-)
-
-PMAX = V14D_PMAX
-DEBUG_RETURN_QSCORES = False
+_PMAX = 128
+_H    = 2048
+_H_FREE = _H // _PMAX            # 16
+_N_PRGS = 2
+_H_FREE_SHARD = _H_FREE // _N_PRGS  # 8
+_H_SHARD = _H_FREE_SHARD * _PMAX    # 1024
+_EPS  = 1e-6
 
 
-def _attn_rmsnorm_sbuf_in_sbuf_out(
-    hidden_sb,
-    gpan_f32,
-    rms_zero_bias,
-    rms_eps_sb,
-    H,
-    num_h_tiles,
+def _rmsnorm_sbuf_in_sbuf_out_hoisted(
+    inp_sb,               # [PMAX, H_free*T] bf16 in SBUF
+    dtype,
+    T,
+    gamma,                # [1, H] bf16 HBM
     sbm=None,
+    gamma_sb_ready=None,  # [PMAX, H_free] bf16 SBUF pre-loaded
+    debug_rmsnorm_out=None,
 ):
-    """Pre-attention RMSNorm subkernel operating entirely on SBUF tensors."""
-    assert sbm is not None, "sbm (SbufManager) is required"
+    """
+    RMSNorm sub-kernel. inp_sb already in SBUF.
 
-    h_all = sbm.alloc_stack((PMAX, num_h_tiles), nl.bfloat16, name="h_all")
+    Heap lifecycle (caller's responsibility):
+      alloc_heap rmsnorm_normed_bf16 [PMAX, H_free*T] bf16  — returned; caller pops.
+      alloc_heap rmsnorm_normed [PMAX, H_free*T] fp32        — popped before returning.
 
-    sbm.open_scope("pre_attn_norm")
+    Returns rmsnorm_normed_bf16 [PMAX, H_free*T] bf16 heap tensor.
+    """
+    H      = _H
+    H_free = _H_FREE
+    B      = T
+    prg_id = nl.program_id(axis=0)
 
-    h_f32 = sbm.alloc_stack((PMAX, num_h_tiles), nl.float32, name="h_f32")
-    nisa.tensor_copy(h_f32, hidden_sb)
+    # heap: bf16 normed — lives through router + expert stages; caller pops
+    rmsnorm_normed_bf16 = sbm.alloc_heap((_PMAX, H_free * T), dtype, buffer=nl.sbuf, name="rmsnorm_normed_bf16")
+    # heap: fp32 normed — only needed for gamma multiply; popped before returning
+    rmsnorm_normed      = sbm.alloc_heap((_PMAX, H_free * T), nl.float32, buffer=nl.sbuf, name="rmsnorm_normed")
 
-    h_sq = sbm.alloc_stack((PMAX, num_h_tiles), nl.float32, name="h_sq")
-    nisa.activation(h_sq, op=nl.square, data=h_f32, bias=rms_zero_bias)
+    sbm.open_scope(name="rmsnorm")
 
-    h_sq_T_psum = nl.ndarray((num_h_tiles, PMAX), nl.float32, buffer=nl.psum)
-    nisa.nc_transpose(h_sq_T_psum, h_sq)
-    h_sq_T_sb = sbm.alloc_stack((num_h_tiles, PMAX), nl.float32, name="h_sq_T_sb")
-    nisa.tensor_copy(h_sq_T_sb, h_sq_T_psum)
-    h_sq_sum_tiles = sbm.alloc_stack((num_h_tiles, 1), nl.float32, name="h_sq_sum_tiles")
-    nisa.tensor_reduce(h_sq_sum_tiles, op=nl.add, data=h_sq_T_sb, axis=1)
-    h_sq_sum_tiles_T_psum = nl.ndarray((1, num_h_tiles), nl.float32, buffer=nl.psum)
-    nisa.nc_transpose(h_sq_sum_tiles_T_psum, h_sq_sum_tiles)
-    h_sq_sum_tiles_T_sb = sbm.alloc_stack((1, num_h_tiles), nl.float32, name="h_sq_sum_tiles_T_sb")
-    nisa.tensor_copy(h_sq_sum_tiles_T_sb, h_sq_sum_tiles_T_psum)
-    h_sq_scalar = sbm.alloc_stack((1, 1), nl.float32, name="h_sq_scalar")
-    nisa.tensor_reduce(h_sq_scalar, op=nl.add, data=h_sq_sum_tiles_T_sb, axis=1)
-    h_sq_total_psum = nl.ndarray((PMAX, 1), nl.float32, buffer=nl.psum)
-    nisa.nc_transpose(h_sq_total_psum, h_sq_scalar.ap([[1, 1], [0, PMAX]], offset=0))
-    h_sq_total = sbm.alloc_stack((PMAX, 1), nl.float32, name="h_sq_total")
-    nisa.tensor_copy(h_sq_total, h_sq_total_psum)
+    rmsnorm_out = inp_sb
 
-    h_rms_inv = sbm.alloc_stack((PMAX, 1), nl.float32, name="h_rms_inv")
-    nisa.activation(h_rms_inv, op=nl.rsqrt, data=h_sq_total, scale=1.0/H, bias=rms_eps_sb)
-
-    h_rms_T_psum = nl.ndarray((num_h_tiles, PMAX), nl.float32, buffer=nl.psum)
-    nisa.nc_transpose(h_rms_T_psum, h_rms_inv.ap([[1, PMAX], [0, num_h_tiles]], offset=0))
-    h_rms_T = sbm.alloc_stack((num_h_tiles, PMAX), nl.float32, name="h_rms_T")
-    nisa.tensor_copy(h_rms_T, h_rms_T_psum)
-    h_rms_expanded_psum = nl.ndarray((PMAX, num_h_tiles), nl.float32, buffer=nl.psum)
-    nisa.nc_transpose(h_rms_expanded_psum, h_rms_T)
-    h_rms_expanded = sbm.alloc_stack((PMAX, num_h_tiles), nl.float32, name="h_rms_expanded")
-    nisa.tensor_copy(h_rms_expanded, h_rms_expanded_psum)
-
-    h_normed = sbm.alloc_stack((PMAX, num_h_tiles), nl.float32, name="h_normed")
-    nisa.tensor_tensor(h_normed, h_f32, h_rms_expanded, op=nl.multiply)
-    nisa.tensor_tensor(h_normed, h_normed, gpan_f32, op=nl.multiply)
-    nisa.tensor_copy(h_all, h_normed)
-
-    sbm.close_scope()
-
-    return h_all
-
-
-def _attn_qkv_rope_kvwrite_sbuf_in_sbuf_out(
-    h_all,
-    wk_sb,
-    wv_sb,
-    wq_head_sb,
-    qnw_sb,
-    knw_sb,
-    cos_f32,
-    sin_f32,
-    pos_write_i32,
-    K_cache,
-    V_cache,
-    rms_zero_bias,
-    rms_ones,
-    rms_eps_sb,
-    H,
-    Hq_tp,
-    S_prior,
-    owned_heads,
-    sbm=None,
-):
-    """QKV projection, Q/K RMSNorm, RoPE, and in-place active K/V cache write."""
-    assert sbm is not None, "sbm (SbufManager) is required"
-
-    B = cos_f32.shape[1]
-    d = PMAX
-    GQA = Hq_tp
-    half_d = d // 2
-    NUM_H_TILES = H // PMAX
-
-    n_prgs = nl.num_programs(0)
-    prg_id = nl.program_id(0)
-
-    k_rope = sbm.alloc_stack((PMAX, B), nl.float32, name="k_rope")
-    k_rope_bf16 = sbm.alloc_stack((PMAX, B), nl.bfloat16, name="k_rope_bf16")
-    k_rope_T_sb = sbm.alloc_stack((B, PMAX), nl.bfloat16, name="k_rope_T_sb")
-    v_active = sbm.alloc_stack((PMAX, B), nl.float32, name="v_active")
-    v_T_sb = sbm.alloc_stack((B, PMAX), nl.bfloat16, name="v_T_sb")
-    q_bf16 = sbm.alloc_stack((PMAX, GQA), nl.bfloat16, name="q_bf16")
-
-    k_rope_bf16_f32 = sbm.alloc_stack((PMAX, B), nl.float32, name="k_rope_bf16_f32")
-    v_from_bf16 = sbm.alloc_stack((PMAX, B), nl.float32, name="v_from_bf16")
-    if DEBUG_RETURN_QSCORES:
-        q_pre_rope_dbg = sbm.alloc_stack((PMAX, GQA), nl.bfloat16, name="q_pre_rope_dbg")
-        q_raw_dbg = sbm.alloc_stack((PMAX, GQA), nl.bfloat16, name="q_raw_dbg")
-
-    sbm.open_scope("kv_proj")
-
-    k_psum = nl.zeros((PMAX, B), dtype=nl.float32, buffer=nl.psum)
-    for h_t in nl.affine_range(NUM_H_TILES):
-        nisa.nc_matmul(
-            k_psum,
-            stationary=wk_sb[0:PMAX, h_t * d:(h_t + 1) * d],
-            moving=h_all[0:PMAX, h_t:h_t + 1],
-        )
-
-    k_vec = sbm.alloc_stack((PMAX, B), nl.float32, name="k_vec")
-    nisa.tensor_copy(k_vec, k_psum)
-
-    k_sq = sbm.alloc_stack((PMAX, B), nl.float32, name="k_sq")
-    nisa.activation(k_sq, op=nl.square, data=k_vec, bias=rms_zero_bias)
-    k_sum_psum = nl.ndarray((PMAX, B), nl.float32, buffer=nl.psum)
-    nisa.nc_matmul(k_sum_psum, stationary=rms_ones, moving=k_sq)
-    k_sum_sb = sbm.alloc_stack((PMAX, 1), nl.float32, name="k_sum_sb")
-    nisa.tensor_copy(k_sum_sb, k_sum_psum)
-    k_rms_inv = sbm.alloc_stack((PMAX, 1), nl.float32, name="k_rms_inv")
-    nisa.activation(k_rms_inv, op=nl.rsqrt, data=k_sum_sb, scale=1.0/d, bias=rms_eps_sb)
-    k_normed = sbm.alloc_stack((PMAX, B), nl.float32, name="k_normed")
-    nisa.tensor_tensor(k_normed, k_vec, k_rms_inv, op=nl.multiply)
-    k_normed2 = sbm.alloc_stack((PMAX, B), nl.float32, name="k_normed2")
-    nisa.tensor_tensor(k_normed2, k_normed, knw_sb, op=nl.multiply)
-
-    k_normed2_bf16 = sbm.alloc_stack((PMAX, B), nl.bfloat16, name="k_normed2_bf16")
-    nisa.tensor_copy(k_normed2_bf16, k_normed2)
-    nisa.tensor_copy(k_normed2, k_normed2_bf16)
-
-    rot_k = sbm.alloc_stack((PMAX, B), nl.bfloat16, name="rot_k")
-    neg_k_upper = sbm.alloc_stack((half_d, B), nl.bfloat16, name="neg_k_upper")
-    nisa.tensor_scalar(neg_k_upper, k_normed2_bf16[half_d:d, 0:B], op0=nl.multiply, operand0=-1.0)
-    nisa.tensor_copy(rot_k[0:half_d, 0:B], neg_k_upper)
-    nisa.tensor_copy(rot_k[half_d:d, 0:B], k_normed2_bf16[0:half_d, 0:B])
-    k_cos = sbm.alloc_stack((PMAX, B), nl.float32, name="k_cos")
-    k_sin_part = sbm.alloc_stack((PMAX, B), nl.float32, name="k_sin_part")
-    nisa.tensor_tensor(k_cos, k_normed2_bf16, cos_f32, op=nl.multiply)
-    nisa.tensor_tensor(k_sin_part, rot_k, sin_f32, op=nl.multiply)
-    k_rope_f32 = sbm.alloc_stack((PMAX, B), nl.float32, name="k_rope_f32")
-    nisa.tensor_tensor(k_rope_f32, k_cos, k_sin_part, op=nl.add)
-    nisa.tensor_copy(k_rope_bf16, k_rope_f32)
-    nisa.tensor_copy(k_rope, k_rope_bf16)
-    k_rope_T_psum = nl.ndarray((B, PMAX), dtype=nl.bfloat16, buffer=nl.psum)
-    nisa.nc_transpose(k_rope_T_psum, k_rope_bf16)
-    nisa.tensor_copy(k_rope_T_sb, k_rope_T_psum)
-    nisa.tensor_copy(k_rope_bf16_f32, k_rope_bf16)
-
-    v_psum = nl.zeros((PMAX, B), dtype=nl.float32, buffer=nl.psum)
-    if n_prgs == 1:
-        for h_t in nl.affine_range(NUM_H_TILES):
-            nisa.nc_matmul(
-                v_psum,
-                stationary=wv_sb[0:PMAX, h_t * d:(h_t + 1) * d],
-                moving=h_all[0:PMAX, h_t:h_t + 1],
+    # --- gamma load (skipped when gamma_sb_ready is supplied) ---
+    if gamma_sb_ready is None:
+        gamma_sb = sbm.alloc_stack((_PMAX, H_free), gamma.dtype, buffer=nl.sbuf, name="gamma_sb")
+        gamma_1d = gamma.reshape((H,))
+        for h1 in nl.static_range(H_free):
+            shard = h1 // _H_FREE_SHARD
+            h2 = h1 - shard * _H_FREE_SHARD
+            nisa.dma_copy(
+                dst=gamma_sb[0:_PMAX, h1:h1 + 1],
+                src=gamma_1d.ap(
+                    pattern=[[_H_FREE_SHARD, _PMAX], [1, 1]],
+                    offset=shard * _H_SHARD + h2,
+                ),
+                dge_mode=3,
             )
-        nisa.tensor_copy(v_active, v_psum)
     else:
-        for h_t_local in nl.affine_range(NUM_H_TILES // 2):
-            if prg_id == 0:
-                h_t = h_t_local
-            else:
-                h_t = h_t_local + NUM_H_TILES // 2
-            nisa.nc_matmul(
-                v_psum,
-                stationary=wv_sb[0:PMAX, h_t * d:(h_t + 1) * d],
-                moving=h_all[0:PMAX, h_t:h_t + 1],
-            )
+        gamma_sb = gamma_sb_ready  # caller-owned — do NOT free
 
-        v_local = sbm.alloc_stack((PMAX, B), nl.float32, name="v_local")
-        v_peer = sbm.alloc_stack((PMAX, B), nl.float32, name="v_peer")
-        nisa.tensor_copy(v_local, v_psum)
-        nisa.sendrecv(src=v_local, dst=v_peer, send_to_rank=1 - prg_id, recv_from_rank=1 - prg_id, pipe_id=0)
+    rmsnorm_sq = sbm.alloc_stack((_PMAX, H_free * T), nl.float32, buffer=nl.sbuf, name="rmsnorm_sq")
+    nisa.activation(rmsnorm_sq[...], op=nl.square, data=rmsnorm_out[...])
+
+    # Within-partition reduce: [PMAX, H_free*T] → [PMAX, T]
+    rmsnorm_reduced = sbm.alloc_stack((_PMAX, T), nl.float32, buffer=nl.sbuf, name="rmsnorm_reduced")
+    nisa.tensor_reduce(rmsnorm_reduced[0:_PMAX, 0:T], nl.add, rmsnorm_sq[0:_PMAX, 0:H_free * T], axis=1)
+
+    # Cross-partition reduce via reduce-as-MATMUL with an all-ones [PMAX, PMAX] stationary
+    # operand. Matches AwsNeuronRmsNorm's HLO lowering (nxdi_moe.md §10.8).
+    mm_ones = sbm.alloc_stack((_PMAX, _PMAX), nl.float32, buffer=nl.sbuf, name="rmsnorm_mm_ones")
+    nisa.memset(mm_ones, value=1.0)
+    final_reduced_psum = nl.ndarray((_PMAX, T), dtype=nl.float32, buffer=nl.psum)
+    nisa.nc_matmul(
+        dst=final_reduced_psum[0:_PMAX, 0:T],
+        stationary=mm_ones[0:_PMAX, 0:_PMAX],
+        moving=rmsnorm_reduced[0:_PMAX, 0:T],
+    )
+
+    eps_sb = sbm.alloc_stack((_PMAX, 1), nl.float32, buffer=nl.sbuf, name="eps_sb")
+    nisa.memset(eps_sb, value=_EPS)
+    norm_factor_sb = sbm.alloc_stack((_PMAX, T), nl.float32, buffer=nl.sbuf, name="norm_factor_sb")
+    nisa.activation(
+        norm_factor_sb[0:_PMAX, 0:T],
+        op=nl.rsqrt,
+        data=final_reduced_psum[0:_PMAX, 0:T],
+        scale=1.0 / H,
+        bias=eps_sb[0:_PMAX, :],
+    )
+
+    norm_factor_bcast = TensorView(norm_factor_sb).expand_dim(dim=2).broadcast(dim=2, size=H_free)
+    x_scaled = sbm.alloc_stack((_PMAX, H_free * T), nl.float32, buffer=nl.sbuf, name="x_scaled")
+    nisa.tensor_tensor(x_scaled[...], rmsnorm_out[...], norm_factor_bcast.get_view(), nl.multiply)
+    # rmsnorm_normed is a heap tensor (allocated before this scope) — write into it directly
+    nisa.tensor_tensor(rmsnorm_normed[...], x_scaled[...], gamma_sb[...], nl.multiply)
+
+    nisa.activation(rmsnorm_normed_bf16[...], op=nl.copy, data=rmsnorm_normed[...])
+
+    sbm.close_scope()  # frees rmsnorm stack tensors (not gamma_sb_ready — caller-owned)
+
+    # Debug: DMA rmsnorm_normed_bf16 [PMAX, H_free*T] → HBM [T, H] (prg_id 0 only).
+    if debug_rmsnorm_out is not None:
         if prg_id == 0:
-            nisa.tensor_tensor(v_active, v_peer, v_local, op=nl.add)
-        else:
-            nisa.tensor_tensor(v_active, v_local, v_peer, op=nl.add)
+            debug_flat = debug_rmsnorm_out.reshape((B, H))
+            for _t in nl.static_range(B):
+                for _h1 in nl.static_range(H_free):
+                    _dbg_psum = nl.ndarray((1, _PMAX), dtype=dtype, buffer=nl.psum)
+                    nisa.nc_transpose(
+                        _dbg_psum,
+                        rmsnorm_normed_bf16[0:_PMAX, _h1 * B + _t : _h1 * B + _t + 1],
+                    )
+                    _dbg_sb = nl.ndarray((1, _PMAX), dtype=dtype, buffer=nl.sbuf)
+                    nisa.tensor_copy(_dbg_sb, _dbg_psum)
+                    nisa.dma_copy(
+                        dst=debug_flat[_t : _t + 1, _h1 * _PMAX : (_h1 + 1) * _PMAX],
+                        src=_dbg_sb,
+                        dge_mode=nisa.dge_mode.hwdge,
+                    )
 
-    v_bf16 = sbm.alloc_stack((PMAX, B), nl.bfloat16, name="v_bf16")
-    nisa.tensor_copy(v_bf16, v_active)
-    v_T_psum = nl.ndarray((B, PMAX), dtype=nl.bfloat16, buffer=nl.psum)
-    nisa.nc_transpose(v_T_psum, v_bf16)
-    nisa.tensor_copy(v_T_sb, v_T_psum)
-    nisa.tensor_copy(v_from_bf16, v_bf16)
+    sbm.pop_heap()  # rmsnorm_normed fp32 — not needed past this point
 
-    sbm.close_scope()
+    return rmsnorm_normed_bf16  # [PMAX, H_free*T] bf16 heap; caller pops
 
-    sbm.open_scope("q_proj")
 
-    q_psums = []
-    for i in range(len(owned_heads)):
-        q_p = nl.ndarray((PMAX, B), dtype=nl.float32, buffer=nl.psum)
-        nisa.memset(q_p, value=0.0)
-        q_psums.append(q_p)
+@nki.jit
+def rmsnorm_hbm(inp, gamma, hoisted_gamma=False, debug_rmsnorm_out=None):
+    """
+    HBM wrapper for RMSNorm.
 
-    for h_t in nl.affine_range(NUM_H_TILES):
-        for i in range(len(owned_heads)):
-            q_h = owned_heads[i]
-            nisa.nc_matmul(
-                q_psums[i],
-                stationary=wq_head_sb[q_h][0:PMAX, h_t * d:(h_t + 1) * d],
-                moving=h_all[0:PMAX, h_t:h_t + 1],
+    inp:   [T, H=2048] bf16 HBM
+    gamma: [1, H=2048] bf16 HBM
+    Returns output [T, H=2048] bf16 HBM (RMSNorm applied; both LNC cores
+    produce identical results, prg_id==0 writes the output).
+    """
+    sbm    = SbufManager(0, nl.tile_size.total_available_sbuf_size, use_auto_alloc=True)
+    T      = inp.shape[0]
+    H_free = _H_FREE
+    prg_id = nl.program_id(axis=0)
+
+    # --- Load inp into SBUF ---
+    sbm.open_scope(name="inp_load")
+    inp_2d = inp.reshape((T, _H))
+    inp_sb = sbm.alloc_stack((_PMAX, H_free * T), inp.dtype, buffer=nl.sbuf, name="inp_sb")
+    for t in nl.static_range(T):
+        for h1 in nl.static_range(H_free):
+            shard = h1 // _H_FREE_SHARD
+            h2 = h1 - shard * _H_FREE_SHARD
+            nisa.dma_copy(
+                dst=inp_sb[0:_PMAX, h1 * T + t:h1 * T + t + 1],
+                src=inp_2d.ap(
+                    pattern=[[_H_FREE_SHARD, _PMAX], [1, 1]],
+                    offset=t * _H + shard * _H_SHARD + h2,
+                ),
+                dge_mode=3,
             )
 
-    q_packed_f32 = sbm.alloc_stack((PMAX, GQA), nl.float32, name="q_packed_f32")
-    nisa.memset(q_packed_f32, value=0.0)
-    for i in range(len(owned_heads)):
-        q_h = owned_heads[i]
-        nisa.tensor_copy(q_packed_f32[0:PMAX, q_h:q_h + 1], q_psums[i])
-    if DEBUG_RETURN_QSCORES:
-        nisa.tensor_copy(q_raw_dbg, q_packed_f32)
+    # --- Optionally pre-load gamma into SBUF ---
+    gamma_sb_ready = None
+    if hoisted_gamma:
+        sbm.open_scope(name="gamma_hoist")
+        gamma_sb_ready     = sbm.alloc_stack((_PMAX, H_free), gamma.dtype, buffer=nl.sbuf, name="gamma_sb_hoist")
+        gamma_1d           = gamma.reshape((_H,))
+        for h1 in nl.static_range(H_free):
+            shard = h1 // _H_FREE_SHARD
+            h2 = h1 - shard * _H_FREE_SHARD
+            nisa.dma_copy(
+                dst=gamma_sb_ready[0:_PMAX, h1:h1 + 1],
+                src=gamma_1d.ap(
+                    pattern=[[_H_FREE_SHARD, _PMAX], [1, 1]],
+                    offset=shard * _H_SHARD + h2,
+                ),
+                dge_mode=3,
+            )
 
-    qnw_gqa_psum_T = nl.ndarray((GQA, PMAX), dtype=nl.float32, buffer=nl.psum)
-    nisa.nc_transpose(qnw_gqa_psum_T, qnw_sb.ap([[1, PMAX], [0, GQA]], offset=0))
-    qnw_gqa_sbuf_T = sbm.alloc_stack((GQA, PMAX), nl.float32, name="qnw_gqa_sbuf_T")
-    nisa.tensor_copy(qnw_gqa_sbuf_T, qnw_gqa_psum_T)
-    qnw_gqa_psum = nl.ndarray((PMAX, GQA), dtype=nl.float32, buffer=nl.psum)
-    nisa.nc_transpose(qnw_gqa_psum, qnw_gqa_sbuf_T)
-    qnw_gqa = sbm.alloc_stack((PMAX, GQA), nl.float32, name="qnw_gqa")
-    nisa.tensor_copy(qnw_gqa, qnw_gqa_psum)
+    rmsnorm_normed_bf16 = _rmsnorm_sbuf_in_sbuf_out_hoisted(
+        inp_sb, inp.dtype, T, gamma, sbm=sbm,
+        gamma_sb_ready=gamma_sb_ready,
+        debug_rmsnorm_out=debug_rmsnorm_out,
+    )
 
-    q_sq = sbm.alloc_stack((PMAX, GQA), nl.float32, name="q_sq")
-    nisa.activation(q_sq, op=nl.square, data=q_packed_f32, bias=rms_zero_bias)
-    q_sum_psum = nl.ndarray((PMAX, GQA), nl.float32, buffer=nl.psum)
-    nisa.nc_matmul(q_sum_psum, stationary=rms_ones, moving=q_sq)
-    q_sum_sb = sbm.alloc_stack((PMAX, GQA), nl.float32, name="q_sum_sb")
-    nisa.tensor_copy(q_sum_sb, q_sum_psum)
-    q_rms_inv = sbm.alloc_stack((PMAX, GQA), nl.float32, name="q_rms_inv")
-    nisa.activation(q_rms_inv, op=nl.rsqrt, data=q_sum_sb, scale=1.0/d, bias=rms_eps_sb)
-    q_normed = sbm.alloc_stack((PMAX, GQA), nl.float32, name="q_normed")
-    nisa.tensor_tensor(q_normed, q_packed_f32, q_rms_inv, op=nl.multiply)
-    q_normed2 = sbm.alloc_stack((PMAX, GQA), nl.float32, name="q_normed2")
-    nisa.tensor_tensor(q_normed2, q_normed, qnw_gqa, op=nl.multiply)
-
-    q_normed2_bf16 = sbm.alloc_stack((PMAX, GQA), nl.bfloat16, name="q_normed2_bf16")
-    nisa.tensor_copy(q_normed2_bf16, q_normed2)
-    nisa.tensor_copy(q_normed2, q_normed2_bf16)
-    if DEBUG_RETURN_QSCORES:
-        nisa.tensor_copy(q_pre_rope_dbg, q_normed2_bf16)
-
-    cos_gqa_psum_T = nl.ndarray((GQA, PMAX), dtype=nl.float32, buffer=nl.psum)
-    nisa.nc_transpose(cos_gqa_psum_T, cos_f32.ap([[1, PMAX], [0, GQA]], offset=0))
-    cos_gqa_sbuf_T = sbm.alloc_stack((GQA, PMAX), nl.float32, name="cos_gqa_sbuf_T")
-    nisa.tensor_copy(cos_gqa_sbuf_T, cos_gqa_psum_T)
-    cos_gqa_psum = nl.ndarray((PMAX, GQA), dtype=nl.float32, buffer=nl.psum)
-    nisa.nc_transpose(cos_gqa_psum, cos_gqa_sbuf_T)
-    cos_gqa_f32 = sbm.alloc_stack((PMAX, GQA), nl.float32, name="cos_gqa_f32")
-    nisa.tensor_copy(cos_gqa_f32, cos_gqa_psum)
-
-    sin_gqa_psum_T = nl.ndarray((GQA, PMAX), dtype=nl.float32, buffer=nl.psum)
-    nisa.nc_transpose(sin_gqa_psum_T, sin_f32.ap([[1, PMAX], [0, GQA]], offset=0))
-    sin_gqa_sbuf_T = sbm.alloc_stack((GQA, PMAX), nl.float32, name="sin_gqa_sbuf_T")
-    nisa.tensor_copy(sin_gqa_sbuf_T, sin_gqa_psum_T)
-    sin_gqa_psum = nl.ndarray((PMAX, GQA), dtype=nl.float32, buffer=nl.psum)
-    nisa.nc_transpose(sin_gqa_psum, sin_gqa_sbuf_T)
-    sin_gqa_f32 = sbm.alloc_stack((PMAX, GQA), nl.float32, name="sin_gqa_f32")
-    nisa.tensor_copy(sin_gqa_f32, sin_gqa_psum)
-
-    rot_q = sbm.alloc_stack((PMAX, GQA), nl.bfloat16, name="rot_q")
-    neg_q_upper = sbm.alloc_stack((half_d, GQA), nl.bfloat16, name="neg_q_upper")
-    nisa.tensor_scalar(neg_q_upper, q_normed2_bf16[half_d:d, 0:GQA], op0=nl.multiply, operand0=-1.0)
-    nisa.tensor_copy(rot_q[0:half_d, 0:GQA], neg_q_upper)
-    nisa.tensor_copy(rot_q[half_d:d, 0:GQA], q_normed2_bf16[0:half_d, 0:GQA])
-
-    q_cos = sbm.alloc_stack((PMAX, GQA), nl.float32, name="q_cos")
-    q_sin_part = sbm.alloc_stack((PMAX, GQA), nl.float32, name="q_sin_part")
-    nisa.tensor_tensor(q_cos, q_normed2_bf16, cos_gqa_f32, op=nl.multiply)
-    nisa.tensor_tensor(q_sin_part, rot_q, sin_gqa_f32, op=nl.multiply)
-    q_rope_f32 = sbm.alloc_stack((PMAX, GQA), nl.float32, name="q_rope_f32")
-    nisa.tensor_tensor(q_rope_f32, q_cos, q_sin_part, op=nl.add)
-    q_rope = sbm.alloc_stack((PMAX, GQA), nl.bfloat16, name="q_rope")
-    nisa.tensor_copy(q_rope, q_rope_f32)
-
-    nisa.tensor_copy(q_bf16, q_rope)
-
-    sbm.close_scope()
-
-    if n_prgs == 1 or prg_id == 0:
-        nisa.dma_copy(
-            dst=V_cache.reshape((B * S_prior, d)).ap(
-                pattern=[[d, 1], [1, d]], offset=0,
-                scalar_offset=pos_write_i32, indirect_dim=0,
-            ),
-            src=v_T_sb,
+    # --- Store output to HBM: [PMAX, H_free*T] col-major → [T, H] row-major ---
+    output = nl.ndarray((T, _H), dtype=inp.dtype, buffer=nl.shared_hbm)
+    sbm.open_scope(name="store_hbm")
+    out_row_sb = sbm.alloc_stack((T, _H), inp.dtype, buffer=nl.sbuf, name="out_row_sb")
+    for h1 in nl.static_range(H_free):
+        tp_psum = nl.ndarray((T, _PMAX), dtype=inp.dtype, buffer=nl.psum)
+        nisa.nc_transpose(
+            dst=tp_psum[0:T, 0:_PMAX],
+            data=rmsnorm_normed_bf16[0:_PMAX, nl.ds(h1 * T, T)],
         )
-    if n_prgs == 1 or prg_id == 1:
-        nisa.dma_copy(
-            dst=K_cache.reshape((B * S_prior, d)).ap(
-                pattern=[[d, 1], [1, d]], offset=0,
-                scalar_offset=pos_write_i32, indirect_dim=0,
-            ),
-            src=k_rope_T_sb,
+        nisa.activation(
+            dst=out_row_sb[0:T, nl.ds(h1 * _PMAX, _PMAX)],
+            op=nl.copy,
+            data=tp_psum[0:T, 0:_PMAX],
         )
-
-    return q_bf16, k_rope_bf16, v_active
-
-
-class Qwen3V14DAttnNeuronConfig(MoENeuronConfig):
-    """Neuron config for the direct v14d token-generation attention path."""
-
-    def __init__(self, **kwargs):
-        # The local kernel updates K/V in place, so NxDI must skip its own
-        # Python-side KV cache update path.
-        kwargs["attn_tkg_nki_kernel_enabled"] = True
-        kwargs["attn_block_tkg_nki_kernel_cache_update"] = True
-        kwargs.setdefault("fused_qkv", False)
-
-        # Force the same leaderboard-friendly runtime mode used by the
-        # multilayer submission: sample on device and run the model async.
-        tensor_capture_config = kwargs.pop("tensor_capture_config", None)
-        on_device_sampling_config = kwargs.pop("on_device_sampling_config", None)
-        if on_device_sampling_config is None:
-            on_device_sampling_config = OnDeviceSamplingConfig(**kwargs)
-        kwargs["on_device_sampling_config"] = on_device_sampling_config
-        if tensor_capture_config is not None:
-            kwargs["tensor_capture_config"] = tensor_capture_config
-        kwargs["output_logits"] = True
-        kwargs["async_mode"] = True
-        super().__init__(**kwargs)
-
-
-def _v14d_load_bsh_hidden_to_sbuf(hidden_states, hidden_size, batch, sbm):
-    hidden_tiles = hidden_size // V14D_PMAX
-    hidden_sb = sbm.alloc_stack(
-        (V14D_PMAX, hidden_tiles),
-        dtype=nl.bfloat16,
-        buffer=nl.sbuf,
-        name="hidden_sb",
-    )
-    nisa.dma_copy(
-        dst=hidden_sb,
-        src=hidden_states.reshape((hidden_size, batch)).ap(
-            pattern=[[1, V14D_PMAX], [V14D_PMAX, hidden_tiles]],
-            offset=0,
-        ),
-        dge_mode=nisa.dge_mode.hwdge,
-    )
-    return hidden_sb
-
-
-def _v14d_store_sbuf_to_bsh(output, out_sb, hidden_size, batch, sbm):
-    out_tiles = hidden_size // V14D_PMAX
-    out_flat = output.reshape((batch, hidden_size))
-    for tile_idx in nl.affine_range(out_tiles):
-        out_tile_psum = nl.ndarray((1, V14D_PMAX), dtype=nl.bfloat16, buffer=nl.psum)
-        nisa.nc_transpose(out_tile_psum, out_sb[0:V14D_PMAX, tile_idx:tile_idx + 1])
-        out_tile = sbm.alloc_stack(
-            (1, V14D_PMAX),
-            dtype=nl.bfloat16,
-            buffer=nl.sbuf,
-            name=f"out_tile_{tile_idx}",
-        )
-        nisa.tensor_copy(out_tile, out_tile_psum)
-        nisa.dma_copy(
-            dst=out_flat[0:batch, tile_idx * V14D_PMAX:(tile_idx + 1) * V14D_PMAX],
-            src=out_tile,
-            dge_mode=nisa.dge_mode.hwdge,
-        )
-
-
-def _v14d_load_gamma_f32(gamma, hidden_size, sbm):
-    hidden_tiles = hidden_size // V14D_PMAX
-    gamma_bf16 = sbm.alloc_stack(
-        (V14D_PMAX, hidden_tiles),
-        dtype=nl.bfloat16,
-        buffer=nl.sbuf,
-        name="gamma_bf16",
-    )
-    nisa.dma_copy(
-        dst=gamma_bf16,
-        src=gamma.reshape((hidden_size, 1)).ap(
-            pattern=[[1, V14D_PMAX], [V14D_PMAX, hidden_tiles]],
-            offset=0,
-        ),
-        dge_mode=nisa.dge_mode.hwdge,
-    )
-    gamma_f32 = sbm.alloc_stack(
-        (V14D_PMAX, hidden_tiles),
-        dtype=nl.float32,
-        buffer=nl.sbuf,
-        name="gamma_f32",
-    )
-    nisa.tensor_copy(gamma_f32, gamma_bf16)
-    return gamma_f32
-
-
-def _v14d_load_vector_weight_f32(weight, name, sbm):
-    weight_bf16 = sbm.alloc_stack(
-        (V14D_PMAX, 1),
-        dtype=nl.bfloat16,
-        buffer=nl.sbuf,
-        name=f"{name}_bf16",
-    )
-    nisa.dma_copy(
-        dst=weight_bf16,
-        src=weight.reshape((V14D_PMAX, 1)),
-        dge_mode=nisa.dge_mode.hwdge,
-    )
-    weight_f32 = sbm.alloc_stack(
-        (V14D_PMAX, 1),
-        dtype=nl.float32,
-        buffer=nl.sbuf,
-        name=f"{name}_f32",
-    )
-    nisa.tensor_copy(weight_f32, weight_bf16)
-    return weight_f32
-
-
-def _v14d_alloc_rms_constants(sbm):
-    rms_zero_bias = sbm.alloc_stack((V14D_PMAX, 1), nl.float32, buffer=nl.sbuf, name="rms_zero_bias")
-    nisa.memset(rms_zero_bias, value=0.0)
-    rms_ones = sbm.alloc_stack((V14D_PMAX, V14D_PMAX), nl.float32, buffer=nl.sbuf, name="rms_ones")
-    nisa.memset(rms_ones, value=1.0)
-    rms_eps_sb = sbm.alloc_stack((V14D_PMAX, 1), nl.float32, buffer=nl.sbuf, name="rms_eps_sb")
-    nisa.memset(rms_eps_sb, value=V14D_EPS)
-    return rms_zero_bias, rms_ones, rms_eps_sb
-
-
-def _v14d_load_position(position_ids, batch, sbm, name_prefix="pos"):
-    pos_write_i32_raw = sbm.alloc_stack(
-        (1, 1),
-        nl.int32,
-        buffer=nl.sbuf,
-        name=f"{name_prefix}_write_i32_raw",
-    )
-    nisa.dma_copy(
-        dst=pos_write_i32_raw,
-        src=position_ids.reshape((batch, 1))[0:1, 0:1],
-        dge_mode=nisa.dge_mode.hwdge,
-    )
-    pos_write_i32 = sbm.alloc_stack(
-        (1, 1),
-        nl.uint32,
-        buffer=nl.sbuf,
-        name=f"{name_prefix}_write_i32",
-    )
-    nisa.tensor_copy(pos_write_i32, pos_write_i32_raw)
-    return pos_write_i32
-
-
-def _v14d_reconstruct_rope(position_ids, batch, sbm):
-    half_d = V14D_PMAX // 2
-    pos_write_i32 = _v14d_load_position(position_ids, batch, sbm, name_prefix="rope_pos")
-    rope_pos_scalar = sbm.alloc_stack((1, 1), nl.float32, buffer=nl.sbuf, name="rope_pos_scalar")
-    nisa.tensor_copy(rope_pos_scalar, pos_write_i32)
-    rope_pos_psum = nl.ndarray((V14D_PMAX, 1), nl.float32, buffer=nl.psum)
-    nisa.nc_transpose(rope_pos_psum, rope_pos_scalar.ap([[1, 1], [0, V14D_PMAX]], offset=0))
-    rope_pos = sbm.alloc_stack((V14D_PMAX, 1), nl.float32, buffer=nl.sbuf, name="rope_pos")
-    nisa.tensor_copy(rope_pos, rope_pos_psum)
-
-    rope_inv_freq_T = sbm.alloc_stack((1, V14D_PMAX), nl.float32, buffer=nl.sbuf, name="rope_inv_freq_T")
-    for rope_i in range(half_d):
-        rope_value = V14D_ROPE_INV_FREQ_VALUES[rope_i]
-        nisa.memset(rope_inv_freq_T[0:1, rope_i:rope_i + 1], value=rope_value)
-        nisa.memset(rope_inv_freq_T[0:1, rope_i + half_d:rope_i + half_d + 1], value=rope_value)
-    rope_inv_freq_psum = nl.ndarray((V14D_PMAX, 1), nl.float32, buffer=nl.psum)
-    nisa.nc_transpose(rope_inv_freq_psum, rope_inv_freq_T)
-    rope_inv_freq = sbm.alloc_stack((V14D_PMAX, 1), nl.float32, buffer=nl.sbuf, name="rope_inv_freq")
-    nisa.tensor_copy(rope_inv_freq, rope_inv_freq_psum)
-    rope_angle = sbm.alloc_stack((V14D_PMAX, 1), nl.float32, buffer=nl.sbuf, name="rope_angle")
-    nisa.tensor_tensor(rope_angle, rope_inv_freq, rope_pos, op=nl.multiply)
-    return pos_write_i32, nl.cos(rope_angle), nl.sin(rope_angle)
-
-
-def _v14d_owned_heads():
-    n_prgs = nl.num_programs(0)
-    prg_id = nl.program_id(0)
-    if n_prgs == 1:
-        return [0, 1, 2, 3, 4, 5, 6, 7]
     if prg_id == 0:
-        return [0, 1, 2, 3]
-    return [4, 5, 6, 7]
+        nisa.dma_copy(dst=output[0:T, 0:_H], src=out_row_sb[0:T, 0:_H])
+    sbm.close_scope()  # store_hbm
+
+    sbm.pop_heap()  # rmsnorm_normed_bf16
+
+    if hoisted_gamma:
+        sbm.close_scope()  # gamma_hoist
+    sbm.close_scope()  # inp_load
+
+    return output
+
+# Hardware constants
+_PMAX = 128
+
+# Qwen3-30B-A3B at TP=4 fixed dims
+_H = 2048
+_E = 128
+_K = 8
+_I = 192
+_H_FREE = _H // _PMAX
+
+# LNC=2 H-sharding constants
+_N_PRGS = 2
+_H_FREE_SHARD = _H_FREE // _N_PRGS
+_H_SHARD = _H_FREE_SHARD * _PMAX
 
 
-@nki.jit
-def _qwen3_tkg_v14d_rmsnorm_kernel(
-    hidden_states: nl.ndarray,
-    gamma_pre_attn: nl.ndarray,
-) -> nl.ndarray:
-    """HBM-facing wrapper around the SBUF pre-attention RMSNorm subkernel."""
-
-    batch = hidden_states.shape[0]
-    hidden_size = hidden_states.shape[2]
-    hidden_tiles = hidden_size // V14D_PMAX
-
-    sbm = create_auto_alloc_manager(logger=Logger("qwen-attn-tkg-v14d-rmsnorm"))
-    sbm.open_scope(name="qwen_attn_tkg_v14d_rmsnorm_wrapper")
-
-    hidden_sb = _v14d_load_bsh_hidden_to_sbuf(hidden_states, hidden_size, batch, sbm)
-    gamma_f32 = _v14d_load_gamma_f32(gamma_pre_attn, hidden_size, sbm)
-    rms_zero_bias, _, rms_eps_sb = _v14d_alloc_rms_constants(sbm)
-    out_sb = _attn_rmsnorm_sbuf_in_sbuf_out(
-        hidden_sb,
-        gamma_f32,
-        rms_zero_bias,
-        rms_eps_sb,
-        hidden_size,
-        hidden_tiles,
-        sbm=sbm,
+def _flattened_custom_rmsnorm_to_nkilib_layout(rmsnorm_flat, dtype, T, sbm):
+    """Convert custom RMSNorm [P, H_free*T] layout to nkilib [P, T, H_free]."""
+    rmsnorm_out = sbm.alloc_stack(
+        (_PMAX, T, _H_FREE), dtype, buffer=nl.sbuf, name="rmsnorm_out_nkilib_layout"
     )
-
-    out = nl.ndarray(
-        (batch, 1, hidden_size),
-        dtype=hidden_states.dtype,
-        buffer=nl.shared_hbm,
-        name="qwen_attn_tkg_v14d_normed",
-    )
-    _v14d_store_sbuf_to_bsh(out, out_sb, hidden_size, batch, sbm)
-
-    sbm.close_scope()
-    return out
-
-
-@nki.jit
-def _qwen3_tkg_v14d_qkv_rope_kernel(
-    normed_states: nl.ndarray,
-    Wq: nl.ndarray,
-    Wk: nl.ndarray,
-    Wv: nl.ndarray,
-    q_norm_weight: nl.ndarray,
-    k_norm_weight: nl.ndarray,
-    K_cache: nl.ndarray,
-    V_cache: nl.ndarray,
-    position_ids: nl.ndarray,
-    rotary_position_ids: nl.ndarray,
-) -> tuple[nl.ndarray, nl.ndarray, nl.ndarray, nl.ndarray, nl.ndarray]:
-    """HBM-facing wrapper around the QKV/RoPE/KV-write subkernel."""
-
-    batch = normed_states.shape[0]
-    hidden_size = Wq.shape[1]
-    hidden_tiles = hidden_size // V14D_PMAX
-    hq_tp = Wq.shape[0] // V14D_PMAX
-    seq_len = K_cache.shape[2]
-
-    sbm = create_auto_alloc_manager(logger=Logger("qwen-attn-tkg-v14d-qkv-rope"))
-    sbm.open_scope(name="qwen_attn_tkg_v14d_qkv_rope_wrapper")
-
-    h_all = _v14d_load_bsh_hidden_to_sbuf(normed_states, hidden_size, batch, sbm)
-    qnw_f32 = _v14d_load_vector_weight_f32(q_norm_weight, "qnw", sbm)
-    knw_f32 = _v14d_load_vector_weight_f32(k_norm_weight, "knw", sbm)
-    pos_write_i32 = _v14d_load_position(position_ids, batch, sbm, name_prefix="cache_pos")
-    _, cos_f32, sin_f32 = _v14d_reconstruct_rope(rotary_position_ids, batch, sbm)
-    rms_zero_bias, rms_ones, rms_eps_sb = _v14d_alloc_rms_constants(sbm)
-
-    wk_sb = sbm.alloc_stack(
-        (V14D_PMAX, hidden_tiles * V14D_PMAX),
-        dtype=nl.bfloat16,
-        buffer=nl.sbuf,
-        name="wk_sb",
-    )
-    nisa.dma_copy(dst=wk_sb, src=Wk, dge_mode=nisa.dge_mode.hwdge)
-    wv_sb = sbm.alloc_stack(
-        (V14D_PMAX, hidden_tiles * V14D_PMAX),
-        dtype=nl.bfloat16,
-        buffer=nl.sbuf,
-        name="wv_sb",
-    )
-    nisa.dma_copy(dst=wv_sb, src=Wv, dge_mode=nisa.dge_mode.hwdge)
-
-    owned_heads = _v14d_owned_heads()
-    wq_head_sb = [None] * 8
-    for q_h in owned_heads:
-        wq_tile = sbm.alloc_stack(
-            (V14D_PMAX, hidden_tiles * V14D_PMAX),
-            dtype=nl.bfloat16,
-            buffer=nl.sbuf,
-            name=f"wq_head_{q_h}",
+    for h1 in nl.static_range(_H_FREE):
+        nisa.tensor_copy(
+            dst=rmsnorm_out[0:_PMAX, 0:T, h1],
+            src=rmsnorm_flat[0:_PMAX, h1 * T : h1 * T + T],
         )
-        nisa.dma_copy(
-            dst=wq_tile,
-            src=Wq[q_h * V14D_PMAX:(q_h + 1) * V14D_PMAX, :],
-            dge_mode=nisa.dge_mode.hwdge,
-        )
-        wq_head_sb[q_h] = wq_tile
-
-    q_bf16, k_rope_bf16, v_active = _attn_qkv_rope_kvwrite_sbuf_in_sbuf_out(
-        h_all,
-        wk_sb,
-        wv_sb,
-        wq_head_sb,
-        qnw_f32,
-        knw_f32,
-        cos_f32,
-        sin_f32,
-        pos_write_i32,
-        K_cache,
-        V_cache,
-        rms_zero_bias,
-        rms_ones,
-        rms_eps_sb,
-        hidden_size,
-        hq_tp,
-        seq_len,
-        owned_heads,
-        sbm=sbm,
-    )
-
-    q_output = nl.ndarray(
-        (batch, hq_tp, 1, V14D_PMAX),
-        dtype=normed_states.dtype,
-        buffer=nl.shared_hbm,
-        name="qwen_attn_tkg_v14d_Q",
-    )
-    k_output = nl.ndarray(
-        (batch, 1, 1, V14D_PMAX),
-        dtype=normed_states.dtype,
-        buffer=nl.shared_hbm,
-        name="qwen_attn_tkg_v14d_K",
-    )
-    v_output = nl.ndarray(
-        (batch, 1, 1, V14D_PMAX),
-        dtype=normed_states.dtype,
-        buffer=nl.shared_hbm,
-        name="qwen_attn_tkg_v14d_V",
-    )
-
-    q_out_2d = q_output.reshape((hq_tp, V14D_PMAX))
-    for head in owned_heads:
-        q_head_psum = nl.ndarray((1, V14D_PMAX), dtype=nl.bfloat16, buffer=nl.psum)
-        nisa.nc_transpose(q_head_psum, q_bf16[0:V14D_PMAX, head:head + 1])
-        q_head_sb = sbm.alloc_stack((1, V14D_PMAX), nl.bfloat16, buffer=nl.sbuf, name=f"q_head_out_{head}")
-        nisa.tensor_copy(q_head_sb, q_head_psum)
-        nisa.dma_copy(dst=q_out_2d[head:head + 1, 0:V14D_PMAX], src=q_head_sb, dge_mode=nisa.dge_mode.hwdge)
-
-    n_prgs = nl.num_programs(0)
-    prg_id = nl.program_id(0)
-    if n_prgs == 1 or prg_id == 1:
-        k_psum = nl.ndarray((1, V14D_PMAX), dtype=nl.bfloat16, buffer=nl.psum)
-        nisa.nc_transpose(k_psum, k_rope_bf16)
-        k_sb = sbm.alloc_stack((1, V14D_PMAX), nl.bfloat16, buffer=nl.sbuf, name="k_out_sb")
-        nisa.tensor_copy(k_sb, k_psum)
-        nisa.dma_copy(dst=k_output.reshape((1, V14D_PMAX)), src=k_sb, dge_mode=nisa.dge_mode.hwdge)
-    if n_prgs == 1 or prg_id == 0:
-        v_bf16 = sbm.alloc_stack((V14D_PMAX, batch), nl.bfloat16, buffer=nl.sbuf, name="v_out_bf16")
-        nisa.tensor_copy(v_bf16, v_active)
-        v_psum = nl.ndarray((1, V14D_PMAX), dtype=nl.bfloat16, buffer=nl.psum)
-        nisa.nc_transpose(v_psum, v_bf16)
-        v_sb = sbm.alloc_stack((1, V14D_PMAX), nl.bfloat16, buffer=nl.sbuf, name="v_out_sb")
-        nisa.tensor_copy(v_sb, v_psum)
-        nisa.dma_copy(dst=v_output.reshape((1, V14D_PMAX)), src=v_sb, dge_mode=nisa.dge_mode.hwdge)
-
-    sbm.close_scope()
-    return q_output, k_output, v_output, K_cache, V_cache
+    return rmsnorm_out
 
 
-def _tile_transpose_v14d_weight(attn, weight: torch.Tensor, num_heads: int) -> torch.Tensor:
-    return (
-        weight.reshape(
-            num_heads,
-            attn.head_dim,
-            attn.hidden_size // attn.head_dim,
-            attn.head_dim,
-        )
-        .permute(0, 3, 2, 1)
-        .reshape(num_heads * attn.head_dim, attn.hidden_size)
-        .contiguous()
-    )
-
-
-def _get_v14d_qkv_weights(attn):
-    qkv_proj = attn.get_qkv_proj()
-    q_size = attn.num_heads * attn.head_dim
-    kv_size = attn.num_key_value_heads * attn.head_dim
-
-    if attn.fused_qkv:
-        qkv_weight = qkv_proj.Wqkv.weight.data
-        if qkv_weight.shape[0] == attn.hidden_size:
-            qkv_weight = qkv_weight.transpose(0, 1)
-        Wq, Wk, Wv = torch.tensor_split(qkv_weight, (q_size, q_size + kv_size), dim=0)
-    else:
-        Wq = qkv_proj.q_proj.weight.data
-        Wk = qkv_proj.k_proj.weight.data
-        Wv = qkv_proj.v_proj.weight.data
-        if Wq.shape[0] == attn.hidden_size:
-            Wq = Wq.transpose(0, 1)
-            Wk = Wk.transpose(0, 1)
-            Wv = Wv.transpose(0, 1)
-
-    return (
-        _tile_transpose_v14d_weight(attn, Wq, attn.num_heads),
-        _tile_transpose_v14d_weight(attn, Wk, attn.num_key_value_heads),
-        _tile_transpose_v14d_weight(attn, Wv, attn.num_key_value_heads),
-    )
-
-
-def _get_v14d_rope(attn, hidden_states, rotary_position_ids, cos_cache, sin_cache):
-    if cos_cache is None or sin_cache is None or cos_cache.shape[-1] != attn.head_dim:
-        cos_cache, sin_cache = attn.rotary_emb(hidden_states, rotary_position_ids)
-
-    return (
-        cos_cache.reshape(hidden_states.shape[0], attn.head_dim),
-        sin_cache.reshape(hidden_states.shape[0], attn.head_dim),
-        cos_cache,
-        sin_cache,
-    )
-
-
-def _slice_v14d_cache_for_baseline_attention(attn, K_cache, V_cache, attention_mask):
-    """Return the logical KV slice expected by baseline compute_for_token_gen."""
-
-    s_prior = attention_mask.shape[-1]
-    k_seq_dim = 3 if attn.k_cache_transposed else 2
-    v_seq_dim = 2
-    k_cache_len = K_cache.shape[k_seq_dim]
-    v_cache_len = V_cache.shape[v_seq_dim]
-
-    if k_cache_len == s_prior and v_cache_len == s_prior:
-        return K_cache, V_cache
-
-    if attn.neuron_config.padding_side == "right":
-        K_attn = torch.ops.aten.slice(K_cache, dim=k_seq_dim, start=0, end=s_prior)
-        V_attn = torch.ops.aten.slice(V_cache, dim=v_seq_dim, start=0, end=s_prior)
-    else:
-        K_attn = torch.ops.aten.slice(K_cache, dim=k_seq_dim, start=k_cache_len - s_prior, end=k_cache_len)
-        V_attn = torch.ops.aten.slice(V_cache, dim=v_seq_dim, start=v_cache_len - s_prior, end=v_cache_len)
-
-    return K_attn, V_attn
-
-
-def _attention_tkg_v14d(
-    attn,
-    hidden_states: torch.Tensor,
-    attention_mask: torch.Tensor,
-    position_ids: torch.Tensor,
-    past_key_value: Tuple[torch.Tensor],
-    rmsnorm: nn.Module,
-    active_mask: Optional[torch.Tensor] = None,
-    adapter_ids=None,
-    cos_cache: Optional[torch.Tensor] = None,
-    sin_cache: Optional[torch.Tensor] = None,
-    rotary_position_ids: Optional[torch.LongTensor] = None,
-    active_block_table: Optional[torch.Tensor] = None,
-    use_polar_compatible_rope: bool = False,
+def _qwen3_moe_sbuf_in_sbuf_out_custom_rms_nkilib(
+    rmsnorm_out,          # [PMAX, T, H_FREE] dtype in SBUF (already RMSNorm'd, nkilib layout)
+    dtype,
+    T,
+    router_w,             # [H, E] HBM
+    gate_up_w,            # [E, H, 2*I] HBM
+    down_w,               # [E, I, H] HBM
+    sbm=None,
 ):
-    if attn.sequence_parallel_enabled and attn.tensor_model_parallel_group is not None:
-        hidden_states = gather_from_sequence_parallel_region(
-            hidden_states,
-            attn.sequence_dimension,
-            process_group=attn.tensor_model_parallel_group,
+    """
+    nkilib router_topk and moe_tkg kernels used by NxDI's moe_fused_nki_kernel_enabled
+    Qwen TKG path. Caller produces rmsnorm_out via nkilib rmsnorm_tkg.
+    """
+    prg_id = nl.program_id(axis=0)
+
+    router_in = rmsnorm_out
+    if router_w.dtype != rmsnorm_out.dtype:
+        router_in = sbm.alloc_stack(
+            (_PMAX, T, _H_FREE), router_w.dtype, buffer=nl.sbuf, name="router_in"
+        )
+        nisa.tensor_copy(dst=router_in[0:_PMAX, 0:T, 0:_H_FREE], src=rmsnorm_out[0:_PMAX, 0:T, 0:_H_FREE])
+
+    expert_index = nl.ndarray((T, _K), dtype=nl.uint32, buffer=nl.sbuf, name="expert_index")
+    expert_affinities = nl.ndarray((T, _E), dtype=nl.float32, buffer=nl.sbuf, name="expert_affinities")
+    # nkilib currently requires router_logits to receive a store even when the
+    # caller does not need logits. Keep that required scratch write in SBUF.
+    router_logits_scratch = nl.ndarray((T, _E), dtype=dtype, buffer=nl.sbuf, name="router_logits_scratch")
+
+    router_outputs = _router_topk(
+        x=router_in,
+        w=router_w,
+        w_bias=None,
+        router_logits=router_logits_scratch,
+        expert_affinities=expert_affinities,
+        expert_index=expert_index,
+        act_fn=RouterActFnType.SOFTMAX,
+        k=_K,
+        x_hbm_layout=0,
+        x_sb_layout=XSBLayout_tp2013__1,
+        router_pre_norm=True,
+        norm_topk_prob=True,
+        use_column_tiling=True,
+        use_indirect_dma_scatter=False,
+        return_eager_affi=False,
+        use_PE_broadcast_w_bias=False,
+        shard_on_tokens=T > 1,
+        skip_store_expert_index=False,
+        skip_store_router_logits=False,
+    )
+    expert_index = router_outputs[1]
+    expert_affinities = router_outputs[2]
+
+    if T > 1:
+        expert_mlp_in = rmsnorm_out
+    else:
+        expert_mlp_in = nl.ndarray(
+            (_PMAX, T, _H_FREE_SHARD), dtype=dtype, buffer=nl.sbuf, name="expert_mlp_in"
+        )
+        nisa.tensor_copy(
+            dst=expert_mlp_in[0:_PMAX, 0:T, 0:_H_FREE_SHARD],
+            src=rmsnorm_out[0:_PMAX, 0:T, nl.ds(prg_id * _H_FREE_SHARD, _H_FREE_SHARD)],
         )
 
-    bsz, s_tkg, hidden_size = hidden_states.shape
-    assert bsz == 1, "v14d token-generation attention currently expects batch size 1"
-    assert s_tkg == 1, "v14d token-generation attention currently expects one token"
-    assert hidden_size == attn.hidden_size, "v14d token-generation attention expects unpadded hidden states"
-    assert attn.tp_degree == 4, "v14d token-generation attention expects TP=4"
-    assert attn.hidden_size == 16 * V14D_PMAX, "v14d token-generation attention expects hidden_size=2048"
-    assert attn.head_dim == V14D_PMAX, "v14d token-generation attention hardcodes head_dim=128"
-    assert attn.num_key_value_heads == 1, "v14d token-generation attention expects one local KV head"
-    assert attn.num_heads == 8, "v14d token-generation attention expects eight local Q heads"
-    assert attn.logical_nc_config in (1, 2), "v14d token-generation attention supports LNC=1 or LNC=2"
-    assert not attn.k_cache_transposed, "v14d token-generation attention expects non-transposed K cache"
-    assert not attn.o_bias, "v14d token-generation attention does not apply o_proj bias"
-    assert attn.get_learned_sinks() is None, "v14d token-generation attention does not support learned sinks"
-    assert active_block_table is None, "v14d token-generation attention does not support block KV cache"
-    assert not use_polar_compatible_rope, "v14d token-generation attention expects contiguous RoPE layout"
-    assert rmsnorm is not None, "v14d token-generation attention fuses pre-attention RMSNorm"
-    assert position_ids is not None, "v14d token-generation attention requires position_ids"
-    assert attention_mask is not None, "baseline token-generation attention requires attention_mask"
-    assert past_key_value is not None, "v14d token-generation attention requires KV cache"
-    assert attn.q_layernorm is not None and attn.k_layernorm is not None, "v14d token-generation attention requires Q/K RMSNorm"
-
-    if rotary_position_ids is None:
-        rotary_position_ids = position_ids
-
-    K_prior, V_prior = past_key_value[:2]
-    assert K_prior.shape[0] == 1 and V_prior.shape[0] == 1, "v14d token-generation attention expects batch-1 KV cache"
-    assert K_prior.shape[1] == 1 and V_prior.shape[1] == 1, "v14d token-generation attention expects one local KV head"
-    assert K_prior.shape[2] % V14D_PMAX == 0, "v14d token-generation attention expects 128-aligned KV buckets"
-    assert K_prior.shape[-1] == V14D_PMAX and V_prior.shape[-1] == V14D_PMAX, "v14d token-generation attention expects head_dim=128 KV cache"
-    Wq, Wk, Wv = _get_v14d_qkv_weights(attn)
-    _, _, cos_cache, sin_cache = _get_v14d_rope(
-        attn,
-        hidden_states,
-        rotary_position_ids,
-        cos_cache,
-        sin_cache,
+    return _moe_tkg(
+        hidden_input=expert_mlp_in,
+        expert_gate_up_weights=gate_up_w.reshape((_E, _H, 2, _I)),
+        expert_down_weights=down_w,
+        expert_affinities=expert_affinities,
+        expert_index=expert_index,
+        is_all_expert=False,
+        expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
+        activation_fn=ActFnType.SiLU,
+        output_dtype=dtype,
     )
 
-    original_dtype = hidden_states.dtype
-    normed_states = _qwen3_tkg_v14d_rmsnorm_kernel[attn.logical_nc_config](
-        hidden_states.to(attn.torch_dtype),
-        rmsnorm.weight.data,
+
+def _store_h_sharded_sbuf_output(out_sb, output, dtype, T, sbm):
+    prg_id = nl.program_id(axis=0)
+    out_tile_sb = sbm.alloc_stack((T, _H_SHARD), dtype, buffer=nl.sbuf, name="out_tile_sb")
+
+    for t in nl.static_range(T):
+        for h1 in nl.static_range(_H_FREE_SHARD):
+            tp_psum = nl.ndarray((1, _PMAX), dtype=dtype, buffer=nl.psum)
+            nisa.nc_transpose(
+                dst=tp_psum[0:1, 0:_PMAX],
+                data=out_sb[0:_PMAX, t, h1 : h1 + 1],
+            )
+            interleave_copy(
+                dst=out_tile_sb.ap(
+                    pattern=[[_H_SHARD, 1], [_H_FREE_SHARD, _PMAX]],
+                    offset=t * _H_SHARD + h1,
+                ),
+                src=tp_psum[0:1, 0:_PMAX],
+                index=h1,
+            )
+        if prg_id == 0:
+            nisa.dma_copy(dst=output[t : t + 1, 0:_H_SHARD], src=out_tile_sb[t : t + 1, 0:_H_SHARD])
+        else:
+            nisa.dma_copy(dst=output[t : t + 1, _H_SHARD:_H], src=out_tile_sb[t : t + 1, 0:_H_SHARD])
+
+
+def _store_t_sharded_sbuf_output(out_sb, output, dtype, T, sbm):
+    prg_id = nl.program_id(axis=0)
+    t_first_shard = T // _N_PRGS
+    t_second_shard = T - t_first_shard
+    t_local = t_first_shard if prg_id == 0 else t_second_shard
+    t_offset = 0 if prg_id == 0 else t_first_shard
+
+    out_tile_sb = sbm.alloc_stack((t_local, _H), dtype, buffer=nl.sbuf, name="out_tile_sb")
+    for local_t in nl.static_range(t_local):
+        global_t = t_offset + local_t
+        for h1 in nl.static_range(_H_FREE):
+            tp_psum = nl.ndarray((1, _PMAX), dtype=dtype, buffer=nl.psum)
+            nisa.nc_transpose(
+                dst=tp_psum[0:1, 0:_PMAX],
+                data=out_sb[0:_PMAX, global_t, h1 : h1 + 1],
+            )
+            interleave_copy(
+                dst=out_tile_sb.ap(
+                    pattern=[[_H, 1], [_H_FREE, _PMAX]],
+                    offset=local_t * _H + h1,
+                ),
+                src=tp_psum[0:1, 0:_PMAX],
+                index=h1,
+            )
+        nisa.dma_copy(dst=output[global_t : global_t + 1, 0:_H], src=out_tile_sb[local_t : local_t + 1, 0:_H])
+
+
+def moe_fused_tkg(inp, gamma, router_w, gate_up_w, down_w, replica_groups=None):
+    sbm = SbufManager(0, nl.tile_size.total_available_sbuf_size, use_auto_alloc=True)
+
+    T = inp.shape[0]
+    prg_id = nl.program_id(axis=0)
+    rg = nccl.ReplicaGroup(replica_groups) if replica_groups is not None else None
+
+    sbm.open_scope(name="moe_fused_tkg")
+
+    rmsnorm_out = sbm.alloc_stack(
+        (_PMAX, T, _H_FREE), inp.dtype, buffer=nl.sbuf, name="rmsnorm_out"
+    )
+    _rmsnorm_tkg(
+        input=inp.reshape((1, T, _H)),
+        gamma=gamma,
+        output=rmsnorm_out,
+        eps=1e-6,
+        hidden_dim_tp=False,
+        single_core_forced=(T > 1),
+        sbm=sbm,
     )
 
-    Q, K, V, K_prior, V_prior = _qwen3_tkg_v14d_qkv_rope_kernel[attn.logical_nc_config](
-        normed_states=normed_states,
-        Wq=Wq,
-        Wk=Wk,
-        Wv=Wv,
-        q_norm_weight=attn.q_layernorm.weight.data,
-        k_norm_weight=attn.k_layernorm.weight.data,
-        K_cache=K_prior.data,
-        V_cache=V_prior.data,
-        position_ids=position_ids.to(torch.int32),
-        rotary_position_ids=rotary_position_ids.to(torch.int32),
+    # MoE produces a TP-partial [T, H] HBM tensor (sum over this rank's experts only).
+    moe_out_hbm = _qwen3_moe_sbuf_in_sbuf_out_custom_rms_nkilib(
+        rmsnorm_out,
+        inp.dtype,
+        T,
+        router_w,
+        gate_up_w,
+        down_w,
+        sbm=sbm,
     )
 
-    K_attn, V_attn = _slice_v14d_cache_for_baseline_attention(attn, K_prior, V_prior, attention_mask)
+    # Load each LNC core's owned H_SHARD slice of the TP-partial MoE output
+    # and the residual (= pre-RMSNorm `inp`) into SBUF, in the same
+    # CHANNEL-INTERLEAVED layout the rest of this kernel runs in (matching
+    # nkilib's _rmsnorm_tkg / _moe_tkg internal convention — see rmsnorm_tkg
+    # docstring lines 79-86 for the pseudocode).
+    #
+    # Layout: dst[p, t, h1] = HBM[t, prg_id*H_SHARD + p*H_FREE_SHARD + h1]
+    #   → partition p indexes the HIGH bits within the shard (stride H_FREE_SHARD)
+    #   → h1 indexes the LOW bits (stride 1)
+    # This is what _store_h_sharded_sbuf_output expects (its interleave_copy
+    # writes out_sb[p, t, h1] → HBM position prg_id*H_SHARD + p*H_FREE_SHARD + h1).
+    free_size = T * _H_FREE_SHARD
+    inp_flat = inp.reshape((T * _H,))
+    moe_out_flat = moe_out_hbm.reshape((T * _H,))
 
-    attn_output = attn.compute_for_token_gen(
-        Q,
-        K,
-        V,
-        position_ids,
-        (K_attn, V_attn),
-        attention_mask,
-        active_mask,
-        is_prefix_caching=attn.neuron_config.is_prefix_caching,
+    moe_partial_sb = sbm.alloc_stack(
+        (_PMAX, free_size), inp.dtype, buffer=nl.sbuf, name="moe_partial_sb"
     )
-    attn_output = attn_output.transpose(1, 2).contiguous()
-    attn_output = attn_output.reshape(bsz, s_tkg, attn.num_heads * attn.head_dim)
-    attn_output = attn.get_o_proj()(attn_output, adapter_ids=adapter_ids)
-    attn_output = attn_output.to(original_dtype)
+    residual_sb = sbm.alloc_stack(
+        (_PMAX, free_size), inp.dtype, buffer=nl.sbuf, name="residual_sb"
+    )
+    # Pattern levels (innermost → outermost source iteration):
+    #   level 0: stride H_FREE_SHARD, count PMAX → partition dim p
+    #   level 1: stride 1,            count H_FREE_SHARD → h1 (free, inner)
+    #   level 2: stride H,            count T → t (free, outer)
+    h_load_pattern = [[_H_FREE_SHARD, _PMAX], [1, _H_FREE_SHARD], [_H, T]]
+    h_load_offset = prg_id * _H_SHARD
+    nisa.dma_copy(
+        dst=moe_partial_sb,
+        src=moe_out_flat.ap(pattern=h_load_pattern, offset=h_load_offset),
+        dge_mode=nisa.dge_mode.hwdge,
+    )
+    nisa.dma_copy(
+        dst=residual_sb,
+        src=inp_flat.ap(pattern=h_load_pattern, offset=h_load_offset),
+        dge_mode=nisa.dge_mode.hwdge,
+    )
 
-    return attn_output, (K_prior, V_prior), cos_cache, sin_cache
+    # AR across TP in SBUF: TP-partial → TP-summed. Same accumulation order as
+    # `reduce_from_tensor_model_parallel_region` (bf16 sum across TP).
+    ar_sb = nl.zeros(
+        (_PMAX, free_size), dtype=inp.dtype, buffer=nl.sbuf, name="ar_sb"
+    )
+    nccl.all_reduce(
+        dsts=[ar_sb], srcs=[moe_partial_sb], op=nl.add, replica_group=rg,
+    )
+
+    # Residual add in SBUF: bf16 add, same op/dtype/order as the previous
+    # external `residual + hidden_states`. Both operands are channel-interleaved
+    # so the per-element add covers matching H positions.
+    nisa.tensor_tensor(dst=ar_sb, data1=ar_sb, data2=residual_sb, op=nl.add)
+
+    # Store the post-residual H-shard back to HBM. _store_h_sharded_sbuf_output
+    # expects channel-interleaved layout, which we just produced.
+    output = nl.ndarray((T, _H), dtype=inp.dtype, buffer=nl.shared_hbm)
+    _store_h_sharded_sbuf_output(
+        ar_sb.reshape((_PMAX, T, _H_FREE_SHARD)), output, inp.dtype, T, sbm
+    )
+
+    sbm.close_scope()
+
+    return output
+
+
+_flash_fwd_call = nki_jit()(attention_isa_kernel)
+_moe_fused_nkilib_call = nki.jit(moe_fused_tkg)
+
+
+def _nki_data(tensor):
+    return tensor.data if tensor is not None and hasattr(tensor, "data") else tensor
+
+
+SampleOutput = Union[SampleEncoderDecoderOutput, SampleDecoderOnlyOutput]
+
+GQA_SHARDING_STRATEGY = GQA.REPLICATE_TO_TP_DEGREE
+
+
+# Get the modules_to_not_convert from the neuron configs
+def get_modules_to_not_convert(neuron_config: MoENeuronConfig):
+    return getattr(neuron_config, "modules_to_not_convert", None)
+
+
+def _helper_concat_and_delete_qkv(qwen_state_dict: Dict[str, Any], layer_num: int, attr: str):
+    """
+    Helper function to concatenate and delete QKV attributes for fusedqkv (weight or scale).
+    Args:
+        qwen_state_dict: The state dictionary containing model weights
+        layer_num: The index of the layer to process
+        attr: The attribute to process ('weight' or 'scale')
+    """
+    qwen_state_dict[f"layers.{layer_num}.self_attn.Wqkv.{attr}"] = torch.cat(
+        [
+            qwen_state_dict[f"layers.{layer_num}.self_attn.q_proj.{attr}"],
+            qwen_state_dict[f"layers.{layer_num}.self_attn.k_proj.{attr}"],
+            qwen_state_dict[f"layers.{layer_num}.self_attn.v_proj.{attr}"],
+        ],
+    )
+    del qwen_state_dict[f"layers.{layer_num}.self_attn.q_proj.{attr}"]
+    del qwen_state_dict[f"layers.{layer_num}.self_attn.k_proj.{attr}"]
+    del qwen_state_dict[f"layers.{layer_num}.self_attn.v_proj.{attr}"]
+
+
+def convert_state_dict_to_fused_qkv(qwen_state_dict: Dict[str, Any], cfg: InferenceConfig):
+    """
+    This function concats the qkv weights and scales to a Wqkv weight and scale for fusedqkv, and deletes the qkv weights.
+    """
+    mods_to_not_conv = get_modules_to_not_convert(cfg.neuron_config)
+    if mods_to_not_conv is None:
+        mods_to_not_conv = []
+
+    for l in range(cfg.num_hidden_layers):  # noqa: E741
+        _helper_concat_and_delete_qkv(qwen_state_dict, l, "weight")
+        if (
+            cfg.neuron_config.quantized_mlp_kernel_enabled or cfg.neuron_config.quantized
+        ) and f"layers.{l}.self_attn" not in mods_to_not_conv:
+            _helper_concat_and_delete_qkv(qwen_state_dict, l, "scale")
+
+    gc.collect()
+
+    return qwen_state_dict
+
+
+def maybe_dequantize_layer(neuron_state_dict, config):
+    scale_layers = []
+    for layer_key in neuron_state_dict.keys():
+        if "_scale_inv" in layer_key:
+            scales = neuron_state_dict[layer_key]
+            scale_layers.append(layer_key)
+            fp8_layer_name = layer_key.replace("_scale_inv", "")
+            fp8_layer = neuron_state_dict[fp8_layer_name]
+            block_size = config.quantization_config["weight_block_size"]
+            scales_expanded = scales.repeat_interleave(block_size[0], dim=0).repeat_interleave(block_size[1], dim=1)
+            scaled_layer = fp8_layer.to(torch.float32) * scales_expanded.to(torch.float32)
+            neuron_state_dict[fp8_layer_name] = scaled_layer.to(config.neuron_config.torch_dtype)
+
+    # delete scale layers
+    for scale_layer in scale_layers:
+        del neuron_state_dict[scale_layer]
+
+
+def convert_qwen3_moe_hf_to_neuron_state_dict(neuron_state_dict, config):
+    """
+    Helper function which converts the huggingface checkpoints to state dictionary compatible with the stucture of the neuron MoE model.
+    """
+    assert config.neuron_config.glu_mlp is True, "Only GLU MLP is supported"
+
+    # dequantize layers if needed
+    maybe_dequantize_layer(neuron_state_dict, config)
+
+    # to facilitate rank usage in base model
+    neuron_state_dict["rank_util.rank"] = torch.arange(
+        0, config.neuron_config.tp_degree, dtype=torch.int32
+    )
+
+    for l in range(config.num_hidden_layers):  # noqa: E741
+        # To facilitate rank usage in attention
+        neuron_state_dict[f"layers.{l}.self_attn.rank_util.rank"] = torch.arange(
+            0, config.neuron_config.tp_degree, dtype=torch.int32
+        )
+
+        # Rename the q_norm, k_norm names
+        neuron_state_dict[f"layers.{l}.self_attn.k_layernorm.weight"] = (
+            neuron_state_dict[f"layers.{l}.self_attn.k_norm.weight"].detach().clone()
+        )
+        del neuron_state_dict[f"layers.{l}.self_attn.k_norm.weight"]
+
+        # Rename the q_norm, k_norm names
+        neuron_state_dict[f"layers.{l}.self_attn.q_layernorm.weight"] = (
+            neuron_state_dict[f"layers.{l}.self_attn.q_norm.weight"].detach().clone()
+        )
+        del neuron_state_dict[f"layers.{l}.self_attn.q_norm.weight"]
+
+        # Copy router weights
+        neuron_state_dict[f"layers.{l}.mlp.router.linear_router.weight"] = (
+            neuron_state_dict[f"layers.{l}.mlp.gate.weight"].detach().clone()
+        )
+        del neuron_state_dict[f"layers.{l}.mlp.gate.weight"]
+
+        intermediate_size, hidden_size = neuron_state_dict[
+            f"layers.{l}.mlp.experts.0.gate_proj.weight"
+        ].shape
+        device = neuron_state_dict[f"layers.{l}.mlp.experts.0.gate_proj.weight"].device
+        dtype = neuron_state_dict[f"layers.{l}.mlp.experts.0.gate_proj.weight"].dtype
+
+        # copy the MLP parameters
+        gate_up_proj = torch.empty(
+            config.num_experts,
+            hidden_size,
+            2 * intermediate_size,
+            dtype=dtype,
+            device=device,
+        )
+        for e in range(config.num_experts):
+            # Copy gate_proj and up_proj after concatenation
+            gate_proj_weights = (
+                neuron_state_dict[f"layers.{l}.mlp.experts.{e}.gate_proj.weight"]
+                .T.detach()
+                .clone()
+            )
+            up_proj_weights = (
+                neuron_state_dict[f"layers.{l}.mlp.experts.{e}.up_proj.weight"]
+                .T.detach()
+                .clone()
+            )
+
+            gate_up_proj_slice = torch.narrow(gate_up_proj, 0, e, 1)
+            gate_proj_slice = torch.narrow(gate_up_proj_slice, 2, 0, intermediate_size)
+            gate_proj_slice.copy_(gate_proj_weights)
+            up_proj_slice = torch.narrow(
+                gate_up_proj_slice, 2, intermediate_size, intermediate_size
+            )
+            up_proj_slice.copy_(up_proj_weights)
+
+            del neuron_state_dict[f"layers.{l}.mlp.experts.{e}.gate_proj.weight"]
+            del neuron_state_dict[f"layers.{l}.mlp.experts.{e}.up_proj.weight"]
+
+        # padding gate_up_proj on intermediate size
+        pad_size = getattr(config, "moe_intermediate_pad_size", 0)
+        if pad_size > 0:
+            gate_up_proj = gate_up_proj.reshape(config.num_experts, hidden_size, 2, -1)
+            # padding right on gate_up_proj: (num_experts, hidden_size, 2, intermediate_size)
+            gate_up_proj = torch.nn.functional.pad(gate_up_proj, (0, pad_size))
+            gate_up_proj = gate_up_proj.reshape(config.num_experts, hidden_size, -1)
+        neuron_state_dict[f"layers.{l}.mlp.expert_mlps.mlp_op.gate_up_proj.weight"] = gate_up_proj
+
+        down_proj = torch.empty(
+            config.num_experts,
+            intermediate_size,
+            hidden_size,
+            dtype=dtype,
+            device=device,
+        )
+        for e in range(config.num_experts):
+            # Copy down_proj
+            down_proj_weights = (
+                neuron_state_dict[f"layers.{l}.mlp.experts.{e}.down_proj.weight"]
+                .T.detach()
+                .clone()
+            )
+            down_proj_slice = torch.narrow(down_proj, 0, e, 1)
+            down_proj_slice.copy_(down_proj_weights)
+            del neuron_state_dict[f"layers.{l}.mlp.experts.{e}.down_proj.weight"]
+
+        # padding down_proj on intermediate size
+        if pad_size > 0:
+            # padding bottom on down_proj: (num_experts, intermediate_size, hidden_size)
+            down_proj = torch.nn.functional.pad(down_proj, (0, 0, 0, pad_size))
+        neuron_state_dict[f"layers.{l}.mlp.expert_mlps.mlp_op.down_proj.weight"] = down_proj
+
+        gc.collect()
+
+    if config.neuron_config.fused_qkv:
+        neuron_state_dict = convert_state_dict_to_fused_qkv(neuron_state_dict, config)
+
+    return neuron_state_dict
+
+
+def get_rmsnorm_cls():
+    # Initialize to the appropriate implementation of RMSNorm
+    # If infer on NXD -> CustomRMSNorm
+    # If infer on CPU -> HF_RMSNorm (CustomRMSNorm does not work on CPU)
+    return Qwen3MoeRMSNorm if cpu_mode() else CustomRMSNorm
+
+
+class Qwen3MoeInferenceConfig(InferenceConfig):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Qwen3-MoE config has `num_experts` instead of `num_local_experts`
+        # We need to add `num_local_experts` as it is expected by `initialize_moe_module`
+        self.num_local_experts = self.num_experts
+        # Qwen3-MoE has no shared experts
+        self.n_shared_experts = 0
+        # ExpertMLPsV2 reads moe_intermediate from config.intermediate_size
+
+        # check whether need to pad intermediate size
+        self.maybe_pad_intermediate()
+
+        # enable moe_fused_nki_kernel
+        self.enable_moe_fused_nki_kernel()
+
+        self.intermediate_size = self.moe_intermediate_size
+        # We need router dtype to be FP32 for accuracy
+        self.neuron_config.router_config.dtype = torch.float32
+        # HF uses softmax (non-configurable) act for Qwen3-MoE
+        self.neuron_config.router_config.act_fn = "softmax"
+        # Set DISABLE_NUMERIC_CC_TOKEN=1 for Qwen3 MoE as a workaround
+        # for the extra add/multiple in all-gather/reduce-scatter CC ops
+        # https://github.com/pytorch/xla/pull/3825 (openxla PR https://github.com/openxla/xla/pull/7677 not accepted)
+        self.neuron_config.disable_numeric_cc_token = True
+        # Qwen3 normalizes top k affinities
+        self.neuron_config.normalize_top_k_affinities = True
+
+    def maybe_pad_intermediate(self):
+        moe_tp_degree = self.neuron_config.moe_tp_degree
+        I_TP = self.moe_intermediate_size // moe_tp_degree
+        if getattr(self.neuron_config.blockwise_matmul_config, "use_shard_on_intermediate_dynamic_while", False):
+            # If shard-on-I enabled, check the intermediate size per tp is divisible by SHARD_ON_INTERMEDIATE_DIMENTION_PER_TP
+            if I_TP % SHARD_ON_INTERMEDIATE_DIMENTION_PER_TP != 0:
+                padded_moe_intermediate_size = math.ceil(I_TP / SHARD_ON_INTERMEDIATE_DIMENTION_PER_TP) * SHARD_ON_INTERMEDIATE_DIMENTION_PER_TP * moe_tp_degree
+                self.moe_intermediate_pad_size = max(padded_moe_intermediate_size - self.moe_intermediate_size, 0)
+                # set moe_intermediate_size to padded size
+                self.moe_intermediate_size = padded_moe_intermediate_size
+
+    def enable_moe_fused_nki_kernel(self):
+        I_TP = self.moe_intermediate_size // self.neuron_config.moe_tp_degree
+        # if moe_fused_nki_kernel_enabled is enabled and the intermeidiate_size_per_tp is divisible by MOE_TKG_MK_INTERMEDIATE_PER_TP
+        if getattr(self.neuron_config, "moe_fused_nki_kernel_enabled", False) and I_TP % MOE_TKG_MK_INTERMEDIATE_PER_TP == 0:
+            self.moe_fused_nki_kernel_enabled = True
+
+    def get_required_attributes(self) -> List[str]:
+        return [
+            "head_dim",
+            "hidden_act",
+            "hidden_size",
+            "max_position_embeddings",
+            "moe_intermediate_size",
+            "norm_topk_prob",
+            "num_attention_heads",
+            "num_experts",
+            "num_experts_per_tok",
+            "num_hidden_layers",
+            "num_key_value_heads",
+            "rms_norm_eps",
+            "rope_scaling",
+            "rope_theta",
+            "tie_word_embeddings",
+            "vocab_size",
+        ]
+
+    @classmethod
+    def get_neuron_config_cls(cls):
+        return MoENeuronConfig
+
+
+class NeuronQwen3MoEAttention(NeuronAttentionBase):
+    def __init__(self, config: Qwen3MoeInferenceConfig):
+        rotary_emb = RotaryEmbedding(
+            config.head_dim,
+            max_position_embeddings=config.max_position_embeddings,
+            base=config.rope_theta,
+        )
+
+        super().__init__(
+            config=config,
+            hidden_size=config.hidden_size,
+            num_attention_heads=config.num_attention_heads,
+            num_key_value_heads=config.num_key_value_heads,
+            head_dim=config.head_dim,
+            rotary_emb=rotary_emb,
+            rms_norm_eps=config.rms_norm_eps,
+            # qk_norm in the base class is different from Qwen3RMSNorm
+            use_qk_norm=False,
+        )
+
+        # Override q_layernorm and k_layernorm with RMSNorm
+        self.q_layernorm = get_rmsnorm_cls()(self.head_dim, self.rms_norm_eps)
+        self.k_layernorm = get_rmsnorm_cls()(self.head_dim, self.rms_norm_eps)
+
+        if not parallel_state.model_parallel_is_initialized():
+            raise ValueError(
+                "NeuronQwen3MoEAttention has to be initialized in a distributed env. Please use neuronx_distributed"
+                " module to initialize a distributed env."
+            )
 
 
 class NeuronQwen3MoeDecoderLayer(nn.Module):
-    """Decoder layer using the installed NxDI Qwen modules plus local TKG attention."""
+    """
+    Just replace the attention with the NXD version, and MLP with the NXD version
+    """
 
     def __init__(self, config: Qwen3MoeInferenceConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-        # Keep the config-level TKG flags enabled so NxDI skips its own KV
-        # cache update path, but mask the block-TKG dispatch flag while
-        # constructing the baseline attention module to preserve the standard
-        # CTE o_proj path.
-        _saved_block_flag = config.neuron_config.attn_block_tkg_nki_kernel_enabled
-        config.neuron_config.attn_block_tkg_nki_kernel_enabled = False
-        try:
-            self.self_attn = NeuronQwen3MoEAttention(config=config)
-        finally:
-            config.neuron_config.attn_block_tkg_nki_kernel_enabled = _saved_block_flag
+        self.self_attn = NeuronQwen3MoEAttention(config=config)
         self.moe_fused_nki_kernel_enabled = getattr(config, "moe_fused_nki_kernel_enabled", False)
 
         self.input_layernorm = get_rmsnorm_cls()(
@@ -940,6 +965,34 @@ class NeuronQwen3MoeDecoderLayer(nn.Module):
         self.qkv_kernel_fused_rmsnorm = not self.sequence_parallel_enabled
         self.moe_mask_padded_tokens = config.neuron_config.moe_mask_padded_tokens
 
+        # Replica groups for nccl.all_reduce inside the fused MoE TKG kernel.
+        # Format mirrors qwen_fused_transformer_multilayer.py — derived from
+        # tp_degree to avoid torch.distributed calls during mock tracing.
+        self._replica_groups = (list(range(config.neuron_config.tp_degree)),)
+
+    def _moe_fused_nkilib_tkg(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states_shape = hidden_states.shape
+        hidden_states_2d = hidden_states.reshape(-1, self.hidden_size)
+
+        # Keep the same weights NxDI's token-gen MoE wrapper owns; only swap the NKI entry point.
+        gamma = _nki_data(self.post_attention_layernorm.weight.unsqueeze(0))
+        router_w = _nki_data(self.mlp.router.weight_T)
+        gate_up_w = _nki_data(self.mlp.expert_mlps.mlp_op.gate_up_proj.weight)
+        down_w = _nki_data(self.mlp.expert_mlps.mlp_op.down_proj.weight)
+        logical_nc_config = self.mlp.moe_fused_tkg.logical_nc_config
+
+        # Kernel does the TP all-reduce + residual add internally (in SBUF),
+        # so the returned tensor is the post-residual hidden state.
+        output_2d = _moe_fused_nkilib_call[logical_nc_config](
+            hidden_states_2d,
+            gamma,
+            router_w,
+            gate_up_w,
+            down_w,
+            replica_groups=self._replica_groups,
+        )
+        return output_2d.reshape(hidden_states_shape)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -949,6 +1002,16 @@ class NeuronQwen3MoeDecoderLayer(nn.Module):
         padding_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        """
+        Args:
+            hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
+            attention_mask (`torch.FloatTensor`, *optional*):
+                attention mask of size `(batch_size, sequence_length)` if flash attention is used or `(batch_size, 1,
+                query_sequence_length, key_sequence_length)` if default attention is used.
+            position_ids (`torch.FloatTensor`, *optional*):
+                position ids of size `(batch_size, sequence_length)`.
+            past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
+        """
         if "padding_mask" in kwargs:
             warnings.warn(
                 "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
@@ -956,106 +1019,52 @@ class NeuronQwen3MoeDecoderLayer(nn.Module):
 
         residual = hidden_states
 
-        is_token_gen = past_key_value is not None or kwargs.get("get_kv_per_layer", False)
-        if kwargs.get("windowed_context_encoding_window_idx", -1) >= 0:
-            is_token_gen = False
-        if self.self_attn.neuron_config.is_prefix_caching:
-            q_len = hidden_states.size(1)
-            if self.sequence_parallel_enabled:
-                q_len *= self.self_attn.tensor_model_parallel_group.size()
-            is_token_gen = is_token_gen and q_len < 128
-
+        qkv_fused_rmsnorm = None
+        # We wrap input_layernorm/self_attn/post_attention_layernorm with module markers start/end
+        # as a hint for compiler's modular-flow to avoid layer boundries in-between decoder layer components
         hidden_states = ModuleMarkerStartWrapper()(hidden_states)
-        if is_token_gen:
-            assert self.input_layernorm is not None, "v14d token-generation attention requires input_layernorm"
-            assert not self.self_attn.neuron_config.flash_decoding_enabled, "v14d token-generation attention does not support flash decoding"
-            assert not self.self_attn.neuron_config.is_chunked_prefill, "v14d token-generation attention does not support chunked prefill"
+        if self.input_layernorm:
+            if self.qkv_kernel_enabled and self.qkv_kernel_fused_rmsnorm:
+                qkv_fused_rmsnorm = self.input_layernorm
+            else:
+                hidden_states = self.input_layernorm(hidden_states)
 
-            tkg_position_ids = position_ids
-            if self.self_attn.neuron_config.is_block_kv_layout:
-                tkg_position_ids = kwargs["scatter_index"]
+        # Self Attention
+        hidden_states, present_key_value, cos_cache, sin_cache = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            rmsnorm=qkv_fused_rmsnorm,
+            **kwargs,
+        )
+        hidden_states = residual + hidden_states
 
-            tkg_past_key_value = past_key_value
-            if kwargs.get("get_kv_per_layer", False):
-                kv_mgr = kwargs.get("kv_mgr")
-                assert kv_mgr is not None, "v14d token-generation attention requires a KV cache manager"
-                # Match NxDI's block-TKG path: first let the cache manager run
-                # its normal per-layer lookup, then pass the direct backing cache
-                # to the in-place NKI kernel.
-                kv_mgr.get_kv_by_layer_id(**kwargs)
-                if self.self_attn.dp_degree > 1:
-                    tkg_past_key_value = kv_mgr.get_kv_by_layer_id(
-                        idx=kwargs["idx"],
-                        kvcache_buffer=kwargs["kvcache_buffer"],
-                        seq_len=hidden_states.size(1),
-                        skip_slice=True,
-                    )
-                else:
-                    tkg_past_key_value = kv_mgr._fetch_cache(
-                        idx=kwargs["idx"],
-                        kvcache_buffer=kwargs["kvcache_buffer"],
-                    )
-
-            if self.self_attn.neuron_config.apply_seq_ids_mask:
-                seq_ids = kwargs.get("seq_ids")
-                assert seq_ids is not None, "seq_ids is required when apply_seq_ids_mask is enabled"
-                position_ids_invalid = (
-                    tkg_past_key_value[1].shape[2] - KV_CACHE_PAD_FOR_SEQ_IDS_MASKING
-                ) + torch.arange(
-                    tkg_position_ids.shape[-1],
-                    device=tkg_position_ids.device,
-                    dtype=tkg_position_ids.dtype,
-                ).reshape(1, -1).broadcast_to(tkg_position_ids.shape)
-                seq_ids_mask = torch.ge(seq_ids, torch.full_like(seq_ids, 0))
-                seq_ids_mask = seq_ids_mask.reshape(-1, 1).broadcast_to(tkg_position_ids.shape)
-                tkg_position_ids = torch.where(seq_ids_mask, tkg_position_ids, position_ids_invalid)
-
-            hidden_states, present_key_value, cos_cache, sin_cache = _attention_tkg_v14d(
-                self.self_attn,
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                position_ids=tkg_position_ids,
-                past_key_value=tkg_past_key_value,
-                rmsnorm=self.input_layernorm,
-                active_mask=kwargs.get("active_mask"),
-                adapter_ids=kwargs.get("adapter_ids"),
-                cos_cache=kwargs.get("cos_cache"),
-                sin_cache=kwargs.get("sin_cache"),
-                rotary_position_ids=kwargs.get("rotary_position_ids"),
-                active_block_table=kwargs.get("active_block_table"),
-                use_polar_compatible_rope=kwargs.get("use_polar_compatible_rope", False),
-            )
+        # MoE
+        if self.moe_fused_nki_kernel_enabled and past_key_value is not None:
+            # Fused-NKI TKG path: kernel does post_attention_layernorm + MoE
+            # + TP all-reduce + residual add internally (residual stashed in
+            # SBUF at kernel entry, added back after the in-SBUF AR).
+            hidden_states = self._moe_fused_nkilib_tkg(hidden_states)
         else:
-            qkv_fused_rmsnorm = None
-            if self.input_layernorm:
-                if self.qkv_kernel_enabled and self.qkv_kernel_fused_rmsnorm:
-                    qkv_fused_rmsnorm = self.input_layernorm
-                else:
-                    hidden_states = self.input_layernorm(hidden_states)
+            residual = hidden_states
+            if not self.moe_fused_nki_kernel_enabled:
+                hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states, padding_mask)[0]
+            hidden_states = residual + hidden_states
 
-            hidden_states, present_key_value, cos_cache, sin_cache = self.self_attn(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_value,
-                rmsnorm=qkv_fused_rmsnorm,
-                **kwargs,
-            )
-        hidden_states = residual + hidden_states
-
-        residual = hidden_states
-        if not self.moe_fused_nki_kernel_enabled:
-            hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states, padding_mask)[0]
-        hidden_states = residual + hidden_states
-
+        # End module marker
         hidden_states = ModuleMarkerEndWrapper()(hidden_states)
         outputs = (hidden_states, present_key_value, cos_cache, sin_cache, None)
+
         return outputs
 
 
 class NeuronQwen3MoeModel(NeuronBaseModel):
-    """Qwen3 MoE model using the local decoder layer."""
+    """
+    NeuronQwen3MoeModel extends the Qwen3MoeModel to be traceable.
+    The forward function of this class is traced.
+    """
 
     def setup_attr_for_model(self, config: Qwen3MoeInferenceConfig):
         self.on_device_sampling = config.neuron_config.on_device_sampling_config is not None
@@ -1093,17 +1102,15 @@ class NeuronQwen3MoeModel(NeuronBaseModel):
 
 
 class NeuronQwen3MoeForCausalLM(NeuronBaseForCausalLM):
-    """Qwen3 MoE CausalLM using the local model class."""
+    """
+    This class can be used as Qwen3MoeForCausalLM
+    """
 
     _model_cls = NeuronQwen3MoeModel
 
     @staticmethod
     def load_hf_model(model_path, **kwargs):
         return Qwen3MoeForCausalLM.from_pretrained(model_path, **kwargs)
-
-    @classmethod
-    def get_neuron_config_cls(cls):
-        return Qwen3V14DAttnNeuronConfig
 
     @classmethod
     def get_config_cls(cls):
@@ -1113,34 +1120,51 @@ class NeuronQwen3MoeForCausalLM(NeuronBaseForCausalLM):
     def convert_hf_to_neuron_state_dict(state_dict: dict, config: Qwen3MoeInferenceConfig) -> dict:
         return convert_qwen3_moe_hf_to_neuron_state_dict(state_dict, config)
 
+    # Wraps NeuronBaseForCausalLM.enable_context_encoding() to add compile_tag.
     def enable_context_encoding(self):
         self.compile_tag = CONTEXT_ENCODING_MODEL_TAG
         super().enable_context_encoding()
 
+    # Wraps NeuronBaseForCausalLM.enable_token_generation() to add compile_tag.
     def enable_token_generation(self):
         self.compile_tag = TOKEN_GENERATION_MODEL_TAG
         super().enable_token_generation()
 
     def get_compiler_args(self):
+        # Set compiler optimization level based on model tag
         if self.compile_tag == CONTEXT_ENCODING_MODEL_TAG:
             optimization_level = "-O1"
         elif self.compile_tag == TOKEN_GENERATION_MODEL_TAG:
+            # Disable Modular flow for TKG graph with EP enabled as it causes perf degradation
             optimization_level = "-O3" if self.neuron_config.moe_ep_degree > 1 else "-O1"
         compiler_args = f"--enable-saturate-infinity --enable-mixed-precision-accumulation --model-type transformer {optimization_level}"
+        # Add flags for cc-overlap
         compiler_args += (
             " --tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2'"
         )
         compiler_args += " --auto-cast=none"
+        # Enable vector-offset DGE
         compiler_args += " --internal-enable-dge-levels vector_dynamic_offsets"
         compiler_args += " --internal-hlo2tensorizer-options='--verify-hlo=true'"
         if self.neuron_config.scratchpad_page_size:
             compiler_args += (
                 f" --hbm-scratchpad-page-size={self.neuron_config.scratchpad_page_size} "
             )
+
+        if self.neuron_config.attn_block_tkg_nki_kernel_enabled:
+            assert (
+                self.neuron_config.attn_block_tkg_nki_kernel_cascaded_attention
+            ), "If using attn_block_tkg_nki_kernel_enabled for Qwen3MoE you must also use attn_block_tkg_nki_kernel_cascaded_attention"
+            # Enabled RMSNorm pre-RoPE in the Attn TKG MK
+            self.neuron_config.pre_rope_rmsnorm = True
+            # When enabling the Cascaded Attn TKG MK we will run over 5 million instructions on E2E
+            compiler_args += " --internal-max-instruction-limit=15000000"
+
         return compiler_args
 
 
-def generate(model_path, traced_model_path, skip_compile=False):
+def generate(skip_compile=False):
+    # Initialize configs and tokenizer.
     generation_config = GenerationConfig.from_pretrained(model_path)
 
     if not skip_compile:
@@ -1149,40 +1173,39 @@ def generate(model_path, traced_model_path, skip_compile=False):
             batch_size=1,
             max_context_length=128,
             seq_len=1024,
-            on_device_sampling_config=OnDeviceSamplingConfig(
-                do_sample=True,
-                temperature=0.6,
-                top_k=20,
-                top_p=0.95,
-            ),
+            on_device_sampling_config=OnDeviceSamplingConfig(do_sample=True, temperature=0.6, top_k=20, top_p=0.95),
             enable_bucketing=False,
-            flash_decoding_enabled=False,
+            flash_decoding_enabled=False
         )
         config = Qwen3MoeInferenceConfig(
             neuron_config,
             load_config=load_pretrained_config(model_path),
-        )
+        )        
         tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side="right")
         tokenizer.pad_token = tokenizer.eos_token
-
+        # Compile and save model.
         print("\nCompiling and saving model...")
         model = NeuronQwen3MoeForCausalLM(model_path, config)
         model.compile(traced_model_path)
         tokenizer.save_pretrained(traced_model_path)
 
+    # Load from compiled checkpoint.
     print("\nLoading model from compiled checkpoint...")
     model = NeuronQwen3MoeForCausalLM(traced_model_path)
     model.load(traced_model_path)
     tokenizer = AutoTokenizer.from_pretrained(traced_model_path)
 
+    # Generate outputs.
     print("\nGenerating outputs...")
     prompt = "Give me a short introduction to large language models."
-    messages = [{"role": "user", "content": prompt}]
+    messages = [
+        {"role": "user", "content": prompt}
+    ]
     text = tokenizer.apply_chat_template(
         messages,
         tokenize=False,
         add_generation_prompt=True,
-        enable_thinking=True,
+        enable_thinking=True # Switches between thinking and non-thinking modes. Default is True.
     )
     inputs = tokenizer([text], padding=True, return_tensors="pt")
     generation_model = HuggingFaceGenerationAdapter(model)
@@ -1192,11 +1215,7 @@ def generate(model_path, traced_model_path, skip_compile=False):
         attention_mask=inputs.attention_mask,
         max_length=model.config.neuron_config.max_length,
     )
-    output_tokens = tokenizer.batch_decode(
-        outputs,
-        skip_special_tokens=True,
-        clean_up_tokenization_spaces=False,
-    )
+    output_tokens = tokenizer.batch_decode(outputs, skip_special_tokens=True, clean_up_tokenization_spaces=False)
     print("Generated outputs:")
     for i, output_token in enumerate(output_tokens):
         print(f"Output {i}: {output_token}")
