@@ -1,9 +1,0 @@
-
-peak sb usage: 0.00
-peak psum usage: 0.00
-
-#=1 x bytes
-
-
-
-top 20 tensors with long live time

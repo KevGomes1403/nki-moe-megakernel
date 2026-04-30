@@ -1,3 +1,0 @@
-2026-04-27T17:22:05Z INFO 534485 [root]: /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/neuronx-cc compile --help
-2026-04-27T17:22:05Z INFO 534485 [root]: NeuronX Compiler version 2.24.5133.0+58f8de22 Python version 3.12.3 HWM version 2.24.0.5133+58f8de22 NumPy version 2.4.4 Running on AMI ami-066602ad9a8bee11f Running in region usw2-az3
-2026-04-27T17:22:05Z INFO 534485 [root]: Subcommand returned with exitcode=0

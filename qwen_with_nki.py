@@ -12,10 +12,19 @@ from neuronx_distributed_inference.models.qwen3_moe.modeling_qwen3_moe import Qw
 _QWEN_FORCED_CONFIG_FLAGS = {
     "moe_fused_nki_kernel_enabled": True,
     "qkv_nki_kernel_enabled": True,
+    "qkv_kernel_enabled": True,
     "output_logits": True,
     "async_mode": True,
-    "fused_qkv": True
+    "fused_qkv": True,
+    "attn_block_tkg_nki_kernel_enabled": True,
+    "attn_block_tkg_nki_kernel_cascaded_attention": True,
+    "attn_block_tkg_nki_kernel_cache_update": True,
 }
+
+# nkilib attention TKG kernel asserts s_prior % p_max == 0 after LNC=2 sharding,
+# i.e. bucket_size % 256 == 0. Default bucket [128, 256, 640] for max_length=640
+# fails on 640. Override with 256-aligned buckets covering the full 640 range.
+_QWEN_FORCED_TKG_BUCKETS = [128, 256, 512, 768]
 
 
 _QWEN_FORCED_SAMPLING_FLAGS = {
@@ -80,6 +89,12 @@ def _inject_qwen_forced_config_flags():
         kwargs["on_device_sampling_config"] = _make_qwen_forced_on_device_sampling_config(kwargs)
         kwargs["blockwise_matmul_config"] = _make_qwen_forced_blockwise_matmul_config()
         kwargs["disable_normalize_top_k_affinities"] = False
+        kwargs["token_generation_buckets"] = list(_QWEN_FORCED_TKG_BUCKETS)
+        # NxDI asserts buckets[-1] <= max_length AND sizes the KV cache S-dim
+        # from max_length (kv_cache_manager.py:194-235). The TKG NKI kernel
+        # asserts curr_sprior <= full_sprior, so max_length must cover the
+        # largest bucket. Affects both submitted model and baseline (same patch).
+        kwargs["max_length"] = max(kwargs.get("max_length") or 0, max(_QWEN_FORCED_TKG_BUCKETS))
 
         original_init(self, *args, **kwargs)
 
@@ -146,7 +161,7 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeRMSNorm
 
 from neuronx_distributed_inference.models.config import InferenceConfig, MoENeuronConfig, MOE_TKG_MK_INTERMEDIATE_PER_TP
 from neuronx_distributed_inference.models.model_wrapper import CONTEXT_ENCODING_MODEL_TAG, TOKEN_GENERATION_MODEL_TAG
-from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
+from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase, QKNormPlacement, EPDispatchOption
 from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
 from neuronx_distributed_inference.modules.moe_v2 import initialize_moe_module
 from neuronx_distributed_inference.models.layer_boundary_marker import (
@@ -167,242 +182,9 @@ from nkilib.core.router_topk.router_topk import (
 from nkilib.core.subkernels.rmsnorm_tkg import rmsnorm_tkg as _rmsnorm_tkg
 from nkilib.core.utils.allocator import SbufManager
 from nkilib.core.utils.tensor_view import TensorView
-from nkilib.core.utils.common_types import ActFnType, ExpertAffinityScaleMode, RouterActFnType
+from nkilib.core.utils.common_types import ActFnType, ExpertAffinityScaleMode, QuantizationType, RouterActFnType
 from nkilib.core.utils.interleave_copy import interleave_copy
-
-
-_PMAX = 128
-_H    = 2048
-_H_FREE = _H // _PMAX            # 16
-_N_PRGS = 2
-_H_FREE_SHARD = _H_FREE // _N_PRGS  # 8
-_H_SHARD = _H_FREE_SHARD * _PMAX    # 1024
-_EPS  = 1e-6
-
-
-def _rmsnorm_sbuf_in_sbuf_out_hoisted(
-    inp_sb,               # [PMAX, H_free*T] bf16 in SBUF
-    dtype,
-    T,
-    gamma,                # [1, H] bf16 HBM
-    sbm=None,
-    gamma_sb_ready=None,  # [PMAX, H_free] bf16 SBUF pre-loaded
-    debug_rmsnorm_out=None,
-):
-    """
-    RMSNorm sub-kernel. inp_sb already in SBUF.
-
-    Heap lifecycle (caller's responsibility):
-      alloc_heap rmsnorm_normed_bf16 [PMAX, H_free*T] bf16  — returned; caller pops.
-      alloc_heap rmsnorm_normed [PMAX, H_free*T] fp32        — popped before returning.
-
-    Returns rmsnorm_normed_bf16 [PMAX, H_free*T] bf16 heap tensor.
-    """
-    H      = _H
-    H_free = _H_FREE
-    B      = T
-    prg_id = nl.program_id(axis=0)
-
-    # heap: bf16 normed — lives through router + expert stages; caller pops
-    rmsnorm_normed_bf16 = sbm.alloc_heap((_PMAX, H_free * T), dtype, buffer=nl.sbuf, name="rmsnorm_normed_bf16")
-    # heap: fp32 normed — only needed for gamma multiply; popped before returning
-    rmsnorm_normed      = sbm.alloc_heap((_PMAX, H_free * T), nl.float32, buffer=nl.sbuf, name="rmsnorm_normed")
-
-    sbm.open_scope(name="rmsnorm")
-
-    rmsnorm_out = inp_sb
-
-    # --- gamma load (skipped when gamma_sb_ready is supplied) ---
-    if gamma_sb_ready is None:
-        gamma_sb = sbm.alloc_stack((_PMAX, H_free), gamma.dtype, buffer=nl.sbuf, name="gamma_sb")
-        gamma_1d = gamma.reshape((H,))
-        for h1 in nl.static_range(H_free):
-            shard = h1 // _H_FREE_SHARD
-            h2 = h1 - shard * _H_FREE_SHARD
-            nisa.dma_copy(
-                dst=gamma_sb[0:_PMAX, h1:h1 + 1],
-                src=gamma_1d.ap(
-                    pattern=[[_H_FREE_SHARD, _PMAX], [1, 1]],
-                    offset=shard * _H_SHARD + h2,
-                ),
-                dge_mode=3,
-            )
-    else:
-        gamma_sb = gamma_sb_ready  # caller-owned — do NOT free
-
-    rmsnorm_sq = sbm.alloc_stack((_PMAX, H_free * T), nl.float32, buffer=nl.sbuf, name="rmsnorm_sq")
-    nisa.activation(rmsnorm_sq[...], op=nl.square, data=rmsnorm_out[...])
-
-    # Within-partition reduce: [PMAX, H_free*T] → [PMAX, T]
-    rmsnorm_reduced = sbm.alloc_stack((_PMAX, T), nl.float32, buffer=nl.sbuf, name="rmsnorm_reduced")
-    nisa.tensor_reduce(rmsnorm_reduced[0:_PMAX, 0:T], nl.add, rmsnorm_sq[0:_PMAX, 0:H_free * T], axis=1)
-
-    # Cross-partition reduce via reduce-as-MATMUL with an all-ones [PMAX, PMAX] stationary
-    # operand. Matches AwsNeuronRmsNorm's HLO lowering (nxdi_moe.md §10.8).
-    mm_ones = sbm.alloc_stack((_PMAX, _PMAX), nl.float32, buffer=nl.sbuf, name="rmsnorm_mm_ones")
-    nisa.memset(mm_ones, value=1.0)
-    final_reduced_psum = nl.ndarray((_PMAX, T), dtype=nl.float32, buffer=nl.psum)
-    nisa.nc_matmul(
-        dst=final_reduced_psum[0:_PMAX, 0:T],
-        stationary=mm_ones[0:_PMAX, 0:_PMAX],
-        moving=rmsnorm_reduced[0:_PMAX, 0:T],
-    )
-
-    eps_sb = sbm.alloc_stack((_PMAX, 1), nl.float32, buffer=nl.sbuf, name="eps_sb")
-    nisa.memset(eps_sb, value=_EPS)
-    norm_factor_sb = sbm.alloc_stack((_PMAX, T), nl.float32, buffer=nl.sbuf, name="norm_factor_sb")
-    nisa.activation(
-        norm_factor_sb[0:_PMAX, 0:T],
-        op=nl.rsqrt,
-        data=final_reduced_psum[0:_PMAX, 0:T],
-        scale=1.0 / H,
-        bias=eps_sb[0:_PMAX, :],
-    )
-
-    norm_factor_bcast = TensorView(norm_factor_sb).expand_dim(dim=2).broadcast(dim=2, size=H_free)
-    x_scaled = sbm.alloc_stack((_PMAX, H_free * T), nl.float32, buffer=nl.sbuf, name="x_scaled")
-    nisa.tensor_tensor(x_scaled[...], rmsnorm_out[...], norm_factor_bcast.get_view(), nl.multiply)
-    # rmsnorm_normed is a heap tensor (allocated before this scope) — write into it directly
-    nisa.tensor_tensor(rmsnorm_normed[...], x_scaled[...], gamma_sb[...], nl.multiply)
-
-    nisa.activation(rmsnorm_normed_bf16[...], op=nl.copy, data=rmsnorm_normed[...])
-
-    sbm.close_scope()  # frees rmsnorm stack tensors (not gamma_sb_ready — caller-owned)
-
-    # Debug: DMA rmsnorm_normed_bf16 [PMAX, H_free*T] → HBM [T, H] (prg_id 0 only).
-    if debug_rmsnorm_out is not None:
-        if prg_id == 0:
-            debug_flat = debug_rmsnorm_out.reshape((B, H))
-            for _t in nl.static_range(B):
-                for _h1 in nl.static_range(H_free):
-                    _dbg_psum = nl.ndarray((1, _PMAX), dtype=dtype, buffer=nl.psum)
-                    nisa.nc_transpose(
-                        _dbg_psum,
-                        rmsnorm_normed_bf16[0:_PMAX, _h1 * B + _t : _h1 * B + _t + 1],
-                    )
-                    _dbg_sb = nl.ndarray((1, _PMAX), dtype=dtype, buffer=nl.sbuf)
-                    nisa.tensor_copy(_dbg_sb, _dbg_psum)
-                    nisa.dma_copy(
-                        dst=debug_flat[_t : _t + 1, _h1 * _PMAX : (_h1 + 1) * _PMAX],
-                        src=_dbg_sb,
-                        dge_mode=nisa.dge_mode.hwdge,
-                    )
-
-    sbm.pop_heap()  # rmsnorm_normed fp32 — not needed past this point
-
-    return rmsnorm_normed_bf16  # [PMAX, H_free*T] bf16 heap; caller pops
-
-
-@nki.jit
-def rmsnorm_hbm(inp, gamma, hoisted_gamma=False, debug_rmsnorm_out=None):
-    """
-    HBM wrapper for RMSNorm.
-
-    inp:   [T, H=2048] bf16 HBM
-    gamma: [1, H=2048] bf16 HBM
-    Returns output [T, H=2048] bf16 HBM (RMSNorm applied; both LNC cores
-    produce identical results, prg_id==0 writes the output).
-    """
-    sbm    = SbufManager(0, nl.tile_size.total_available_sbuf_size, use_auto_alloc=True)
-    T      = inp.shape[0]
-    H_free = _H_FREE
-    prg_id = nl.program_id(axis=0)
-
-    # --- Load inp into SBUF ---
-    sbm.open_scope(name="inp_load")
-    inp_2d = inp.reshape((T, _H))
-    inp_sb = sbm.alloc_stack((_PMAX, H_free * T), inp.dtype, buffer=nl.sbuf, name="inp_sb")
-    for t in nl.static_range(T):
-        for h1 in nl.static_range(H_free):
-            shard = h1 // _H_FREE_SHARD
-            h2 = h1 - shard * _H_FREE_SHARD
-            nisa.dma_copy(
-                dst=inp_sb[0:_PMAX, h1 * T + t:h1 * T + t + 1],
-                src=inp_2d.ap(
-                    pattern=[[_H_FREE_SHARD, _PMAX], [1, 1]],
-                    offset=t * _H + shard * _H_SHARD + h2,
-                ),
-                dge_mode=3,
-            )
-
-    # --- Optionally pre-load gamma into SBUF ---
-    gamma_sb_ready = None
-    if hoisted_gamma:
-        sbm.open_scope(name="gamma_hoist")
-        gamma_sb_ready     = sbm.alloc_stack((_PMAX, H_free), gamma.dtype, buffer=nl.sbuf, name="gamma_sb_hoist")
-        gamma_1d           = gamma.reshape((_H,))
-        for h1 in nl.static_range(H_free):
-            shard = h1 // _H_FREE_SHARD
-            h2 = h1 - shard * _H_FREE_SHARD
-            nisa.dma_copy(
-                dst=gamma_sb_ready[0:_PMAX, h1:h1 + 1],
-                src=gamma_1d.ap(
-                    pattern=[[_H_FREE_SHARD, _PMAX], [1, 1]],
-                    offset=shard * _H_SHARD + h2,
-                ),
-                dge_mode=3,
-            )
-
-    rmsnorm_normed_bf16 = _rmsnorm_sbuf_in_sbuf_out_hoisted(
-        inp_sb, inp.dtype, T, gamma, sbm=sbm,
-        gamma_sb_ready=gamma_sb_ready,
-        debug_rmsnorm_out=debug_rmsnorm_out,
-    )
-
-    # --- Store output to HBM: [PMAX, H_free*T] col-major → [T, H] row-major ---
-    output = nl.ndarray((T, _H), dtype=inp.dtype, buffer=nl.shared_hbm)
-    sbm.open_scope(name="store_hbm")
-    out_row_sb = sbm.alloc_stack((T, _H), inp.dtype, buffer=nl.sbuf, name="out_row_sb")
-    for h1 in nl.static_range(H_free):
-        tp_psum = nl.ndarray((T, _PMAX), dtype=inp.dtype, buffer=nl.psum)
-        nisa.nc_transpose(
-            dst=tp_psum[0:T, 0:_PMAX],
-            data=rmsnorm_normed_bf16[0:_PMAX, nl.ds(h1 * T, T)],
-        )
-        nisa.activation(
-            dst=out_row_sb[0:T, nl.ds(h1 * _PMAX, _PMAX)],
-            op=nl.copy,
-            data=tp_psum[0:T, 0:_PMAX],
-        )
-    if prg_id == 0:
-        nisa.dma_copy(dst=output[0:T, 0:_H], src=out_row_sb[0:T, 0:_H])
-    sbm.close_scope()  # store_hbm
-
-    sbm.pop_heap()  # rmsnorm_normed_bf16
-
-    if hoisted_gamma:
-        sbm.close_scope()  # gamma_hoist
-    sbm.close_scope()  # inp_load
-
-    return output
-
-# Hardware constants
-_PMAX = 128
-
-# Qwen3-30B-A3B at TP=4 fixed dims
-_H = 2048
-_E = 128
-_K = 8
-_I = 192
-_H_FREE = _H // _PMAX
-
-# LNC=2 H-sharding constants
-_N_PRGS = 2
-_H_FREE_SHARD = _H_FREE // _N_PRGS
-_H_SHARD = _H_FREE_SHARD * _PMAX
-
-
-def _flattened_custom_rmsnorm_to_nkilib_layout(rmsnorm_flat, dtype, T, sbm):
-    """Convert custom RMSNorm [P, H_free*T] layout to nkilib [P, T, H_free]."""
-    rmsnorm_out = sbm.alloc_stack(
-        (_PMAX, T, _H_FREE), dtype, buffer=nl.sbuf, name="rmsnorm_out_nkilib_layout"
-    )
-    for h1 in nl.static_range(_H_FREE):
-        nisa.tensor_copy(
-            dst=rmsnorm_out[0:_PMAX, 0:T, h1],
-            src=rmsnorm_flat[0:_PMAX, h1 * T : h1 * T + T],
-        )
-    return rmsnorm_out
+from nkilib.experimental.transformer.attention_block_tkg import attention_block_tkg as _attention_block_tkg_call
 
 
 def _qwen3_moe_sbuf_in_sbuf_out_custom_rms_nkilib(
@@ -628,8 +410,170 @@ def moe_fused_tkg(inp, gamma, router_w, gate_up_w, down_w, replica_groups=None):
     return output
 
 
+def attn_fused_tkg(
+    inp,                       # [T, H] HBM — pre-attn hidden_states; X for kernel and residual.
+    gamma,                     # [1, H] HBM — input_layernorm.weight (rmsnorm_X gamma).
+    q_norm_gamma,              # [1, d_head] HBM — q_layernorm.weight, used as pre-RoPE Q gamma.
+    k_norm_gamma,              # [1, d_head] HBM — k_layernorm.weight, used as pre-RoPE K gamma.
+    W_qkv,                     # HBM — fused QKV proj weights (transposed for kernel).
+    W_out,                     # HBM — o_proj weights.
+    K_cache,                   # HBM — KV cache (in-place updated when update_cache=True).
+    V_cache,                   # HBM — KV cache.
+    cos,                       # [d_head//2, B, S_tkg] HBM — RoPE cos.
+    sin,                       # [d_head//2, B, S_tkg] HBM — RoPE sin.
+    attention_mask,            # HBM — already permuted to kernel format by host.
+    kv_cache_update_idx,       # [B, 1] int32 HBM — start position for in-place KV write.
+    rms_norm_eps,              # float — gamma RMSNorm eps.
+    qk_norm_eps,               # float — pre-RoPE QK norm eps (Qwen3 uses it).
+    softmax_scale,             # float or None — caller passes (1 / self.softmax_scale).
+    K_cache_transposed,        # bool.
+    is_pre_rope_qk_norm,       # bool — Qwen3 = True.
+    rope_contiguous_layout,    # bool — Qwen3 = True (Llama3-style halves).
+    update_cache,              # bool — True for our config (cache update inside kernel).
+    replica_groups=None,
+):
+    """
+    Fused attn TKG: attention_block_tkg + TP all-reduce + pre-attn residual add,
+    all in SBUF (no HBM round-trip between the kernel's o_proj output and the
+    AR/residual stages). Mirrors moe_fused_tkg's shape.
+
+    Composition pattern (per nkilib/experimental/transformer/transformer_tkg.py:90,
+    231): attention_block_tkg's @nki.jit body is composable when called from an
+    outer non-jitted function with caller-managed sbm. The outer function is
+    jitted at the call site (_attn_fused_nkilib_call below) — double-jit causes
+    a stack overflow.
+
+    Layout:
+      - attention_block_tkg with transposed_out=True, out_in_sb=True returns
+        [H_1=PMAX, H_2=H_FREE_SHARD, B*S=T] in SBUF (output_projection_tkg.py:118-130).
+        Mapping: h = prg_id*H_SHARD + h_1*H_FREE_SHARD + h_2, where prg_id is the
+        LNC core index. Channel-interleaved within this core's H shard.
+      - For T=1 this matches the MoE convention [PMAX, T, H_FREE_SHARD] exactly
+        (T dim collapses) so we can reuse moe_fused_tkg's residual DMA pattern
+        and _store_h_sharded_sbuf_output. T>1 (speculation) would need a
+        layout-aware residual load — not supported yet, asserted below.
+
+    Bit-accuracy: same op/dtype/order as the host-side
+    `reduce_from_tensor_model_parallel_region(attn_out)` + `residual + attn_out`
+    chain. nccl.all_reduce with op=nl.add over the TP replica group, then bf16
+    tensor_tensor add — identical to what moe_fused_tkg already proves works.
+
+    KV cache: kernel writes K_cache/V_cache HBM in-place when update_cache=True.
+    Returned tuple's K/V slots are the post-update cache views.
+    """
+    sbm = SbufManager(0, nl.tile_size.total_available_sbuf_size, use_auto_alloc=True)
+
+    T = inp.shape[0]
+    # T=1 layout assumption — see docstring. Speculation (T>1) needs work.
+    assert T == 1, f"attn_fused_tkg currently assumes T=B*S_tkg=1, got T={T}"
+
+    prg_id = nl.program_id(axis=0)
+    rg = nccl.ReplicaGroup(replica_groups) if replica_groups is not None else None
+
+    sbm.open_scope(name="attn_fused_tkg")
+
+    # attention_block_tkg expects X as [B, S_tkg, H]; flatten T → 1×T×H.
+    X_hbm = inp.reshape((1, T, _H))
+
+    # Fused attn block. transposed_out=True + out_in_sb=True keeps the o_proj
+    # output in SBUF in the channel-interleaved layout described above. sbm is
+    # shared so the inner kernel's SBUF lives in our scope.
+    attn_kernel_out = _attention_block_tkg_call(
+        X=X_hbm,
+        X_hidden_dim_actual=None,
+        rmsnorm_X_enabled=True,
+        rmsnorm_X_eps=rms_norm_eps,
+        rmsnorm_X_gamma=gamma,
+        W_qkv=W_qkv,
+        bias_qkv=None,
+        quantization_type_qkv=QuantizationType.NONE,
+        weight_dequant_scale_qkv=None,
+        input_dequant_scale_qkv=None,
+        rmsnorm_QK_pre_rope_enabled=is_pre_rope_qk_norm,
+        rmsnorm_QK_pre_rope_eps=qk_norm_eps if is_pre_rope_qk_norm else 0.0,
+        rmsnorm_QK_pre_rope_W_Q=q_norm_gamma if is_pre_rope_qk_norm else None,
+        rmsnorm_QK_pre_rope_W_K=k_norm_gamma if is_pre_rope_qk_norm else None,
+        cos=cos,
+        sin=sin,
+        rope_contiguous_layout=rope_contiguous_layout,
+        rmsnorm_QK_post_rope_enabled=False,
+        rmsnorm_QK_post_rope_eps=0.0,
+        rmsnorm_QK_post_rope_W_Q=None,
+        rmsnorm_QK_post_rope_W_K=None,
+        K_cache_transposed=K_cache_transposed,
+        active_blocks_table=None,
+        K_cache=K_cache,
+        V_cache=V_cache,
+        attention_mask=attention_mask,
+        sink=None,
+        softmax_scale=softmax_scale,
+        update_cache=update_cache,
+        kv_cache_update_idx=kv_cache_update_idx,
+        W_out=W_out,
+        bias_out=None,
+        quantization_type_out=QuantizationType.NONE,
+        weight_dequant_scale_out=None,
+        input_dequant_scale_out=None,
+        transposed_out=True,
+        out_in_sb=True,
+        sbm=sbm,
+    )
+    attn_out_sb = attn_kernel_out[0]  # [PMAX, H_FREE_SHARD, T] SBUF, TP-partial.
+
+    # Free attention block's heap allocations before AR + residual stages
+    # (transformer_tkg.py:273-274 does the same to reclaim SBUF).
+    while sbm.heap:
+        sbm.pop_heap()
+
+    # nccl.all_reduce wants 2D SBUF [PMAX, free]. For T=1 this is [PMAX, H_FREE_SHARD]
+    # — same shape MoE uses post-AR. Same bf16 sum order as the host AR primitive.
+    free_size = _H_FREE_SHARD * T
+    ar_sb = nl.zeros(
+        (_PMAX, free_size), dtype=inp.dtype, buffer=nl.sbuf, name="attn_ar_sb"
+    )
+    nccl.all_reduce(
+        dsts=[ar_sb],
+        srcs=[attn_out_sb.reshape((_PMAX, free_size))],
+        op=nl.add,
+        replica_group=rg,
+    )
+
+    # Load residual (= pre-attn `inp`) for this LNC core's H shard into SBUF
+    # in the same channel-interleaved layout as attn_out_sb. Pattern levels
+    # (innermost → outermost source iteration) match moe_fused_tkg's load:
+    #   level 0: stride H_FREE_SHARD, count PMAX → partition p (high bits)
+    #   level 1: stride 1,            count H_FREE_SHARD → h1 (low bits within shard)
+    #   level 2: stride H,            count T → outer t (no-op for T=1)
+    inp_flat = inp.reshape((T * _H,))
+    residual_sb = sbm.alloc_stack(
+        (_PMAX, free_size), inp.dtype, buffer=nl.sbuf, name="attn_residual_sb"
+    )
+    h_load_pattern = [[_H_FREE_SHARD, _PMAX], [1, _H_FREE_SHARD], [_H, T]]
+    nisa.dma_copy(
+        dst=residual_sb,
+        src=inp_flat.ap(pattern=h_load_pattern, offset=prg_id * _H_SHARD),
+        dge_mode=nisa.dge_mode.hwdge,
+    )
+
+    # Residual add in SBUF: bf16 add, same op/dtype/order as previous external
+    # `residual + hidden_states` add at qwen_with_nki.py:1187.
+    nisa.tensor_tensor(dst=ar_sb, data1=ar_sb, data2=residual_sb, op=nl.add)
+
+    # Store post-residual H-shard back to HBM. _store_h_sharded_sbuf_output
+    # consumes the same channel-interleaved layout we produced.
+    output = nl.ndarray((T, _H), dtype=inp.dtype, buffer=nl.shared_hbm)
+    _store_h_sharded_sbuf_output(
+        ar_sb.reshape((_PMAX, T, _H_FREE_SHARD)), output, inp.dtype, T, sbm
+    )
+
+    sbm.close_scope()
+
+    return output
+
+
 _flash_fwd_call = nki_jit()(attention_isa_kernel)
 _moe_fused_nkilib_call = nki.jit(moe_fused_tkg)
+_attn_fused_nkilib_call = nki.jit(attn_fused_tkg)
 
 
 def _nki_data(tensor):
@@ -928,6 +872,139 @@ class NeuronQwen3MoEAttention(NeuronAttentionBase):
                 " module to initialize a distributed env."
             )
 
+    def attention_block_tokengen_nki_kernel(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        active_mask: Optional[torch.LongTensor] = None,
+        cos_cache: Optional[torch.Tensor] = None,
+        sin_cache: Optional[torch.Tensor] = None,
+        rmsnorm=None,
+        rotary_position_ids: Optional[torch.LongTensor] = None,
+        update_kv_per_layer: bool = True,
+        active_block_table: Optional[torch.Tensor] = None,
+        use_polar_compatible_rope: bool = False,
+    ):
+        # Hoisted from NeuronAttentionBase.attention_block_tokengen_nki_kernel so
+        # the attn TKG kernel call site lives in this file (mirroring the MoE
+        # fused TKG hoist). Body is byte-for-byte equivalent to the upstream
+        # method; only the kernel-handle name changes.
+        bsz, s_tkg, h = hidden_states.shape
+        h_out = h // 2 if self.is_eagle3_draft else h
+        num_q_heads = self.num_heads
+
+        rmsnorm_enabled = rmsnorm is not None
+        W_gamma = rmsnorm.weight.data.unsqueeze(0) if rmsnorm is not None else None
+
+        rope_contiguous_layout = not use_polar_compatible_rope
+
+        if self.rotary_emb is not None:
+            if cos_cache is None or sin_cache is None:
+                cos_cache, sin_cache = self.rotary_emb(hidden_states, rotary_position_ids)
+                cos_cache = cos_cache[..., : cos_cache.shape[-1] // 2].permute(2, 0, 1)
+                sin_cache = sin_cache[..., : sin_cache.shape[-1] // 2].permute(2, 0, 1)
+        else:
+            cos_cache = None
+            sin_cache = None
+
+        attention_mask = attention_mask.expand(-1, num_q_heads, -1, -1)
+        expected_active_mask_shape = (bsz, 1, s_tkg, s_tkg)
+        if s_tkg == 1:
+            active_mask = torch.ones(
+                expected_active_mask_shape,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+        else:
+            assert (
+                active_mask.shape == expected_active_mask_shape
+            ), f"{active_mask.shape} != {expected_active_mask_shape}"
+        active_mask = active_mask.expand(-1, num_q_heads, -1, -1)
+        attention_mask[:, :, :, -s_tkg:] = active_mask
+        attention_mask = attention_mask.permute(3, 0, 1, 2)
+
+        K_prior, V_prior = past_key_value[:2]
+        K_prior = K_prior.data
+        V_prior = V_prior.data
+        update_cache_in_kernel = update_kv_per_layer and self.attn_block_tkg_nki_kernel_cache_update
+        sink = self.get_learned_sinks().data.unsqueeze(-1) if self.learned_sinks_size is not None else None
+        kv_cache_update_idx = position_ids[:, :1].to(torch.int32)
+
+        W_out = self.get_o_proj().o_proj.weight.data
+        if self.o_bias:
+            W_out_bias_param = self.get_o_proj().o_proj.bias / self.tp_degree
+            W_out_bias = W_out_bias_param.data.unsqueeze(0)
+        else:
+            W_out_bias = None
+
+        has_qk_layernorm = self.q_layernorm is not None and self.k_layernorm is not None
+        qk_norm_eps = self.rms_norm_eps if self.rms_norm_eps else 1e-6
+
+        is_pre_rope_qk_norm = has_qk_layernorm and self.qk_norm_placement == QKNormPlacement.PRE_ROPE
+        rmsnorm_QK_pre_rope_W_Q = self.q_layernorm.weight.data.unsqueeze(0) if is_pre_rope_qk_norm else None
+        rmsnorm_QK_pre_rope_W_K = self.k_layernorm.weight.data.unsqueeze(0) if is_pre_rope_qk_norm else None
+
+        is_post_rope_qk_norm = has_qk_layernorm and self.qk_norm_placement == QKNormPlacement.POST_ROPE
+        rmsnorm_QK_post_rope_W_Q = self.q_layernorm.weight.data.unsqueeze(0) if is_post_rope_qk_norm else None
+        rmsnorm_QK_post_rope_W_K = self.k_layernorm.weight.data.unsqueeze(0) if is_post_rope_qk_norm else None
+
+        attn_output, K, V = _attention_block_tkg_call[self.logical_nc_config](
+            X=hidden_states,
+            X_hidden_dim_actual=getattr(self.config, "original_hidden_size", None),
+            rmsnorm_X_enabled=rmsnorm_enabled,
+            rmsnorm_X_eps=self.rms_norm_eps,
+            rmsnorm_X_gamma=W_gamma,
+            W_qkv=self.get_qkv_proj().Wqkv.weight.data,
+            bias_qkv=self.get_qkv_proj().Wqkv.bias.data.unsqueeze(0) if self.qkv_bias else None,
+            quantization_type_qkv=QuantizationType.NONE,
+            weight_dequant_scale_qkv=None,
+            input_dequant_scale_qkv=None,
+            rmsnorm_QK_pre_rope_enabled=is_pre_rope_qk_norm,
+            rmsnorm_QK_pre_rope_eps=qk_norm_eps if is_pre_rope_qk_norm else 0.0,
+            rmsnorm_QK_pre_rope_W_Q=rmsnorm_QK_pre_rope_W_Q,
+            rmsnorm_QK_pre_rope_W_K=rmsnorm_QK_pre_rope_W_K,
+            cos=cos_cache,
+            sin=sin_cache,
+            rope_contiguous_layout=rope_contiguous_layout,
+            rmsnorm_QK_post_rope_enabled=is_post_rope_qk_norm,
+            rmsnorm_QK_post_rope_eps=qk_norm_eps if is_post_rope_qk_norm else 0.0,
+            rmsnorm_QK_post_rope_W_Q=rmsnorm_QK_post_rope_W_Q,
+            rmsnorm_QK_post_rope_W_K=rmsnorm_QK_post_rope_W_K,
+            K_cache_transposed=self.k_cache_transposed,
+            active_blocks_table=active_block_table.to(torch.uint32) if active_block_table is not None else None,
+            K_cache=K_prior,
+            V_cache=V_prior,
+            attention_mask=attention_mask,
+            sink=sink,
+            softmax_scale=None if self.softmax_scale is None else (1 / self.softmax_scale),
+            update_cache=update_cache_in_kernel,
+            kv_cache_update_idx=kv_cache_update_idx,
+            W_out=W_out,
+            bias_out=W_out_bias,
+            quantization_type_out=QuantizationType.NONE,
+            weight_dequant_scale_out=None,
+            input_dequant_scale_out=None,
+            transposed_out=False,
+            out_in_sb=False,
+        )
+
+        attn_output = attn_output.reshape((bsz, s_tkg, h_out))
+        # Qwen forced config: SP off, DP=1 → only the AR_AG branch is reachable.
+        # Other dispatch options remain in the upstream method for general models.
+        assert not self.sequence_parallel_enabled
+        assert self.ep_dispatch_cc_option == EPDispatchOption.AR_AG
+        attn_output = mappings.reduce_from_tensor_model_parallel_region(
+            attn_output, process_group=self.tensor_model_parallel_group
+        )
+
+        if not update_cache_in_kernel:
+            K = K.permute(1, 0, 2) if self.k_cache_transposed else K.permute(1, 2, 0)
+            K = K.unsqueeze(1)
+
+        return attn_output, (K, V), cos_cache, sin_cache
+
 
 class NeuronQwen3MoeDecoderLayer(nn.Module):
     """
@@ -939,6 +1016,9 @@ class NeuronQwen3MoeDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.self_attn = NeuronQwen3MoEAttention(config=config)
         self.moe_fused_nki_kernel_enabled = getattr(config, "moe_fused_nki_kernel_enabled", False)
+        self.attn_fused_nki_kernel_enabled = getattr(
+            config.neuron_config, "attn_block_tkg_nki_kernel_enabled", False
+        )
 
         self.input_layernorm = get_rmsnorm_cls()(
             config.hidden_size,
@@ -967,6 +1047,118 @@ class NeuronQwen3MoeDecoderLayer(nn.Module):
         # Format mirrors qwen_fused_transformer_multilayer.py — derived from
         # tp_degree to avoid torch.distributed calls during mock tracing.
         self._replica_groups = (list(range(config.neuron_config.tp_degree)),)
+
+    def _attn_fused_nkilib_tkg(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.LongTensor,
+        past_key_value,
+        active_mask: Optional[torch.Tensor] = None,
+        cos_cache: Optional[torch.Tensor] = None,
+        sin_cache: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
+        """
+        Fused attn TKG path: replaces input_layernorm + self_attn(...) + (residual
+        + attn_out) with a single _attn_fused_nkilib_call invocation. Kernel does
+        input RMSNorm + QKV + attn + o_proj + TP all-reduce + residual-add in SBUF.
+
+        Host-side prep mirrors NeuronQwen3MoEAttention.attention_block_tokengen_nki_kernel
+        verbatim (same cos/sin permute, same mask permute, same kv_cache_update_idx
+        cast). Weights are pulled from self.self_attn so they're the exact param
+        instances NxDI sets up.
+
+        KV cache is updated in-place inside the kernel; returned present_key_value
+        references the same buffers as past_key_value (matches the un-fused path's
+        update_cache_in_kernel=True branch in attention_base.py:1378-1381).
+        """
+        attn = self.self_attn
+        bsz, s_tkg, h = hidden_states.shape
+        num_q_heads = attn.num_heads
+
+        # rotary_position_ids may be present in kwargs but explicitly None — dict.get's
+        # default is only used for missing keys. Match attention_base.py:1733-1734's
+        # explicit None-check.
+        rotary_position_ids = kwargs.get("rotary_position_ids", None)
+        if rotary_position_ids is None:
+            rotary_position_ids = position_ids
+        use_polar_compatible_rope = kwargs.get("use_polar_compatible_rope", False)
+        rope_contiguous_layout = not use_polar_compatible_rope
+
+        # RoPE cos/sin (override:1136-1141)
+        if cos_cache is None or sin_cache is None:
+            cos_cache, sin_cache = attn.rotary_emb(hidden_states, rotary_position_ids)
+            cos_cache = cos_cache[..., : cos_cache.shape[-1] // 2].permute(2, 0, 1)
+            sin_cache = sin_cache[..., : sin_cache.shape[-1] // 2].permute(2, 0, 1)
+
+        # Attention mask prep (override:1143-1157)
+        attention_mask = attention_mask.expand(-1, num_q_heads, -1, -1)
+        expected_active_mask_shape = (bsz, 1, s_tkg, s_tkg)
+        if s_tkg == 1:
+            active_mask = torch.ones(
+                expected_active_mask_shape,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+        else:
+            assert (
+                active_mask.shape == expected_active_mask_shape
+            ), f"{active_mask.shape} != {expected_active_mask_shape}"
+        active_mask = active_mask.expand(-1, num_q_heads, -1, -1)
+        attention_mask[:, :, :, -s_tkg:] = active_mask
+        attention_mask = attention_mask.permute(3, 0, 1, 2)
+
+        # KV cache + update idx (override:1159-1164)
+        K_cache = past_key_value[0].data
+        V_cache = past_key_value[1].data
+        kv_cache_update_idx = position_ids[:, :1].to(torch.int32)
+
+        # Weights and norm gammas (override:1166-1182)
+        gamma = self.input_layernorm.weight.data.unsqueeze(0)
+        has_qk_layernorm = attn.q_layernorm is not None and attn.k_layernorm is not None
+        is_pre_rope_qk_norm = (
+            has_qk_layernorm and attn.qk_norm_placement == QKNormPlacement.PRE_ROPE
+        )
+        q_norm_gamma = attn.q_layernorm.weight.data.unsqueeze(0) if is_pre_rope_qk_norm else None
+        k_norm_gamma = attn.k_layernorm.weight.data.unsqueeze(0) if is_pre_rope_qk_norm else None
+        W_qkv = attn.get_qkv_proj().Wqkv.weight.data
+        W_out = attn.get_o_proj().o_proj.weight.data
+
+        qk_norm_eps = attn.rms_norm_eps if attn.rms_norm_eps else 1e-6
+        softmax_scale = None if attn.softmax_scale is None else (1 / attn.softmax_scale)
+
+        # Wrapper takes [B*S_tkg, H]; kernel itself reshapes to [1, T, H].
+        inp_2d = hidden_states.reshape(-1, self.hidden_size)
+
+        output_2d = _attn_fused_nkilib_call[attn.logical_nc_config](
+            inp_2d,
+            gamma,
+            q_norm_gamma,
+            k_norm_gamma,
+            W_qkv,
+            W_out,
+            K_cache,
+            V_cache,
+            cos_cache,
+            sin_cache,
+            attention_mask,
+            kv_cache_update_idx,
+            attn.rms_norm_eps,
+            qk_norm_eps,
+            softmax_scale,
+            attn.k_cache_transposed,
+            is_pre_rope_qk_norm,
+            rope_contiguous_layout,
+            True,  # update_cache — forced by attn_block_tkg_nki_kernel_cache_update flag
+            replica_groups=self._replica_groups,
+        )
+        output = output_2d.reshape(bsz, s_tkg, h)
+
+        # In-place KV update — return the same cache buffers as present_key_value.
+        present_key_value = (past_key_value[0], past_key_value[1])
+
+        return output, present_key_value, cos_cache, sin_cache
 
     def _moe_fused_nkilib_tkg(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states_shape = hidden_states.shape
@@ -1015,28 +1207,41 @@ class NeuronQwen3MoeDecoderLayer(nn.Module):
                 "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
             )
 
-        residual = hidden_states
-
-        qkv_fused_rmsnorm = None
         # We wrap input_layernorm/self_attn/post_attention_layernorm with module markers start/end
         # as a hint for compiler's modular-flow to avoid layer boundries in-between decoder layer components
         hidden_states = ModuleMarkerStartWrapper()(hidden_states)
-        if self.input_layernorm:
-            if self.qkv_kernel_enabled and self.qkv_kernel_fused_rmsnorm:
-                qkv_fused_rmsnorm = self.input_layernorm
-            else:
-                hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        hidden_states, present_key_value, cos_cache, sin_cache = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            rmsnorm=qkv_fused_rmsnorm,
-            **kwargs,
-        )
-        hidden_states = residual + hidden_states
+        if self.attn_fused_nki_kernel_enabled and past_key_value is not None:
+            # Fused-NKI attn TKG path: kernel does input_layernorm + QKV + attn
+            # + o_proj + TP all-reduce + pre-attn residual add internally
+            # (residual stashed in SBUF at kernel entry, added back after the
+            # in-SBUF AR). Mirrors the MoE wrapper below.
+            hidden_states, present_key_value, cos_cache, sin_cache = self._attn_fused_nkilib_tkg(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                **kwargs,
+            )
+        else:
+            residual = hidden_states
+            qkv_fused_rmsnorm = None
+            if self.input_layernorm:
+                if self.qkv_kernel_enabled and self.qkv_kernel_fused_rmsnorm:
+                    qkv_fused_rmsnorm = self.input_layernorm
+                else:
+                    hidden_states = self.input_layernorm(hidden_states)
+
+            hidden_states, present_key_value, cos_cache, sin_cache = self.self_attn(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                rmsnorm=qkv_fused_rmsnorm,
+                **kwargs,
+            )
+            hidden_states = residual + hidden_states
 
         # MoE
         if self.moe_fused_nki_kernel_enabled and past_key_value is not None:

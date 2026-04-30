@@ -1,1 +1,0 @@
-neuronx-cc compile graph.hlo --framework XLA --target trn3 --output graph.neff --model-type=transformer -O1 --lnc=2 '--internal-hlo2tensorizer-options=--experimental-unsafe-fp8e4m3fn-as-fp8e4m3 --verify-hlo=true' --logfile=log-neuron-cc.txt --verbose=35

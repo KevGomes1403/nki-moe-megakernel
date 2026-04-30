@@ -11,3 +11,17 @@ output/
 *.neff
 *.ntff
 *.pb
+
+# Neuron compiler artifacts
+neuronxcc-*/
+*_compiler_dir/
+artifacts/
+command.txt
+*.hlo
+*.textproto
+metaneff
+*.dbg
+*.dbg_sg*
+input_stats.csv
+mempressure.txt
+penguin.py
