@@ -58,7 +58,7 @@ def _qwen3_moe_sbuf_in_sbuf_out_hoisted(
     Fused RMSNorm + Router + TopK(K=8) + Expert MLP for Qwen3 MoE TKG.
     Sub-kernel — no @nki.jit decorator. Called from inside a jitted function.
     inp_sb: [PMAX, H_free*T] bf16 already in SBUF.
-    Returns: out_sb [PMAX=128, H_free*T=16*T] bf16 in SBUF — column-major, partition-first.
+    Returns: out_sb [PMAX=128, T*H_free_shard=8*T] bf16 in SBUF — 2D, partition-first.
              caller must consume before any further sbm.alloc_stack
 
     New kwargs (all default None):
@@ -101,8 +101,8 @@ def _qwen3_moe_sbuf_in_sbuf_out_hoisted(
     sbm.pop_heap()  # top8_logits_bf16
     sbm.pop_heap()  # rmsnorm_normed_bf16
 
-    return out_sb  # [PMAX=128, T, H_free_shard=8] bf16 — local H shard, partition-first
-                   # caller must consume before any further sbm.alloc_stack
+    return out_sb.reshape((_PMAX, T * _H_FREE_SHARD))  # [PMAX=128, T*H_free_shard] bf16 — 2D for nccl.all_reduce
+                                                        # caller must consume before any further sbm.alloc_stack
 
 
 # ---------------------------------------------------------------------------

@@ -48,8 +48,8 @@ from nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
 from nkilib.experimental.transformer.transformer_tkg import (
     _sb2sb_all_reduce_gather,
 )
-from kernels.attn_tkg.attn_fused_nki import qwen3_attn_tkg_fused_oproj_v13bc_kv_norm_hoisted_weights
-from kernels.moe_fused_tkg.moe_fused_nki import _qwen3_moe_sbuf_in_sbuf_out_hoisted
+from kernels.attn_tkg.attn_fused_nki import attn_fused_qwen
+from kernels.moe_fused_tkg.moe_fused_nki_old import _qwen3_moe_sbuf_in_sbuf_out_hoisted
 
 H        = 2048
 H0       = 128
@@ -232,7 +232,7 @@ def _multilayer_body(
         Wq_cur = tuple(Wq_cur)
         Wo_cur = tuple(Wo_cur)
         Router_cur = sbm.alloc_stack(
-            (PMAX, ROUTER_BATCH, E), dtype, name=f"Router_L{layer_idx}"
+            (PMAX, ROUTER_BATCH, E), nl.float32, name=f"Router_L{layer_idx}"
         )
 
         # HBM → SBUF loads for this layer's weights. No explicit "prefetch":
@@ -282,7 +282,7 @@ def _multilayer_body(
                                      name=f"L{layer_idx}_hidden_bf16")
         nisa.tensor_copy(hidden_sb_bf16, residual_sb)
 
-        out_sb = qwen3_attn_tkg_fused_oproj_v13bc_kv_norm_hoisted_weights(
+        out_sb = attn_fused_qwen(
             hidden_sb=hidden_sb_bf16,
             Wq=Wq_list[layer_idx],          # [Hq_tp*d, H]  = [1024, 2048]
             Wk=Wk_list[layer_idx],          # HBM fallback — unused when wk_sb is set
