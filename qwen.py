@@ -8,6 +8,14 @@ from neuronx_distributed_inference.utils.hf_adapter import HuggingFaceGeneration
 from neuronx_distributed_inference.models.config import MoENeuronConfig, OnDeviceSamplingConfig
 from neuronx_distributed_inference.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeInferenceConfig
 
+import os
+# os.environ["NEURON_FRAMEWORK_DEBUG"] = "1"
+# os.environ["XLA_IR_DEBUG"]= "1"
+# os.environ["XLA_HLO_DEBUG"]= "1"
+# os.environ["NEURON_RT_INSPECT_ENABLE"]= "1"
+# os.environ["NEURON_RT_INSPECT_DEVICE_PROFILE"]= "1"
+# os.environ["NEURON_RT_INSPECT_OUTPUT_DIR"]= "./output/baseline_kernel/"
+# os.environ["BASE_COMPILE_WORK_DIR"] = "./baseline_compiler_dir/"
 torch.manual_seed(0)
 
 import gc
@@ -36,7 +44,7 @@ from transformers import Qwen3MoeForCausalLM
 from transformers.generation import SampleDecoderOnlyOutput, SampleEncoderDecoderOutput
 from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeRMSNorm
 
-from neuronx_distributed_inference.models.config import InferenceConfig, MoENeuronConfig, SHARD_ON_INTERMEDIATE_DIMENSION_PER_TP, MOE_TKG_MK_INTERMEDIATE_PER_TP
+from neuronx_distributed_inference.models.config import InferenceConfig, MoENeuronConfig, MOE_TKG_MK_INTERMEDIATE_PER_TP
 from neuronx_distributed_inference.models.model_wrapper import CONTEXT_ENCODING_MODEL_TAG, TOKEN_GENERATION_MODEL_TAG
 from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
 from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
@@ -272,9 +280,9 @@ class Qwen3MoeInferenceConfig(InferenceConfig):
         moe_tp_degree = self.neuron_config.moe_tp_degree
         I_TP = self.moe_intermediate_size // moe_tp_degree
         if getattr(self.neuron_config.blockwise_matmul_config, "use_shard_on_intermediate_dynamic_while", False):
-            # If shard-on-I enabled, check the intermediate size per tp is divisible by SHARD_ON_INTERMEDIATE_DIMENSION_PER_TP
-            if I_TP % SHARD_ON_INTERMEDIATE_DIMENSION_PER_TP != 0:
-                padded_moe_intermediate_size = math.ceil(I_TP / SHARD_ON_INTERMEDIATE_DIMENSION_PER_TP) * SHARD_ON_INTERMEDIATE_DIMENSION_PER_TP * moe_tp_degree
+            # If shard-on-I enabled, check the intermediate size per tp is divisible by SHARD_ON_INTERMEDIATE_DIMENTION_PER_TP
+            if I_TP % SHARD_ON_INTERMEDIATE_DIMENTION_PER_TP != 0:
+                padded_moe_intermediate_size = math.ceil(I_TP / SHARD_ON_INTERMEDIATE_DIMENTION_PER_TP) * SHARD_ON_INTERMEDIATE_DIMENTION_PER_TP * moe_tp_degree
                 self.moe_intermediate_pad_size = max(padded_moe_intermediate_size - self.moe_intermediate_size, 0)
                 # set moe_intermediate_size to padded size
                 self.moe_intermediate_size = padded_moe_intermediate_size
@@ -595,4 +603,3 @@ def generate(skip_compile=False):
     print("Generated outputs:")
     for i, output_token in enumerate(output_tokens):
         print(f"Output {i}: {output_token}")
-

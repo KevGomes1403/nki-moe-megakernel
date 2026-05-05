@@ -48,8 +48,8 @@ from nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
 from nkilib.experimental.transformer.transformer_tkg import (
     _sb2sb_all_reduce_gather,
 )
-from kernels.attn_tkg.agents.v14d_kv_norm_hoisted_weights import qwen3_attn_tkg_fused_oproj_v13bc_kv_norm_hoisted_weights
-from kernels.moe_fused_tkg.versions.kernel_v30c_hoisted import _qwen3_moe_sbuf_in_sbuf_out_hoisted
+from kernels.attn_tkg.attn_fused_nki import attn_fused_qwen
+from kernels.moe_fused_tkg.moe_fused_nki_old import _qwen3_moe_sbuf_in_sbuf_out_hoisted
 
 H        = 2048
 H0       = 128
@@ -104,7 +104,7 @@ def _multilayer_body(
     rg = nccl.ReplicaGroup(replica_groups) if replica_groups is not None else None
 
     sbm = BufferManager(0, SBM_SIZE_BYTES, Logger("transformer_qwen3_moe_tkg_multilayer"))
-    sbm.set_auto_alloc(False)
+    sbm.set_auto_alloc(True)
 
     # -----------------------------------------------------------------------
     # Load X into SBUF as the initial residual [H0, BxS*H1].
@@ -152,7 +152,7 @@ def _multilayer_body(
     gpan_bf16_all = sbm.alloc_stack((PMAX, num_layers * NH), dtype, name="gpan_bf16_all")
 
     # Each DMA is independent across layers — compiler can parallelize them.
-    for li in nl.affine_range(num_layers):
+    for li in range(num_layers):
         nisa.dma_copy(
             dst=qnw_bf16_all[0:PMAX, li:li + 1],
             src=qn_list[li].reshape((PMAX, 1)),
@@ -207,7 +207,7 @@ def _multilayer_body(
     # Switch to explicit-address mode so interleave_degree=2 actually cycles
     # the SBUF backing. With auto_alloc=True the allocator ignores the
     # section cursor (see _get_safe_batch_interleave_degree in attention_tkg).
-    sbm.set_auto_alloc(False)
+    sbm.set_auto_alloc(True)
     sbm.set_name_prefix("weights_")
     # interleave_degree=2 gives the compiler a second physical slot per
     # per-iteration alloc_stack, so it can schedule iter (i+1)'s weight DMAs
@@ -240,7 +240,7 @@ def _multilayer_body(
         # previous iteration's compute automatically.
         nisa.dma_copy(dst=Wk_cur, src=Wk_list[layer_idx], dge_mode=nisa.dge_mode.hwdge)
         nisa.dma_copy(dst=Wv_cur, src=Wv_list[layer_idx], dge_mode=nisa.dge_mode.hwdge)
-        for hi in nl.affine_range(NOH):
+        for hi in range(NOH):
             q_h = OWNED[hi]
             nisa.dma_copy(
                 dst=Wq_cur[hi],
@@ -282,7 +282,7 @@ def _multilayer_body(
                                      name=f"L{layer_idx}_hidden_bf16")
         nisa.tensor_copy(hidden_sb_bf16, residual_sb)
 
-        out_sb = qwen3_attn_tkg_fused_oproj_v13bc_kv_norm_hoisted_weights(
+        out_sb = attn_fused_qwen(
             hidden_sb=hidden_sb_bf16,
             Wq=Wq_list[layer_idx],          # [Hq_tp*d, H]  = [1024, 2048]
             Wk=Wk_list[layer_idx],          # HBM fallback — unused when wk_sb is set
@@ -326,7 +326,7 @@ def _multilayer_body(
         )
 
         sbm.close_scope()
-        sbm.set_auto_alloc(False)
+        sbm.set_auto_alloc(True)
 
         # Residual add #1: bf16 add into bf16 residual
         nisa.tensor_tensor(dst=residual_sb, data1=residual_sb,
@@ -365,7 +365,7 @@ def _multilayer_body(
         # Free all sbm allocs from the MoE block
         while sbm.heap:
             sbm.pop_heap()
-        sbm.set_auto_alloc(False)
+        sbm.set_auto_alloc(True)
 
         # Residual add #2: bf16 add into bf16 residual
         nisa.tensor_tensor(dst=residual_sb, data1=residual_sb,
@@ -496,3 +496,10 @@ def _build_multilayer_kernel(num_layers: int):
 
 transformer_qwen3_moe_tkg_multilayer = _build_multilayer_kernel(NUM_LAYERS)
 transformer_qwen3_moe_tkg_multilayer_jit = nki.jit(transformer_qwen3_moe_tkg_multilayer)
+
+_kernel_cache: dict = {NUM_LAYERS: transformer_qwen3_moe_tkg_multilayer_jit}
+
+def get_multilayer_kernel_jit(num_layers: int):
+    if num_layers not in _kernel_cache:
+        _kernel_cache[num_layers] = nki.jit(_build_multilayer_kernel(num_layers))
+    return _kernel_cache[num_layers]
