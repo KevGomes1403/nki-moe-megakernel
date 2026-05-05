@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 300" width="560" height="300">
+
+  <!-- Gridlines -->
+  <line x1="64" y1="224" x2="524" y2="224" stroke="#e5e7eb" stroke-width="1"/>
+  <line x1="64" y1="188" x2="524" y2="188" stroke="#e5e7eb" stroke-width="1"/>
+  <line x1="64" y1="153" x2="524" y2="153" stroke="#e5e7eb" stroke-width="1"/>
+  <line x1="64" y1="117" x2="524" y2="117" stroke="#e5e7eb" stroke-width="1"/>
+  <line x1="64" y1="81"  x2="524" y2="81"  stroke="#e5e7eb" stroke-width="1"/>
+  <line x1="64" y1="46"  x2="524" y2="46"  stroke="#e5e7eb" stroke-width="1"/>
+
+  <!-- Y-axis rule -->
+  <line x1="64" y1="20" x2="64" y2="224" stroke="#d1d5db" stroke-width="1"/>
+
+  <!-- Y-axis labels -->
+  <text x="58" y="228" text-anchor="end" font-size="11" fill="#9ca3af" font-family="system-ui,sans-serif">0</text>
+  <text x="58" y="192" text-anchor="end" font-size="11" fill="#9ca3af" font-family="system-ui,sans-serif">25</text>
+  <text x="58" y="157" text-anchor="end" font-size="11" fill="#9ca3af" font-family="system-ui,sans-serif">50</text>
+  <text x="58" y="121" text-anchor="end" font-size="11" fill="#9ca3af" font-family="system-ui,sans-serif">75</text>
+  <text x="58" y="85"  text-anchor="end" font-size="11" fill="#9ca3af" font-family="system-ui,sans-serif">100</text>
+  <text x="58" y="50"  text-anchor="end" font-size="11" fill="#9ca3af" font-family="system-ui,sans-serif">125</text>
+
+  <!-- Y-axis title (rotated) -->
+  <text x="14" y="132" text-anchor="middle" font-size="11" fill="#6b7280" font-family="system-ui,sans-serif"
+        transform="rotate(-90 14 132)">tok / s</text>
+
+  <!--
+    Scale: chart height = 204px (y 20..224), max = 140 tok/s → 1.457 px/tok/s
+    XLA:     69.7  × 1.457 = 101.6 → height=102, y=122
+    NKI MoE: 106.3 × 1.457 = 154.9 → height=155, y=69
+    Mega:    122.7 × 1.457 = 178.8 → height=179, y=45
+
+    Bar x positions (bar width=96, spacing=56):
+    XLA:     x=112  center=160
+    NKI MoE: x=264  center=312
+    Mega:    x=416  center=464
+  -->
+
+  <!-- Bar: XLA baseline -->
+  <rect x="112" y="122" width="96" height="102" fill="#d1d5db" rx="3"/>
+  <text x="160" y="144" text-anchor="middle" font-size="13" font-weight="bold"
+        fill="#4b5563" font-family="system-ui,sans-serif">69.7</text>
+
+  <!-- Bar: XLA + NKI MoE -->
+  <rect x="264" y="69" width="96" height="155" fill="#93c5fd" rx="3"/>
+  <text x="312" y="91" text-anchor="middle" font-size="13" font-weight="bold"
+        fill="#1e40af" font-family="system-ui,sans-serif">106.3</text>
+
+  <!-- Bar: Megakernel -->
+  <rect x="416" y="45" width="96" height="179" fill="#2563eb" rx="3"/>
+  <text x="464" y="67" text-anchor="middle" font-size="13" font-weight="bold"
+        fill="white" font-family="system-ui,sans-serif">122.7</text>
+
+  <!-- X-axis labels -->
+  <text x="160" y="241" text-anchor="middle" font-size="12" fill="#374151" font-family="system-ui,sans-serif">XLA</text>
+  <text x="160" y="257" text-anchor="middle" font-size="11" fill="#9ca3af" font-family="system-ui,sans-serif">baseline</text>
+
+  <text x="312" y="241" text-anchor="middle" font-size="12" fill="#374151" font-family="system-ui,sans-serif">XLA + NKI MoE</text>
+  <text x="312" y="257" text-anchor="middle" font-size="11" fill="#6b7280" font-family="system-ui,sans-serif">1.52×</text>
+
+  <text x="464" y="241" text-anchor="middle" font-size="12" fill="#374151" font-family="system-ui,sans-serif">Megakernel</text>
+  <text x="464" y="257" text-anchor="middle" font-size="11" font-weight="bold" fill="#2563eb" font-family="system-ui,sans-serif">1.76×</text>
+
+  <!-- Caption -->
+  <text x="294" y="286" text-anchor="middle" font-size="11" fill="#9ca3af"
+        font-family="system-ui,sans-serif">Token generation throughput (tok/s) · Qwen3-30B-A3B decode, bs=1, trn3</text>
+
+</svg>

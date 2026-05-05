@@ -4,9 +4,22 @@ A full-model NKI megakernel for Qwen3-30B-A3B decode inference on AWS Trainium 2
 
 ## Results
 
-Benchmarked against the NxDI baseline on Trainium 3, decode (bs=1, seq=640):
+End-to-end on Trainium 3, 640 output tokens, bs=1:
 
-| | Baseline | Megakernel | Δ |
+| | XLA | XLA + NKI MoE | Megakernel |
+|---|---|---|---|
+| Token gen latency p50 | 14.37 ms | 9.43 ms | **8.15 ms** |
+| Token gen throughput | 69.7 tok/s | 106.3 tok/s | **122.7 tok/s** |
+| E2E throughput | 65.9 tok/s | 97.3 tok/s | **110.7 tok/s** |
+| vs. XLA | — | 1.52× | **1.76×** |
+
+"XLA + NKI MoE" replaces expert computation with the NKI Library MoE TKG kernel; attention stays in XLA. "Megakernel" runs all 48 decoder layers entirely in NKI.
+
+![Token generation throughput comparison](assets/throughput.svg)
+
+**Per-layer breakdown** (comparing the megakernel against the XLA + NKI MoE hybrid, profiled with the Neuron Explorer):
+
+| Metric | XLA + NKI MoE | Megakernel | Δ |
 |---|---|---|---|
 | Wall time / layer | 165.26 μs | 134.47 μs | **−30.80 μs (18.5%)** |
 | Sync engine | 53.52 μs | 19.05 μs | −34.47 μs |
@@ -14,7 +27,7 @@ Benchmarked against the NxDI baseline on Trainium 3, decode (bs=1, seq=640):
 | Tensor engine | 48.86 μs | 48.15 μs | −0.71 μs |
 | CC ops (AllReduce) | 13.45 μs | 27.77 μs | +14.32 μs |
 
-**1.68× throughput improvement** over the full XLA baseline. The sync engine savings come from eliminating ~98 graph boundaries per decoder block. DMA efficiency improves significantly: 43% fewer packets, each 2.7× larger on average.
+The sync engine savings come from eliminating ~98 graph boundaries per decoder block. DMA efficiency improves significantly — 43% fewer packets, each 2.7× larger on average — because larger contiguous weight loads better amortize packet generation overhead and saturate memory bandwidth.
 
 ## Design
 
@@ -57,11 +70,6 @@ python main.py --mode generate --enable-nki \
   --compiled-model-path ~/qwen-30b-a3b/traced_nki_model \
   --prompt "What is the capital of France?"
 
-# Validate megakernel output against baseline
-python main.py --mode validate --enable-nki \
-  --model-path ~/qwen-30b-a3b/hf_model \
-  --compiled-model-path ~/qwen-30b-a3b/traced_nki_model
-
 # Benchmark
 python main.py --mode benchmark --enable-nki \
   --model-path ~/qwen-30b-a3b/hf_model \
@@ -80,8 +88,6 @@ rm -rf ~/qwen-30b-a3b/traced_nki_model /var/tmp/neuron-compile-cache/*
 qwen.py                                   # Baseline XLA model
 qwen_with_nki.py                          # Megakernel model (--enable-nki)
 main.py                                   # Entry point: generate / validate / benchmark
-models/
-  qwen_fused_transformer_multilayer.py    # NxDI model class wiring the megakernel
 kernels/
   attn_tkg/attn_fused_nki.py             # Attention subkernel
   moe_fused_tkg/moe_fused_nki.py         # MoE subkernel
