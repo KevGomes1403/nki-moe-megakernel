@@ -1,112 +1,89 @@
-# AWS Trainium2/3 MoE Kernel Challenge
+# Qwen3-30B-A3B Megakernel for Trainium
 
-**MLSys 2026 Competition Track**
+A full-model NKI megakernel for Qwen3-30B-A3B decode inference on AWS Trainium 2/3. All 48 decoder layers run in a single NKI jit invocation — no HBM round-trips between layers.
 
-Participants will write custom kernels with the Neuron Kernel Interface (NKI) for the Qwen3-30B-A3B Mixture of Experts model and optimize inference performance on AWS Trainium2/3 hardware.
+## Results
 
-For full details on the competition, read [the competition guidelines](https://github.com/aws-neuron/nki-moe/blob/main/CONTEST.md). 
+Benchmarked against the NxDI baseline on Trainium 3, decode (bs=1, seq=640):
 
-To register your team, [enter your information here](https://docs.google.com/forms/d/e/1FAIpQLSeWuJ9h9F0-aC5OwhKcIKgzUB8Sc3DFdBNEgzxzHfM4QsajcA/viewform?usp=sharing&ouid=108119140038382966223&resourcekey=0-VVlo6GUSizIcln6HhBFvKQ) (just one entry per team). We will close this registration link when the event is at capacity, so if you're able to complete registration please assume it is confirmed.
+| | Baseline | Megakernel | Δ |
+|---|---|---|---|
+| Wall time / layer | 165.26 μs | 134.47 μs | **−30.80 μs (18.5%)** |
+| Sync engine | 53.52 μs | 19.05 μs | −34.47 μs |
+| DMA active | 91.99 μs | 66.50 μs | −25.49 μs |
+| Tensor engine | 48.86 μs | 48.15 μs | −0.71 μs |
+| CC ops (AllReduce) | 13.45 μs | 27.77 μs | +14.32 μs |
 
-## Getting Started
+**1.68× throughput improvement** over the full XLA baseline. The sync engine savings come from eliminating ~98 graph boundaries per decoder block. DMA efficiency improves significantly: 43% fewer packets, each 2.7× larger on average.
 
-To learn NKI, follow [the official NKI guide](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/nki/index.html) and various example NKI kernels from the [nki-samples repository](https://github.com/aws-neuron/nki-samples). Another tool to help with optimizing NKI kernels is [NKI autotune](https://github.com/awslabs/nki-autotune).
+## Design
 
-## Setup Steps
+The megakernel fuses the entire Qwen3-30B-A3B decoder stack (input layernorm through residual add) into two subkernels per layer, chained across all 48 layers with the residual hidden state kept in Sbuf throughout.
 
-1. Create a Trainium2 instance with AWS Neuron SDK v2.27 using EC2 based on the [setup guide](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/setup/neuron-setup/multiframework/multi-framework-ubuntu24-neuron-dlami.html#setup-ubuntu24-multi-framework-dlami).
-2. Activate the Neuron virtual environment to run inference by running the appropriate activation command for your SDK version:
-   ```bash
-   source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
-   ```
-3. Clone this repository and run `cd [PATH]/nki-moe` where `[PATH]` is the directory where you have performed the clone.
-4. Download the Qwen3-30B-A3B model to a `~/qwen-30b-a3b/hf_model` folder in your root directory. We recommend doing so using the [Hugging Face CLI](https://huggingface.co/docs/huggingface_hub/en/guides/cli). You can install this by running `pip3 install huggingface_hub[cli]`.
-5. To run inference, navigate to `[PATH]/nki-moe` and run:
-   ```bash
-   python3 main.py --mode generate --model-path ~/qwen-30b-a3b/hf_model --compiled-model-path ~/qwen-30b-a3b/traced_model --prompt "What is the capital of France?"
-   ```
+**Attention subkernel** — RMSNorm → QKV projections → RoPE → KV cache update → scaled dot-product attention → output projection → AllReduce.
 
-## NKI Kernel Development
+**MoE subkernel** — RMSNorm → router top-k → selective weight loading → gate/up/down expert GEMMs → weighted sum → AllReduce.
 
-This repository contains the standard model implementation in `qwen.py`.
+LNC=2 is used throughout. KV heads (4 total) are sharded across 4 LNCs within a single chip. `SbufManager` handles on-chip memory allocation and weight double-buffering across layers.
 
-Your task is to identify parts of the model (operators, fused operators, layers, or even the whole model) that can be implemented as NKI kernels and add them to create optimized versions of the model.
+## Setup
 
-### Sample NKI Kernels
-
-This repository includes two NKI kernel examples to help you get started:
-
-#### 1. Tensor Add Example (`nki_tensor_add_example.py`)
-
-A simple NKI kernel demonstrating basic tensor operations. This serves as a minimal reference implementation showing:
-- Basic NKI kernel structure with `@nki.jit` decorator
-- Tensor indexing and loading from HBM to SBUF
-- Element-wise operations
-- Storing results back to HBM
-
-This example is not integrated into the model but provides a foundation for understanding NKI kernel development.
-
-#### 2. RMSNorm Kernel (`nki_custom_rmsnorm.py`)
-
-A production-ready NKI RMSNorm implementation integrated into the Qwen model. This kernel follows the pattern from the [official AWS NKI RMSNorm tutorial](https://awsdocs-neuron.readthedocs-hosted.com/en/v2.26.0/general/nki/tutorials/rmsnorm.html).
-
-
-We also have `qwen_with_nki.py` which has model implementation with custom NKI kernels integrated. To test the different implementations:
+Tested on Trainium 2 and 3 with AWS Neuron SDK v2.27.
 
 ```bash
-# Standard inference (uses qwen.py)
-python3 main.py --mode generate --model-path ~/qwen-30b-a3b/hf_model --compiled-model-path ~/qwen-30b-a3b/traced_model --prompt "What is the capital of France?"
+# 1. Activate the Neuron venv
+source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
 
-# With NKI RMSNorm kernel (uses qwen_with_nki.py)
-python3 main.py --mode generate --enable-nki --model-path ~/qwen-30b-a3b/hf_model --compiled-model-path ~/qwen-30b-a3b/traced_model --prompt "What is the capital of France?"
+# 2. Clone and enter the repo
+git clone https://github.com/KevGomes1403/nki-moe && cd nki-moe
+
+# 3. Download the model weights
+pip install huggingface_hub[cli]
+huggingface-cli download Qwen/Qwen3-30B-A3B --local-dir ~/qwen-30b-a3b/hf_model
 ```
 
-**Important:** When switching between NKI and standard modes, remove the traced model directory and compile cache to ensure proper recompilation:
+## Running
+
 ```bash
-rm -rf ~/qwen-30b-a3b/traced_model
-rm -rf /var/tmp/neuron-compile-cache/*
+# Baseline (XLA)
+python main.py --mode generate \
+  --model-path ~/qwen-30b-a3b/hf_model \
+  --compiled-model-path ~/qwen-30b-a3b/traced_model \
+  --prompt "What is the capital of France?"
+
+# Megakernel
+python main.py --mode generate --enable-nki \
+  --model-path ~/qwen-30b-a3b/hf_model \
+  --compiled-model-path ~/qwen-30b-a3b/traced_nki_model \
+  --prompt "What is the capital of France?"
+
+# Validate megakernel output against baseline
+python main.py --mode validate --enable-nki \
+  --model-path ~/qwen-30b-a3b/hf_model \
+  --compiled-model-path ~/qwen-30b-a3b/traced_nki_model
+
+# Benchmark
+python main.py --mode benchmark --enable-nki \
+  --model-path ~/qwen-30b-a3b/hf_model \
+  --compiled-model-path ~/qwen-30b-a3b/traced_nki_model
 ```
 
-The `--enable-nki` flag in `main.py` controls which model file is loaded:
-- Without flag: loads `qwen.py` (standard implementation)
-- With flag: loads `qwen_with_nki.py` (NKI-accelerated implementation)
+When switching between baseline and megakernel, clear the compile cache:
 
-Key areas to focus on:
-* MoE routing and expert selection logic
-* Expert computation (gate_proj, up_proj, down_proj)
-* Attention mechanisms with MoE-specific optimizations
-* Memory-efficient tensor operations for sparse expert execution
+```bash
+rm -rf ~/qwen-30b-a3b/traced_nki_model /var/tmp/neuron-compile-cache/*
+```
 
-## Evaluation and Scoring
+## Repository Layout
 
-The contest organizers will execute each team's submission across the twenty withheld benchmarks on a dedicated Trainium instance. The submissions will be evaluated on:
-
-1) Accuracy of generated output vs. our reference implementation. Accuracy evaluation will be a binary assessor: Any benchmark that fails an accuracy threshold will result in a score of 0\.   
-2) Latency (Time to first token (TTFT))  
-3) Throughput measured as output tokens / second  
-4) Amount of model written in NKI (measured as NKI FLOPS / total model FLOPS) (will be applied as a scaling factor for (b) and (c)). Note: NKI FLOPs measures the number of multiply-accumulate (MAC) operations.
-
-Rankings will be established by calculating the total normalized number of points per team, where points are normalized against the baseline.
-
-We define **points** as **Accuracy** (binary) **\* Reduced Latency \* Increased Throughput \* (1 + Normalized NKI FLOPS)**, where:
-
-* **Accuracy** = 1 if accuracy matches or exceeds a predetermined threshold, 0 otherwise  
-* **Reduced Latency** = Reference implementation TTFT divided by submission TTFT  
-* **Increased Throughput** = Submission tokens/sec divided by reference implementation tokens/sec  
-* **Normalized NKI FLOPS** = Submission NKI FLOPS divided by total model FLOPS
-
-For example, a submission that is sufficiently accurate, with 10x reduced latency, 2x increased throughput, and 0.85 normalized NKI FLOPS would obtain 1 \* 10 \* 2 \* 1.85 \= 37 points.
-
-## Additional Tools
-
-1. **Profiling:** If you would like to profile your implementation in order to get a better understanding of performance bottlenecks and opportunities for optimization, you can use the [Neuron Explorer](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/tools/neuron-explorer/index.html).
-2. **Benchmarking:** You can also leverage the [NKI benchmarking API](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/nki/api/generated/nki.benchmark.html) to retrieve execution latency statistics.
-
-## FAQ's
-1. What batch size will be used in evalution? We will use a batch size of 1 in the final evaluation.
-2. Should I use NKI 1 or NKI 2? We will make both NKI 1 and NKI 2 available in the evaluation suite, but we will prefer solutions that use NKI 2.
-3. How can I access Trn2? Please follow the notes [here](https://github.com/aws-neuron/nki-moe/issues/9).
-
-## Contact
-
-**Email**: [nki-mlsys-2026@amazon.com](mailto:nki-mlsys-2026@amazon.com)
+```
+qwen.py                                   # Baseline XLA model
+qwen_with_nki.py                          # Megakernel model (--enable-nki)
+main.py                                   # Entry point: generate / validate / benchmark
+models/
+  qwen_fused_transformer_multilayer.py    # NxDI model class wiring the megakernel
+kernels/
+  attn_tkg/attn_fused_nki.py             # Attention subkernel
+  moe_fused_tkg/moe_fused_nki.py         # MoE subkernel
+  transformer/transformer_qwen_multilayer.py  # Top-level 48-layer loop
+```
