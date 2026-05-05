@@ -71,7 +71,7 @@ python main.py --mode generate --enable-nki \
   --prompt "What is the capital of France?"
 
 # Benchmark
-python main.py --mode benchmark --enable-nki \
+python main.py --mode evaluate-single --enable-nki \
   --model-path ~/qwen-30b-a3b/hf_model \
   --compiled-model-path ~/qwen-30b-a3b/traced_nki_model
 ```
