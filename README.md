@@ -13,7 +13,7 @@ End-to-end on Trainium 3, 640 output tokens, bs=1:
 | E2E throughput | 65.9 tok/s | 97.3 tok/s | **110.7 tok/s** |
 | vs. XLA | — | 1.52× | **1.76×** |
 
-"XLA + NKI MoE" replaces expert computation with the NKI Library MoE TKG kernel; attention stays in XLA. "Megakernel" runs all 48 decoder layers entirely in NKI.
+"XLA + NKI MoE" replaces expert computation with the NKI Library MoE TKG kernel; attention stays in XLA. "Megakernel" runs all 48 decoder layers entirely in NKI with custom attention and MoE kernels.
 
 ![Token generation throughput comparison](assets/throughput.svg)
 
@@ -27,7 +27,7 @@ End-to-end on Trainium 3, 640 output tokens, bs=1:
 | Tensor engine | 48.86 μs | 48.15 μs | −0.71 μs |
 | CC ops (AllReduce) | 13.45 μs | 27.77 μs | +14.32 μs |
 
-The sync engine savings come from eliminating ~98 graph boundaries per decoder block. DMA efficiency improves significantly — 43% fewer packets, each 2.7× larger on average — because larger contiguous weight loads better amortize packet generation overhead and saturate memory bandwidth.
+The sync engine savings come from eliminating ~98 graph boundaries per decoder block. DMA efficiency improves significantly — 43% fewer packets, each 2.7× larger on average.
 
 ## Design
 
