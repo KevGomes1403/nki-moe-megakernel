@@ -15,7 +15,7 @@ End-to-end on Trainium 3, 640 output tokens, bs=1:
 
 "XLA + NKI MoE" replaces expert computation with the NKI Library MoE TKG kernel; attention stays in XLA. "Megakernel" runs all 48 decoder layers entirely in NKI with custom attention and MoE kernels.
 
-![Token generation throughput comparison](assets/throughput.svg)
+![Token generation throughput comparison](../../assets/throughput.svg)
 
 **Per-layer breakdown** (comparing the megakernel against the XLA + NKI MoE hybrid, profiled with the Neuron Explorer):
 
@@ -86,10 +86,10 @@ rm -rf ~/qwen-30b-a3b/traced_nki_model /var/tmp/neuron-compile-cache/*
 
 ```
 qwen.py                                   # Baseline XLA model
-qwen_with_nki.py                          # Megakernel model (--enable-nki)
+qwen_with_megakernel.py                          # Megakernel model (--enable-nki)
 main.py                                   # Entry point: generate / validate / benchmark
 kernels/
   attn_tkg/attn_fused_nki.py             # Attention subkernel
   moe_fused_tkg/moe_fused_nki.py         # MoE subkernel
-  transformer/transformer_qwen_multilayer.py  # Top-level 48-layer loop
+  transformer/transformer_qwen.py  # Top-level 48-layer loop
 ```

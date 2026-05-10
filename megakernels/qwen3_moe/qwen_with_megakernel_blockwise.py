@@ -71,7 +71,7 @@ from neuronx_distributed_inference.modules.attention.utils import RotaryEmbeddin
 from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm
 from neuronx_distributed_inference.modules.moe_v2 import initialize_moe_module
 
-from kernels.transformer.transformer_qwen_multilayer import (
+from megakernels.qwen3_moe.transformer_qwen import (
     transformer_qwen3_moe_tkg_multilayer_jit,
     get_multilayer_kernel_jit,
 )
@@ -88,12 +88,6 @@ import os
 os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2"
 os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = "trn3"
 
-# os.environ["NEURON_FRAMEWORK_DEBUG"] = "1"
-# os.environ["XLA_IR_DEBUG"]= "1"
-# os.environ["XLA_HLO_DEBUG"]= "1"
-# os.environ["NEURON_RT_INSPECT_ENABLE"]= "1"
-# os.environ["NEURON_RT_INSPECT_DEVICE_PROFILE"]= "1"
-# os.environ["NEURON_RT_INSPECT_OUTPUT_DIR"]= "./output/fused/"
 
 # ---------------------------------------------------------------------------
 # Neuron config
@@ -103,13 +97,13 @@ class Qwen3MoEV3MultilayerNeuronConfig(MoENeuronConfig):
     """MoENeuronConfig for the 48-layer fused TKG megakernel."""
 
     def __init__(self, **kwargs):
-        # kwargs["blockwise_matmul_config"] = BlockwiseMatmulConfig.from_kwargs(
-        #     use_torch_block_wise=False,
-        #     block_size=256,
-        #     logical_nc_config=2,
-        #     use_shard_on_block_dynamic_while=True,
-        #     block_sharding_strategy="PING_PONG",
-        # )
+        kwargs["blockwise_matmul_config"] = BlockwiseMatmulConfig.from_kwargs(
+            use_torch_block_wise=False,
+            block_size=256,
+            logical_nc_config=2,
+            use_shard_on_block_dynamic_while=True,
+            block_sharding_strategy="PING_PONG",
+        )
         kwargs["disable_normalize_top_k_affinities"] = False
         # Full-KV cache layout expected by v14a (no slicing).
         kwargs["attn_tkg_nki_kernel_enabled"] = True
@@ -120,15 +114,11 @@ class Qwen3MoEV3MultilayerNeuronConfig(MoENeuronConfig):
         # Pop tensor_capture_config before passing to OnDeviceSamplingConfig — it
         # doesn't accept that kwarg and will raise TypeError if it sees it.
         _tcc = kwargs.pop("tensor_capture_config", None)
-        # NxDI defaults global_topk=256, which makes the rotational top-k kernel
-        # extract 256 elements before the user's top_k mask is applied — adds
-        # ~1.7ms of Vector-bound epilogue on Qwen3 vocab=151936. Cap to top_k.
-        kwargs.setdefault("global_topk", kwargs.get("top_k", 64))
         kwargs["on_device_sampling_config"] = OnDeviceSamplingConfig(**kwargs)
         if _tcc is not None:
             kwargs["tensor_capture_config"] = _tcc
         # kwargs["output_logits"] = True
-        # kwargs["async_mode"] = True
+        kwargs["async_mode"] = True
         super().__init__(**kwargs)
 
 

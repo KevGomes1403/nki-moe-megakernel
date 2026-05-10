@@ -19,10 +19,6 @@ from neuronx_distributed_inference.models.config import (
     to_torch_dtype,
 )
 
-# load the baseline model
-from neuronx_distributed_inference.models.qwen3_moe import (
-    modeling_qwen3_moe as baseline_qwen,
-)
 from neuronx_distributed_inference.modules.generation.sampling import (
     prepare_sampling_params,
 )
@@ -77,6 +73,12 @@ def parse_args():
         ],
     )
     parser.add_argument("--qwen", type=str, default="qwen")
+    parser.add_argument(
+        "--model",
+        choices=["qwen3_moe", "gpt_oss"],
+        default="qwen3_moe",
+        help="Which model architecture to load. Selects baseline + NKI module pair.",
+    )
     parser.add_argument("--enable-nki", action="store_true")
     parser.add_argument("--base-latency", type=float, default=526.15)
     parser.add_argument("--base-throughput", type=float, default=134.61)
@@ -906,17 +908,38 @@ def main():
         "{None: (1e-5, 0.05), 1000: (1e-5, 0.03), 50: (1e-5, 0.03), 5: (1e-5, 0.03)}"
     )
 
-    # points to your local model definition from qwen.py or qwen_with_nki.py
+    # Model registry: maps --model to (xla_module, nki_module, class_name, baseline_module)
+    _MODEL_REGISTRY = {
+        "qwen3_moe": (
+            "megakernels.qwen3_moe.qwen",
+            "megakernels.qwen3_moe.qwen_with_megakernel",
+            "NeuronQwen3MoeForCausalLM",
+            "neuronx_distributed_inference.models.qwen3_moe.modeling_qwen3_moe",
+        ),
+        "gpt_oss": (
+            "megakernels.gpt_oss.gpt_oss",
+            "megakernels.gpt_oss.gpt_oss_with_megakernel",
+            "NeuronGptOssForCausalLM",
+            "neuronx_distributed_inference.models.gpt_oss.modeling_gpt_oss",
+        ),
+    }
+    xla_mod_name, nki_mod_name, cls_name, baseline_mod_name = _MODEL_REGISTRY[args.model]
+
     if args.enable_nki:
-        print("Loading qwen_with_nki module (NKI-accelerated RMSNorm enabled)")
-        qwen = importlib.import_module("qwen_with_nki")
+        print(f"Loading {nki_mod_name} (NKI megakernel)")
+        target_mod = importlib.import_module(nki_mod_name)
     else:
-        qwen = importlib.import_module(args.qwen)
+        # Honor --qwen for back-compat (only meaningful for qwen3_moe).
+        if args.model == "qwen3_moe" and args.qwen != "qwen":
+            target_mod = importlib.import_module(args.qwen)
+        else:
+            target_mod = importlib.import_module(xla_mod_name)
+    target_cls = getattr(target_mod, cls_name)
+    baseline_mod = importlib.import_module(baseline_mod_name)
+    baseline_cls = getattr(baseline_mod, cls_name)
 
     if args.mode == "generate":
-        model, tokenizer, generation_config = prepare_inference(
-            qwen.NeuronQwen3MoeForCausalLM, args
-        )
+        model, tokenizer, generation_config = prepare_inference(target_cls, args)
 
         run_generation(model, tokenizer, args.prompts, generation_config)
 
@@ -925,13 +948,9 @@ def main():
             print("Validation not supported for trn2, exiting.")
             quit()
 
-        model, tokenizer, generation_config = prepare_inference(
-            qwen.NeuronQwen3MoeForCausalLM, args
-        )
+        model, tokenizer, generation_config = prepare_inference(target_cls, args)
 
-        base_model, _, base_generation_config = prepare_inference(
-            baseline_qwen.NeuronQwen3MoeForCausalLM, args
-        )
+        base_model, _, base_generation_config = prepare_inference(baseline_cls, args)
 
         passed = run_accuracy_check(
             base_model,
@@ -951,7 +970,7 @@ def main():
     elif args.mode == "evaluate_single":
         if args.platform_target == "trn2":
             model, tokenizer, generation_config = prepare_inference(
-                qwen.NeuronQwen3MoeForCausalLM, args
+                target_cls, args
             )
 
             accuracy = 1
@@ -960,11 +979,11 @@ def main():
             # Compile baseline first; both prepare_inference calls write to
             # /tmp/nxd_model/, so the second compile is what find_hlos() reads.
             base_model, _, base_generation_config = prepare_inference(
-                baseline_qwen.NeuronQwen3MoeForCausalLM, args
+                baseline_cls, args
             )
 
             model, tokenizer, generation_config = prepare_inference(
-                qwen.NeuronQwen3MoeForCausalLM, args
+                target_cls, args
             )
 
             accuracy = run_accuracy_check(
@@ -1011,7 +1030,7 @@ def main():
 
     elif args.mode == "evaluate_all" and args.platform_target == "trn2":
         model, tokenizer, generation_config = prepare_inference(
-            qwen.NeuronQwen3MoeForCausalLM, args
+            target_cls, args
         )
 
         accuracy = 1
@@ -1066,11 +1085,11 @@ def main():
         # Compile baseline first; both prepare_inference calls write to
         # /tmp/nxd_model/, so the second compile is what find_hlos() reads.
         base_model, _, base_generation_config = prepare_inference(
-            baseline_qwen.NeuronQwen3MoeForCausalLM, args
+            baseline_cls, args
         )
 
         model, tokenizer, generation_config = prepare_inference(
-            qwen.NeuronQwen3MoeForCausalLM, args
+            target_cls, args
         )
 
         prompts = parse_prompts("prompts.txt")
