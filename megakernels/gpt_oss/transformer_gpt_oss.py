@@ -100,14 +100,11 @@ def _multilayer_body(
     residual_sb = nl.ndarray((H0, BxS * H1), dtype=dtype, buffer=nl.sbuf,
                              name="residual_sb")
     X_flat = X.reshape((BxS * H,))
-    residual_load_sb = nl.ndarray((H0, BxS * H1), dtype=dtype, buffer=nl.sbuf,
-                                   name="residual_load_sb")
     nisa.dma_copy(
-        dst=residual_load_sb,
+        dst=residual_sb,
         src=X_flat.ap(pattern=[[H1, H0], [1, H1], [H, BxS]], offset=0),
         dge_mode=nisa.dge_mode.hwdge,
     )
-    nisa.tensor_copy(residual_sb, residual_load_sb)
 
     for layer_idx in range(num_layers):
         is_sliding = (layer_idx % 2 == 0)
@@ -252,8 +249,8 @@ def _multilayer_body(
         )
 
         # moe_tkg already produces full H1 in tp102_0; bare AR matches residual.
-        moe_reduced_sb = nl.zeros((H0, BxS * H1), dtype=dtype, buffer=nl.sbuf,
-                                  name=f"L{layer_idx}_moe_reduced_sb")
+        moe_reduced_sb = nl.ndarray((H0, BxS * H1), dtype=dtype, buffer=nl.sbuf,
+                                    name=f"L{layer_idx}_moe_reduced_sb")
         nccl.all_reduce(
             dsts=[moe_reduced_sb],
             srcs=[moe_out_sb.reshape((H0, BxS * H1))],
@@ -270,14 +267,11 @@ def _multilayer_body(
 
     # Store residual to HBM. Final model.norm runs Python-side.
     Y = nl.ndarray((B, S_tkg, H), dtype=dtype, buffer=nl.shared_hbm, name="Y")
-    residual_out_bf16_sb = nl.ndarray((H0, BxS * H1), dtype=dtype, buffer=nl.sbuf,
-                                       name="residual_out_bf16_sb")
-    nisa.tensor_copy(residual_out_bf16_sb, residual_sb)
     if prg_id == 0:
         Y_flat = Y.reshape((BxS * H,))
         nisa.dma_copy(
             dst=Y_flat.ap(pattern=[[H1, H0], [1, H1], [H, BxS]], offset=0),
-            src=residual_out_bf16_sb,
+            src=residual_sb,
             dge_mode=nisa.dge_mode.hwdge,
         )
     if N_PRGS > 1:

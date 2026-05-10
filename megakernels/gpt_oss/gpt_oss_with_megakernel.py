@@ -20,6 +20,10 @@ from torch import nn
 os.environ["NEURON_LOGICAL_NC_CONFIG"] = "1"
 os.environ.setdefault("NEURON_PLATFORM_TARGET_OVERRIDE", "trn3")
 
+from neuronx_distributed.parallel_layers.layers import (  # noqa: E402
+    ColumnParallelLinear,
+    RowParallelLinear,
+)
 from neuronx_distributed_inference.models.config import OnDeviceSamplingConfig  # noqa: E402
 from neuronx_distributed_inference.models.gpt_oss.modeling_gpt_oss import (  # noqa: E402
     GptOssInferenceConfig,
@@ -79,7 +83,39 @@ def convert_gpt_oss_hf_to_neuron_state_dict(state_dict: dict, config) -> dict:
     # Public converter does pad→convert; the private one skips pad. Pad first
     # so weights match the compiled hidden_size=3072.
     _BaseNeuronGptOssForCausalLM._pad_hf_state_dict(state_dict, config)
-    return _BaseNeuronGptOssForCausalLM._convert_hf_format_state_dict(state_dict, config)
+    state_dict = _BaseNeuronGptOssForCausalLM._convert_hf_format_state_dict(state_dict, config)
+
+    # Bake the per-step transposes / bias-divide that _gather_weights_from_parent
+    # would otherwise do every TKG forward. New keys are loaded into the
+    # NeuronGptOssDecoderLayerV1 modules registered below.
+    tp = config.neuron_config.tp_degree
+    for l in range(config.num_hidden_layers):
+        # Wqkv: [I_full, H] → [H, I_full]; RowParallelLinear shards dim 1 →
+        # per-rank [H, I_per_rank] which is the kernel's expected layout.
+        wqkv_key = f"layers.{l}.self_attn.Wqkv.weight"
+        state_dict[f"layers.{l}.self_attn.Wqkv_nki.weight"] = (
+            state_dict[wqkv_key].transpose(0, 1).contiguous()
+        )
+
+        # o_proj weight: [H, Hq_full] → [Hq_full, H]; ColumnParallelLinear
+        # shards dim 0 → per-rank [Hq_per_rank, H], matching the kernel.
+        wo_key = f"layers.{l}.self_attn.o_proj.weight"
+        state_dict[f"layers.{l}.self_attn.Wo_nki.weight"] = (
+            state_dict[wo_key].transpose(0, 1).contiguous()
+        )
+
+        # o_proj.bias is replicated [H] (RowParallel adds it pre-AR). Divide
+        # by tp once so the kernel's AR-sum reproduces the bias exactly.
+        bo_key = f"layers.{l}.self_attn.o_proj.bias"
+        state_dict[f"layers.{l}.self_attn.Wo_nki_bias"] = (
+            state_dict[bo_key] / tp
+        ).contiguous()
+
+    # NB: router transpose is handled by NxDI's RouterTopK(store_transposed_weights=True)
+    # which auto-registers `router.weight_T` (shape [H, E]) on device. We just
+    # read it from _gather_weights_from_parent.
+
+    return state_dict
 
 
 class NeuronGptOssDecoderLayerV1(NeuronGptOssDecoderLayer):
@@ -100,6 +136,53 @@ class NeuronGptOssDecoderLayerV1(NeuronGptOssDecoderLayer):
         self._replica_groups = (list(range(config.neuron_config.tp_degree)),)
         # Set by NeuronGptOssModelV1.init_model. Weakref to avoid module cycle.
         self._parent_model_ref = None
+
+        # Pre-baked kernel-layout weights. Receive values from
+        # convert_gpt_oss_hf_to_neuron_state_dict so _gather_weights_from_parent
+        # can skip the per-step .T.contiguous() / bias divide.
+        _dtype = config.neuron_config.torch_dtype
+        H = config.hidden_size
+        d_head = config.head_dim
+        Hq_full = config.num_attention_heads * d_head
+        Hkv_full = config.num_key_value_heads * d_head
+        I_full = Hq_full + 2 * Hkv_full
+
+        # RowParallelLinear shards dim 1 of weight → per-rank [H, I_per_rank],
+        # matching the kernel layout. bias=False; we read the QKV bias from the
+        # original (unaltered) qkv.Wqkv.bias path which is already [I_per_rank].
+        self.self_attn.Wqkv_nki = RowParallelLinear(
+            input_size=I_full,
+            output_size=H,
+            bias=False,
+            input_is_parallel=False,
+            dtype=_dtype,
+        )
+        # The per-rank loader (trace.py:804) routes weights tagged `fused_qkv`
+        # through create_local_weight_qkv, which splits Q/K/V independently
+        # along partition_dim before chunking each per rank. Without this the
+        # plain contiguous shard interleaves Q and K/V across ranks (wrong
+        # attention output). create_local_weight_qkv accepts any partition_dim
+        # so it works with our transposed [H, I_full] layout sharded on dim 1.
+        setattr(self.self_attn.Wqkv_nki.weight, "fused_qkv", True)
+        setattr(self.self_attn.Wqkv_nki.weight, "num_attention_heads",
+                config.num_attention_heads)
+        setattr(self.self_attn.Wqkv_nki.weight, "num_key_value_heads",
+                config.num_key_value_heads)
+        setattr(self.self_attn.Wqkv_nki.weight, "head_dim", d_head)
+        # ColumnParallelLinear shards dim 0 → per-rank [Hq_per_rank, H], the
+        # kernel's expected Wo layout.
+        self.self_attn.Wo_nki = ColumnParallelLinear(
+            input_size=H,
+            output_size=Hq_full,
+            bias=False,
+            gather_output=False,
+            dtype=_dtype,
+        )
+        # o_proj bias is replicated across ranks (RowParallel adds pre-AR);
+        # store the divided copy as a plain Parameter (not sharded).
+        self.self_attn.Wo_nki_bias = nn.Parameter(
+            torch.empty(H, dtype=_dtype), requires_grad=False
+        )
 
     @property
     def _parent_model(self):
@@ -123,7 +206,6 @@ class NeuronGptOssDecoderLayerV1(NeuronGptOssDecoderLayer):
         H_padded = cfg.hidden_size
         I_per_rank = cfg.intermediate_size // cfg.neuron_config.moe_tp_degree
         E_count = cfg.num_local_experts
-        tp_degree = cfg.neuron_config.tp_degree
 
         Wqkv, bqkv, Wo, bo = [], [], [], []
         sinks = []
@@ -134,22 +216,21 @@ class NeuronGptOssDecoderLayerV1(NeuronGptOssDecoderLayer):
         for l in self._parent_model.layers:
             attn = l.self_attn
             qkv = self._pick_qkv(attn)
-            # ColumnParallelLinear stores [I_per_rank, H]; kernel wants [H, I].
-            Wqkv.append(qkv.Wqkv.weight.T.contiguous())
+            # Pre-baked by convert_gpt_oss_hf_to_neuron_state_dict: weight in
+            # kernel layout [H, I_per_rank], bias divided by tp_degree.
+            Wqkv.append(attn.Wqkv_nki.weight)
             bqkv.append(qkv.Wqkv.bias.reshape(1, -1))
-            # o_proj.o_proj is the underlying plain Linear (weight [H, Hq_per_rank]).
-            o_linear = attn.o_proj.o_proj
-            Wo.append(o_linear.weight.T.contiguous())
-            # o_proj is RowParallel: bias is replicated and added pre-AR. Divide
-            # by tp_degree so the AR-sum produces the bias once.
-            bo.append((o_linear.bias / tp_degree).reshape(1, -1))
+            Wo.append(attn.Wo_nki.weight)
+            bo.append(attn.Wo_nki_bias.reshape(1, -1))
             sinks.append(self._pick_sinks(attn).reshape(-1, 1))
 
             gpre.append(l.input_layernorm.weight.unsqueeze(0))
             gpost.append(l.post_attention_layernorm.weight.unsqueeze(0))
 
             moe = l.feed_forward.moe
-            router_w.append(moe.router.linear_router.weight.T.contiguous())
+            # store_transposed_weights=True (set via init_tkg_module) auto-
+            # registers router.weight_T with shape [H, E].
+            router_w.append(moe.router.weight_T)
             router_b.append(moe.router.linear_router.bias.reshape(1, -1))
 
             mlp_op = moe.expert_mlps.mlp_op
@@ -229,16 +310,19 @@ class NeuronGptOssDecoderLayerV1(NeuronGptOssDecoderLayer):
                 # Mask layout: [past_cache_mask | active_mask] with active=1 at
                 # the last s_tkg slots, then [S_total, B, H, S_tkg]. Mirrors
                 # stock NxDI's mask-prep (attention_base.py:1247-1263).
+                # TODO(perf #2b): the .expand→.contiguous head broadcast and
+                # .permute→.contiguous below still materialize per step. If
+                # attention_block_tkg can consume a stride-0 head view we can
+                # drop the materialization.
                 def _prep_mask(m):
                     if m is None:
                         return None
-                    bsz = m.shape[0]
                     m = m.expand(-1, num_heads_per_rank, -1, -1).contiguous()
-                    active_mask = torch.ones(
-                        (bsz, num_heads_per_rank, s_tkg, s_tkg),
-                        dtype=m.dtype, device=m.device,
-                    )
-                    m[:, :, :, -s_tkg:] = active_mask
+                    # Scalar fill avoids allocating a torch.ones tensor every
+                    # step. Caching the tensor on self breaks tracing — the
+                    # cached XLA tensor escapes the trace boundary and trips
+                    # convert_parameters_to_constants on a later pass.
+                    m[:, :, :, -s_tkg:] = 1.0
                     return m.permute(3, 0, 1, 2).contiguous()
 
                 mask_full = _prep_mask(attention_mask)
