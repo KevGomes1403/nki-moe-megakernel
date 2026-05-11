@@ -2,14 +2,14 @@
 """GPT-OSS-20B with the 24-layer fused TKG megakernel.
 
 CTE: stock per-layer NxDI path.
-TKG: layer 0 dispatches the megakernel for all 24 layers; layers 1..L-1 are
-pass-throughs that forward the kernel's KV outputs into next_decoder_cache.
+TKG: `NeuronGptOssModelV2.get_model_output` bypasses NxDI's per-layer loop and
+calls the megakernel once for all 24 layers. KV cache updates are in-place via
+the kernel's scatter.
 """
 
 import os
 import shlex
 import warnings
-import weakref
 from typing import Optional, Tuple
 
 import torch
@@ -41,6 +41,7 @@ from neuronx_distributed_inference.models.model_wrapper import (  # noqa: E402
     CONTEXT_ENCODING_MODEL_TAG,
     TOKEN_GENERATION_MODEL_TAG,
 )
+from neuronx_distributed_inference.modules.lora_serving import is_lora_module  # noqa: E402
 
 
 class GptOssV1MultilayerNeuronConfig(GptOssNeuronConfig):
@@ -85,9 +86,9 @@ def convert_gpt_oss_hf_to_neuron_state_dict(state_dict: dict, config) -> dict:
     _BaseNeuronGptOssForCausalLM._pad_hf_state_dict(state_dict, config)
     state_dict = _BaseNeuronGptOssForCausalLM._convert_hf_format_state_dict(state_dict, config)
 
-    # Bake the per-step transposes / bias-divide that _gather_weights_from_parent
-    # would otherwise do every TKG forward. New keys are loaded into the
-    # NeuronGptOssDecoderLayerV1 modules registered below.
+    # Bake the per-step transposes / bias-divide that the model-level gather
+    # would otherwise do every TKG forward. New keys load into the
+    # NeuronGptOssDecoderLayerV1 weight params registered below.
     tp = config.neuron_config.tp_degree
     for l in range(config.num_hidden_layers):
         # Wqkv: [I_full, H] → [H, I_full]; RowParallelLinear shards dim 1 →
@@ -113,13 +114,21 @@ def convert_gpt_oss_hf_to_neuron_state_dict(state_dict: dict, config) -> dict:
 
     # NB: router transpose is handled by NxDI's RouterTopK(store_transposed_weights=True)
     # which auto-registers `router.weight_T` (shape [H, E]) on device. We just
-    # read it from _gather_weights_from_parent.
+    # read it from the model gather.
 
     return state_dict
 
 
 class NeuronGptOssDecoderLayerV1(NeuronGptOssDecoderLayer):
-    """Layer 0 dispatches the megakernel; layers 1..L-1 are pass-throughs."""
+    """Stock decoder layer + extra kernel-layout weight params.
+
+    The megakernel needs Wqkv / Wo in a different layout than NxDI's defaults
+    and Wo bias pre-divided by tp_degree. Register the kernel-layout params on
+    the layer so `convert_gpt_oss_hf_to_neuron_state_dict` can route values
+    into them through the state-dict loader. No `forward` override: the V2
+    model bypasses the per-layer loop entirely on TKG, and CTE uses the stock
+    `NeuronGptOssDecoderLayer.forward`.
+    """
 
     def __init__(self, config, layer_idx, rotary_cache_manager):
         # Mask attn_block_tkg_nki_kernel_enabled during super().__init__() so
@@ -132,14 +141,7 @@ class NeuronGptOssDecoderLayerV1(NeuronGptOssDecoderLayer):
             super().__init__(config, layer_idx, rotary_cache_manager)
         finally:
             config.neuron_config.attn_block_tkg_nki_kernel_enabled = _saved
-        self._num_hidden_layers = config.num_hidden_layers
-        self._replica_groups = (list(range(config.neuron_config.tp_degree)),)
-        # Set by NeuronGptOssModelV1.init_model. Weakref to avoid module cycle.
-        self._parent_model_ref = None
 
-        # Pre-baked kernel-layout weights. Receive values from
-        # convert_gpt_oss_hf_to_neuron_state_dict so _gather_weights_from_parent
-        # can skip the per-step .T.contiguous() / bias divide.
         _dtype = config.neuron_config.torch_dtype
         H = config.hidden_size
         d_head = config.head_dim
@@ -148,8 +150,8 @@ class NeuronGptOssDecoderLayerV1(NeuronGptOssDecoderLayer):
         I_full = Hq_full + 2 * Hkv_full
 
         # RowParallelLinear shards dim 1 of weight → per-rank [H, I_per_rank],
-        # matching the kernel layout. bias=False; we read the QKV bias from the
-        # original (unaltered) qkv.Wqkv.bias path which is already [I_per_rank].
+        # matching the kernel layout. bias=False; QKV bias is read from the
+        # original qkv.Wqkv.bias path which is already [I_per_rank].
         self.self_attn.Wqkv_nki = RowParallelLinear(
             input_size=I_full,
             output_size=H,
@@ -184,9 +186,33 @@ class NeuronGptOssDecoderLayerV1(NeuronGptOssDecoderLayer):
             torch.empty(H, dtype=_dtype), requires_grad=False
         )
 
-    @property
-    def _parent_model(self):
-        return self._parent_model_ref() if self._parent_model_ref is not None else None
+
+class NeuronGptOssModelV1(NeuronGptOssModel):
+    """Overrides `get_model_output` to bypass the per-layer loop on TKG.
+
+    CTE path delegates to `super().get_model_output(...)` unchanged.
+
+    TKG path: embed → mask + RoPE prep → single megakernel call (all 24 layers
+    fused) → final RMSNorm → return `(hidden_states, flat_kv_list)`. The
+    megakernel scatters KV in-place into `self.kv_mgr.past_key_values`, so the
+    returned cache list is just references to the (now-updated) buffer
+    tensors — matching the `update_kv_per_layer=True` convention NxDI's loop
+    builds incrementally.
+    """
+
+    def init_model(self, config):
+        super().init_model(config)
+        # NxDI built `layers` with stock NeuronGptOssDecoderLayer; rebuild with
+        # V1 layers (which carry the kernel-layout weight params), sharing the
+        # rotary_cache_manager from the first stock layer.
+        rotary_cache_manager = self.layers[0].rotary_cache_manager
+        updated_configs = get_updated_configs(config)
+        self.layers = nn.ModuleList([
+            NeuronGptOssDecoderLayerV1(conf, idx, rotary_cache_manager)
+            for idx, conf in enumerate(updated_configs)
+        ])
+        self._num_hidden_layers = config.num_hidden_layers
+        self._replica_groups = (list(range(config.neuron_config.tp_degree)),)
 
     @staticmethod
     def _pick_qkv(attn):
@@ -200,8 +226,16 @@ class NeuronGptOssDecoderLayerV1(NeuronGptOssDecoderLayer):
             return attn.tkg_learned_sinks.sink
         return attn.learned_sinks.sink
 
-    def _gather_weights_from_parent(self):
-        """Gather per-layer weights, reshaped/transposed to kernel layouts."""
+    def _gather_weights(self):
+        """Gather per-layer weights, reshaped/transposed to kernel layouts.
+
+        Re-gathered every TKG call. Caching across calls breaks tracing:
+        nn.Parameter `.data` gets re-wrapped as a per-trace XLA tensor, so a
+        cached ref from an earlier trace trips `convert_parameters_to_constants`
+        ("XLA data... while an async operation is in flight"). The gather
+        itself is cheap — the .T.contiguous() / bias-divide are baked into
+        the state dict by `convert_gpt_oss_hf_to_neuron_state_dict`.
+        """
         cfg = self.config
         H_padded = cfg.hidden_size
         I_per_rank = cfg.intermediate_size // cfg.neuron_config.moe_tp_degree
@@ -213,7 +247,7 @@ class NeuronGptOssDecoderLayerV1(NeuronGptOssDecoderLayer):
         router_w, router_b = [], []
         gate_up, gate_up_b, down, down_b = [], [], [], []
 
-        for l in self._parent_model.layers:
+        for l in self.layers:
             attn = l.self_attn
             qkv = self._pick_qkv(attn)
             # Pre-baked by convert_gpt_oss_hf_to_neuron_state_dict: weight in
@@ -248,141 +282,157 @@ class NeuronGptOssDecoderLayerV1(NeuronGptOssDecoderLayer):
                 router_w, router_b,
                 gate_up, gate_up_b, down, down_b)
 
-    def _gather_kv_caches(self, kv_mgr):
+    def _gather_kv_caches(self):
         # past_key_values is flat [K0, V0, K1, V1, ...]. SWA layers have
         # max_len=sliding_window-1; full layers have max_len=max_length.
         L = self._num_hidden_layers
-        Ks = [kv_mgr.past_key_values[2 * i] for i in range(L)]
-        Vs = [kv_mgr.past_key_values[2 * i + 1] for i in range(L)]
+        Ks = [self.kv_mgr.past_key_values[2 * i] for i in range(L)]
+        Vs = [self.kv_mgr.past_key_values[2 * i + 1] for i in range(L)]
         return Ks, Vs
 
-    def forward(
+    def get_model_output(
         self,
-        hidden_states: torch.Tensor,
+        input_ids: Optional[torch.LongTensor] = None,
+        seq_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        local_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        adapter_ids=None,
-        kv_mgr=None,
-        idx: int = 0,
-        is_for_context_encoding: bool = True,
+        past_key_values=None,
+        active_mask=None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        prev_hidden: Optional[torch.FloatTensor] = None,
+        adapter_ids: Optional[torch.LongTensor] = None,
+        rotary_position_ids: Optional[torch.LongTensor] = None,
+        update_cache: bool = False,
+        is_for_context_encoding: bool = False,
+        vision_embeddings=None,
+        vision_mask=None,
+        deepstack_vision_embeds=None,
+        local_attn_mask: Optional[torch.Tensor] = None,
+        windowed_context_encoding_window_idx: int = -1,
+        padding_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        is_tkg = not is_for_context_encoding
-
-        if is_tkg:
-            from megakernels.gpt_oss.transformer_gpt_oss import (
-                get_multilayer_kernel_jit,
+        if is_for_context_encoding:
+            return super().get_model_output(
+                input_ids=input_ids,
+                seq_ids=seq_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                active_mask=active_mask,
+                inputs_embeds=inputs_embeds,
+                prev_hidden=prev_hidden,
+                adapter_ids=adapter_ids,
+                rotary_position_ids=rotary_position_ids,
+                update_cache=update_cache,
+                is_for_context_encoding=is_for_context_encoding,
+                vision_embeddings=vision_embeddings,
+                vision_mask=vision_mask,
+                deepstack_vision_embeds=deepstack_vision_embeds,
+                local_attn_mask=local_attn_mask,
+                windowed_context_encoding_window_idx=windowed_context_encoding_window_idx,
+                padding_mask=padding_mask,
+                **kwargs,
             )
 
-            L = self._num_hidden_layers
-            if self.layer_idx == 0:
-                assert self._parent_model is not None
-                assert kv_mgr is not None
-
-                hidden_states = ModuleMarkerStartWrapper()(hidden_states)
-
-                # gpt-oss uses one rotary; pass the same cos/sin to both slots.
-                cos_cache, sin_cache = self.self_attn.rotary_emb(
-                    hidden_states, position_ids
-                )
-                # NxDI emits [B, S, d_head] with the second half duplicated.
-                # Kernel wants [d_head//2, B, S].
-                d_head = self.config.head_dim
-                cos_at_pos = cos_cache[..., : d_head // 2].permute(2, 0, 1).contiguous()
-                sin_at_pos = sin_cache[..., : d_head // 2].permute(2, 0, 1).contiguous()
-
-                (Wqkv_l, bqkv_l, Wo_l, bo_l, sinks_l,
-                 gpre_l, gpost_l,
-                 router_w_l, router_b_l,
-                 gate_up_l, gate_up_b_l, down_l, down_b_l) = (
-                    self._gather_weights_from_parent()
-                )
-                K_caches, V_caches = self._gather_kv_caches(kv_mgr)
-
-                num_heads_per_rank = (
-                    self.config.num_attention_heads
-                    // self.config.neuron_config.tp_degree
-                )
-                s_tkg = hidden_states.shape[1]
-
-                # Mask layout: [past_cache_mask | active_mask] with active=1 at
-                # the last s_tkg slots, then [S_total, B, H, S_tkg]. Mirrors
-                # stock NxDI's mask-prep (attention_base.py:1247-1263).
-                # TODO(perf #2b): the .expand→.contiguous head broadcast and
-                # .permute→.contiguous below still materialize per step. If
-                # attention_block_tkg can consume a stride-0 head view we can
-                # drop the materialization.
-                def _prep_mask(m):
-                    if m is None:
-                        return None
-                    m = m.expand(-1, num_heads_per_rank, -1, -1).contiguous()
-                    # Scalar fill avoids allocating a torch.ones tensor every
-                    # step. Caching the tensor on self breaks tracing — the
-                    # cached XLA tensor escapes the trace boundary and trips
-                    # convert_parameters_to_constants on a later pass.
-                    m[:, :, :, -s_tkg:] = 1.0
-                    return m.permute(3, 0, 1, 2).contiguous()
-
-                mask_full = _prep_mask(attention_mask)
-                mask_window = _prep_mask(local_mask) if local_mask is not None else mask_full
-
-                kernel_out = get_multilayer_kernel_jit(L)[1](
-                    hidden_states,
-                    *Wqkv_l, *bqkv_l, *Wo_l, *bo_l,
-                    *sinks_l,
-                    *gpre_l, *gpost_l,
-                    *router_w_l, *router_b_l,
-                    *gate_up_l, *gate_up_b_l, *down_l, *down_b_l,
-                    *K_caches, *V_caches,
-                    cos_at_pos, sin_at_pos,
-                    cos_at_pos, sin_at_pos,
-                    mask_window, mask_full,
-                    position_ids.to(torch.int32),
-                    # SWA wraps the cache: index = position % (sliding_window-1).
-                    (position_ids.to(torch.int32)
-                     % (self.config.sliding_window - 1)),
-                    replica_groups=self._replica_groups,
-                )
-                Y = kernel_out[0]
-                K_out = list(kernel_out[1     : 1 + L])
-                V_out = list(kernel_out[1 + L : 1 + 2 * L])
-
-                Y = ModuleMarkerEndWrapper()(Y)
-
-                self._parent_model._tkg_kv_out = (K_out, V_out)
-                return (Y, (K_out[0], V_out[0]), cos_cache, sin_cache, None)
-
-            K_out, V_out = self._parent_model._tkg_kv_out
-            return (hidden_states,
-                    (K_out[self.layer_idx], V_out[self.layer_idx]),
-                    None, None, None)
-
-        return super().forward(
-            hidden_states,
-            attention_mask=attention_mask,
-            local_mask=local_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            adapter_ids=adapter_ids,
-            **kwargs,
+        # TKG fast path: embed → megakernel → norm → return.
+        from megakernels.gpt_oss.transformer_gpt_oss import (
+            get_multilayer_kernel_jit,
         )
 
+        if inputs_embeds is None:
+            inputs_embeds = (
+                self.embed_tokens(input_ids)
+                if not is_lora_module(self.embed_tokens)
+                else self.embed_tokens(input_ids, adapter_ids=adapter_ids)
+            )
+        # TKG never runs with sequence parallelism, so the SP scatter from
+        # NxDI's get_model_output is a no-op here.
+        hidden_states = inputs_embeds
 
-class NeuronGptOssModelV1(NeuronGptOssModel):
-    def init_model(self, config):
-        super().init_model(config)
-        # NxDI built `layers` with stock NeuronGptOssDecoderLayer; rebuild with
-        # V1, sharing the rotary_cache_manager from the first stock layer.
-        rotary_cache_manager = self.layers[0].rotary_cache_manager
-        updated_configs = get_updated_configs(config)
-        self.layers = nn.ModuleList([
-            NeuronGptOssDecoderLayerV1(conf, idx, rotary_cache_manager)
-            for idx, conf in enumerate(updated_configs)
-        ])
-        for layer in self.layers:
-            layer._parent_model_ref = weakref.ref(self)
+        hidden_states = ModuleMarkerStartWrapper()(hidden_states)
+
+        # gpt-oss uses one rotary; pass the same cos/sin to both slots.
+        # NxDI emits [B, S, d_head] with the second half duplicated.
+        # Kernel wants [d_head//2, B, S].
+        cos_cache, sin_cache = self.layers[0].self_attn.rotary_emb(
+            hidden_states, position_ids
+        )
+        d_head = self.config.head_dim
+        cos_at_pos = cos_cache[..., : d_head // 2].permute(2, 0, 1).contiguous()
+        sin_at_pos = sin_cache[..., : d_head // 2].permute(2, 0, 1).contiguous()
+
+        # Mask layout: [past_cache_mask | active_mask] with active=1 at the
+        # last s_tkg slots, then [S_total, B, H, S_tkg]. Mirrors stock NxDI's
+        # mask-prep (attention_base.py:1247-1263).
+        # TODO(perf #2b): the .expand→.contiguous head broadcast and
+        # .permute→.contiguous below still materialize per step. If
+        # attention_block_tkg can consume a stride-0 head view we can drop
+        # the materialization.
+        num_heads_per_rank = (
+            self.config.num_attention_heads
+            // self.config.neuron_config.tp_degree
+        )
+        s_tkg = hidden_states.shape[1]
+
+        def _prep_mask(m):
+            if m is None:
+                return None
+            m = m.expand(-1, num_heads_per_rank, -1, -1).contiguous()
+            # Scalar fill avoids allocating a torch.ones tensor every step.
+            # Caching the tensor on self breaks tracing — the cached XLA
+            # tensor escapes the trace boundary and trips
+            # convert_parameters_to_constants on a later pass.
+            m[:, :, :, -s_tkg:] = 1.0
+            return m.permute(3, 0, 1, 2).contiguous()
+
+        mask_full = _prep_mask(attention_mask)
+        mask_window = (
+            _prep_mask(local_attn_mask) if local_attn_mask is not None else mask_full
+        )
+
+        (Wqkv_l, bqkv_l, Wo_l, bo_l, sinks_l,
+         gpre_l, gpost_l,
+         router_w_l, router_b_l,
+         gate_up_l, gate_up_b_l, down_l, down_b_l) = self._gather_weights()
+        K_caches, V_caches = self._gather_kv_caches()
+
+        L = self._num_hidden_layers
+        kernel_out = get_multilayer_kernel_jit(L)[1](
+            hidden_states,
+            *Wqkv_l, *bqkv_l, *Wo_l, *bo_l,
+            *sinks_l,
+            *gpre_l, *gpost_l,
+            *router_w_l, *router_b_l,
+            *gate_up_l, *gate_up_b_l, *down_l, *down_b_l,
+            *K_caches, *V_caches,
+            cos_at_pos, sin_at_pos,
+            cos_at_pos, sin_at_pos,
+            mask_window, mask_full,
+            position_ids.to(torch.int32),
+            # SWA wraps the cache: index = position % (sliding_window-1).
+            (position_ids.to(torch.int32)
+             % (self.config.sliding_window - 1)),
+            replica_groups=self._replica_groups,
+        )
+        Y = kernel_out[0]
+        K_out = kernel_out[1     : 1 + L]
+        V_out = kernel_out[1 + L : 1 + 2 * L]
+
+        Y = ModuleMarkerEndWrapper()(Y)
+
+        hidden_states = self.norm(Y)
+
+        # NxDI's loop builds next_decoder_cache by `next_decoder_cache += kv`
+        # per layer when `update_kv_per_layer=True` (set because we have
+        # attn_block_tkg_nki_kernel_cache_update=True and is_for_context_encoding=False).
+        # Result is a flat list [K0, V0, K1, V1, ...] — reproduce the same.
+        next_decoder_cache = []
+        for i in range(L):
+            next_decoder_cache.append(K_out[i])
+            next_decoder_cache.append(V_out[i])
+
+        return (hidden_states, next_decoder_cache)
 
 
 class NeuronGptOssForCausalLM(_BaseNeuronGptOssForCausalLM):
