@@ -45,8 +45,194 @@ EPS        = 1e-5
 PMAX       = H0
 E          = 32
 TOP_K      = 4
+SLIDING_WIN = 128  # config.sliding_window for gpt-oss; matches SWA cache size
 
 SBM_SIZE_BYTES = 200 * 1024
+
+
+def _stream_shuffle_broadcast(src, dst):
+    """Replicate src (1, F) across all partitions of dst (P, F)."""
+    dst_npar = dst.shape[0]
+    shuffle_mask = [0] * 32
+    for i in range((dst_npar + 31) // 32):
+        cur_npar = min(32, dst_npar - i * 32)
+        nisa.nc_stream_shuffle(
+            src=src[0:1, :],
+            dst=dst[i * 32 : i * 32 + cur_npar, 0 : dst.shape[1]],
+            shuffle_mask=shuffle_mask,
+        )
+
+
+def _build_full_mask_hbm(position_ids, S_ctx, B, num_heads, S_tkg):
+    """Build full-attention mask [S_ctx, B, num_heads, S_tkg] from position_ids.
+
+    Rule per (t, b): mask = 1 if t < pos[b] OR t == S_ctx - 1 else 0.
+    See tests/gpt_oss/test_phase4_mask_rope.py:_kernel_full_mask_impl.
+    """
+    P_MAX = 128
+    # S_ctx must be a multiple of 128; gpt-oss buckets (128, 256, 384, 640) all are.
+    n_tile = S_ctx // P_MAX
+
+    out = nl.ndarray((S_ctx, B, num_heads, S_tkg), dtype=nl.bfloat16,
+                     buffer=nl.shared_hbm, name="mask_full_hbm")
+
+    # ----------------------- pos: load + broadcast ------------------------
+    pos_one = nl.ndarray((1, B), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=pos_one, src=position_ids.reshape((1, B)))
+
+    pos_bcast = nl.ndarray((P_MAX, B), dtype=nl.float32, buffer=nl.sbuf)
+    _stream_shuffle_broadcast(pos_one, pos_bcast)
+
+    # ----------------------- iota: t = 0..S_ctx-1 -------------------------
+    iota_tile = nl.ndarray((P_MAX, n_tile, num_heads), dtype=nl.float32,
+                           buffer=nl.sbuf)
+    nisa.iota(
+        iota_tile,
+        pattern=[[P_MAX, n_tile], [0, num_heads]],
+        offset=0,
+        channel_multiplier=1,
+    )
+
+    # ----------------------- mask: (iota < pos) OR (iota == S_ctx - 1) ----
+    # tensor_scalar requires fp32 arithmetic operands; bf16 cast at SBUF->HBM.
+    mask_lt = nl.ndarray((P_MAX, n_tile, num_heads), dtype=nl.float32,
+                         buffer=nl.sbuf)
+    nisa.tensor_scalar(
+        dst=mask_lt,
+        data=iota_tile,
+        op0=nl.less,
+        operand0=pos_bcast[:, 0:1],
+    )
+
+    mask_eq = nl.ndarray((P_MAX, n_tile, num_heads), dtype=nl.float32,
+                         buffer=nl.sbuf)
+    nisa.tensor_scalar(
+        dst=mask_eq,
+        data=iota_tile,
+        op0=nl.equal,
+        operand0=S_ctx - 1,
+    )
+
+    mask_or = nl.ndarray((P_MAX, n_tile, num_heads), dtype=nl.bfloat16,
+                         buffer=nl.sbuf)
+    nisa.tensor_tensor(mask_or, mask_lt, mask_eq, op=nl.maximum)
+
+    # SBUF [P_MAX, n_tile, num_heads] -> HBM [S_ctx, B, num_heads, S_tkg]
+    # HBM flat offset(p, k, h) = (k*P_MAX + p) * B * num_heads * S_tkg + h * S_tkg
+    out_flat = out.reshape((S_ctx * B * num_heads * S_tkg,))
+    nisa.dma_copy(
+        dst=out_flat.ap(
+            pattern=[[num_heads * S_tkg, P_MAX],
+                     [P_MAX * num_heads * S_tkg, n_tile],
+                     [S_tkg, num_heads]],
+            offset=0,
+        ),
+        src=mask_or,
+    )
+
+    return out
+
+
+def _build_swa_mask_hbm(position_ids, S_ctx, B, num_heads, S_tkg, W):
+    """Build SWA mask [S_ctx, B, num_heads, S_tkg] from position_ids.
+
+    eff_pos = min(pos, W-1); mask = 1 if t < eff_pos OR t == S_ctx-1 else 0.
+    See tests/gpt_oss/test_phase4_mask_rope.py:_kernel_swa_mask_impl.
+    """
+    P_MAX = 128
+    # gpt-oss: S_ctx == W == 128, so single tile.
+    assert S_ctx == P_MAX, "SWA S_ctx must equal 128 for gpt-oss"
+
+    out = nl.ndarray((S_ctx, B, num_heads, S_tkg), dtype=nl.bfloat16,
+                     buffer=nl.shared_hbm, name="mask_window_hbm")
+
+    # ----------------------- pos: load + clamp + broadcast ----------------
+    pos_one = nl.ndarray((1, B), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=pos_one, src=position_ids.reshape((1, B)))
+
+    # eff_pos = min(pos, W - 1) — unifies short / long pos cases.
+    eff_pos_one = nl.ndarray((1, B), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(
+        dst=eff_pos_one,
+        data=pos_one,
+        op0=nl.minimum,
+        operand0=W - 1,
+    )
+
+    pos_bcast = nl.ndarray((P_MAX, B), dtype=nl.float32, buffer=nl.sbuf)
+    _stream_shuffle_broadcast(eff_pos_one, pos_bcast)
+
+    # ----------------------- iota: t = 0..S_ctx-1 -------------------------
+    iota_tile = nl.ndarray((P_MAX, num_heads), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.iota(
+        iota_tile,
+        pattern=[[0, num_heads]],
+        offset=0,
+        channel_multiplier=1,
+    )
+
+    # ----------------------- mask: (iota < eff_pos) OR (iota == S-1) ------
+    mask_lt = nl.ndarray((P_MAX, num_heads), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(
+        dst=mask_lt,
+        data=iota_tile,
+        op0=nl.less,
+        operand0=pos_bcast[:, 0:1],
+    )
+
+    mask_eq = nl.ndarray((P_MAX, num_heads), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(
+        dst=mask_eq,
+        data=iota_tile,
+        op0=nl.equal,
+        operand0=S_ctx - 1,
+    )
+
+    mask_or = nl.ndarray((P_MAX, num_heads), dtype=nl.bfloat16, buffer=nl.sbuf)
+    nisa.tensor_tensor(mask_or, mask_lt, mask_eq, op=nl.maximum)
+
+    out_flat = out.reshape((S_ctx * B * num_heads * S_tkg,))
+    nisa.dma_copy(
+        dst=out_flat.ap(
+            pattern=[[num_heads * S_tkg, P_MAX],
+                     [S_tkg, num_heads]],
+            offset=0,
+        ),
+        src=mask_or,
+    )
+
+    return out
+
+
+def _build_permuted_rope_hbm(rope_unperm, name):
+    """Permute (B, S_tkg, half_d) -> (half_d, B, S_tkg) via strided DMA.
+
+    See tests/gpt_oss/test_phase4_mask_rope.py:_kernel_permute_cos_impl.
+    """
+    Bd, Sd, D = rope_unperm.shape  # B, S_tkg, half_d
+    BS = Bd * Sd
+
+    out = nl.ndarray((D, Bd, Sd), dtype=rope_unperm.dtype, buffer=nl.shared_hbm,
+                     name=name)
+
+    # SBUF tile in the post-permute layout: [half_d partitions, B*S_tkg free]
+    tile = nl.ndarray((D, BS), dtype=rope_unperm.dtype, buffer=nl.sbuf)
+
+    # Strided HBM load: partition stride 1, free stride D in flat input.
+    rope_flat = rope_unperm.reshape((BS * D,))
+    nisa.dma_copy(
+        dst=tile,
+        src=rope_flat.ap(
+            pattern=[[1, D],     # partition: D rows, stride 1 in flat input
+                     [D, BS]],   # free dim:  BS cols, stride D in flat input
+            offset=0,
+        ),
+    )
+
+    # SBUF [D, BS] -> HBM [D, B, S_tkg] is a contiguous store.
+    nisa.dma_copy(dst=out.reshape((D, BS)), src=tile)
+
+    return out
 
 
 def _multilayer_body(
@@ -66,12 +252,8 @@ def _multilayer_body(
     down_b_list,         # tuple of L: [E, H]                   bf16  HBM
     K_caches,            # tuple of L: per-layer K cache        bf16  HBM (mutated in-place)
     V_caches,            # tuple of L: per-layer V cache        bf16  HBM (mutated in-place)
-    cos_window,          # [d_head//2, B, S_tkg]                bf16  HBM (RoPE cos, SWA)
-    sin_window,          # [d_head//2, B, S_tkg]                bf16  HBM (RoPE sin, SWA)
-    cos_global,          # [d_head//2, B, S_tkg]                bf16  HBM (RoPE cos, full)
-    sin_global,          # [d_head//2, B, S_tkg]                bf16  HBM (RoPE sin, full)
-    mask_window,         # [S_ctx_window, B, q_heads_attn, S]   bf16  HBM (SWA mask)
-    mask_full,           # [S_ctx_full,   B, q_heads_attn, S]   bf16  HBM (full mask)
+    cos_unperm,          # [B, S_tkg, d_head//2]                bf16  HBM (RoPE cos, un-permuted)
+    sin_unperm,          # [B, S_tkg, d_head//2]                bf16  HBM (RoPE sin, un-permuted)
     position_ids,        # [B, 1]                               int32 HBM (full layers)
     position_ids_window, # [B, 1]                               int32 HBM (SWA layers, modulo'd)
     num_layers,
@@ -96,6 +278,22 @@ def _multilayer_body(
     sbm = BufferManager(0, SBM_SIZE_BYTES, Logger("transformer_gpt_oss_tkg_multilayer"))
     sbm.set_auto_alloc(True)
 
+    # ---- Phase 4: build masks and permute RoPE cos/sin inside the kernel ----
+    # Derive cache sizes from K caches: even layers (SWA) use K_caches[0],
+    # odd layers (full) use K_caches[1]. K_cache layout: [B, kv_heads, S_max_ctx,
+    # d_head] (4-D, kv_heads=1 for GQA), so the cache dim is shape[-2].
+    S_WINDOW_CTX = K_caches[0].shape[-2]   # SWA cache size (128 for gpt-oss)
+    S_FULL       = K_caches[1].shape[-2]   # full cache size (e.g. 640 for bk640)
+
+    mask_full_hbm = _build_full_mask_hbm(
+        position_ids, S_FULL, B, num_heads_per_rank, S_tkg
+    )
+    mask_window_hbm = _build_swa_mask_hbm(
+        position_ids, S_WINDOW_CTX, B, num_heads_per_rank, S_tkg, SLIDING_WIN
+    )
+    cos_perm_hbm = _build_permuted_rope_hbm(cos_unperm, name="cos_perm_hbm")
+    sin_perm_hbm = _build_permuted_rope_hbm(sin_unperm, name="sin_perm_hbm")
+
     # Load X into SBUF residual in XSBLayout_tp102__0 (P-stride H1 in H).
     residual_sb = nl.ndarray((H0, BxS * H1), dtype=dtype, buffer=nl.sbuf,
                              name="residual_sb")
@@ -108,9 +306,10 @@ def _multilayer_body(
 
     for layer_idx in range(num_layers):
         is_sliding = (layer_idx % 2 == 0)
-        cos = cos_window if is_sliding else cos_global
-        sin = sin_window if is_sliding else sin_global
-        attn_mask = mask_window if is_sliding else mask_full
+        # Masks and RoPE cos/sin are built once above; select the right one
+        # per layer. SWA and full-attention layers share the same permuted
+        # cos/sin (gpt-oss has a single rotary), so cos/sin do not branch.
+        attn_mask = mask_window_hbm if is_sliding else mask_full_hbm
         kv_idx = position_ids_window if is_sliding else position_ids
 
         # ---- Attention ----
@@ -139,8 +338,8 @@ def _multilayer_body(
             rmsnorm_QK_pre_rope_eps=EPS,
             rmsnorm_QK_pre_rope_W_Q=None,
             rmsnorm_QK_pre_rope_W_K=None,
-            cos=cos,
-            sin=sin,
+            cos=cos_perm_hbm,
+            sin=sin_perm_hbm,
             rope_contiguous_layout=True,
             rmsnorm_QK_post_rope_enabled=False,
             rmsnorm_QK_post_rope_eps=EPS,
@@ -317,9 +516,7 @@ def _build_multilayer_kernel(num_layers: int):
         + dn_names + dnb_names
         + k_names + v_names
         + [
-            "cos_window", "sin_window",
-            "cos_global", "sin_global",
-            "mask_window", "mask_full",
+            "cos_unperm", "sin_unperm",
             "position_ids",
             "position_ids_window",
         ]
@@ -359,9 +556,7 @@ def _build_multilayer_kernel(num_layers: int):
         f"        gate_up_list, gate_up_b_list,\n"
         f"        down_list, down_b_list,\n"
         f"        K_caches, V_caches,\n"
-        f"        cos_window, sin_window,\n"
-        f"        cos_global, sin_global,\n"
-        f"        mask_window, mask_full,\n"
+        f"        cos_unperm, sin_unperm,\n"
         f"        position_ids,\n"
         f"        position_ids_window,\n"
         f"        num_layers={num_layers},\n"

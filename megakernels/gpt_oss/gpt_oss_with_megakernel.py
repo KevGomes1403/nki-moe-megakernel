@@ -213,6 +213,9 @@ class NeuronGptOssModelV1(NeuronGptOssModel):
         ])
         self._num_hidden_layers = config.num_hidden_layers
         self._replica_groups = (list(range(config.neuron_config.tp_degree)),)
+        self._num_heads_per_rank = (
+            config.num_attention_heads // config.neuron_config.tp_degree
+        )
 
     @staticmethod
     def _pick_qkv(attn):
@@ -352,44 +355,19 @@ class NeuronGptOssModelV1(NeuronGptOssModel):
 
         hidden_states = ModuleMarkerStartWrapper()(hidden_states)
 
-        # gpt-oss uses one rotary; pass the same cos/sin to both slots.
-        # NxDI emits [B, S, d_head] with the second half duplicated.
-        # Kernel wants [d_head//2, B, S].
+        # gpt-oss uses one rotary; pass the un-permuted half-d slice and let
+        # the kernel do the (B, S, d//2) -> (d//2, B, S) permute via a strided
+        # DMA on load (Phase 4). NxDI emits [B, S, d_head] with the second
+        # half duplicated; we only need the first half.
         cos_cache, sin_cache = self.layers[0].self_attn.rotary_emb(
             hidden_states, position_ids
         )
         d_head = self.config.head_dim
-        cos_at_pos = cos_cache[..., : d_head // 2].permute(2, 0, 1).contiguous()
-        sin_at_pos = sin_cache[..., : d_head // 2].permute(2, 0, 1).contiguous()
+        cos_unperm = cos_cache[..., : d_head // 2].contiguous()
+        sin_unperm = sin_cache[..., : d_head // 2].contiguous()
 
-        # Mask layout: [past_cache_mask | active_mask] with active=1 at the
-        # last s_tkg slots, then [S_total, B, H, S_tkg]. Mirrors stock NxDI's
-        # mask-prep (attention_base.py:1247-1263).
-        # TODO(perf #2b): the .expand→.contiguous head broadcast and
-        # .permute→.contiguous below still materialize per step. If
-        # attention_block_tkg can consume a stride-0 head view we can drop
-        # the materialization.
-        num_heads_per_rank = (
-            self.config.num_attention_heads
-            // self.config.neuron_config.tp_degree
-        )
-        s_tkg = hidden_states.shape[1]
-
-        def _prep_mask(m):
-            if m is None:
-                return None
-            m = m.expand(-1, num_heads_per_rank, -1, -1).contiguous()
-            # Scalar fill avoids allocating a torch.ones tensor every step.
-            # Caching the tensor on self breaks tracing — the cached XLA
-            # tensor escapes the trace boundary and trips
-            # convert_parameters_to_constants on a later pass.
-            m[:, :, :, -s_tkg:] = 1.0
-            return m.permute(3, 0, 1, 2).contiguous()
-
-        mask_full = _prep_mask(attention_mask)
-        mask_window = (
-            _prep_mask(local_attn_mask) if local_attn_mask is not None else mask_full
-        )
+        # Phase 4: attention_mask / local_attn_mask are no longer passed —
+        # the kernel derives both masks from position_ids via iota+tensor_scalar.
 
         (Wqkv_l, bqkv_l, Wo_l, bo_l, sinks_l,
          gpre_l, gpost_l,
@@ -406,13 +384,12 @@ class NeuronGptOssModelV1(NeuronGptOssModel):
             *router_w_l, *router_b_l,
             *gate_up_l, *gate_up_b_l, *down_l, *down_b_l,
             *K_caches, *V_caches,
-            cos_at_pos, sin_at_pos,
-            cos_at_pos, sin_at_pos,
-            mask_window, mask_full,
+            cos_unperm, sin_unperm,
             position_ids.to(torch.int32),
             # SWA wraps the cache: index = position % (sliding_window-1).
             (position_ids.to(torch.int32)
              % (self.config.sliding_window - 1)),
+            num_heads_per_rank=self._num_heads_per_rank,
             replica_groups=self._replica_groups,
         )
         Y = kernel_out[0]
