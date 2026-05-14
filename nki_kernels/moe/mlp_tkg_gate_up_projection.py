@@ -14,9 +14,15 @@
 
 """Gate and Up projection sub-kernels for MLP TKG with column tiling and LHS/RHS swap modes."""
 
+import os as _os
+
 import nki
 import nki.isa as nisa
 import nki.language as nl
+
+# Revert to upstream per-HTile weight DMA (bypasses the in-function hoist).
+# Mirrors selective_expert_impl.py's flag — see that file's docstring.
+_MOE_LEGACY_WEIGHT_LOAD = _os.environ.get("NKI_MOE_LEGACY_WEIGHT_LOAD", "0") == "1"
 
 from nkilib.core.utils.allocator import SbufManager, sizeinbytes
 from nkilib.core.utils.interleave_copy import interleave_copy
@@ -48,36 +54,26 @@ def emit_hoisted_gate_up_dma(
     shard_dim_intr: tuple[int, int],
     dge_mode: int = None,
 ):
-    """
-    Issue the hoisted gate/up weight DMA (exp 6 Phase A/B split) given a
-    pre-allocated SBUF tile. Used by:
+    """Issue the hoisted gate/up weight DMA into a pre-allocated SBUF tile.
 
-    1. `gate_up_projection_lhs_rhs_swap` for the in-line hoisted DMA path
-       (default exp 6 behaviour when caller does NOT prefetch).
-    2. `selective_expert_impl._selective_expert_moe_tkg` for the cross-expert
-       prefetch ring (exp 7) where the DMA is emitted BEFORE the K-loop body
-       so expert k+1's weights start arriving during expert k's matmul.
-
-    Layout invariant: Phase A + Phase B together fill the entire
-    [H0, H1_shard, shared_I] region exactly the way a single DMA would, so
-    downstream matmul indexing into `hoisted_weight` is unchanged.
+    Split into two H1-halves (Phase A then B) so the matmul on A's rows can
+    start before B lands. Used both by the in-function hoist below and by
+    the cross-expert prefetch ring in selective_expert_impl.
     """
     H0 = dims.H0
     shared_I = shard_dim_intr[1] - shard_dim_intr[0]
     full_weight_view = (
-        unsharded_weight.slice(dim=0, start=shard_dim_hidden[0], end=shard_dim_hidden[1])  # LNC shard
-        .reshape_dim(dim=0, shape=(H0, dims.H1_shard))  # shared_H -> H0, H1_shard
-        .slice(dim=2, start=shard_dim_intr[0], end=shard_dim_intr[1])  # Slice on shared_I dim
+        unsharded_weight.slice(dim=0, start=shard_dim_hidden[0], end=shard_dim_hidden[1])
+        .reshape_dim(dim=0, shape=(H0, dims.H1_shard))
+        .slice(dim=2, start=shard_dim_intr[0], end=shard_dim_intr[1])
     )
     _hoisted_dge = dge_mode if dge_mode is not None else nisa.dge_mode.hwdge
     half_h1 = dims.H1_shard // 2
-    # Phase A: first half of H1 - matmul can begin on these rows immediately
     nisa.dma_copy(
         dst=hoisted_weight[0:H0, 0:half_h1, 0:shared_I],
         src=full_weight_view.slice(dim=1, start=0, end=half_h1).get_view(),
         dge_mode=_hoisted_dge,
     )
-    # Phase B: second half - overlaps with the matmul of Phase A's tiles
     nisa.dma_copy(
         dst=hoisted_weight[0:H0, half_h1:dims.H1_shard, 0:shared_I],
         src=full_weight_view.slice(dim=1, start=half_h1, end=dims.H1_shard).get_view(),
@@ -333,13 +329,10 @@ def gate_up_projection_lhs_rhs_swap(
         wrapper (`process_gate_up_projection`), halving DMA descriptor count and
         doubling the contiguous per-row inner chunk.
 
-    Optional pre-loaded hoisted weight (exp 7 cross-expert prefetch):
-        When `hoisted_weight` is set AND `skip_hoisted_dma=True`, the caller has
-        already issued the DMA into `hoisted_weight` (e.g., for cross-expert
-        prefetch in selective_expert_impl). This sub-kernel skips the in-line
-        Phase A/B DMA and goes straight to matmul against the pre-loaded tile.
-        When `skip_hoisted_dma=False` (default), the existing exp 6 behaviour
-        applies: emit Phase A/B DMAs immediately before the matmul loop.
+    Optional pre-loaded hoisted weight:
+        When `hoisted_weight` is set AND `skip_hoisted_dma=True`, the caller
+        has already issued the DMA (cross-expert prefetch ring); skip the
+        in-line DMA and matmul against the pre-loaded tile.
 
     Returns:
         Output tensor with shape [128, I/128, T]
@@ -525,26 +518,15 @@ def gate_up_projection_lhs_rhs_swap(
         )
         result_psums.append(result_psum)
 
-    # ---------- Hoisted weight load (Exp 3 + Exp 6 Phase A/B + Exp 7 prefetch) ----------
-    # Three modes:
-    #   1. hoisted_weight is None              -> per-HTile ring buffer load (legacy path)
-    #   2. hoisted_weight set, skip_hoisted_dma=False (exp 6 default)
-    #      -> emit Phase A/B DMA here, immediately before matmul loop
-    #   3. hoisted_weight set, skip_hoisted_dma=True (exp 7)
-    #      -> caller (selective_expert_impl) already issued the DMA before
-    #         the K-loop body, so we just use the pre-loaded tile
+    # Hoisted weight modes:
+    #   1. hoisted_weight is None             -> per-HTile ring (legacy)
+    #   2. hoisted_weight set, skip_dma=False -> emit Phase A/B DMA here
+    #   3. hoisted_weight set, skip_dma=True  -> caller already issued DMA
+    #                                            (cross-expert prefetch ring)
+    # The wrapper routes gate via HWDGE and up via SWDGE so the two equal-sized
+    # weight loads run on different DGE engines in parallel.
     use_hoisted_weight = (hoisted_weight is not None) and (not use_fused_load)
     if use_hoisted_weight and not skip_hoisted_dma:
-        # Exp 4: gate -> HWDGE (Sync), up -> SWDGE (GpSimd) for parallel
-        # execution at the hoisted-DMA scope. The wrapper passes
-        # hoisted_dge_mode=hwdge for the gate call and swdge for the up call,
-        # so gate and up weight loads run on DIFFERENT descriptor-generation
-        # engines and can overlap on HW. Each individual hoisted DMA stays
-        # contiguous on a single engine (unlike exp 1's imbalanced split),
-        # preserving the canonical HW intersect SW co-execution window while
-        # giving 50:50 volume balance (gate and up weights are equal size).
-        # Exp 6: split hoisted DMA into two H1-halves so TE matmul can start
-        # after Phase A lands and Phase B overlaps with first matmul iterations.
         emit_hoisted_gate_up_dma(
             unsharded_weight=unsharded_weight,
             hoisted_weight=hoisted_weight,
@@ -736,25 +718,14 @@ def process_gate_up_projection(
     The MLP TKG implementation therefore uses Static DMA for tensor loads.
     If HBM out-of-memory (OOM) issues arise, we can fall back to DGE mode.
 
-    Cross-expert prefetch (exp 7):
-    -----------------------------
-    When `pre_loaded_hoisted_gate` AND `pre_loaded_hoisted_up` are provided
-    (only valid on the lhs_rhs_swap path with column tiling disabled and fused
-    load disabled), this function:
-      - skips internal hoisted-weight allocation, and
-      - threads the pre-loaded tiles into `gate_up_projection_lhs_rhs_swap`
-        with `skip_hoisted_dma=True` so the inner sub-kernel does NOT re-issue
-        the DMA.
-    The caller (selective_expert_impl) is responsible for emitting the DMAs
-    BEFORE this call into the matching ring-buffer slot, enabling expert k+1's
-    weights to load concurrently with expert k's matmul.
+    Cross-expert prefetch:
+        When `pre_loaded_hoisted_gate`/`_up` are provided (lhs_rhs_swap path
+        only, no column tiling, no fused load), skip internal hoist allocation
+        and thread the pre-loaded tiles into the inner kernel with
+        `skip_hoisted_dma=True`. Caller emits the DMAs before this call.
 
-    Note:
-    -----
-    Intermediate gate/up projection tensors are always fp32 to improve numerical accuracy.
-    Hidden tensor in SBUF has layout [H, T], tiled as [128(H0), T, H//128] to fully utilize the partition dimension.
-    Caller will have the flexibility to manage sbm:sbufManager's scope and interleave degree.
-
+    Intermediate gate/up tensors are fp32 for numerical accuracy. Hidden in
+    SBUF uses layout [128(H0), T, H//128] for full partition utilization.
     """
     gate_w, up_w = params.gate_proj_weights_tensor, params.up_proj_weights_tensor
     gate_b, up_b = (
@@ -1013,17 +984,10 @@ def process_gate_up_projection(
             # Not enough budget for fused tiles -> disable fusion and fall through to regular tiles.
             use_fused_gate_up_load = False
 
-    # ---------------- Exp 3: Hoisted gate/up weight tiles (lhs_rhs_swap only) ----------------
-    # When on the lhs_rhs_swap path (column tiling disabled) and not using the
-    # fused gate+up load, replace the per-HTile ring buffer with two pre-allocated
-    # tiles spanning the full [H0, H1_shard, I] weight slice. One single dma_copy
-    # loads each tile up-front, dropping per-projection HWDGE DMA_DIRECT2D inst
-    # count from num_HTiles -> 1.
-    #
-    # Exp 7: When the caller provides `pre_loaded_hoisted_gate` and
-    # `pre_loaded_hoisted_up` (cross-expert prefetch from selective_expert_impl),
-    # we skip internal allocation and reuse the caller's ring-buffer slot. The
-    # DMA emission is also skipped — the caller has already issued it.
+    # Hoisted gate/up weight tiles (lhs_rhs_swap path, no fused load): one
+    # [H0, H1_shard, I] tile per projection, loaded with a single DMA instead
+    # of a per-HTile ring buffer. Caller-preloaded tiles take precedence
+    # (cross-expert prefetch ring); otherwise we allocate them here.
     use_caller_preloaded_hoist = (
         pre_loaded_hoisted_gate is not None
         and pre_loaded_hoisted_up is not None
@@ -1037,18 +1001,14 @@ def process_gate_up_projection(
     use_hoisted_gate_up_load = (
         (not params.use_tkg_gate_up_proj_column_tiling)
         and (not use_fused_gate_up_load)
+        and (not _MOE_LEGACY_WEIGHT_LOAD)
     )
 
     if not use_fused_gate_up_load:
         if use_caller_preloaded_hoist:
-            # Exp 7: caller-supplied ring-buffer slot already loaded — no allocation,
-            # no DMA emission inside lhs_rhs_swap (skip_hoisted_dma=True below).
             gate_hoisted_weight = pre_loaded_hoisted_gate
             up_hoisted_weight = pre_loaded_hoisted_up
         elif use_hoisted_gate_up_load:
-            # Exp 3 default path: allocate two hoisted tiles (gate, up) each
-            # spanning the full H1_shard so we never need a ring-buffer rollover
-            # inside the HTile loop.
             weight_dtype = nl.float8_e4m3 if str(up_w.dtype) == "float8e4" else up_w.dtype
             if not params.skip_gate_proj:
                 gate_hoisted_weight = sbm.alloc_stack(
@@ -1169,9 +1129,9 @@ def process_gate_up_projection(
                     fused_weight_tiles=fused_weight_tiles,
                     i_offset_in_fused=0,
                     hoisted_weight=gate_hoisted_weight,
-                    # Exp 4: route gate hoisted DMA through HWDGE (Sync engine).
+                    # gate -> HWDGE, up -> SWDGE: equal-sized loads on
+                    # different DGE engines run in parallel.
                     hoisted_dge_mode=nisa.dge_mode.hwdge,
-                    # Exp 7: caller pre-loaded ring slot -> skip in-line DMA.
                     skip_hoisted_dma=use_caller_preloaded_hoist,
                 )
 
@@ -1196,12 +1156,7 @@ def process_gate_up_projection(
                 fused_weight_tiles=fused_weight_tiles,
                 i_offset_in_fused=(I_end - I_start) if use_fused_gate_up_load else 0,
                 hoisted_weight=up_hoisted_weight,
-                # Exp 4: route up hoisted DMA through SWDGE (GpSimd engine) so it
-                # runs in parallel with gate's HWDGE DMA. With identical gate/up
-                # weight shapes (~226.5 MB each at TP=8), the engines see a
-                # perfect 50:50 split at the hoisted scope.
                 hoisted_dge_mode=nisa.dge_mode.swdge,
-                # Exp 7: caller pre-loaded ring slot -> skip in-line DMA.
                 skip_hoisted_dma=use_caller_preloaded_hoist,
             )
 

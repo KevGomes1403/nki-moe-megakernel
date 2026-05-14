@@ -278,10 +278,8 @@ def _multilayer_body(
     sbm = BufferManager(0, SBM_SIZE_BYTES, Logger("transformer_gpt_oss_tkg_multilayer"))
     sbm.set_auto_alloc(True)
 
-    # ---- Phase 4: build masks and permute RoPE cos/sin inside the kernel ----
-    # Derive cache sizes from K caches: even layers (SWA) use K_caches[0],
-    # odd layers (full) use K_caches[1]. K_cache layout: [B, kv_heads, S_max_ctx,
-    # d_head] (4-D, kv_heads=1 for GQA), so the cache dim is shape[-2].
+    # Cache sizes by attention type. K_cache layout is
+    # [B, kv_heads, S_max_ctx, d_head] (4-D, kv_heads=1 for GQA).
     S_WINDOW_CTX = K_caches[0].shape[-2]   # SWA cache size (128 for gpt-oss)
     S_FULL       = K_caches[1].shape[-2]   # full cache size (e.g. 640 for bk640)
 
@@ -306,9 +304,7 @@ def _multilayer_body(
 
     for layer_idx in range(num_layers):
         is_sliding = (layer_idx % 2 == 0)
-        # Masks and RoPE cos/sin are built once above; select the right one
-        # per layer. SWA and full-attention layers share the same permuted
-        # cos/sin (gpt-oss has a single rotary), so cos/sin do not branch.
+        # gpt-oss alternates SWA / full attention. Shared RoPE across both.
         attn_mask = mask_window_hbm if is_sliding else mask_full_hbm
         kv_idx = position_ids_window if is_sliding else position_ids
 
@@ -316,8 +312,8 @@ def _multilayer_body(
         sbm.set_name_prefix(f"L{layer_idx}_attn_")
         sbm.set_auto_alloc(True)
 
-        # Copy residual: attention_block_tkg's fused RMSNorm writes back in-place
-        # and would corrupt the residual stream otherwise.
+        # Copy residual — attention_block_tkg's fused RMSNorm writes back
+        # in-place and would corrupt the residual otherwise.
         attn_in_sb = nl.ndarray((H0, BxS * H1), dtype=dtype, buffer=nl.sbuf,
                                  name=f"L{layer_idx}_attn_in_sb")
         nisa.tensor_copy(attn_in_sb, residual_sb)
@@ -403,10 +399,9 @@ def _multilayer_body(
         expert_affinities_sb = nl.ndarray((T, E), dtype=nl.float32,
                                           buffer=nl.sbuf,
                                           name=f"L{layer_idx}_expert_affinities_sb")
-        # router_pre_norm=False matches HF: topK(logits) → softmax(topK) →
-        # scatter. The (topK, ACT2, Scatter) path rebinds expert_affinities
-        # (router_topk.py:975), so we must capture the returned value.
-        # norm_topk_prob=False — HF does not renormalize.
+        # HF routing: topK(logits) → softmax(topK) → scatter, no renorm.
+        # The (topK, ACT2, Scatter) path rebinds expert_affinities, so we
+        # capture the returned value.
         router_outputs = router_topk(
             x=moe_in_sb,
             w=router_w_list[layer_idx],
@@ -425,8 +420,8 @@ def _multilayer_body(
         )
         expert_affinities_sb = router_outputs[2]
 
-        # up clamp shifted by +1 because ExpertMLPsV2.preshard_hook folds +1.0
-        # into expert_gate_up_bias's up half (expert_mlps_v2.py:220-225).
+        # up clamp +1: ExpertMLPsV2.preshard_hook folds +1.0 into the
+        # up half of expert_gate_up_bias.
         moe_out_sb = moe_tkg(
             hidden_input=moe_in_sb,
             expert_gate_up_weights=gate_up_list[layer_idx],

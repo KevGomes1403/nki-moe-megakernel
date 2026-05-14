@@ -12,28 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Selective-expert MoE token generation implementation that processes only top-K selected experts per token.
+"""Selective-expert MoE TKG: processes only top-K experts per token.
 
-Vendored from nkilib/core/moe/moe_tkg/selective_expert_impl.py @
-nkilib 0.1.0+gd4920de. Edits relative to upstream:
-  1. Relative `...` / `..` imports rewritten to absolute `nkilib.core.*`.
-  2. New `name_prefix: str = ""` kwarg threaded through
-     `_selective_expert_moe_tkg`. The function creates its own internal
-     `SbufManager` (line ~107), so the megakernel's outer
-     `sbm.set_name_prefix(...)` does NOT reach this code path. We
-     `set_name_prefix(name_prefix)` on the internal sbm immediately after
-     creation, and prepend `name_prefix` to every subsequent
-     `sbm.set_name_prefix(...)` call in the per-token loop. Without this,
-     the same `T0_K0_*` names would be emitted by every layer's MoE
-     invocation in the megakernel, producing duplicate-op-name compile
-     errors. The megakernel's caller passes
-     `name_prefix=f"L{layer_idx}_moe_"`.
-  3. Exp 7: cross-expert prefetch ring for gate/up hoisted weights. Before
-     the K-loop body runs, we issue the DMA for the NEXT expert's gate/up
-     weights into the OTHER slot of a 2-slot ring buffer so the DMA for
-     expert k+1 overlaps with the matmul of expert k. `process_gate_up_projection`
-     consumes a pre-loaded slot for the current iteration and skips its
-     in-line DMA emission.
+Vendored from nkilib selective_expert_impl.py with two megakernel-specific
+additions: (1) a `name_prefix` kwarg so per-layer MoE invocations don't
+collide on op names (the function builds its own internal SbufManager so
+the megakernel's outer prefix doesn't reach here), and (2) a 2-slot
+cross-expert prefetch ring that issues expert k+1's gate/up DMAs while
+expert k's matmul runs.
 """
 
 import os as _os
@@ -41,12 +27,13 @@ import os as _os
 import nki.isa as nisa
 import nki.language as nl
 
-# Env-var guard for the fused gate+up DMA path. Default OFF: matches the canonical
-# upstream nkilib behaviour so the megakernel's multi-layer compiler schedule is
-# unchanged. Set NKI_MOE_ENABLE_FUSION=1 to enable the fused gate+up dma_copy that
-# halves descriptor count in standalone (saves ~13us at H=3072, I=384, K=4). Read
-# at module import — toggle requires NEFF recompile.
+# Fused gate+up dma_copy — halves descriptor count (~13 µs win at bs=1).
 _MOE_FUSION_ENABLED = _os.environ.get("NKI_MOE_ENABLE_FUSION", "0") == "1"
+
+# Revert to upstream's per-HTile weight DMA (disables all in-function hoists
+# and the cross-expert prefetch ring). For A/B testing the hoist's
+# contribution to SBUF demand — see study_results/megakernel_study.md.
+_MOE_LEGACY_WEIGHT_LOAD = _os.environ.get("NKI_MOE_LEGACY_WEIGHT_LOAD", "0") == "1"
 
 from nkilib.core.mlp.mlp_parameters import (
     MLPBiasParameters,
@@ -288,29 +275,20 @@ def _selective_expert_moe_tkg(
     # convert dims.T to 1 to compute output by each token
     dims.T = 1
 
-    # ---------------- Exp 7: cross-expert prefetch ring for gate/up hoisted weights ----------------
-    # The hoisted-weight optimization (exp 3) loads the entire [H0, H1_shard, I]
-    # slice for one expert into a single SBUF tile before the matmul. Exp 7 lifts
-    # this DMA OUT of process_gate_up_projection and double-buffers it across two
-    # ring slots so expert k+1's DMA can run concurrently with expert k's matmul.
-    #
-    # Activation conditions (mirror process_gate_up_projection's hoisted path):
-    #   - column tiling disabled (set above)
-    #   - fused gate+up load disabled (NKI_MOE_ENABLE_FUSION=0)
-    #   - not skipping gate proj (need both gate AND up tiles)
-    #   - K >= 2 (otherwise no overlap possible)
+    # Cross-expert prefetch ring: double-buffer the hoisted gate/up DMA across
+    # two slots so expert k+1's weights load concurrently with expert k's
+    # matmul. Mirrors the activation conditions of the in-function hoist in
+    # process_gate_up_projection.
     use_prefetch_ring = (
         (not params.use_tkg_gate_up_proj_column_tiling)
         and (not _MOE_FUSION_ENABLED)
         and (not params.skip_gate_proj)
         and (dims.K >= 2)
+        and (not _MOE_LEGACY_WEIGHT_LOAD)
     )
 
     if use_prefetch_ring:
-        # Compute hoisted DMA shard arguments. These mirror process_gate_up_projection's
-        # per-call setup: the entire H/I tensor maps to a single hoisted tile.
-        # shard_dim_intr assumes the single I-shard path (dims.I <= dims.max_I_shard_size),
-        # which is also assumed by the exp 3 hoisted tile shape (dims.H0, dims.H1_shard, dims.I).
+        # Single-I-shard path: entire [H0, H1_shard, I] maps to one hoisted tile.
         _h_offset = dims.H1_offset * dims.H0
         _shard_dim_hidden = (_h_offset, _h_offset + dims.H_per_shard)
         _shard_dim_intr = (0, dims.I)
@@ -332,14 +310,8 @@ def _selective_expert_moe_tkg(
         )
         broadcast_token_affinity(expert_affinity_sb, gathered_affinities_sb, global_token_idx, dims, sbm)
 
-        # ---------------- Exp 7: Allocate 2-slot prefetch ring buffer ----------------
-        # Each slot holds the gate and up hoisted weight tiles for one expert.
-        # Two slots let expert k+1's DMA execute concurrently with expert k's matmul.
-        #
-        # SBUF budget: 4 hoisted tiles vs the 2 tiles process_gate_up_projection
-        # would have allocated internally. Net delta = +2 * (H0, H1_shard, I) bf16
-        # ≈ +37 KB / partition for gpt-oss (H1_shard=24, I=384) — well within the
-        # 200 KB SBM budget given exp 6 used only 55 % (113 KB).
+        # 2-slot ring per (gate, up). +2×(H0, H1_shard, I) bf16 vs the in-function
+        # hoist; ~+37 KB/partition at gpt-oss shapes.
         prefetch_gate_slots = None
         prefetch_up_slots = None
         if use_prefetch_ring:
@@ -359,9 +331,7 @@ def _selective_expert_moe_tkg(
                 prefetch_gate_slots.append(gate_slot)
                 prefetch_up_slots.append(up_slot)
 
-            # Prime the ring: issue DMA for expert k=0's weights into slot 0 BEFORE
-            # entering the K-loop body so the first iteration's matmul can run as
-            # soon as Phase A lands.
+            # Prime slot 0 with expert k=0 before the K-loop.
             sbm.set_name_prefix(f"{name_prefix}T{global_token_idx}_prefetch_K0_")
             _expert0_offset = expert_idx.ap(
                 pattern=[[dims.K, 1], [1, 1]], offset=global_token_idx * dims.K + 0
@@ -452,15 +422,11 @@ def _selective_expert_moe_tkg(
                 expert_id_scalar_offset,
             )
 
-            # ---------------- Exp 7: prefetch expert k+1's gate/up weights ----------------
-            # Issue DMA for the NEXT expert's weights into the OTHER ring slot BEFORE
-            # the current expert's matmul runs. This lets the DMA queue work on
-            # k+1's bytes while the Tensor Engine consumes k's pre-loaded slot.
+            # Prefetch expert k+1 into the other ring slot before k's matmul
+            # runs — DMA queue works on k+1 while TE consumes k.
             if use_prefetch_ring and expert_k_idx + 1 < dims.K:
                 next_k = expert_k_idx + 1
                 next_slot = next_k % 2
-                # Save current sbm name prefix and switch to a prefetch-specific
-                # one so the emitted DMA instructions have unique op names.
                 _saved_prefix = sbm.get_name_prefix()
                 sbm.set_name_prefix(f"{name_prefix}T{global_token_idx}_prefetch_K{next_k}_")
                 next_expert_offset = expert_idx.ap(
@@ -484,10 +450,8 @@ def _selective_expert_moe_tkg(
                     shard_dim_intr=_shard_dim_intr,
                     dge_mode=nisa.dge_mode.swdge,
                 )
-                # Restore the per-expert name prefix for the matmul scope.
                 sbm.set_name_prefix(_saved_prefix)
 
-            # Pick the pre-loaded ring slot for the current expert k.
             if use_prefetch_ring:
                 _cur_slot = expert_k_idx % 2
                 _pre_loaded_gate = prefetch_gate_slots[_cur_slot]
