@@ -14,8 +14,14 @@
 
 """Down projection sub-kernels for MLP TKG with column tiling and LHS/RHS swap modes."""
 
+import os as _os
+
 import nki.isa as nisa
 import nki.language as nl
+
+# Revert to upstream per-HTile down weight DMA (bypasses the in-function
+# hoist). Mirrors selective_expert_impl.py's flag.
+_MOE_LEGACY_WEIGHT_LOAD = _os.environ.get("NKI_MOE_LEGACY_WEIGHT_LOAD", "0") == "1"
 
 from nkilib.core.utils.allocator import SbufManager
 from nkilib.core.utils.interleave_copy import interleave_copy
@@ -232,16 +238,12 @@ def down_projection_lhs_rhs_swap(
     Tiled computation:
         H/128 * [ I/128 * (Weight[128, 128] @ Hidden[128, T]) ]
 
-    Exp 5: Optional hoisted weight load
-    -----------------------------------
-    When a pre-allocated `hoisted_weight` tile of shape
-    [I0, num_total_128_tiles_per_I, H_per_shard] is provided, the per-(HTile, i_tile)
-    DMA is replaced with a SINGLE dma_copy that pulls the full down-projection
-    weight slice in one descriptor stream. The matmul indexes into this hoisted
-    tile with the same effective stride pattern (optimized or non-optimized
-    layout). This drops the down-proj DMA descriptor count from
-    (num_HTiles * num_total_128_tiles_per_I) -> 1 per call, mirroring the gate/up
-    hoist applied in Exp 3.
+    Optional hoisted weight load:
+        When `hoisted_weight` is provided (shape
+        [I0, num_total_128_tiles_per_I, H_per_shard]), the per-(HTile, i_tile)
+        DMA is replaced with a single dma_copy pulling the full weight slice.
+        Drops descriptor count from (num_HTiles * num_total_128_tiles_per_I)
+        to 1 per call.
 
     Returns:
         Output tensor with shape [128, H//128, T]
@@ -294,26 +296,10 @@ def down_projection_lhs_rhs_swap(
         )
         result_psums.append(result_psum)
 
-    # ---------- Hoisted weight load (Exp 5) ----------
-    # When a pre-allocated `hoisted_weight` tile is provided, issue ONE dma_copy
-    # that pulls the full down-projection weight slice in a single descriptor
-    # stream. This drops the per-(HTile, i_tile) DMA cadence
-    # (num_HTiles * num_total_128_tiles_per_I small DMAs) down to a single larger
-    # DMA, cutting GpSimd DMA_DIRECT2D descriptor count per down call from
-    # ~num_HTiles*num_total_128_tiles_per_I -> 1.
-    #
-    # Source layout reasoning: weight is [I, H_total]; we slice the H_per_shard
-    # band. The SBUF hoisted_weight has shape [I0, num_total_128_tiles_per_I,
-    # H_per_shard], and the canonical per-(HTile, i_tile) DMA places HBM I
-    # position (i_tile.index * I0 + p) into SBUF partition p of slot i_tile.index.
-    # That means partition stride must be H_total (one I row) and slot stride
-    # must be I0 * H_total (jump I0 rows). The naive
-    # reshape_dim(dim=0, shape=(I0, num_total_128_tiles_per_I)) does C-order so
-    # it puts slot as the INNER sub-dim (stride H_total) and partition as the
-    # OUTER (stride num_total_128_tiles_per_I * H_total), which inverts the
-    # mapping. To get the canonical mapping we reshape into
-    # (num_total_128_tiles_per_I, I0) so partition is the inner sub-dim with
-    # stride H_total, then permute (1, 0, 2) to make partition dim-0.
+    # Hoisted weight load: one dma_copy for the full down-projection weight
+    # slice. The naive reshape_dim((I0, num_total_128_tiles_per_I)) would put
+    # slot as the inner sub-dim; we need partition inner (stride H_total) so
+    # reshape to (num_total_128_tiles_per_I, I0) then permute (1, 0, 2).
     use_hoisted_weight = hoisted_weight is not None
     if use_hoisted_weight:
         full_weight_view = (
@@ -325,8 +311,6 @@ def down_projection_lhs_rhs_swap(
             .reshape_dim(dim=0, shape=(dims.num_total_128_tiles_per_I, I0))
             .permute((1, 0, 2))
         )
-        # Preserve the canonical down-proj engine choice (GpSimd via adaptive_dge_mode).
-        # Exp 5 is about descriptor count, not engine choice.
         nisa.dma_copy(
             dst=hoisted_weight[0:I0, 0 : dims.num_total_128_tiles_per_I, 0 : dims.H_per_shard],
             src=full_weight_view.get_view(),
@@ -590,20 +574,15 @@ def process_down_projection(
         current_address, remaining_space, params, dims, gate_tile_info, sbm.is_auto_alloc()
     )
 
-    # ---------------- Exp 5: Hoisted down weight tile (lhs_rhs_swap only) ----------------
-    # When on the lhs_rhs_swap path (column tiling disabled), replace the per-HTile
-    # per-i_tile ring-buffer with a single pre-allocated tile spanning the full
-    # [I0, num_total_128_tiles_per_I, H_per_shard] weight slice. ONE dma_copy
-    # loads the full tile up-front, dropping per-call GpSimd DMA_DIRECT2D inst
-    # count from (num_HTiles * num_total_128_tiles_per_I) -> 1.
-    #
-    # Budget note: bytes(hoisted tile) = I0 * num_total_128_tiles_per_I * H_per_shard
-    # * dtype_size = I * H_per_shard * dtype_size. This equals the bytes of
-    # (num_HTiles * num_total_128_tiles_per_I) ring-buffer tiles when HTile evenly
-    # divides H_per_shard. If the allocator already had budget for the ring tiles,
-    # the hoisted path is bytes-equivalent or smaller.
+    # Hoisted down weight tile (lhs_rhs_swap path): replace the per-HTile,
+    # per-i_tile ring buffer with a single [I0, num_total_128_tiles_per_I,
+    # H_per_shard] tile loaded by one DMA. Bytes-equivalent to the ring tiles
+    # when HTile divides H_per_shard.
     down_hoisted_w_tile = None
-    use_hoisted_down_load = not params.use_tkg_down_proj_column_tiling
+    use_hoisted_down_load = (
+        (not params.use_tkg_down_proj_column_tiling)
+        and (not _MOE_LEGACY_WEIGHT_LOAD)
+    )
 
     weight_tiles = []
     if use_hoisted_down_load:
