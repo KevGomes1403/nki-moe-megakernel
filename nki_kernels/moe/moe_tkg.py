@@ -46,7 +46,7 @@ from nkilib.core.moe.moe_tkg.all_expert_impl import _all_expert_moe_tkg
 from nkilib.core.moe.moe_tkg.all_expert_mx_impl import _all_expert_moe_tkg_mx
 from .moe_tkg_affinity_masking import mask_expert_affinities
 from .selective_expert_impl import _selective_expert_moe_tkg
-from nkilib.core.moe.moe_tkg.selective_expert_mx_impl import _selective_expert_moe_tkg_mxfp4
+from .selective_expert_mx_impl import _selective_expert_moe_tkg_mxfp4
 
 # Constants
 _SUPPORTED_MX_DTYPES = (nl.float4_e2m1fn_x4, nl.float8_e4m3fn_x4)
@@ -286,7 +286,7 @@ def moe_tkg(
             _all_expert_moe_tkg(mlp_params, output)
     else:
         if is_mx_kernel:
-            _selective_expert_moe_tkg_mxfp4(mlp_params, output)
+            _selective_expert_moe_tkg_mxfp4(mlp_params, output, name_prefix=name_prefix)
         else:
             _selective_expert_moe_tkg(mlp_params, output, name_prefix=name_prefix)
 

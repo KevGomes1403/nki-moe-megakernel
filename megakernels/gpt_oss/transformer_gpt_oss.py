@@ -32,6 +32,7 @@ from nkilib.core.utils.common_types import (
     RouterActFnType,
 )
 from nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
+from nkilib.core.utils.tensor_view import TensorView
 from nkilib.experimental.transformer.transformer_tkg import _sb2sb_all_reduce_gather
 
 NUM_LAYERS = 24
@@ -246,10 +247,12 @@ def _multilayer_body(
     gpost_list,          # tuple of L: [1, H]                   bf16  HBM (post_attn_layernorm)
     router_w_list,       # tuple of L: [H, E]                   bf16  HBM
     router_b_list,       # tuple of L: [1, E]                   bf16  HBM
-    gate_up_list,        # tuple of L: [E, H, 2, I]             bf16  HBM (fused gate+up)
-    gate_up_b_list,      # tuple of L: [E, 2, I]                bf16  HBM
-    down_list,           # tuple of L: [E, I, H]                bf16  HBM
+    gate_up_list,        # tuple of L: bf16 [E, H, 2, I] or uint16 [E, 128, 2, H/512, I] (MX)
+    gate_up_b_list,      # tuple of L: bf16 [E, 2, I] or [E, I_p, 2, n_I_tiles, 4] (MX)
+    down_list,           # tuple of L: bf16 [E, I, H] or uint16 [E, I_p, n_I_tiles, H] (MX)
     down_b_list,         # tuple of L: [E, H]                   bf16  HBM
+    gate_up_s_list,      # tuple of L: uint8 [E, 16, 2, H/512, I] (MX only, else ())
+    down_s_list,         # tuple of L: uint8 [E, I_p/8, n_I_tiles, H] (MX only, else ())
     K_caches,            # tuple of L: per-layer K cache        bf16  HBM (mutated in-place)
     V_caches,            # tuple of L: per-layer V cache        bf16  HBM (mutated in-place)
     cos_unperm,          # [B, S_tkg, d_head//2]                bf16  HBM (RoPE cos, un-permuted)
@@ -258,6 +261,7 @@ def _multilayer_body(
     position_ids_window, # [B, 1]                               int32 HBM (SWA layers, modulo'd)
     num_layers,
     num_heads_per_rank,  # q_heads after TP shard (e.g. 16 at TP=4, 8 at TP=8)
+    mxfp4,               # bool: True selects MXFP4 MoE path
     replica_groups=None,
 ):
     B, S_tkg, _ = X.shape
@@ -420,27 +424,70 @@ def _multilayer_body(
         )
         expert_affinities_sb = router_outputs[2]
 
-        # up clamp +1: ExpertMLPsV2.preshard_hook folds +1.0 into the
-        # up half of expert_gate_up_bias.
-        moe_out_sb = moe_tkg(
-            hidden_input=moe_in_sb,
-            expert_gate_up_weights=gate_up_list[layer_idx],
-            expert_down_weights=down_list[layer_idx],
-            expert_affinities=expert_affinities_sb,
-            expert_index=expert_index_sb,
-            is_all_expert=False,
-            expert_gate_up_bias=gate_up_b_list[layer_idx],
-            expert_down_bias=down_b_list[layer_idx],
-            activation_fn=ActFnType.Swish,
-            expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
-            name_prefix=f"L{layer_idx}_moe_",
-            gate_clamp_upper_limit=7.0,
-            gate_clamp_lower_limit=None,
-            up_clamp_upper_limit=8.0,
-            up_clamp_lower_limit=-6.0,
-            output_in_sbuf=True,
-            output_dtype=dtype,
-        )
+        # Up clamp [-6, 8]: HF's `clamp(up+b_up, -7, 7) + 1` ≡
+        # `clamp(up + (b_up+1), -6, 8)` after +1 is folded into bias by NxDI's
+        # preshard hook (bf16) or hidden_act_bias=1.0 (MX).
+        # MX needs HBM hidden_input + HBM output (kernel asserts no SBUF
+        # output in MX selective). Residual is already H-shuffled under MX
+        # (is_full_model_shuffled=True), so a plain SBUF↔HBM copy preserves
+        # the layout the kernel expects.
+        if mxfp4:
+            hbm_hidden = nl.ndarray((BxS, H), dtype=dtype, buffer=nl.shared_hbm,
+                                    name=f"L{layer_idx}_moe_hidden_hbm")
+            tiling_pattern = [[H1, H0], [1, H1], [H, BxS]]
+            nisa.dma_copy(
+                dst=hbm_hidden.reshape((BxS * H,)).ap(pattern=tiling_pattern, offset=0),
+                src=moe_in_sb,
+                dge_mode=nisa.dge_mode.hwdge,
+            )
+            moe_out_hbm = moe_tkg(
+                hidden_input=hbm_hidden,
+                expert_gate_up_weights=TensorView(gate_up_list[layer_idx]).reinterpret_cast(nl.float4_e2m1fn_x4),
+                expert_down_weights=TensorView(down_list[layer_idx]).reinterpret_cast(nl.float4_e2m1fn_x4),
+                expert_gate_up_weights_scale=gate_up_s_list[layer_idx],
+                expert_down_weights_scale=down_s_list[layer_idx],
+                expert_affinities=expert_affinities_sb,
+                expert_index=expert_index_sb,
+                is_all_expert=False,
+                expert_gate_up_bias=gate_up_b_list[layer_idx],
+                expert_down_bias=down_b_list[layer_idx],
+                activation_fn=ActFnType.Swish,
+                expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
+                name_prefix=f"L{layer_idx}_moe_",
+                gate_clamp_upper_limit=7.0,
+                gate_clamp_lower_limit=None,
+                up_clamp_upper_limit=8.0,
+                up_clamp_lower_limit=-6.0,
+                output_in_sbuf=False,
+                output_dtype=dtype,
+            )
+            moe_out_sb = nl.ndarray((H0, BxS, H1), dtype=dtype, buffer=nl.sbuf,
+                                    name=f"L{layer_idx}_moe_out_sb")
+            nisa.dma_copy(
+                dst=moe_out_sb,
+                src=moe_out_hbm.reshape((BxS * H,)).ap(pattern=tiling_pattern, offset=0),
+                dge_mode=nisa.dge_mode.hwdge,
+            )
+        else:
+            moe_out_sb = moe_tkg(
+                hidden_input=moe_in_sb,
+                expert_gate_up_weights=gate_up_list[layer_idx],
+                expert_down_weights=down_list[layer_idx],
+                expert_affinities=expert_affinities_sb,
+                expert_index=expert_index_sb,
+                is_all_expert=False,
+                expert_gate_up_bias=gate_up_b_list[layer_idx],
+                expert_down_bias=down_b_list[layer_idx],
+                activation_fn=ActFnType.Swish,
+                expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
+                name_prefix=f"L{layer_idx}_moe_",
+                gate_clamp_upper_limit=7.0,
+                gate_clamp_lower_limit=None,
+                up_clamp_upper_limit=8.0,
+                up_clamp_lower_limit=-6.0,
+                output_in_sbuf=True,
+                output_dtype=dtype,
+            )
 
         # moe_tkg already produces full H1 in tp102_0; bare AR matches residual.
         moe_reduced_sb = nl.ndarray((H0, BxS * H1), dtype=dtype, buffer=nl.sbuf,
@@ -475,11 +522,12 @@ def _multilayer_body(
     return (Y,) + tuple(K_post) + tuple(V_post)
 
 
-def _build_multilayer_kernel(num_layers: int):
+def _build_multilayer_kernel(num_layers: int, mxfp4: bool = False):
     """Code-gen a kernel with explicit per-layer tensor args.
 
     NKI classifies tuple/list args as scalars (no HBM binding), so each weight
-    and KV cache must be its own top-level arg.
+    and KV cache must be its own top-level arg. Under mxfp4=True, the kernel
+    also takes per-layer GateUpScale_* / DownScale_* args.
     """
     def names(prefix):
         return [f"{prefix}_{i:02d}" for i in range(num_layers)]
@@ -497,6 +545,8 @@ def _build_multilayer_kernel(num_layers: int):
     gub_names     = names("GateUpB")
     dn_names      = names("Down")
     dnb_names     = names("DownB")
+    gus_names     = names("GateUpScale") if mxfp4 else []
+    dns_names     = names("DownScale")   if mxfp4 else []
     k_names       = names("K")
     v_names       = names("V")
 
@@ -509,6 +559,7 @@ def _build_multilayer_kernel(num_layers: int):
         + rw_names + rb_names
         + gu_names + gub_names
         + dn_names + dnb_names
+        + gus_names + dns_names
         + k_names + v_names
         + [
             "cos_unperm", "sin_unperm",
@@ -518,7 +569,7 @@ def _build_multilayer_kernel(num_layers: int):
     )
 
     def tup(ns):
-        return "(" + ", ".join(ns) + ",)"
+        return "(" + ", ".join(ns) + ",)" if ns else "()"
 
     src = (
         f"def transformer_gpt_oss_tkg_multilayer(\n"
@@ -539,6 +590,8 @@ def _build_multilayer_kernel(num_layers: int):
         f"    gate_up_b_list = {tup(gub_names)}\n"
         f"    down_list      = {tup(dn_names)}\n"
         f"    down_b_list    = {tup(dnb_names)}\n"
+        f"    gate_up_s_list = {tup(gus_names)}\n"
+        f"    down_s_list    = {tup(dns_names)}\n"
         f"    K_caches       = {tup(k_names)}\n"
         f"    V_caches       = {tup(v_names)}\n"
         f"    return _multilayer_body(\n"
@@ -550,17 +603,19 @@ def _build_multilayer_kernel(num_layers: int):
         f"        router_w_list, router_b_list,\n"
         f"        gate_up_list, gate_up_b_list,\n"
         f"        down_list, down_b_list,\n"
+        f"        gate_up_s_list, down_s_list,\n"
         f"        K_caches, V_caches,\n"
         f"        cos_unperm, sin_unperm,\n"
         f"        position_ids,\n"
         f"        position_ids_window,\n"
         f"        num_layers={num_layers},\n"
         f"        num_heads_per_rank=num_heads_per_rank,\n"
+        f"        mxfp4={mxfp4},\n"
         f"        replica_groups=replica_groups,\n"
         f"    )\n"
     )
 
-    fname = f"<generated:gpt_oss_multilayer_L{num_layers}>"
+    fname = f"<generated:gpt_oss_multilayer_L{num_layers}_mx{int(mxfp4)}>"
     linecache.cache[fname] = (len(src), None, src.splitlines(keepends=True), fname)
     code = compile(src, fname, "exec")
     ns = {"_multilayer_body": _multilayer_body}
@@ -571,10 +626,11 @@ def _build_multilayer_kernel(num_layers: int):
 transformer_gpt_oss_tkg_multilayer = _build_multilayer_kernel(NUM_LAYERS)
 transformer_gpt_oss_tkg_multilayer_jit = nki.jit(transformer_gpt_oss_tkg_multilayer)
 
-_kernel_cache: dict = {NUM_LAYERS: transformer_gpt_oss_tkg_multilayer_jit}
+_kernel_cache: dict = {(NUM_LAYERS, False): transformer_gpt_oss_tkg_multilayer_jit}
 
 
-def get_multilayer_kernel_jit(num_layers: int):
-    if num_layers not in _kernel_cache:
-        _kernel_cache[num_layers] = nki.jit(_build_multilayer_kernel(num_layers))
-    return _kernel_cache[num_layers]
+def get_multilayer_kernel_jit(num_layers: int, mxfp4: bool = False):
+    key = (num_layers, mxfp4)
+    if key not in _kernel_cache:
+        _kernel_cache[key] = nki.jit(_build_multilayer_kernel(num_layers, mxfp4=mxfp4))
+    return _kernel_cache[key]

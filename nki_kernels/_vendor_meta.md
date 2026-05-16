@@ -35,6 +35,8 @@ nki_kernels/moe/
   router_topk.py                ← nkilib/core/router_topk/router_topk.py
   moe_tkg.py                    ← nkilib/core/moe/moe_tkg/moe_tkg.py
   selective_expert_impl.py      ← nkilib/core/moe/moe_tkg/selective_expert_impl.py
+  selective_expert_mx_impl.py   ← nkilib/core/moe/moe_tkg/selective_expert_mx_impl.py
+  down_projection_mx_shard_H.py ← nkilib/core/mlp/mlp_tkg/down_projection_mx_shard_H.py
   moe_tkg_utils.py              ← nkilib/core/moe/moe_tkg/moe_tkg_utils.py
   moe_tkg_affinity_masking.py   ← nkilib/core/moe/moe_tkg/moe_tkg_affinity_masking.py
 ```

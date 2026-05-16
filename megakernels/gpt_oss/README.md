@@ -39,6 +39,41 @@ The megakernel fuses the entire 24-layer GPT-OSS-20B decoder stack (input layern
 
 TP=8 is used throughout. KV heads are sharded across the 8 LNC=1 cores. `SbufManager` handles on-chip memory allocation; weight double-buffering across layers eliminates the per-layer HBM round-trip cost present in XLA.
 
+## MXFP4 expert weights
+
+The megakernel also supports gpt-oss-20b's native **MXFP4** expert weights (the format the model ships in) via `--mxfp4`. Selected by `is_mxfp4_compute=True`, this swaps the bf16 MoE primitive for the MX selective-expert kernel and routes per-layer expert weights through `nc_matmul_mx` / `quantize_mx` with block-size-32 scales.
+
+Two NKI primitives under `nki_kernels/moe/` back this path:
+
+- `selective_expert_mx_impl.py` — selective-expert MoE TKG with MXFP4 gate/up + down projections (vendored from `nkilib`, with a `name_prefix` kwarg added so 24 per-layer instantiations don't collide on NKI's duplicate-op-name checker).
+- `down_projection_mx_shard_H.py` — H-sharded MXFP4 down projection sub-kernel used by the above.
+
+**Caveat — HBM round-trip per layer.** The current MX MoE kernel asserts `output_in_sbuf=False` and requires its hidden input in HBM (in the model's shuffled-H layout). The megakernel therefore inserts a per-layer `dma_copy` of the MoE input out to `shared_hbm` and the MoE output back into SBUF on either side of the MX call (see `transformer_gpt_oss.py:434-470`). The bf16 path, by contrast, keeps the MoE input/output entirely in SBUF. This round-trip is the dominant overhead of the MX path today and is the next thing to remove — it would require teaching the MX selective-expert kernel to accept an SBUF hidden tensor and emit an SBUF output.
+
+### Running MXFP4
+
+```bash
+# Megakernel with native MXFP4 weights
+python main.py --model gpt_oss --mode generate --enable-nki --mxfp4 \
+  --model-path ~/models/gpt-oss-20b \
+  --compiled-model-path ~/models/gpt-oss-20b/traced_nki_mx_model \
+  --prompt "What is the capital of France?"
+
+# Benchmark
+python main.py --model gpt_oss --mode evaluate-single --enable-nki --mxfp4 \
+  --model-path ~/models/gpt-oss-20b \
+  --compiled-model-path ~/models/gpt-oss-20b/traced_nki_mx_model
+```
+
+Notes:
+
+- `--mxfp4` forces `is_full_model_shuffled=True` (the residual layout the MX MoE kernel expects) and routes CTE through the NKI shard-on-intermediate blockwise path — NxDI's torch blockwise dequant does not support gpt-oss's swizzled MX weight layout.
+- Use a **separate compile cache directory** from the bf16 megakernel (e.g. `traced_nki_mx_model` vs `traced_nki_model`); the NEFFs are not interchangeable. Clear the global cache when switching paths:
+
+  ```bash
+  rm -rf ~/models/gpt-oss-20b/traced_nki_mx_model /var/tmp/neuron-compile-cache/*
+  ```
+
 ## Setup
 
 Tested on Trainium 3 (`trn3pd98.3xlarge`) with AWS Neuron SDK v2.27.
