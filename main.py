@@ -80,6 +80,13 @@ def parse_args():
         help="Which model architecture to load. Selects baseline + NKI module pair.",
     )
     parser.add_argument("--enable-nki", action="store_true")
+    parser.add_argument(
+        "--mxfp4",
+        dest="is_mxfp4_compute",
+        action="store_true",
+        default=False,
+        help="(gpt_oss only) Use MXFP4 expert weights instead of bf16. Forces is_full_model_shuffled=True.",
+    )
     parser.add_argument("--base-latency", type=float, default=526.15)
     parser.add_argument("--base-throughput", type=float, default=134.61)
     # new arguments for the leaderboard
@@ -390,7 +397,16 @@ def prepare_inference(model_cls, args):
             **config_kwargs
         )
 
-    config_kwargs["blockwise_matmul_config"] = {'use_torch_block_wise': True}
+    # MXFP4 dequant in NxDI's torch blockwise path doesn't support the swizzled
+    # weight layout; only the NKI blockwise kernel does. For MX, route CTE to
+    # the NKI shard-on-intermediate path which supports SWIGLU + MX.
+    if config_kwargs.get("is_mxfp4_compute", False):
+        config_kwargs["blockwise_matmul_config"] = {
+            'use_torch_block_wise': False,
+            'use_shard_on_intermediate_dynamic_while': True,
+        }
+    else:
+        config_kwargs["blockwise_matmul_config"] = {'use_torch_block_wise': True}
     neuron_config = model_cls.get_neuron_config_cls()(**config_kwargs)
 
     config = model_cls.get_config_cls()(
