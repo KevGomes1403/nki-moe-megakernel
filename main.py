@@ -15,6 +15,7 @@ from enum import Enum
 
 import torch
 from neuronx_distributed_inference.models.config import (
+    FusedSpecNeuronConfig,
     OnDeviceSamplingConfig,
     to_torch_dtype,
 )
@@ -197,6 +198,14 @@ def parse_args():
     parser.add_argument("--draft-model-path", type=str)
     parser.add_argument("--draft-model-tp-degree", type=int, default=None)
     parser.add_argument("--compiled-draft-model-path", type=str)
+    parser.add_argument(
+        "--draft-model-arch",
+        type=str,
+        choices=["qwen3"],
+        default=None,
+        help="Architecture of the draft model used for fused speculation. "
+             "If unset, auto-derived from --model (qwen3_moe -> qwen3).",
+    )
     parser.add_argument(
         "--enable-fused-speculation", action="store_true", default=False
     )
@@ -386,6 +395,9 @@ def prepare_inference(model_cls, args):
     # Skip values not specified in the args to avoid setting values to None in the config.
     config_kwargs = copy.deepcopy(vars(args))
     config_kwargs = {k: v for k, v in config_kwargs.items() if v is not None}
+    # Fused-spec scaffolding fields (set in main()) are not NeuronConfig kwargs.
+    config_kwargs.pop("draft_model_cls", None)
+    config_kwargs.pop("draft_model_arch", None)
 
     if args.on_device_sampling:
         # NxDI defaults global_topk=256, which makes the on-device sampler's
@@ -393,6 +405,15 @@ def prepare_inference(model_cls, args):
         # applied — adds ~1.7ms of Vector-bound epilogue on Qwen3 vocab=151936.
         # Cap to top_k (or 64 if unset).
         config_kwargs.setdefault("global_topk", config_kwargs.get("top_k", 64))
+        if args.enable_fused_speculation:
+            # NxDI's vanilla fused-spec target needs per-position argmax over
+            # spec_len positions; in _sample_on_device that path only fires when
+            # on_device_sampling.do_sample is False (model_base.py:1164).
+            # With do_sample=True the elif drops to sampling only logits[:, -1, :]
+            # and returns a 1-D [bs] tensor, which crashes _tkg_postprocessor's
+            # target_tokens[:, :-1]. HF-level sampling (top_k/top_p/temp) still
+            # applies to the final accepted-token stream via generation_config.
+            config_kwargs["do_sample"] = False
         config_kwargs["on_device_sampling_config"] = OnDeviceSamplingConfig(
             **config_kwargs
         )
@@ -409,10 +430,55 @@ def prepare_inference(model_cls, args):
         config_kwargs["blockwise_matmul_config"] = {'use_torch_block_wise': True}
     neuron_config = model_cls.get_neuron_config_cls()(**config_kwargs)
 
+    # Fused speculation: build a draft NeuronConfig from the same CLI args
+    # (stripping MoE-only kwargs the dense draft doesn't accept) and attach
+    # a FusedSpecNeuronConfig so NeuronBaseForCausalLM.enable_fused_spec()
+    # compiles target+draft into a single fused-speculation graph.
+    fused_spec_config = None
+    if args.enable_fused_speculation:
+        assert args.draft_model_path is not None, (
+            "--enable-fused-speculation requires --draft-model-path"
+        )
+        draft_model_cls = getattr(args, "draft_model_cls", None)
+        assert draft_model_cls is not None, (
+            "Internal: args.draft_model_cls should be resolved before prepare_inference()"
+        )
+        draft_kwargs = dict(config_kwargs)
+        for k in (
+            "blockwise_matmul_config",
+            "capacity_factor",
+            "fused_shared_experts",
+            "early_expert_affinity_modulation",
+            "disable_normalize_top_k_affinities",
+            "router_act_fn",
+            "router_dtype",
+        ):
+            draft_kwargs.pop(k, None)
+        draft_kwargs["enable_fused_speculation"] = False
+        draft_kwargs["speculation_length"] = 0
+        draft_kwargs["enable_eagle_speculation"] = False
+        if args.draft_model_tp_degree is not None:
+            draft_kwargs["tp_degree"] = args.draft_model_tp_degree
+        if args.tkg_batch_size is not None:
+            draft_kwargs["batch_size"] = args.tkg_batch_size
+        draft_neuron_config = draft_model_cls.get_neuron_config_cls()(**draft_kwargs)
+        draft_config = draft_model_cls.get_config_cls()(
+            draft_neuron_config,
+            load_config=load_pretrained_config(args.draft_model_path),
+        )
+        fused_spec_config = FusedSpecNeuronConfig(
+            worker_cls=model_cls._model_cls,
+            draft_config=draft_config,
+            draft_model_path=args.draft_model_path,
+            draft_model_cls=draft_model_cls,
+        )
+
     config = model_cls.get_config_cls()(
         neuron_config, load_config=load_pretrained_config(args.model_path)
     )
-    
+    if fused_spec_config is not None:
+        config.fused_spec_config = fused_spec_config
+
     model = model_cls(args.model_path, config)
 
     if not args.skip_compile:
@@ -517,6 +583,13 @@ def benchmark_sampling(model, tokenizer, generation_config, prompts):
         if neuron_config.max_new_tokens is None
         else None,
     }
+    # HF's generate() only routes to _assisted_decoding (which NxDI overrides to
+    # dispatch _fused_assisted_decoding) when prompt_lookup_num_tokens (or an
+    # assistant_model) is present. Without it, HF falls to standard _sample and
+    # crashes on outputs.tokens (the fused-spec model returns fused_outputs, not
+    # tokens). Mirrors NxDI's own benchmark_sampling (utils/benchmark.py:96-97).
+    if neuron_config.enable_fused_speculation:
+        input_param["prompt_lookup_num_tokens"] = neuron_config.speculation_length
 
     latency_collectors = create_submodule_latency_collectors(model)
 
@@ -892,7 +965,7 @@ def calculate_score(
     return final_score
 
 
-def find_hlos():
+def find_hlos(enable_fused_speculation=False):
 
     # this path is defined by default NxD, the string matching works with Neuron SDK 2.27
     enc_dir = "/tmp/nxd_model/context_encoding_model/_tp0_bk0"
@@ -900,7 +973,9 @@ def find_hlos():
     assert len(ctx_enc) == 1
     ctx_rt = os.path.join(enc_dir, ctx_enc[0])
 
-    tkg_dir = "/tmp/nxd_model/token_generation_model/_tp0_bk0"
+    # Under fused speculation the TKG submodule is replaced by fused_speculation_model.
+    tkg_subdir = "fused_speculation_model" if enable_fused_speculation else "token_generation_model"
+    tkg_dir = f"/tmp/nxd_model/{tkg_subdir}/_tp0_bk0"
     tkg_gen = [f for f in os.listdir(tkg_dir) if "hlo_module" in f.lower()]
     assert len(tkg_gen) == 1
     tkg_rt = os.path.join(tkg_dir, tkg_gen[0])
@@ -954,6 +1029,28 @@ def main():
     baseline_mod = importlib.import_module(baseline_mod_name)
     baseline_cls = getattr(baseline_mod, cls_name)
 
+    # Resolve draft model class for fused speculation. Draft is a separate,
+    # smaller, same-vocab model (e.g. dense Qwen3-0.6B for a qwen3_moe target).
+    _DRAFT_REGISTRY = {
+        "qwen3": (
+            "neuronx_distributed_inference.models.qwen3.modeling_qwen3",
+            "NeuronQwen3ForCausalLM",
+        ),
+    }
+    _DEFAULT_DRAFT_FOR_TARGET = {"qwen3_moe": "qwen3"}
+    args.draft_model_cls = None
+    if args.enable_fused_speculation:
+        draft_arch = args.draft_model_arch or _DEFAULT_DRAFT_FOR_TARGET.get(args.model)
+        if draft_arch is None:
+            raise ValueError(
+                f"--enable-fused-speculation requires --draft-model-arch "
+                f"(no default for --model {args.model})"
+            )
+        draft_mod_name, draft_cls_name = _DRAFT_REGISTRY[draft_arch]
+        args.draft_model_cls = getattr(
+            importlib.import_module(draft_mod_name), draft_cls_name
+        )
+
     if args.mode == "generate":
         model, tokenizer, generation_config = prepare_inference(target_cls, args)
 
@@ -962,6 +1059,14 @@ def main():
     elif args.mode == "validate":
         if args.platform_target == "trn2":
             print("Validation not supported for trn2, exiting.")
+            quit()
+
+        if args.enable_fused_speculation:
+            print(
+                "Validation is not supported under --enable-fused-speculation "
+                "(NxDI's logit_validation rejects spec graphs). "
+                "Use --mode generate or --mode evaluate_single for spec runs."
+            )
             quit()
 
         model, tokenizer, generation_config = prepare_inference(target_cls, args)
@@ -992,34 +1097,43 @@ def main():
             accuracy = 1
 
         elif args.platform_target == "trn3":
-            # Compile baseline first; both prepare_inference calls write to
-            # /tmp/nxd_model/, so the second compile is what find_hlos() reads.
-            base_model, _, base_generation_config = prepare_inference(
-                baseline_cls, args
-            )
+            if args.enable_fused_speculation:
+                # NxDI's logit_validation doesn't support spec graphs; baseline
+                # compile would be wasted. Score with accuracy=1, matching the
+                # spec-mode convention used by the trn2 branch.
+                model, tokenizer, generation_config = prepare_inference(
+                    target_cls, args
+                )
+                accuracy = 1
+            else:
+                # Compile baseline first; both prepare_inference calls write to
+                # /tmp/nxd_model/, so the second compile is what find_hlos() reads.
+                base_model, _, base_generation_config = prepare_inference(
+                    baseline_cls, args
+                )
 
-            model, tokenizer, generation_config = prepare_inference(
-                target_cls, args
-            )
+                model, tokenizer, generation_config = prepare_inference(
+                    target_cls, args
+                )
 
-            accuracy = run_accuracy_check(
-                base_model,
-                base_generation_config,
-                model,
-                tokenizer,
-                generation_config,
-                args.prompts,
-                args.divergence_difference_tol,
-                args.tol_map,
-                num_tokens_to_check=args.num_tokens_to_check,
-            )
+                accuracy = run_accuracy_check(
+                    base_model,
+                    base_generation_config,
+                    model,
+                    tokenizer,
+                    generation_config,
+                    args.prompts,
+                    args.divergence_difference_tol,
+                    args.tol_map,
+                    num_tokens_to_check=args.num_tokens_to_check,
+                )
 
         report = benchmark_sampling(model, tokenizer, generation_config, args.prompts)
 
         latency = report["e2e_model"]["latency_ms_p99"]
         throughput = report["e2e_model"]["throughput"]
 
-        ctx_enc_hlo_path, tkg_gen_hlo_path = find_hlos()
+        ctx_enc_hlo_path, tkg_gen_hlo_path = find_hlos(args.enable_fused_speculation)
 
         nki_flop_ratio = count_nki_flop_ratio(ctx_enc_hlo_path, tkg_gen_hlo_path)
 
@@ -1069,7 +1183,7 @@ def main():
             latency = report["e2e_model"]["latency_ms_p99"]
             throughput = report["e2e_model"]["throughput"]
 
-            ctx_enc_hlo_path, tkg_gen_hlo_path = find_hlos()
+            ctx_enc_hlo_path, tkg_gen_hlo_path = find_hlos(args.enable_fused_speculation)
 
             nki_flop_ratio = count_nki_flop_ratio(ctx_enc_hlo_path, tkg_gen_hlo_path)
 
@@ -1098,15 +1212,23 @@ def main():
         print(f"\nTotal Score: {total_score}\n")
 
     elif args.mode == "evaluate_all" and args.platform_target == "trn3":
-        # Compile baseline first; both prepare_inference calls write to
-        # /tmp/nxd_model/, so the second compile is what find_hlos() reads.
-        base_model, _, base_generation_config = prepare_inference(
-            baseline_cls, args
-        )
+        if args.enable_fused_speculation:
+            # Skip baseline compile/accuracy under fused spec (see evaluate_single).
+            model, tokenizer, generation_config = prepare_inference(
+                target_cls, args
+            )
+            base_model = None
+            base_generation_config = None
+        else:
+            # Compile baseline first; both prepare_inference calls write to
+            # /tmp/nxd_model/, so the second compile is what find_hlos() reads.
+            base_model, _, base_generation_config = prepare_inference(
+                baseline_cls, args
+            )
 
-        model, tokenizer, generation_config = prepare_inference(
-            target_cls, args
-        )
+            model, tokenizer, generation_config = prepare_inference(
+                target_cls, args
+            )
 
         prompts = parse_prompts("prompts.txt")
         prompt_data = parse_prompt_data("prompt_data_trn3.csv")
@@ -1120,24 +1242,27 @@ def main():
             base_latency = float(data[3])
             base_throughput = float(data[4])
 
-            accuracy = run_accuracy_check(
-                base_model,
-                base_generation_config,
-                model,
-                tokenizer,
-                generation_config,
-                [prompt],
-                args.divergence_difference_tol,
-                args.tol_map,
-                num_tokens_to_check=args.num_tokens_to_check,
-            )
+            if args.enable_fused_speculation:
+                accuracy = 1
+            else:
+                accuracy = run_accuracy_check(
+                    base_model,
+                    base_generation_config,
+                    model,
+                    tokenizer,
+                    generation_config,
+                    [prompt],
+                    args.divergence_difference_tol,
+                    args.tol_map,
+                    num_tokens_to_check=args.num_tokens_to_check,
+                )
 
             report = benchmark_sampling(model, tokenizer, generation_config, [prompt])
 
             latency = report["e2e_model"]["latency_ms_p99"]
             throughput = report["e2e_model"]["throughput"]
 
-            ctx_enc_hlo_path, tkg_gen_hlo_path = find_hlos()
+            ctx_enc_hlo_path, tkg_gen_hlo_path = find_hlos(args.enable_fused_speculation)
 
             nki_flop_ratio = count_nki_flop_ratio(ctx_enc_hlo_path, tkg_gen_hlo_path)
 
