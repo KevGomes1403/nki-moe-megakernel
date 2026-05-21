@@ -71,8 +71,8 @@ from neuronx_distributed_inference.modules.attention.utils import RotaryEmbeddin
 from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm
 from neuronx_distributed_inference.modules.moe_v2 import initialize_moe_module
 
-from megakernels.qwen3_moe.transformer_qwen import (
-    transformer_qwen3_moe_tkg_multilayer_jit,
+from megakernels.qwen3_moe.transformer_qwen3_moe_speculative import (
+    transformer_qwen3_moe_speculative_jit,
     get_multilayer_kernel_jit,
 )
 
@@ -81,6 +81,15 @@ try:
 except ImportError:
     def _register_tensor(name, tensor):
         pass
+
+# ---------------------------------------------------------------------------
+# DEBUG instrumentation toggle: when True, the megakernel returns 3 extra
+# HBM dump tensors (attn_in, attn_out, moe_out) captured at layer 0, and the
+# integration registers them via _register_tensor so NxDI's tensor_capture
+# infrastructure routes them out as model outputs.
+# ---------------------------------------------------------------------------
+NKI_DEBUG_DUMPS_ENABLED = True
+NKI_DEBUG_DUMPS_NUM = 3  # attn_in, attn_out, moe_out
 
 GQA_SHARDING_STRATEGY = GQA.REPLICATE_TO_TP_DEGREE
 
@@ -120,6 +129,11 @@ class Qwen3MoEV3MultilayerNeuronConfig(MoENeuronConfig):
         # Pop tensor_capture_config before passing to OnDeviceSamplingConfig — it
         # doesn't accept that kwarg and will raise TypeError if it sees it.
         _tcc = kwargs.pop("tensor_capture_config", None)
+        # DEBUG: if instrumentation is enabled and no explicit config was passed,
+        # add a default TensorCaptureConfig with max_intermediate_tensors=3 so
+        # NxDI routes the 3 megakernel dumps out as model outputs.
+        if NKI_DEBUG_DUMPS_ENABLED and _tcc is None:
+            _tcc = TensorCaptureConfig(max_intermediate_tensors=NKI_DEBUG_DUMPS_NUM)
         # NxDI defaults global_topk=256, which makes the rotational top-k kernel
         # extract 256 elements before the user's top_k mask is applied — adds
         # ~1.7ms of Vector-bound epilogue on Qwen3 vocab=151936. Cap to top_k.
@@ -191,31 +205,26 @@ def convert_qwen3_moe_hf_to_neuron_state_dict(neuron_state_dict, config):
         o_proj_w = neuron_state_dict[f"layers.{l}.self_attn.o_proj.weight"]   # [H, Hq]
         neuron_state_dict[f"layers.{l}.self_attn.Wo_nki.weight"] = o_proj_w.T.contiguous()
 
-        # Tile-transposed layout for pretransposed attention kernel:
-        #   W_pt[head*d+p, tile*d+f] = W[head*d+f, tile*d+p]
-        #   Produced by: W.reshape(n_heads, d, n_tiles, d).permute(0, 3, 2, 1).reshape(n_heads*d, H)
-        _d        = config.head_dim                       # 128
-        _nh       = config.num_attention_heads            # 32
-        _nkv      = config.num_key_value_heads            # 4
-        _H_cfg    = config.hidden_size                    # 2048
-        _nh_tiles = _H_cfg // _d                          # 16
-
-        q_proj_w = neuron_state_dict[f"layers.{l}.self_attn.q_proj.weight"]   # [Hq, H]
+        # Plain HF layout — Wq_nki / Wk_nki / Wv_nki are stored as
+        # [head_count * d_head, H] (same as HF q/k/v_proj.weight). The new
+        # transformer_qwen3_moe_speculative kernel calls attention_block_tkg,
+        # which expects W_qkv: [H, (q_heads + 2*kv_heads)*d_head] and does the
+        # transpose internally via _fuse_qkv_weights.
+        #
+        # WARNING: do NOT tile-transpose here. The old attn_fused_nki kernel
+        # (used by transformer_qwen.py + qwen_with_megakernel_blockwise.py)
+        # DOES expect tile-transposed weights, but the new kernel does not.
+        # Applying that tile-transpose silently produces garbage logits on
+        # the first generated token. Guarded by
+        # tests/qwen3_moe/test_speculative_megakernel.py::test_converter_produces_plain_layout.
         neuron_state_dict[f"layers.{l}.self_attn.Wq_nki.weight"] = (
-            q_proj_w.reshape(_nh, _d, _nh_tiles, _d)
-            .permute(0, 3, 2, 1).reshape(_nh * _d, _H_cfg).contiguous()
+            neuron_state_dict[f"layers.{l}.self_attn.q_proj.weight"].detach().clone()
         )
-
-        k_proj_w = neuron_state_dict[f"layers.{l}.self_attn.k_proj.weight"]   # [nkv*d, H]
         neuron_state_dict[f"layers.{l}.self_attn.Wk_nki.weight"] = (
-            k_proj_w.reshape(_nkv, _d, _nh_tiles, _d)
-            .permute(0, 3, 2, 1).reshape(_nkv * _d, _H_cfg).contiguous()
+            neuron_state_dict[f"layers.{l}.self_attn.k_proj.weight"].detach().clone()
         )
-
-        v_proj_w = neuron_state_dict[f"layers.{l}.self_attn.v_proj.weight"]   # [nkv*d, H]
         neuron_state_dict[f"layers.{l}.self_attn.Wv_nki.weight"] = (
-            v_proj_w.reshape(_nkv, _d, _nh_tiles, _d)
-            .permute(0, 3, 2, 1).reshape(_nkv * _d, _H_cfg).contiguous()
+            neuron_state_dict[f"layers.{l}.self_attn.v_proj.weight"].detach().clone()
         )
 
         neuron_state_dict[f"layers.{l}.mlp.router.linear_router.weight"] = (
@@ -472,10 +481,22 @@ class NeuronQwen3MoeDecoderLayerV3(nn.Module):
                     replica_groups=self._replica_groups,
                 )
                 Y = kernel_out[0]
-        
+
                 K_out = list(kernel_out[1     : 1 + L])
                 V_out = list(kernel_out[1 + L : 1 + 2 * L])
-                
+
+                # DEBUG: extract the 3 layer-0 dump tensors appended by the
+                # megakernel and register them via NxDI's tensor_capture so
+                # they get routed out as model outputs (and persist in the
+                # XLA graph rather than being DCE'd).
+                if NKI_DEBUG_DUMPS_ENABLED:
+                    dbg_attn_in  = kernel_out[1 + 2 * L]
+                    dbg_attn_out = kernel_out[2 + 2 * L]
+                    dbg_moe_out  = kernel_out[3 + 2 * L]
+                    _register_tensor("attn_in",  dbg_attn_in)
+                    _register_tensor("attn_out", dbg_attn_out)
+                    _register_tensor("moe_out",  dbg_moe_out)
+
                 Y = ModuleMarkerEndWrapper()(Y)
 
                 # Stash the post-scatter KV handles so pass-through layers can
