@@ -732,6 +732,24 @@ def run_generation(model, tokenizer, prompts, generation_config):
     print("\nGenerating outputs...")
     print(f"Prompts: {prompts}")
 
+    # DEBUG: when the neuron config has tensor_capture_config, wire up a hook
+    # that saves the captured tensors to disk on each step. The dump location
+    # is configurable via env var NKI_DEBUG_DUMP_DIR.
+    tensor_capture_hook = None
+    if getattr(model.neuron_config, "tensor_capture_config", None) is not None:
+        import os as _os
+        from neuronx_distributed_inference.utils.tensor_capture_utils import (
+            get_tensor_capture_hook,
+        )
+        _save_dir = _os.environ.get(
+            "NKI_DEBUG_DUMP_DIR", "/tmp/nki_debug_dumps"
+        )
+        tensor_capture_hook = get_tensor_capture_hook(
+            capture_indices=None,
+            tensor_capture_save_dir=_save_dir,
+        )
+        print(f"[debug] tensor_capture_hook enabled, saving to {_save_dir}")
+
     _, output_tokens = get_generate_outputs(
         model,
         prompts,
@@ -739,6 +757,7 @@ def run_generation(model, tokenizer, prompts, generation_config):
         is_hf=False,
         generation_config=generation_config,
         max_length=model.neuron_config.max_length,
+        tensor_capture_hook=tensor_capture_hook,
     )
 
     print("Generated outputs:")

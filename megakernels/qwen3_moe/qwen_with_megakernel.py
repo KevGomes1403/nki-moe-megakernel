@@ -29,8 +29,9 @@ Flag / open items (also in kernel docstring):
   - Router weight pre-transpose is deferred — we `.T.contiguous()` at
     forward-time like V2 (traced once per layer, becomes a compile-time
     constant in the NEFF). Converter stays identical to V2.
-  - Only TKG B=1 is handled by the megakernel. Speculative decoding / B>1
-    must fall back to the per-layer path (not wired yet).
+  - Speculative decoding (T>1) is supported: the megakernel now handles
+    consecutive `position_ids` ``[B, T]`` (e.g. ``[p, p+1, ..., p+T-1]``).
+    cos/sin are passed in shape ``[B, T, d]`` (one position per slot).
 """
 
 import gc
@@ -51,7 +52,6 @@ from neuronx_distributed.utils import cpu_mode
 from neuronx_distributed_inference.models.config import (
     MoENeuronConfig,
     OnDeviceSamplingConfig,
-    TensorCaptureConfig,
 )
 from neuronx_distributed_inference.models.layer_boundary_marker import (
     ModuleMarkerEndWrapper,
@@ -76,21 +76,6 @@ from megakernels.qwen3_moe.transformer_qwen3_moe_speculative import (
     get_multilayer_kernel_jit,
 )
 
-try:
-    from neuronx_distributed.utils.tensor_capture import register_tensor as _register_tensor
-except ImportError:
-    def _register_tensor(name, tensor):
-        pass
-
-# ---------------------------------------------------------------------------
-# DEBUG instrumentation toggle: when True, the megakernel returns 3 extra
-# HBM dump tensors (attn_in, attn_out, moe_out) captured at layer 0, and the
-# integration registers them via _register_tensor so NxDI's tensor_capture
-# infrastructure routes them out as model outputs.
-# ---------------------------------------------------------------------------
-NKI_DEBUG_DUMPS_ENABLED = True
-NKI_DEBUG_DUMPS_NUM = 3  # attn_in, attn_out, moe_out
-
 GQA_SHARDING_STRATEGY = GQA.REPLICATE_TO_TP_DEGREE
 
 import os
@@ -102,7 +87,7 @@ os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = "trn3"
 # os.environ["XLA_HLO_DEBUG"]= "1"
 # os.environ["NEURON_RT_INSPECT_ENABLE"]= "1"
 # os.environ["NEURON_RT_INSPECT_DEVICE_PROFILE"]= "1"
-# os.environ["NEURON_RT_INSPECT_OUTPUT_DIR"]= "./output/fused/"
+# os.environ["NEURON_RT_INSPECT_OUTPUT_DIR"]= "./output/qwen_megakernel/"
 
 # ---------------------------------------------------------------------------
 # Neuron config
@@ -129,11 +114,6 @@ class Qwen3MoEV3MultilayerNeuronConfig(MoENeuronConfig):
         # Pop tensor_capture_config before passing to OnDeviceSamplingConfig — it
         # doesn't accept that kwarg and will raise TypeError if it sees it.
         _tcc = kwargs.pop("tensor_capture_config", None)
-        # DEBUG: if instrumentation is enabled and no explicit config was passed,
-        # add a default TensorCaptureConfig with max_intermediate_tensors=3 so
-        # NxDI routes the 3 megakernel dumps out as model outputs.
-        if NKI_DEBUG_DUMPS_ENABLED and _tcc is None:
-            _tcc = TensorCaptureConfig(max_intermediate_tensors=NKI_DEBUG_DUMPS_NUM)
         # NxDI defaults global_topk=256, which makes the rotational top-k kernel
         # extract 256 elements before the user's top_k mask is applied — adds
         # ~1.7ms of Vector-bound epilogue on Qwen3 vocab=151936. Cap to top_k.
@@ -205,26 +185,26 @@ def convert_qwen3_moe_hf_to_neuron_state_dict(neuron_state_dict, config):
         o_proj_w = neuron_state_dict[f"layers.{l}.self_attn.o_proj.weight"]   # [H, Hq]
         neuron_state_dict[f"layers.{l}.self_attn.Wo_nki.weight"] = o_proj_w.T.contiguous()
 
-        # Plain HF layout — Wq_nki / Wk_nki / Wv_nki are stored as
-        # [head_count * d_head, H] (same as HF q/k/v_proj.weight). The new
-        # transformer_qwen3_moe_speculative kernel calls attention_block_tkg,
-        # which expects W_qkv: [H, (q_heads + 2*kv_heads)*d_head] and does the
-        # transpose internally via _fuse_qkv_weights.
-        #
-        # WARNING: do NOT tile-transpose here. The old attn_fused_nki kernel
-        # (used by transformer_qwen.py + qwen_with_megakernel_blockwise.py)
-        # DOES expect tile-transposed weights, but the new kernel does not.
-        # Applying that tile-transpose silently produces garbage logits on
-        # the first generated token. Guarded by
-        # tests/qwen3_moe/test_speculative_megakernel.py::test_converter_produces_plain_layout.
-        neuron_state_dict[f"layers.{l}.self_attn.Wq_nki.weight"] = (
-            neuron_state_dict[f"layers.{l}.self_attn.q_proj.weight"].detach().clone()
-        )
-        neuron_state_dict[f"layers.{l}.self_attn.Wk_nki.weight"] = (
-            neuron_state_dict[f"layers.{l}.self_attn.k_proj.weight"].detach().clone()
-        )
-        neuron_state_dict[f"layers.{l}.self_attn.Wv_nki.weight"] = (
-            neuron_state_dict[f"layers.{l}.self_attn.v_proj.weight"].detach().clone()
+        # Fused QKV — built ONCE here at weight-conversion time (not per decode
+        # step). attention_block_tkg wants W_qkv as
+        # [H, (q_heads + 2*kv_heads)*d_head] PER TP RANK. We pack the full
+        # weight rank-grouped — for rank r: [q-heads of r | k-head of r |
+        # v-head of r] stacked as rows — so PreTransposedColumnParallelLinear
+        # (transpose at preshard, shard dim 1) hands each rank exactly its
+        # [H, I_QKV] slice. Replaces the old per-step in-kernel
+        # _fuse_qkv_weights DMA (a redundant HBM transpose of static weights).
+        _tp = config.neuron_config.tp_degree
+        _q = neuron_state_dict[f"layers.{l}.self_attn.q_proj.weight"]   # [Hq_full, H]
+        _k = neuron_state_dict[f"layers.{l}.self_attn.k_proj.weight"]   # [Hkv_full, H]
+        _v = neuron_state_dict[f"layers.{l}.self_attn.v_proj.weight"]   # [Hkv_full, H]
+        _qd, _kd = _q.shape[0] // _tp, _k.shape[0] // _tp
+        _blocks = []
+        for _r in range(_tp):
+            _blocks.append(_q[_r * _qd:(_r + 1) * _qd])
+            _blocks.append(_k[_r * _kd:(_r + 1) * _kd])
+            _blocks.append(_v[_r * _kd:(_r + 1) * _kd])
+        neuron_state_dict[f"layers.{l}.self_attn.Wqkv_nki.weight"] = (
+            torch.cat(_blocks, dim=0).detach().contiguous()
         )
 
         neuron_state_dict[f"layers.{l}.mlp.router.linear_router.weight"] = (
@@ -331,9 +311,11 @@ class NeuronQwen3MoEAttentionV3(NeuronAttentionBase):
         _Hq_full = config.num_attention_heads * config.head_dim
         _Hkv_full = config.num_key_value_heads * config.head_dim
         self._nki_d = config.head_dim
-        self.Wq_nki = ColumnParallelLinear(_H, _Hq_full,  bias=False, gather_output=False, dtype=_dtype)
-        self.Wk_nki = ColumnParallelLinear(_H, _Hkv_full, bias=False, gather_output=False, dtype=_dtype)
-        self.Wv_nki = ColumnParallelLinear(_H, _Hkv_full, bias=False, gather_output=False, dtype=_dtype)
+        # Fused QKV: one pre-transposed column-parallel weight, [H, I_QKV] per
+        # rank (q + 2*kv heads), populated by the converter. Replaces separate
+        # Wq/Wk/Wv + the per-step in-kernel fusion.
+        self.Wqkv_nki = PreTransposedColumnParallelLinear(
+            _H, _Hq_full + 2 * _Hkv_full, bias=False, gather_output=False, dtype=_dtype)
         self.Wo_nki = ColumnParallelLinear(_H, _Hq_full,  bias=False, gather_output=False, dtype=_dtype)
 
 
@@ -397,15 +379,13 @@ class NeuronQwen3MoeDecoderLayerV3(nn.Module):
         # Pass each layer's weight as its own top-level NKI tensor (same pattern
         # as KV caches).
         layers = self._parent_model.layers
-        Wq, Wk, Wv, Wo = [], [], [], []
+        Wqkv, Wo = [], []
         qn, kn = [], []
         gpre = []
         gpost = []
         router, gate_up, down = [], [], []
         for l in layers:
-            Wq.append(l.self_attn.Wq_nki.weight)
-            Wk.append(l.self_attn.Wk_nki.weight)
-            Wv.append(l.self_attn.Wv_nki.weight)
+            Wqkv.append(l.self_attn.Wqkv_nki.weight)
             Wo.append(l.self_attn.Wo_nki.weight)
             qn.append(l.self_attn.q_layernorm.weight)
             kn.append(l.self_attn.k_layernorm.weight)
@@ -414,7 +394,7 @@ class NeuronQwen3MoeDecoderLayerV3(nn.Module):
             router.append(l.mlp.router.linear_router.weight.T.contiguous())
             gate_up.append(l.mlp.expert_mlps.mlp_op.gate_up_proj.weight)
             down.append(l.mlp.expert_mlps.mlp_op.down_proj.weight)
-        return (Wq, Wk, Wv, Wo, qn, kn, gpre, gpost, router, gate_up, down)
+        return (Wqkv, Wo, qn, kn, gpre, gpost, router, gate_up, down)
 
     def _gather_kv_caches(self, kv_mgr):
         """kv_mgr.past_key_values is flat [K0, V0, K1, V1, ...].
@@ -461,41 +441,32 @@ class NeuronQwen3MoeDecoderLayerV3(nn.Module):
 
                 hidden_states = ModuleMarkerStartWrapper()(hidden_states)
 
-                # RoPE cos/sin at position — same shape trick as V2.
+                # RoPE cos/sin at position. rotary_emb returns [B, T, d] —
+                # one slot per token in position_ids. Pass directly to the
+                # megakernel: it expects per-slot RoPE for both T=1 (single
+                # token gen) and T>1 (speculative decoding verification of
+                # consecutive positions [p, p+1, ..., p+T-1]).
                 cos_cache, sin_cache = self.self_attn.rotary_emb(hidden_states, position_ids)
-                cos_at_pos = cos_cache.squeeze(1)   # [B, d]
-                sin_at_pos = sin_cache.squeeze(1)
+                # cos_cache / sin_cache: [B, T, d]
 
-                (Wq_list, Wk_list, Wv_list, Wo_list,
+                (Wqkv_list, Wo_list,
                  qn_list, kn_list, gpre_list, gpost_list,
                  router_list, gate_up_list, down_list) = self._gather_weights_from_parent()
                 K_caches, V_caches = self._gather_kv_caches(kv_mgr)
 
                 kernel_out = get_multilayer_kernel_jit(L)[2](
                     hidden_states,
-                    *Wq_list, *Wk_list, *Wv_list, *Wo_list,
+                    *Wqkv_list, *Wo_list,
                     *qn_list, *kn_list, *gpre_list, *gpost_list,
                     *router_list, *gate_up_list, *down_list,
                     *K_caches, *V_caches,
-                    cos_at_pos, sin_at_pos, position_ids.to(torch.int32),
+                    cos_cache, sin_cache, position_ids.to(torch.int32),
                     replica_groups=self._replica_groups,
                 )
                 Y = kernel_out[0]
 
                 K_out = list(kernel_out[1     : 1 + L])
                 V_out = list(kernel_out[1 + L : 1 + 2 * L])
-
-                # DEBUG: extract the 3 layer-0 dump tensors appended by the
-                # megakernel and register them via NxDI's tensor_capture so
-                # they get routed out as model outputs (and persist in the
-                # XLA graph rather than being DCE'd).
-                if NKI_DEBUG_DUMPS_ENABLED:
-                    dbg_attn_in  = kernel_out[1 + 2 * L]
-                    dbg_attn_out = kernel_out[2 + 2 * L]
-                    dbg_moe_out  = kernel_out[3 + 2 * L]
-                    _register_tensor("attn_in",  dbg_attn_in)
-                    _register_tensor("attn_out", dbg_attn_out)
-                    _register_tensor("moe_out",  dbg_moe_out)
 
                 Y = ModuleMarkerEndWrapper()(Y)
 
