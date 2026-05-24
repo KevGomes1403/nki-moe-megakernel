@@ -30,10 +30,21 @@ import nki.language as nl
 # Fused gate+up dma_copy — halves descriptor count (~13 µs win at bs=1).
 _MOE_FUSION_ENABLED = _os.environ.get("NKI_MOE_ENABLE_FUSION", "0") == "1"
 
-# Revert to upstream's per-HTile weight DMA (disables all in-function hoists
-# and the cross-expert prefetch ring). For A/B testing the hoist's
-# contribution to SBUF demand — see study_results/megakernel_study.md.
-_MOE_LEGACY_WEIGHT_LOAD = _os.environ.get("NKI_MOE_LEGACY_WEIGHT_LOAD", "0") == "1"
+# Disables the cross-expert gate_up prefetch ring.
+_MOE_LEGACY_GATE_UP_WEIGHT_LOAD = _os.environ.get("NKI_MOE_LEGACY_GATE_UP_WEIGHT_LOAD", "0") == "1"
+
+# Phase 1 indirect-DMA fusion: combines the fused gate+up TensorView (one DMA per
+# expert spanning the contiguous [H, 2*I] HBM slab) with the cross-expert prefetch
+# ring (k+1 loads while expert k computes). On Qwen3-30B-A3B (trn3, LNC=2) the
+# non-fused path caps the contiguous-inner per descriptor at I*bf16=384B because
+# the second select(dim=1, GATE/UP) slices between the gate/up halves; the fused
+# view's inner is 2*I*bf16=768B, halving descriptor count and doubling packet size.
+# Independent of NKI_MOE_ENABLE_FUSION; implies the fused tensor view AND keeps
+# the prefetch ring active. When off, behavior is unchanged from the baseline.
+_MOE_INDIRECT_DMA_FUSION = _os.environ.get("NKI_MOE_INDIRECT_DMA_FUSION", "0") == "1"
+
+# Force shard-on-H at T>1 (keeps output SBUF-resident; shard-on-T writes HBM).
+_MOE_FORCE_SHARD_ON_H = _os.environ.get("NKI_MOE_FORCE_SHARD_ON_H", "0") == "1"
 
 from nkilib.core.mlp.mlp_parameters import (
     MLPBiasParameters,
@@ -78,6 +89,21 @@ def _build_up_view(initial_up_proj_weights_tensor, expert_id_scalar_offset):
         TensorView(initial_up_proj_weights_tensor)
         .select(dim=0, index=expert_id_scalar_offset)
         .select(dim=1, index=GateUpDim.UP.value)
+    )
+
+
+def _build_gate_up_fused_view(initial_gate_proj_weights_tensor, expert_id_scalar_offset):
+    """Construct the FUSED gate+up TensorView for a given expert offset.
+
+    Skips the per-projection ``select(dim=1, GATE/UP)`` and flattens the (2, I)
+    inner pair to ``2*I`` so the free dim is contiguous in HBM. Used by the
+    indirect-DMA fusion path; the resulting view has shape ``[H, 2*I]`` with
+    dynamic access (via the expert scalar_offset).
+    """
+    return (
+        TensorView(initial_gate_proj_weights_tensor)
+        .select(dim=0, index=expert_id_scalar_offset)
+        .flatten_dims(start_dim=1, end_dim=2)
     )
 
 
@@ -166,7 +192,8 @@ def _selective_expert_moe_tkg(
     # Disable shard_on_T when:
     # 1. T == 1: Only one token, no benefit from sharding on this dimension
     # 2. H * I >= 3072 * 1536: Big config has mlp tkg tile size calculation bug (NKL-1013)
-    if T == 1 or H * I >= 3072 * 1536:
+    # 3. NKI_MOE_FORCE_SHARD_ON_H=1
+    if T == 1 or H * I >= 3072 * 1536 or _MOE_FORCE_SHARD_ON_H:
         shard_on_T = False
 
     # For odd T, use ceiling division: core 0 gets T//2, core 1 gets T - T//2
@@ -279,19 +306,33 @@ def _selective_expert_moe_tkg(
     # two slots so expert k+1's weights load concurrently with expert k's
     # matmul. Mirrors the activation conditions of the in-function hoist in
     # process_gate_up_projection.
-    use_prefetch_ring = (
+    #
+    # Two variants:
+    #   - use_prefetch_ring_split: legacy per-projection rings (gate slot + up slot,
+    #     two DMAs per expert). Active when NKI_MOE_INDIRECT_DMA_FUSION=0 AND
+    #     NKI_MOE_ENABLE_FUSION=0.
+    #   - use_prefetch_ring_fused: ONE fused [H0, H1_shard, 2*I] slot per ring
+    #     entry, one DMA per expert via the fused TensorView. Active when
+    #     NKI_MOE_INDIRECT_DMA_FUSION=1 (Phase 1).
+    use_prefetch_ring_common = (
         (not params.use_tkg_gate_up_proj_column_tiling)
-        and (not _MOE_FUSION_ENABLED)
         and (not params.skip_gate_proj)
         and (dims.K >= 2)
-        and (not _MOE_LEGACY_WEIGHT_LOAD)
+        and (not _MOE_LEGACY_GATE_UP_WEIGHT_LOAD)
     )
+    use_prefetch_ring_fused = use_prefetch_ring_common and _MOE_INDIRECT_DMA_FUSION
+    use_prefetch_ring_split = (
+        use_prefetch_ring_common and (not _MOE_FUSION_ENABLED) and (not _MOE_INDIRECT_DMA_FUSION)
+    )
+    use_prefetch_ring = use_prefetch_ring_split or use_prefetch_ring_fused
 
     if use_prefetch_ring:
-        # Single-I-shard path: entire [H0, H1_shard, I] maps to one hoisted tile.
+        # Single-I-shard path: entire [H0, H1_shard, I] (split) or
+        # [H0, H1_shard, 2*I] (fused) maps to one hoisted tile.
         _h_offset = dims.H1_offset * dims.H0
         _shard_dim_hidden = (_h_offset, _h_offset + dims.H_per_shard)
-        _shard_dim_intr = (0, dims.I)
+        _shard_dim_intr_split = (0, dims.I)
+        _shard_dim_intr_fused = (0, 2 * dims.I)
         _weight_dtype = (
             nl.float8_e4m3
             if str(initial_up_proj_weights_tensor.dtype) == "float8e4"
@@ -314,7 +355,8 @@ def _selective_expert_moe_tkg(
         # hoist; ~+37 KB/partition at gpt-oss shapes.
         prefetch_gate_slots = None
         prefetch_up_slots = None
-        if use_prefetch_ring:
+        prefetch_gate_up_fused_slots = None
+        if use_prefetch_ring_split:
             prefetch_gate_slots = []
             prefetch_up_slots = []
             for slot_idx in range(2):
@@ -343,7 +385,7 @@ def _selective_expert_moe_tkg(
                 hoisted_weight=prefetch_gate_slots[0],
                 dims=dims,
                 shard_dim_hidden=_shard_dim_hidden,
-                shard_dim_intr=_shard_dim_intr,
+                shard_dim_intr=_shard_dim_intr_split,
                 dge_mode=nisa.dge_mode.hwdge,
             )
             emit_hoisted_gate_up_dma(
@@ -351,8 +393,40 @@ def _selective_expert_moe_tkg(
                 hoisted_weight=prefetch_up_slots[0],
                 dims=dims,
                 shard_dim_hidden=_shard_dim_hidden,
-                shard_dim_intr=_shard_dim_intr,
+                shard_dim_intr=_shard_dim_intr_split,
                 dge_mode=nisa.dge_mode.swdge,
+            )
+
+        if use_prefetch_ring_fused:
+            # ONE fused [H0, H1_shard, 2*I] slot per ring entry — gate+up in
+            # the same SBUF tile, one DMA per expert via the fused view.
+            prefetch_gate_up_fused_slots = []
+            for slot_idx in range(2):
+                fused_slot = sbm.alloc_stack(
+                    (dims.H0, dims.H1_shard, 2 * dims.I),
+                    name=f"prefetch_gate_up_fused_w_tile_slot{slot_idx}",
+                    dtype=_weight_dtype,
+                )
+                prefetch_gate_up_fused_slots.append(fused_slot)
+
+            # Prime slot 0 with expert k=0 before the K-loop.
+            sbm.set_name_prefix(f"{name_prefix}T{global_token_idx}_prefetch_K0_")
+            _expert0_offset = expert_idx.ap(
+                pattern=[[dims.K, 1], [1, 1]], offset=global_token_idx * dims.K + 0
+            )
+            _gate_up0_view = _build_gate_up_fused_view(
+                initial_gate_proj_weights_tensor, _expert0_offset
+            )
+            # The fused view has dynamic access; emit_hoisted_gate_up_dma forces
+            # dge_mode=unknown (==0) internally for indirect patterns. The
+            # passed-in mode is ignored for indirect views.
+            emit_hoisted_gate_up_dma(
+                unsharded_weight=_gate_up0_view,
+                hoisted_weight=prefetch_gate_up_fused_slots[0],
+                dims=dims,
+                shard_dim_hidden=_shard_dim_hidden,
+                shard_dim_intr=_shard_dim_intr_fused,
+                dge_mode=None,
             )
 
         sbm.open_scope(interleave_degree=memory_safe_degree)
@@ -380,11 +454,13 @@ def _selective_expert_moe_tkg(
             # then flattens (2, I) -> 2*I so the inner free dim is contiguous in HBM. Consumed by
             # process_gate_up_projection for a single fused DMA per HTile (halves descriptor count
             # and doubles the inner contiguous chunk vs two separate gate+up loads).
-            if _MOE_FUSION_ENABLED:
-                params.gate_up_fused_weights_tensor = (
-                    TensorView(initial_gate_proj_weights_tensor)
-                    .select(dim=0, index=expert_id_scalar_offset)
-                    .flatten_dims(start_dim=1, end_dim=2)
+            # NOTE: When NKI_MOE_INDIRECT_DMA_FUSION=1 we drive the fused view via the
+            # prefetch-ring path (pre_loaded_hoisted_gate_up_fused below) instead — set
+            # params.gate_up_fused_weights_tensor=None to suppress the in-function per-HTile
+            # fused alloc/load inside process_gate_up_projection.
+            if _MOE_FUSION_ENABLED and not _MOE_INDIRECT_DMA_FUSION:
+                params.gate_up_fused_weights_tensor = _build_gate_up_fused_view(
+                    initial_gate_proj_weights_tensor, expert_id_scalar_offset
                 )
             else:
                 params.gate_up_fused_weights_tensor = None
@@ -432,33 +508,53 @@ def _selective_expert_moe_tkg(
                 next_expert_offset = expert_idx.ap(
                     pattern=[[dims.K, 1], [1, 1]], offset=global_token_idx * dims.K + next_k
                 )
-                next_gate_view = _build_gate_view(initial_gate_proj_weights_tensor, next_expert_offset)
-                next_up_view = _build_up_view(initial_up_proj_weights_tensor, next_expert_offset)
-                emit_hoisted_gate_up_dma(
-                    unsharded_weight=next_gate_view,
-                    hoisted_weight=prefetch_gate_slots[next_slot],
-                    dims=dims,
-                    shard_dim_hidden=_shard_dim_hidden,
-                    shard_dim_intr=_shard_dim_intr,
-                    dge_mode=nisa.dge_mode.hwdge,
-                )
-                emit_hoisted_gate_up_dma(
-                    unsharded_weight=next_up_view,
-                    hoisted_weight=prefetch_up_slots[next_slot],
-                    dims=dims,
-                    shard_dim_hidden=_shard_dim_hidden,
-                    shard_dim_intr=_shard_dim_intr,
-                    dge_mode=nisa.dge_mode.swdge,
-                )
+                if use_prefetch_ring_split:
+                    next_gate_view = _build_gate_view(initial_gate_proj_weights_tensor, next_expert_offset)
+                    next_up_view = _build_up_view(initial_up_proj_weights_tensor, next_expert_offset)
+                    emit_hoisted_gate_up_dma(
+                        unsharded_weight=next_gate_view,
+                        hoisted_weight=prefetch_gate_slots[next_slot],
+                        dims=dims,
+                        shard_dim_hidden=_shard_dim_hidden,
+                        shard_dim_intr=_shard_dim_intr_split,
+                        dge_mode=nisa.dge_mode.hwdge,
+                    )
+                    emit_hoisted_gate_up_dma(
+                        unsharded_weight=next_up_view,
+                        hoisted_weight=prefetch_up_slots[next_slot],
+                        dims=dims,
+                        shard_dim_hidden=_shard_dim_hidden,
+                        shard_dim_intr=_shard_dim_intr_split,
+                        dge_mode=nisa.dge_mode.swdge,
+                    )
+                else:  # use_prefetch_ring_fused
+                    next_fused_view = _build_gate_up_fused_view(
+                        initial_gate_proj_weights_tensor, next_expert_offset
+                    )
+                    emit_hoisted_gate_up_dma(
+                        unsharded_weight=next_fused_view,
+                        hoisted_weight=prefetch_gate_up_fused_slots[next_slot],
+                        dims=dims,
+                        shard_dim_hidden=_shard_dim_hidden,
+                        shard_dim_intr=_shard_dim_intr_fused,
+                        dge_mode=None,
+                    )
                 sbm.set_name_prefix(_saved_prefix)
 
-            if use_prefetch_ring:
+            if use_prefetch_ring_split:
                 _cur_slot = expert_k_idx % 2
                 _pre_loaded_gate = prefetch_gate_slots[_cur_slot]
                 _pre_loaded_up = prefetch_up_slots[_cur_slot]
+                _pre_loaded_gate_up_fused = None
+            elif use_prefetch_ring_fused:
+                _cur_slot = expert_k_idx % 2
+                _pre_loaded_gate = None
+                _pre_loaded_up = None
+                _pre_loaded_gate_up_fused = prefetch_gate_up_fused_slots[_cur_slot]
             else:
                 _pre_loaded_gate = None
                 _pre_loaded_up = None
+                _pre_loaded_gate_up_fused = None
 
             gate_tile_info = process_gate_up_projection(
                 hidden=input_sb[:, global_token_idx : global_token_idx + 1, :],
@@ -468,6 +564,7 @@ def _selective_expert_moe_tkg(
                 sbm=sbm,
                 pre_loaded_hoisted_gate=_pre_loaded_gate,
                 pre_loaded_hoisted_up=_pre_loaded_up,
+                pre_loaded_hoisted_gate_up_fused=_pre_loaded_gate_up_fused,
             )
 
             # Down projection

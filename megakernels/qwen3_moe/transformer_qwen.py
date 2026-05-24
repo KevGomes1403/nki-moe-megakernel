@@ -65,6 +65,41 @@ SBM_SIZE_BYTES = 200 * 1024
 NUM_LAYERS = 48  # Qwen3-30B-A3B
 
 
+_dbg_dump_counter = [0]
+
+
+def _store_plain_linear_sb_to_hbm(dst_hbm, src_sb, B, S_tkg, prg_id):
+    """Inverse of the X load in this OLD kernel: write SBUF [H0, BxS*H1]
+    (plain-linear layout) to HBM [B, S_tkg, H] canonical layout. Gated on
+    prg_id==0.
+
+    Layout (plain-linear):
+        src_sb[p, bs*H1 + h1] == dst_hbm.flat[bs*H + h1*H0 + p]
+
+    Uses per-column nc_transpose (matching the kernel's own final-Y store
+    path), which is the most reliable way to invert the partition axis to a
+    row in the canonical [B,S,H] HBM layout.
+    """
+    BxS = B * S_tkg
+    if prg_id != 0:
+        return
+    Y_flat = dst_hbm.reshape((BxS, H))
+    dump_id = _dbg_dump_counter[0]
+    _dbg_dump_counter[0] += 1
+    for b in nl.static_range(BxS):
+        for t in nl.static_range(H1):
+            col_psum = nl.ndarray((1, H0), dtype=src_sb.dtype, buffer=nl.psum)
+            nisa.nc_transpose(col_psum, src_sb[0:H0, b * H1 + t : b * H1 + t + 1])
+            col_sb = nl.ndarray((1, H0), dtype=src_sb.dtype, buffer=nl.sbuf,
+                                name=f"dbg_d{dump_id}_col_b{b}_t{t}_sb")
+            nisa.tensor_copy(col_sb, col_psum)
+            nisa.dma_copy(
+                dst=Y_flat[b : b + 1, t * H0 : (t + 1) * H0],
+                src=col_sb,
+                dge_mode=nisa.dge_mode.hwdge,
+            )
+
+
 def _multilayer_body(
     X,             # [B, S_tkg, H]         bf16  HBM  — raw hidden state (pre-norm)
     Wq_list,       # tuple of L tensors, each [Hq_tp*d, H]      bf16  HBM  — per-layer Q projection
@@ -106,6 +141,14 @@ def _multilayer_body(
     sbm = BufferManager(0, SBM_SIZE_BYTES, Logger("transformer_qwen3_moe_tkg_multilayer"))
     sbm.set_auto_alloc(True)
 
+    # ---- DEBUG: layer-0 dump HBM tensors (canonical [B, S, H] layout) ----
+    attn_in_dump_hbm = nl.ndarray((B, S_tkg, H), dtype=dtype,
+                                   buffer=nl.shared_hbm, name="attn_in_dump")
+    attn_out_dump_hbm = nl.ndarray((B, S_tkg, H), dtype=dtype,
+                                    buffer=nl.shared_hbm, name="attn_out_dump")
+    moe_out_dump_hbm = nl.ndarray((B, S_tkg, H), dtype=dtype,
+                                   buffer=nl.shared_hbm, name="moe_out_dump")
+
     # -----------------------------------------------------------------------
     # Load X into SBUF as the initial residual [H0, BxS*H1].
     # This tensor is updated in-place at each layer boundary
@@ -125,6 +168,9 @@ def _multilayer_body(
         dge_mode=nisa.dge_mode.hwdge,
     )
     nisa.tensor_copy(residual_sb, residual_load_sb)
+
+    # ---- DEBUG: dump attn_in (residual right after X load) ----
+    _store_plain_linear_sb_to_hbm(attn_in_dump_hbm, residual_sb, B, S_tkg, prg_id)
 
     # -----------------------------------------------------------------------
     # Hoist layer-invariant attention constants out of the per-layer loop
@@ -325,6 +371,12 @@ def _multilayer_body(
             op=nl.add, replica_group=rg,
         )
 
+        # ---- DEBUG: dump attn_reduced for layer 0 only ----
+        if layer_idx == 0:
+            _store_plain_linear_sb_to_hbm(
+                attn_out_dump_hbm, attn_reduced_sb, B, S_tkg, prg_id
+            )
+
         sbm.close_scope()
         sbm.set_auto_alloc(True)
 
@@ -361,6 +413,12 @@ def _multilayer_body(
         moe_gathered_sb, _ = _sb2sb_all_reduce_gather(
             moe_out_sb, dtype, rg, prg_id, n_prgs, H0, H1, H1_SHARD, BxS
         )
+
+        # ---- DEBUG: dump moe_gathered for layer 0 only ----
+        if layer_idx == 0:
+            _store_plain_linear_sb_to_hbm(
+                moe_out_dump_hbm, moe_gathered_sb, B, S_tkg, prg_id
+            )
 
         # Free all sbm allocs from the MoE block
         while sbm.heap:
@@ -414,7 +472,13 @@ def _multilayer_body(
     # v14a's in-place scatter DMAs (without this, writes are DCE'd as dead
     # stores to read-only inputs). NxDI's model_wrapper aliases each returned
     # KV tensor back to its kv_mgr.past_key_values[i] slot.
-    return (Y,) + tuple(K_caches) + tuple(V_caches)
+    # DEBUG: also return the 3 layer-0 dumps for numerical comparison.
+    return (
+        (Y,)
+        + tuple(K_caches)
+        + tuple(V_caches)
+        + (attn_in_dump_hbm, attn_out_dump_hbm, moe_out_dump_hbm)
+    )
 
 
 def _build_multilayer_kernel(num_layers: int):

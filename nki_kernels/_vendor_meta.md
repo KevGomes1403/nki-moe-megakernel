@@ -67,3 +67,26 @@ On every Neuron SDK upgrade:
 kernels, **unrelated to this vendor effort**. They share the directories but
 not the namespace; the vendored gpt-oss files use upstream filenames so
 the two paths never collide.
+
+## Phase 1 indirect-DMA fusion divergence (NKI_MOE_INDIRECT_DMA_FUSION)
+
+`nki_kernels/moe/selective_expert_impl.py` and
+`nki_kernels/moe/mlp_tkg_gate_up_projection.py` now diverge from upstream
+`nkilib/core/moe/moe_tkg/selective_expert_impl.py` and
+`nkilib/core/mlp/mlp_tkg/mlp_tkg_gate_up_projection.py` to support a new
+env-gated path: `NKI_MOE_INDIRECT_DMA_FUSION=1` combines the existing fused
+gate+up TensorView (`select(dim=0, expert).flatten_dims(1,2)` → `[H, 2*I]`)
+with the cross-expert 2-slot prefetch ring. The non-fused baseline path
+issues two DMAs per expert against a `[H, I]` view whose contiguous-inner
+caps at `I*bf16=384B` (the second `select(dim=1, GATE/UP)` slices the
+`2` axis between gate and up in HBM). The fused view's contiguous-inner is
+`2*I*bf16=768B`, halving descriptor count and doubling packet size at
+Qwen3-30B-A3B shapes; profile of layer 25 showed 31,685 of the 384B packets
+and ~10% MBU. Concretely: one `[H0, H1_shard, 2*I]` prefetch slot per ring
+entry (vs. two `[H0, H1_shard, I]` slots), one `emit_hoisted_gate_up_dma`
+call per expert (vs. two), and routed into the lhs_rhs_swap matmul via a
+new `pre_loaded_fused_hoist` / `pre_loaded_hoisted_gate_up_fused` plumbing
+through `process_gate_up_projection`. `emit_hoisted_gate_up_dma` forces
+`dge_mode=unknown` when the source view has dynamic access (HWDGE/SWDGE
+are not safe for indirect patterns). With the env flag off, behavior is
+unchanged from the prior vendored baseline (a strict additive change).
