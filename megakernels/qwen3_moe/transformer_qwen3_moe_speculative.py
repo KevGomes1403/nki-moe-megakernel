@@ -46,24 +46,11 @@ IO contract (matches ``transformer_qwen.py``)
     K_out = kernel_out[1     : 1 + L]
     V_out = kernel_out[1 + L : 1 + 2 * L]
 
-Wq/Wk/Wv are fused into a single ``W_qkv`` HBM scratch per layer (the vendored
-``attention_block_tkg`` takes a fused W_qkv; the integration ships them
-separately). cos/sin are permuted from ``[B, T, d]`` to ``[d/2, B, S_tkg]`` for
-``rope_contiguous_layout=True`` (with one position per query slot, supporting
-both T=1 single-token and T>1 speculative decoding).
-
-T>1 (speculative decoding)
---------------------------
-With T>1 the target model verifies ``speculation_length`` consecutive tokens
-in one TKG call. ``position_ids`` is ``[B, T]`` with consecutive values
-``[p, p+1, ..., p+T-1]``:
-
-* RoPE: each of the T query slots gets its own per-slot cos/sin.
-* Attention mask: per-slot threshold — query ``t`` attends to cached slots
-  ``s < position_ids[b, t]``.
-* KV cache update: pass only the base position ``position_ids[:, :1]``
-  (shape ``[B, 1]``) — the cache-update path writes ``S_tkg`` consecutive
-  entries starting from the base.
+T>1 (speculative decoding): ``position_ids`` is ``[B, T]`` with consecutive
+values ``[p, ..., p+T-1]``. cos/sin permuted to ``[d/2, B, S_tkg]`` for
+``rope_contiguous_layout=True``; query ``t`` attends to ``s < position_ids[b, t]``.
+Pass ``position_ids[:, :1]`` for KV scatter — the update writes ``S_tkg``
+consecutive slots from the base and asserts shape ``(B, 1)``.
 """
 
 import os as _os
@@ -376,17 +363,8 @@ def _multilayer_body(
         sin, B, S_tkg, D_HEAD, name="sin_perm_hbm"
     )
 
-    # W_qkv is pre-fused at weight-conversion time (the converter in
-    # qwen_with_megakernel.py packs q/k/v into one [H, I_QKV]-per-rank tensor).
-    # No in-kernel QKV fusion, no per-step transpose DMA, no scratch buffer —
-    # the old shared scratch was both a per-step redundant HBM round-trip and
-    # a cross-layer write/read aliasing hazard.
-
-    # Load X into the SBUF residual in LNC-aware shard-interleaved layout:
-    #   residual_sb[p, b*H1 + shard*H2 + h2] = X[b, s, shard*(H0*H2) + p*H2 + h2]
-    # The vendored subkernels slice the SBUF input on dim 2 at shard_id*H1_SHARD,
-    # so h1 must equal shard*H2 + h2. A plain channel-interleaved load is only
-    # equivalent at LNC=1.
+    # LNC-aware shard-interleaved load: residual_sb[p, bs*H1 + shard*H2 + h2] = X[b,s,...].
+    # Subkernels slice dim 2 at shard_id*H1_SHARD; plain interleaved is only correct at LNC=1.
     residual_sb = nl.ndarray((H0, BxS * H1), dtype=dtype, buffer=nl.sbuf,
                               name="residual_sb")
     X_flat = X.reshape((BxS * H,))
@@ -409,15 +387,13 @@ def _multilayer_body(
         sbm.set_name_prefix(f"L{layer_idx}_attn_")
         sbm.set_auto_alloc(True)
 
-        # Copy residual — attention_block_tkg's fused RMSNorm overwrites its
-        # input, so the residual buffer must be preserved separately.
+        # attention_block_tkg's fused RMSNorm overwrites its input; preserve residual.
         attn_in_sb = nl.ndarray((H0, BxS * H1), dtype=dtype, buffer=nl.sbuf,
                                  name=f"L{layer_idx}_attn_in_sb")
         nisa.tensor_copy(attn_in_sb, residual_sb)
         X_sb = attn_in_sb.reshape((H0, BxS, H1))
 
-        # Reshape gamma/qn/kn to the [1, *] shapes the subkernels expect
-        # (view reshapes — no data movement).
+        # reshape to [1, *] views the subkernels expect
         gpre_w  = gpre_list[layer_idx].reshape((1, H))
         qnorm_w = qn_list[layer_idx].reshape((1, D_HEAD))
         knorm_w = kn_list[layer_idx].reshape((1, D_HEAD))
@@ -456,11 +432,8 @@ def _multilayer_body(
             V_cache=V_post[layer_idx],
             attention_mask=mask_full_hbm,
             sink=None,
-            # in-place KV cache update at position_ids. _update_flat_cache
-            # writes S_tkg consecutive entries starting from the BASE position,
-            # so for T>1 spec (consecutive positions [p, p+1, ..., p+T-1])
-            # pass only the first column [B, 1] — the cache update path
-            # asserts shape (B, 1).
+            # T>1: pass only base position [B, 1]; the update writes S_tkg consecutive
+            # entries from there. Cache-update path asserts shape (B, 1).
             update_cache=True,
             kv_cache_update_idx=position_ids[:, :1],
             # output projection (Qwen3 has no O bias)
@@ -511,8 +484,7 @@ def _multilayer_body(
         )
 
         # ===== Router topK ================================================
-        # router_logits gets a real HBM alloc to satisfy NCC_IGCA090 (every
-        # mutable_tensor needs at least one store) even though it's discarded.
+        # HBM alloc required by NCC_IGCA090 (mutable_tensor needs ≥1 store).
         router_logits_hbm = nl.ndarray((T, E), dtype=nl.float32,
                                        buffer=nl.shared_hbm,
                                        name=f"L{layer_idx}_router_logits_scratch")
@@ -522,9 +494,7 @@ def _multilayer_body(
         expert_affinities_sb = nl.ndarray((T, E), dtype=nl.float32,
                                           buffer=nl.sbuf,
                                           name=f"L{layer_idx}_expert_affinities_sb")
-        # x_sb_layout=XSBLayout_tp2013__1 is the LNC=2 shard-interleaved layout
-        # that rmsnorm_tkg / attention_block_tkg produce. tp102__0 only matches
-        # at LNC=1 and would mis-index the hidden state here.
+        # XSBLayout_tp2013__1 is the LNC=2 shard-interleaved layout rmsnorm_tkg produces.
         router_outputs = router_topk(
             x=moe_in_sb,
             w=router_list[layer_idx],
@@ -549,13 +519,8 @@ def _multilayer_body(
         # reshape to the [E, H, 2, I_PER_EXPERT] view moe_tkg expects.
         gate_up_w = gate_up_list[layer_idx].reshape((E, H, 2, I_PER_EXPERT))
 
-        # moe_tkg's selective-expert path (T=1) shards on H and expects
-        # hidden_input as the PER-SHARD slice [H0, T, H1_SHARD]. Passing the
-        # full [H0, T, H1] makes both cores read columns [0:H1_SHARD), pairing
-        # core 1's weight rows with core 0's H values. Mirrors
-        # nkilib/core/moe_block/moe_block_tkg.py:309-314. Guards:
-        # tests/qwen3_moe/test_moe_vs_hf.py and the call-site shape guard in
-        # test_speculative_megakernel.py.
+        # selective-expert path expects the per-shard slice [H0, T, H1_SHARD];
+        # passing full [H0, T, H1] mis-pairs core 1's weights with core 0's H values.
         moe_in_pershard_sb = nl.ndarray((H0, BxS, H1_SHARD), dtype=dtype,
                                          buffer=nl.sbuf,
                                          name=f"L{layer_idx}_moe_in_pershard_sb")
@@ -583,11 +548,8 @@ def _multilayer_body(
             output_in_sbuf=True,
             output_dtype=dtype,
         )
-        # moe_out_sb is [H0, BxS, H1_SHARD] (F: BxS outer, H1_SHARD inner).
-        # Copy into [H0, H1_SHARD*BxS] (H1_SHARD outer, BxS inner) — the
-        # contiguous layout _sb2sb_all_reduce_gather expects. The per-column
-        # copy avoids the illegal-partition-step / non-unit-stride asserts
-        # that a strided view would trip.
+        # Transpose [H0, BxS, H1_SHARD] → [H0, H1_SHARD*BxS] for _sb2sb_all_reduce_gather.
+        # Per-column copy avoids illegal-partition-step asserts on a strided view.
         moe_sharded_sb = nl.ndarray((H0, H1_SHARD * BxS), dtype=dtype,
                                      buffer=nl.sbuf,
                                      name=f"L{layer_idx}_moe_sharded_sb")
@@ -629,8 +591,7 @@ def _multilayer_body(
     if N_PRGS > 1:
         nisa.core_barrier(data=Y, cores=(0, 1))
 
-    # Return KV refs so NCC preserves the in-place scatters; NxDI's
-    # model_wrapper aliases each back to its kv_mgr slot.
+    # Return KV refs so NCC preserves the in-place scatters.
     return (Y,) + tuple(K_post) + tuple(V_post)
 
 
