@@ -19,9 +19,8 @@ import os as _os
 import nki.isa as nisa
 import nki.language as nl
 
-# Revert to upstream per-HTile down weight DMA (bypasses the in-function
-# hoist). Mirrors selective_expert_impl.py's flag.
-_MOE_LEGACY_WEIGHT_LOAD = _os.environ.get("NKI_MOE_LEGACY_WEIGHT_LOAD", "0") == "1"
+# Bypass the down-weight hoist (reshape on I needs I % 128 == 0).
+_MOE_LEGACY_DOWN_WEIGHT_LOAD = _os.environ.get("NKI_MOE_LEGACY_DOWN_WEIGHT_LOAD", "0") == "1"
 
 from nkilib.core.utils.allocator import SbufManager
 from nkilib.core.utils.interleave_copy import interleave_copy
@@ -581,7 +580,7 @@ def process_down_projection(
     down_hoisted_w_tile = None
     use_hoisted_down_load = (
         (not params.use_tkg_down_proj_column_tiling)
-        and (not _MOE_LEGACY_WEIGHT_LOAD)
+        and (not _MOE_LEGACY_DOWN_WEIGHT_LOAD)
     )
 
     weight_tiles = []

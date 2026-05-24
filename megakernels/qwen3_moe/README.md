@@ -39,6 +39,29 @@ The megakernel fuses the entire Qwen3-30B-A3B decoder stack (input layernorm thr
 
 LNC=2 is used throughout. KV heads (4 total) are sharded across 4 LNCs within a single chip. `SbufManager` handles on-chip memory allocation and weight double-buffering across layers.
 
+## Fused Speculation
+
+`transformer_qwen3_moe_speculative.py` is the megakernel used by the target model under fused speculative decoding. The same kernel handles two call patterns:
+
+- **T=1** — standard autoregressive decode for the target after a verification step.
+- **T>1** — speculative verification: the target consumes `speculation_length` consecutive draft tokens in one TKG invocation. Each query slot gets its own RoPE values and per-slot causal mask, and the in-place KV scatter writes all T slots starting from a single base position.
+
+The 48-layer pipeline, SBUF-resident residual, and in-place KV update are identical to the single-token kernel — only `S_tkg` and the per-slot positions/RoPE differ.
+
+```bash
+python main.py --model qwen3_moe --enable-nki --mode evaluate_single \
+  --model-path ~/qwen-30b-a3b/hf_model \
+  --compiled-model-path ~/qwen-30b-a3b/traced_spec_model \
+  --enable-fused-speculation \
+  --draft-model-path ~/qwen-0.6b/hf_model \
+  --compiled-draft-model-path ~/qwen-0.6b/traced_draft_model \
+  --speculation-length 8 \
+  --tp-degree 4 \
+  --seq-len 768 \
+  --context-encoding-buckets 768 \
+  --on-device-sampling
+```
+
 ## Setup
 
 Tested on Trainium 2 and 3 with AWS Neuron SDK v2.27.

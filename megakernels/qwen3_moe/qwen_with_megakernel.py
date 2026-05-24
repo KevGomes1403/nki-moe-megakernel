@@ -29,8 +29,9 @@ Flag / open items (also in kernel docstring):
   - Router weight pre-transpose is deferred — we `.T.contiguous()` at
     forward-time like V2 (traced once per layer, becomes a compile-time
     constant in the NEFF). Converter stays identical to V2.
-  - Only TKG B=1 is handled by the megakernel. Speculative decoding / B>1
-    must fall back to the per-layer path (not wired yet).
+  - Speculative decoding (T>1) is supported: the megakernel now handles
+    consecutive `position_ids` ``[B, T]`` (e.g. ``[p, p+1, ..., p+T-1]``).
+    cos/sin are passed in shape ``[B, T, d]`` (one position per slot).
 """
 
 import gc
@@ -51,7 +52,6 @@ from neuronx_distributed.utils import cpu_mode
 from neuronx_distributed_inference.models.config import (
     MoENeuronConfig,
     OnDeviceSamplingConfig,
-    TensorCaptureConfig,
 )
 from neuronx_distributed_inference.models.layer_boundary_marker import (
     ModuleMarkerEndWrapper,
@@ -71,16 +71,10 @@ from neuronx_distributed_inference.modules.attention.utils import RotaryEmbeddin
 from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm
 from neuronx_distributed_inference.modules.moe_v2 import initialize_moe_module
 
-from megakernels.qwen3_moe.transformer_qwen import (
-    transformer_qwen3_moe_tkg_multilayer_jit,
+from megakernels.qwen3_moe.transformer_qwen3_moe_speculative import (
+    transformer_qwen3_moe_speculative_jit,
     get_multilayer_kernel_jit,
 )
-
-try:
-    from neuronx_distributed.utils.tensor_capture import register_tensor as _register_tensor
-except ImportError:
-    def _register_tensor(name, tensor):
-        pass
 
 GQA_SHARDING_STRATEGY = GQA.REPLICATE_TO_TP_DEGREE
 
@@ -93,7 +87,7 @@ os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = "trn3"
 # os.environ["XLA_HLO_DEBUG"]= "1"
 # os.environ["NEURON_RT_INSPECT_ENABLE"]= "1"
 # os.environ["NEURON_RT_INSPECT_DEVICE_PROFILE"]= "1"
-# os.environ["NEURON_RT_INSPECT_OUTPUT_DIR"]= "./output/fused/"
+# os.environ["NEURON_RT_INSPECT_OUTPUT_DIR"]= "./output/qwen_megakernel/"
 
 # ---------------------------------------------------------------------------
 # Neuron config
@@ -191,31 +185,26 @@ def convert_qwen3_moe_hf_to_neuron_state_dict(neuron_state_dict, config):
         o_proj_w = neuron_state_dict[f"layers.{l}.self_attn.o_proj.weight"]   # [H, Hq]
         neuron_state_dict[f"layers.{l}.self_attn.Wo_nki.weight"] = o_proj_w.T.contiguous()
 
-        # Tile-transposed layout for pretransposed attention kernel:
-        #   W_pt[head*d+p, tile*d+f] = W[head*d+f, tile*d+p]
-        #   Produced by: W.reshape(n_heads, d, n_tiles, d).permute(0, 3, 2, 1).reshape(n_heads*d, H)
-        _d        = config.head_dim                       # 128
-        _nh       = config.num_attention_heads            # 32
-        _nkv      = config.num_key_value_heads            # 4
-        _H_cfg    = config.hidden_size                    # 2048
-        _nh_tiles = _H_cfg // _d                          # 16
-
-        q_proj_w = neuron_state_dict[f"layers.{l}.self_attn.q_proj.weight"]   # [Hq, H]
-        neuron_state_dict[f"layers.{l}.self_attn.Wq_nki.weight"] = (
-            q_proj_w.reshape(_nh, _d, _nh_tiles, _d)
-            .permute(0, 3, 2, 1).reshape(_nh * _d, _H_cfg).contiguous()
-        )
-
-        k_proj_w = neuron_state_dict[f"layers.{l}.self_attn.k_proj.weight"]   # [nkv*d, H]
-        neuron_state_dict[f"layers.{l}.self_attn.Wk_nki.weight"] = (
-            k_proj_w.reshape(_nkv, _d, _nh_tiles, _d)
-            .permute(0, 3, 2, 1).reshape(_nkv * _d, _H_cfg).contiguous()
-        )
-
-        v_proj_w = neuron_state_dict[f"layers.{l}.self_attn.v_proj.weight"]   # [nkv*d, H]
-        neuron_state_dict[f"layers.{l}.self_attn.Wv_nki.weight"] = (
-            v_proj_w.reshape(_nkv, _d, _nh_tiles, _d)
-            .permute(0, 3, 2, 1).reshape(_nkv * _d, _H_cfg).contiguous()
+        # Fused QKV — built ONCE here at weight-conversion time (not per decode
+        # step). attention_block_tkg wants W_qkv as
+        # [H, (q_heads + 2*kv_heads)*d_head] PER TP RANK. We pack the full
+        # weight rank-grouped — for rank r: [q-heads of r | k-head of r |
+        # v-head of r] stacked as rows — so PreTransposedColumnParallelLinear
+        # (transpose at preshard, shard dim 1) hands each rank exactly its
+        # [H, I_QKV] slice. Replaces the old per-step in-kernel
+        # _fuse_qkv_weights DMA (a redundant HBM transpose of static weights).
+        _tp = config.neuron_config.tp_degree
+        _q = neuron_state_dict[f"layers.{l}.self_attn.q_proj.weight"]   # [Hq_full, H]
+        _k = neuron_state_dict[f"layers.{l}.self_attn.k_proj.weight"]   # [Hkv_full, H]
+        _v = neuron_state_dict[f"layers.{l}.self_attn.v_proj.weight"]   # [Hkv_full, H]
+        _qd, _kd = _q.shape[0] // _tp, _k.shape[0] // _tp
+        _blocks = []
+        for _r in range(_tp):
+            _blocks.append(_q[_r * _qd:(_r + 1) * _qd])
+            _blocks.append(_k[_r * _kd:(_r + 1) * _kd])
+            _blocks.append(_v[_r * _kd:(_r + 1) * _kd])
+        neuron_state_dict[f"layers.{l}.self_attn.Wqkv_nki.weight"] = (
+            torch.cat(_blocks, dim=0).detach().contiguous()
         )
 
         neuron_state_dict[f"layers.{l}.mlp.router.linear_router.weight"] = (
@@ -322,9 +311,11 @@ class NeuronQwen3MoEAttentionV3(NeuronAttentionBase):
         _Hq_full = config.num_attention_heads * config.head_dim
         _Hkv_full = config.num_key_value_heads * config.head_dim
         self._nki_d = config.head_dim
-        self.Wq_nki = ColumnParallelLinear(_H, _Hq_full,  bias=False, gather_output=False, dtype=_dtype)
-        self.Wk_nki = ColumnParallelLinear(_H, _Hkv_full, bias=False, gather_output=False, dtype=_dtype)
-        self.Wv_nki = ColumnParallelLinear(_H, _Hkv_full, bias=False, gather_output=False, dtype=_dtype)
+        # Fused QKV: one pre-transposed column-parallel weight, [H, I_QKV] per
+        # rank (q + 2*kv heads), populated by the converter. Replaces separate
+        # Wq/Wk/Wv + the per-step in-kernel fusion.
+        self.Wqkv_nki = PreTransposedColumnParallelLinear(
+            _H, _Hq_full + 2 * _Hkv_full, bias=False, gather_output=False, dtype=_dtype)
         self.Wo_nki = ColumnParallelLinear(_H, _Hq_full,  bias=False, gather_output=False, dtype=_dtype)
 
 
@@ -388,15 +379,13 @@ class NeuronQwen3MoeDecoderLayerV3(nn.Module):
         # Pass each layer's weight as its own top-level NKI tensor (same pattern
         # as KV caches).
         layers = self._parent_model.layers
-        Wq, Wk, Wv, Wo = [], [], [], []
+        Wqkv, Wo = [], []
         qn, kn = [], []
         gpre = []
         gpost = []
         router, gate_up, down = [], [], []
         for l in layers:
-            Wq.append(l.self_attn.Wq_nki.weight)
-            Wk.append(l.self_attn.Wk_nki.weight)
-            Wv.append(l.self_attn.Wv_nki.weight)
+            Wqkv.append(l.self_attn.Wqkv_nki.weight)
             Wo.append(l.self_attn.Wo_nki.weight)
             qn.append(l.self_attn.q_layernorm.weight)
             kn.append(l.self_attn.k_layernorm.weight)
@@ -405,7 +394,7 @@ class NeuronQwen3MoeDecoderLayerV3(nn.Module):
             router.append(l.mlp.router.linear_router.weight.T.contiguous())
             gate_up.append(l.mlp.expert_mlps.mlp_op.gate_up_proj.weight)
             down.append(l.mlp.expert_mlps.mlp_op.down_proj.weight)
-        return (Wq, Wk, Wv, Wo, qn, kn, gpre, gpost, router, gate_up, down)
+        return (Wqkv, Wo, qn, kn, gpre, gpost, router, gate_up, down)
 
     def _gather_kv_caches(self, kv_mgr):
         """kv_mgr.past_key_values is flat [K0, V0, K1, V1, ...].
@@ -452,30 +441,33 @@ class NeuronQwen3MoeDecoderLayerV3(nn.Module):
 
                 hidden_states = ModuleMarkerStartWrapper()(hidden_states)
 
-                # RoPE cos/sin at position — same shape trick as V2.
+                # RoPE cos/sin at position. rotary_emb returns [B, T, d] —
+                # one slot per token in position_ids. Pass directly to the
+                # megakernel: it expects per-slot RoPE for both T=1 (single
+                # token gen) and T>1 (speculative decoding verification of
+                # consecutive positions [p, p+1, ..., p+T-1]).
                 cos_cache, sin_cache = self.self_attn.rotary_emb(hidden_states, position_ids)
-                cos_at_pos = cos_cache.squeeze(1)   # [B, d]
-                sin_at_pos = sin_cache.squeeze(1)
+                # cos_cache / sin_cache: [B, T, d]
 
-                (Wq_list, Wk_list, Wv_list, Wo_list,
+                (Wqkv_list, Wo_list,
                  qn_list, kn_list, gpre_list, gpost_list,
                  router_list, gate_up_list, down_list) = self._gather_weights_from_parent()
                 K_caches, V_caches = self._gather_kv_caches(kv_mgr)
 
                 kernel_out = get_multilayer_kernel_jit(L)[2](
                     hidden_states,
-                    *Wq_list, *Wk_list, *Wv_list, *Wo_list,
+                    *Wqkv_list, *Wo_list,
                     *qn_list, *kn_list, *gpre_list, *gpost_list,
                     *router_list, *gate_up_list, *down_list,
                     *K_caches, *V_caches,
-                    cos_at_pos, sin_at_pos, position_ids.to(torch.int32),
+                    cos_cache, sin_cache, position_ids.to(torch.int32),
                     replica_groups=self._replica_groups,
                 )
                 Y = kernel_out[0]
-        
+
                 K_out = list(kernel_out[1     : 1 + L])
                 V_out = list(kernel_out[1 + L : 1 + 2 * L])
-                
+
                 Y = ModuleMarkerEndWrapper()(Y)
 
                 # Stash the post-scatter KV handles so pass-through layers can

@@ -60,7 +60,7 @@ python main.py --model gpt_oss --mode generate --enable-nki --mxfp4 \
   --prompt "What is the capital of France?"
 
 # Benchmark
-python main.py --model gpt_oss --mode evaluate-single --enable-nki --mxfp4 \
+python main.py --model gpt_oss --mode evaluate_single --enable-nki --mxfp4 \
   --model-path ~/models/gpt-oss-20b \
   --compiled-model-path ~/models/gpt-oss-20b/traced_nki_mx_model
 ```
@@ -106,7 +106,7 @@ python main.py --model gpt_oss --mode generate --enable-nki \
   --prompt "What is the capital of France?"
 
 # Benchmark
-python main.py --model gpt_oss --mode evaluate-single --enable-nki \
+python main.py --model gpt_oss --mode evaluate_single --enable-nki \
   --model-path ~/models/gpt-oss-20b \
   --compiled-model-path ~/models/gpt-oss-20b/traced_nki_model
 ```
