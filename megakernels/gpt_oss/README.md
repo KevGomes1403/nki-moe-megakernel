@@ -50,6 +50,28 @@ Two NKI primitives under `nki_kernels/moe/` back this path:
 
 **Caveat — HBM round-trip per layer.** The current MX MoE kernel asserts `output_in_sbuf=False` and requires its hidden input in HBM (in the model's shuffled-H layout). The megakernel therefore inserts a per-layer `dma_copy` of the MoE input out to `shared_hbm` and the MoE output back into SBUF on either side of the MX call (see `transformer_gpt_oss.py:434-470`). The bf16 path, by contrast, keeps the MoE input/output entirely in SBUF. This round-trip is the dominant overhead of the MX path today and is the next thing to remove — it would require teaching the MX selective-expert kernel to accept an SBUF hidden tensor and emit an SBUF output.
 
+### Results
+
+bs=1, seq=768, TP=8 LNC=1, single trn3 chip, all three rows compiled with `--context-encoding-buckets 768 --token-generation-buckets 768`:
+
+| config           | TKG p50 | tok/s | Δ vs XLA bf16 | notes |
+|---|---:|---:|---:|---|
+| XLA bf16         | 5.31 ms | 188.4 | —           | NxDI default attention + torch-blockwise MoE |
+| Megakernel bf16  | 4.76 ms | 209.7 | **−10%**    | multilayer fused TKG, bf16 weights |
+| Megakernel MXFP4 | 4.97 ms | 200.7 | **−6%**     | MX expert weights via NKI MX kernel; pays the per-layer MoE HBM round-trip above |
+
+**Headline Profile Data:**
+
+| config           | TensorE active | DMA active | HBM read | HBM write | bottleneck |
+|---|---:|---:|---:|---:|---|
+| XLA bf16         | 32% | 57% | 1.00 GB | 1.4 MB  | HBM-bound |
+| Megakernel bf16  | 39% | 57% | 1.01 GB | 0.14 MB | HBM-bound, +7pp TensorE vs XLA |
+| Megakernel MXFP4 | 29% | 58% | 0.94 GB | 85.4 MB | HBM-bound, +85 MB write/token = the per-layer MoE round-trip |
+
+The +85 MB HBM-write delta on the MXFP4 row maps cleanly to ~3.5 MB × 24 layers — i.e. the `dma_copy` round-trip the caveat above describes.
+
+**Note on XLA + MXFP4.** A naive "XLA + MXFP4" comparison (no `--enable-nki`, with `--mxfp4`) is not buildable on this NxDI: gpt-oss-20b's MXFP4 weights ship in a swizzled layout that only the NKI MX MoE kernel can consume — NxDI's torch-blockwise dequant doesn't support the swizzling, and the standard sharder can't split MX scale-block dims across TP=8 (`split_size=0` for a dim of 2). The XLA bf16 row above is the apples-to-apples baseline because XLA dequantizes to bf16 at load time anyway.
+
 ### Running MXFP4
 
 ```bash
