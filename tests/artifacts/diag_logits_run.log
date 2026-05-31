@@ -1,0 +1,47 @@
+/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:100: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+  component, error = import_nki(config)
+/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:102: UserWarning: Warning: Failed to import blockwise_mm_baseline_shard_hidden: No module named 'neuronxcc.nki._private.blockwise_mm'
+  warnings.warn(f"Warning: {error}")
+/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:102: UserWarning: Warning: Failed to import blockwise_mm_bwd: No module named 'neuronxcc.nki._private.blockwise_mm_bwd'
+  warnings.warn(f"Warning: {error}")
+/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:102: UserWarning: Warning: Failed to import blockwise_mm_bwd_baseline_shard_hidden: No module named 'neuronxcc.nki._private.blockwise_mm_bwd'
+  warnings.warn(f"Warning: {error}")
+Loading compiled model from /home/ubuntu/models/qwen36_a3b_traced_logits...
+WARNING:root:NeuronConfig init: Unexpected keyword arguments: {'enable_long_context_mode': False, 'enable_token_tree': False, 'is_chunked_prefill': False, 'is_hidden_dim_shuffled': False, 'is_intermediate_dim_shuffled': False, 'is_prefill_stage': None, 'kv_cache_tiling': False, 'kv_cache_update_with_kernel': False, 'normalize_top_k_affinities': True, 'tile_cc': False}
+INFO:Neuron:Loading presharded checkpoints for ranks: 0...3
+INFO:Neuron:Finished weights loading in 259.05802975595 seconds
+INFO:Neuron:Warming up the model.
+2026-May-31 17:57:35.0363 290208:290278 [2] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):219 CCOM WARN NET/OFI Failed to initialize rdma protocol
+2026-May-31 17:57:35.0366 290208:290278 [2] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):354 CCOM WARN NET/OFI aws-ofi-nccl initialization failed
+2026-May-31 17:57:35.0368 290208:290278 [2] ncclResult_t nccl_net_ofi_init_no_atexit_fini_v6(ncclDebugLogger_t):183 CCOM WARN NET/OFI Initializing plugin failed
+2026-May-31 17:57:35.0370 290208:290278 [2] net_plugin.cc:97 CCOM WARN OFI plugin initNet() failed is EFA enabled?
+INFO:Neuron:Warmup completed in 0.46079111099243164 seconds.
+prompt           : 'The capital of France is'
+prompt tokens    : [760, 6511, 314, 9338, 369]
+prompt detok     : ['The', 'Ġcapital', 'Ġof', 'ĠFrance', 'Ġis']
+prompt seq_len   : 5
+pad to seq_len   : 128
+
+Running prefill...
+output type    : <class 'transformers.modeling_outputs.CausalLMOutputWithPast'>
+  attr loss: None
+  attr logits: shape=(1, 1, 248320) dtype=torch.float32 min=+nan max=+nan
+  attr past_key_values: None
+  attr hidden_states: shape=(1, 1, 248320) dtype=torch.float32 min=+nan max=+nan
+  attr attentions: None
+  attr tokens: shape=(1, 1, 248320) dtype=torch.float32 min=+nan max=+nan
+  attr captured_tensors: None
+output shape   : (1, 1, 248320)
+output dtype   : torch.float32
+output min/max : nan / nan
+output has nan : True
+output has inf : False
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/home/ubuntu/trainium-model-translation/models/qwen3_6_moe/diag_logits.py", line 115, in <module>
+    main()
+  File "/home/ubuntu/trainium-model-translation/models/qwen3_6_moe/diag_logits.py", line 98, in main
+    last_logits = logits[0, prompt_len - 1]
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^
+IndexError: index 4 is out of bounds for dimension 1 with size 1
