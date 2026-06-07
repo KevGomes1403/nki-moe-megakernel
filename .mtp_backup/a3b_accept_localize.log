@@ -1,0 +1,53 @@
+/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:100: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+  component, error = import_nki(config)
+/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:102: UserWarning: Warning: Failed to import blockwise_mm_baseline_shard_hidden: No module named 'neuronxcc.nki._private.blockwise_mm'
+  warnings.warn(f"Warning: {error}")
+/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:102: UserWarning: Warning: Failed to import blockwise_mm_bwd: No module named 'neuronxcc.nki._private.blockwise_mm_bwd'
+  warnings.warn(f"Warning: {error}")
+/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:102: UserWarning: Warning: Failed to import blockwise_mm_bwd_baseline_shard_hidden: No module named 'neuronxcc.nki._private.blockwise_mm_bwd'
+  warnings.warn(f"Warning: {error}")
+/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed_inference/utils/constants.py:1: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+  from neuronx_distributed_inference.models.dbrx.modeling_dbrx import NeuronDbrxForCausalLM
+/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed_inference/utils/constants.py:6: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+  from neuronx_distributed_inference.models.mixtral.modeling_mixtral import NeuronMixtralForCausalLM
+/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed_inference/utils/constants.py:14: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+  from neuronx_distributed_inference.models.qwen3_moe.modeling_qwen3_moe import NeuronQwen3MoeForCausalLM
+WARNING:root:NeuronConfig init: Unexpected keyword arguments: {'enable_long_context_mode': False, 'enable_token_tree': False, 'is_chunked_prefill': False, 'is_hidden_dim_shuffled': False, 'is_intermediate_dim_shuffled': False, 'is_prefill_stage': None, 'kv_cache_tiling': False, 'kv_cache_update_with_kernel': False, 'normalize_top_k_affinities': True, 'tile_cc': False}
+INFO:Neuron:Loading presharded checkpoints for ranks: 0...3
+INFO:Neuron:Finished weights loading in 13.518279814859852 seconds
+INFO:Neuron:Warming up the model.
+2026-Jun-07 16:14:58.0598 714563:714594 [3] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):219 CCOM WARN NET/OFI Failed to initialize rdma protocol
+2026-Jun-07 16:14:58.0601 714563:714594 [3] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):354 CCOM WARN NET/OFI aws-ofi-nccl initialization failed
+2026-Jun-07 16:14:58.0604 714563:714594 [3] ncclResult_t nccl_net_ofi_init_no_atexit_fini_v6(ncclDebugLogger_t):183 CCOM WARN NET/OFI Initializing plugin failed
+2026-Jun-07 16:14:58.0606 714563:714594 [3] net_plugin.cc:97 CCOM WARN OFI plugin initNet() failed is EFA enabled?
+INFO:Neuron:Warmup completed in 0.660513162612915 seconds.
+Found compiled artifacts at /home/ubuntu/models/qwen36_a3b_specdec_traced; skipping compile.
+Loading compiled model from /home/ubuntu/models/qwen36_a3b_specdec_traced...
+graphs: 4 -> ['context_encoding_model', 'token_generation_model', 'mtp_draft_head_model', 'verify_backbone_model']
+
+==========================================================================
+STAGE C LOCALIZE -- one ACCEPT round vs two sequential REJECT rounds
+==========================================================================
+
+=== prompt: 'The capital of France is' ===
+  [state] 204 state tensors; trunk candidates=['trunk_hidden_buffer']
+  first ACCEPT at t=4: x_(t+1)=11751 x_(t+2)=11 positions [5,6]
+  (a) recurrent_state_buffer  max|diff| = 2.17383  (layers.21.linear_attn.recurrent_state_buffer)
+  (b) conv_state_buffer       max|diff| = 0.53125  (layers.14.linear_attn.conv_state_buffer)
+  (c) GQA cache               max|diff| = 10.3438  (rank0:kv_mgr.past_key_values.30)
+  (d) x_(t+3): two-reject=264  accept=264  MATCH
+      vlog logit-vector max|diff| (accept[:,1] vs reject-B[:,0]) = 0.1875
+
+=== prompt: 'List the first five prime numbers:' ===
+  first ACCEPT at t=7: x_(t+1)=248068 x_(t+2)=271 positions [8,9]
+  (a) recurrent_state_buffer  max|diff| = 3.58691  (layers.0.linear_attn.recurrent_state_buffer)
+  (b) conv_state_buffer       max|diff| = 0.515625  (layers.37.linear_attn.conv_state_buffer)
+  (c) GQA cache               max|diff| = 12.4219  (rank2:kv_mgr.past_key_values.79)
+  (d) x_(t+3): two-reject=248069  accept=248069  MATCH
+      vlog logit-vector max|diff| (accept[:,1] vs reject-B[:,0]) = 0.882812
+
+==========================================================================
+LOCALIZATION SUMMARY (which buffer diverges accept-vs-two-reject)
+==========================================================================
+  'The capital of France is'                    -> RECURRENT(S2)=2.174, CONV2=0.5312, GQA=10.34, VLOG[:,1]=0.1875
+  'List the first five prime numbers:'          -> RECURRENT(S2)=3.587, CONV2=0.5156, GQA=12.42, VLOG[:,1]=0.8828

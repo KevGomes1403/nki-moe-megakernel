@@ -1,0 +1,40 @@
+/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:100: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+  component, error = import_nki(config)
+/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:102: UserWarning: Warning: Failed to import blockwise_mm_baseline_shard_hidden: No module named 'neuronxcc.nki._private.blockwise_mm'
+  warnings.warn(f"Warning: {error}")
+/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:102: UserWarning: Warning: Failed to import blockwise_mm_bwd: No module named 'neuronxcc.nki._private.blockwise_mm_bwd'
+  warnings.warn(f"Warning: {error}")
+/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:102: UserWarning: Warning: Failed to import blockwise_mm_bwd_baseline_shard_hidden: No module named 'neuronxcc.nki._private.blockwise_mm_bwd'
+  warnings.warn(f"Warning: {error}")
+/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed_inference/utils/constants.py:1: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+  from neuronx_distributed_inference.models.dbrx.modeling_dbrx import NeuronDbrxForCausalLM
+/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed_inference/utils/constants.py:6: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+  from neuronx_distributed_inference.models.mixtral.modeling_mixtral import NeuronMixtralForCausalLM
+/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed_inference/utils/constants.py:14: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+  from neuronx_distributed_inference.models.qwen3_moe.modeling_qwen3_moe import NeuronQwen3MoeForCausalLM
+WARNING:root:NeuronConfig init: Unexpected keyword arguments: {'enable_long_context_mode': False, 'enable_token_tree': False, 'is_chunked_prefill': False, 'is_hidden_dim_shuffled': False, 'is_intermediate_dim_shuffled': False, 'is_prefill_stage': None, 'kv_cache_tiling': False, 'kv_cache_update_with_kernel': False, 'normalize_top_k_affinities': True, 'tile_cc': False}
+INFO:Neuron:Loading presharded checkpoints for ranks: 0...3
+INFO:Neuron:Finished weights loading in 13.08284089481458 seconds
+INFO:Neuron:Warming up the model.
+2026-Jun-06 23:52:18.0878 641487:641550 [2] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):219 CCOM WARN NET/OFI Failed to initialize rdma protocol
+2026-Jun-06 23:52:18.0881 641487:641550 [2] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):354 CCOM WARN NET/OFI aws-ofi-nccl initialization failed
+2026-Jun-06 23:52:18.0883 641487:641550 [2] ncclResult_t nccl_net_ofi_init_no_atexit_fini_v6(ncclDebugLogger_t):183 CCOM WARN NET/OFI Initializing plugin failed
+2026-Jun-06 23:52:18.0885 641487:641550 [2] net_plugin.cc:97 CCOM WARN OFI plugin initNet() failed is EFA enabled?
+INFO:Neuron:Warmup completed in 0.6147129535675049 seconds.
+`generation_config` default values have been modified to match model-specific defaults: {'bos_token_id': 248044}. If this is not desired, please set these values explicitly.
+config: enable_verify_backbone=True mtp_num_hidden_layers=0
+Found compiled artifacts at /home/ubuntu/models/qwen36_a3b_verify_traced; skipping compile.
+Loading compiled model from /home/ubuntu/models/qwen36_a3b_verify_traced...
+graphs registered: 3 -> ['context_encoding_model', 'token_generation_model', 'verify_backbone_model']
+=== sanity generation (before verify) ===
+'The capital of France is Paris, a city renowned for its rich history, culture, and iconic landmarks.'
+=== verify graph smoke ===
+verify_logits shape=(1, 2, 248320) finite=True shape_ok=True pos0_argmax=1040 (' like') pos1_argmax=198 ('\n')
+verify() returned 1 host output(s) (logits only; the KV/seed/candidate outputs are input_output-aliased, so on device they are written in place to their state buffers, not returned). num_kv=80 num_seed=60 num_dn=30 expected_candidates=61
+device state keys (candidate-related): 61 found
+=== candidate outputs (read from aliased device state) ===
+candidates_present=True recurrent(present=True shape_ok=True finite=True) conv(present=True shape_ok=True finite=True) trunk(present=True shape=(1, 2, 2048) shape_ok=True finite=True) S1_nondegenerate=True
+=== sanity generation (after verify) ===
+'The capital of France is Paris, a city renowned for its rich history, culture, and iconic landmarks.'
+non-destructive (text matches before/after verify): True
+STAGE B.2 DEVICE SMOKE: PASS

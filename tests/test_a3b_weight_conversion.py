@@ -6,8 +6,9 @@ Validates:
                              mlp.moe.expert_mlps.mlp_op.{gate_up_proj,down_proj}
   * shared expert pass-through (singular name, owned by NeuronMoEBlock)
   * shared_expert_gate pass-through (sigmoid gate over shared output)
-  * MTP key remap            mtp.layers.0.* -> mtp_head.*
-  * outer wrapper preserves mtp.* keys
+  * MTP key remap            mtp.fc/pre_fc_norm_*/norm + mtp.layers.0.* -> mtp_head.*
+  * MTP draft layer gets the same full-attention + MoE conversions as a main layer
+  * MTP RMSNorms converted to (1 + w); draft LM head tied to the main lm_head
 """
 
 from __future__ import annotations
@@ -143,15 +144,29 @@ def _make_mini_state_dict(cfg: Qwen36A3BInferenceConfig) -> dict:
             sd[f"layers.{l}.linear_attn.norm.weight"] = torch.randn(value_dim, dtype=bf) * 0.5
             sd[f"layers.{l}.linear_attn.out_proj.weight"] = torch.randn(H, value_dim, dtype=bf) * 0.02
 
-    # --- MTP weights (HF-style "mtp.layers.0.*") ---
-    sd["mtp.layers.0.embed_layernorm.weight"] = torch.zeros(H, dtype=bf)
-    sd["mtp.layers.0.hidden_layernorm.weight"] = torch.zeros(H, dtype=bf)
-    sd["mtp.layers.0.input_proj.weight"] = torch.randn(H, 2 * H, dtype=bf) * 0.02
-    sd["mtp.layers.0.final_layernorm.weight"] = torch.zeros(H, dtype=bf)
-    sd["mtp.layers.0.lm_head.weight"] = torch.randn(V, H, dtype=bf) * 0.02
-    # Inner decoder-layer weights for MTP get routed under mtp_head.decoder_layer.*
-    sd["mtp.layers.0.input_layernorm.weight"] = torch.zeros(H, dtype=bf)
-    sd["mtp.layers.0.post_attention_layernorm.weight"] = torch.zeros(H, dtype=bf)
+    # --- MTP head (real Qwen3-Next layout). The draft layer is a standard
+    #     full-attention + MoE layer; embeddings/LM head are not shipped (tied). ---
+    sd["mtp.fc.weight"] = torch.randn(H, 2 * H, dtype=bf) * 0.02
+    sd["mtp.pre_fc_norm_embedding.weight"] = torch.zeros(H, dtype=bf)
+    sd["mtp.pre_fc_norm_hidden.weight"] = torch.zeros(H, dtype=bf)
+    sd["mtp.norm.weight"] = torch.zeros(H, dtype=bf)
+
+    mp = "mtp.layers.0"
+    sd[f"{mp}.input_layernorm.weight"] = torch.zeros(H, dtype=bf)
+    sd[f"{mp}.post_attention_layernorm.weight"] = torch.zeros(H, dtype=bf)
+    sd[f"{mp}.self_attn.q_proj.weight"] = torch.randn(num_heads * head_dim * 2, H, dtype=bf) * 0.02
+    sd[f"{mp}.self_attn.k_proj.weight"] = torch.randn(num_kv * head_dim, H, dtype=bf) * 0.02
+    sd[f"{mp}.self_attn.v_proj.weight"] = torch.randn(num_kv * head_dim, H, dtype=bf) * 0.02
+    sd[f"{mp}.self_attn.o_proj.weight"] = torch.randn(H, num_heads * head_dim, dtype=bf) * 0.02
+    sd[f"{mp}.self_attn.q_norm.weight"] = torch.zeros(head_dim, dtype=bf)
+    sd[f"{mp}.self_attn.k_norm.weight"] = torch.zeros(head_dim, dtype=bf)
+    sd[f"{mp}.mlp.gate.weight"] = torch.randn(cfg.num_experts, H, dtype=bf) * 0.02
+    sd[f"{mp}.mlp.experts.gate_up_proj"] = torch.randn(cfg.num_experts, 2 * I, H, dtype=bf) * 0.02
+    sd[f"{mp}.mlp.experts.down_proj"] = torch.randn(cfg.num_experts, H, I, dtype=bf) * 0.02
+    sd[f"{mp}.mlp.shared_expert.gate_proj.weight"] = torch.randn(SI, H, dtype=bf) * 0.02
+    sd[f"{mp}.mlp.shared_expert.up_proj.weight"] = torch.randn(SI, H, dtype=bf) * 0.02
+    sd[f"{mp}.mlp.shared_expert.down_proj.weight"] = torch.randn(H, SI, dtype=bf) * 0.02
+    sd[f"{mp}.mlp.shared_expert_gate.weight"] = torch.randn(1, H, dtype=bf) * 0.02
 
     return sd
 
@@ -225,32 +240,73 @@ class TestSharedExpert(unittest.TestCase):
 
 
 class TestMTPRemap(unittest.TestCase):
-    def test_outer_wrapper_preserves_mtp(self):
+    def test_top_level_rename(self):
         cfg = _make_mini_config()
-        sd = _make_mini_state_dict(cfg)
-        # Outer wrapper would also strip prefixes; verify mtp.* survives.
-        prefixed = {f"model.{k}" if not k.startswith("lm_head.") and not k.startswith("mtp.") else k: v for k, v in sd.items()}
-        out = NeuronQwen36A3BForCausalLM.convert_hf_to_neuron_state_dict(prefixed, cfg)
-        # After conversion, MTP keys live under mtp_head.*
+        out = convert_qwen36_a3b_hf_to_neuron_state_dict(_make_mini_state_dict(cfg), cfg)
+        for old in ("mtp.fc.weight", "mtp.pre_fc_norm_embedding.weight",
+                    "mtp.pre_fc_norm_hidden.weight", "mtp.norm.weight"):
+            self.assertNotIn(old, out)
         self.assertIn("mtp_head.embed_norm.weight", out)
         self.assertIn("mtp_head.hidden_norm.weight", out)
-        self.assertIn("mtp_head.eh_proj.weight", out)
         self.assertIn("mtp_head.final_norm.weight", out)
-        self.assertIn("mtp_head.mtp_lm_head.weight", out)
-        # Decoder-layer-internal MTP weights end up under mtp_head.decoder_layer.*
-        self.assertIn("mtp_head.decoder_layer.input_layernorm.weight", out)
-        self.assertIn("mtp_head.decoder_layer.post_attention_layernorm.weight", out)
+        self.assertEqual(
+            out["mtp_head.eh_proj.weight"].shape, (cfg.hidden_size, 2 * cfg.hidden_size)
+        )
 
-    def test_inner_remap(self):
+    def test_no_stray_mtp_keys(self):
+        cfg = _make_mini_config()
+        out = convert_qwen36_a3b_hf_to_neuron_state_dict(_make_mini_state_dict(cfg), cfg)
+        self.assertEqual([k for k in out if k.startswith("mtp.")], [])
+
+    def test_draft_layer_full_attention_converted(self):
+        """The MTP decoder layer gets the same GQA conversions as a main layer."""
+        cfg = _make_mini_config()
+        out = convert_qwen36_a3b_hf_to_neuron_state_dict(_make_mini_state_dict(cfg), cfg)
+        p = "mtp_head.decoder_layer.self_attn"
+        # q_proj split into query + sigmoid output gate; q/k norms renamed.
+        self.assertEqual(
+            out[f"{p}.q_proj.weight"].shape,
+            (cfg.num_attention_heads * cfg.head_dim, cfg.hidden_size),
+        )
+        self.assertIn(f"{p}.output_gate_proj.weight", out)
+        self.assertIn(f"{p}.q_layernorm.weight", out)
+        self.assertIn(f"{p}.k_layernorm.weight", out)
+        self.assertNotIn(f"{p}.q_norm.weight", out)
+
+    def test_draft_layer_moe_converted(self):
+        cfg = _make_mini_config()
+        out = convert_qwen36_a3b_hf_to_neuron_state_dict(_make_mini_state_dict(cfg), cfg)
+        p = "mtp_head.decoder_layer.mlp"
+        self.assertIn(f"{p}.moe.router.linear_router.weight", out)
+        self.assertEqual(
+            out[f"{p}.moe.expert_mlps.mlp_op.gate_up_proj.weight"].shape,
+            (cfg.num_experts, cfg.hidden_size, 2 * cfg.moe_intermediate_size),
+        )
+        self.assertIn(f"{p}.shared_expert_gate.weight", out)
+
+    def test_norms_one_plus_w(self):
+        """Zero-init HF norms become 1.0 after the (1 + w) conversion."""
+        cfg = _make_mini_config()
+        out = convert_qwen36_a3b_hf_to_neuron_state_dict(_make_mini_state_dict(cfg), cfg)
+        for nk in ("mtp_head.embed_norm.weight", "mtp_head.hidden_norm.weight",
+                   "mtp_head.final_norm.weight",
+                   "mtp_head.decoder_layer.input_layernorm.weight"):
+            torch.testing.assert_close(out[nk].float(), torch.ones_like(out[nk].float()))
+
+    def test_lm_head_tied_to_main(self):
         cfg = _make_mini_config()
         sd = _make_mini_state_dict(cfg)
+        main_lm_head = sd["lm_head.weight"].clone()
         out = convert_qwen36_a3b_hf_to_neuron_state_dict(sd, cfg)
-        self.assertNotIn("mtp.layers.0.embed_layernorm.weight", out)
-        self.assertIn("mtp_head.embed_norm.weight", out)
-        self.assertEqual(
-            out["mtp_head.eh_proj.weight"].shape,
-            (cfg.hidden_size, 2 * cfg.hidden_size),
-        )
+        self.assertIn("mtp_head.mtp_lm_head.weight", out)
+        torch.testing.assert_close(out["mtp_head.mtp_lm_head.weight"], main_lm_head)
+        torch.testing.assert_close(out["mtp_head.mtp_lm_head.weight"], out["lm_head.weight"])
+
+    def test_disabled_drops_mtp(self):
+        cfg = _make_mini_config()
+        cfg.mtp_num_hidden_layers = 0
+        out = convert_qwen36_a3b_hf_to_neuron_state_dict(_make_mini_state_dict(cfg), cfg)
+        self.assertEqual([k for k in out if k.startswith("mtp")], [])
 
 
 if __name__ == "__main__":

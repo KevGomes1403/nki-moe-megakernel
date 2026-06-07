@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Qwen3.6-A3B — MTP head architecture</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#161b22; --panel2:#1c2330; --ink:#e6edf3; --muted:#9aa7b4;
+    --line:#30363d;
+    --main:#1f6feb;       /* main model / tied weights      */
+    --mtp:#2ea043;        /* MTP-specific checkpoint weights */
+    --wire:#d29922;       /* new runtime wiring, no weights  */
+    --tensor:#a371f7;     /* activations / tensors           */
+    --reject:#f85149;     /* reject path                     */
+    --accept:#3fb950;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  header{padding:28px 32px 12px;border-bottom:1px solid var(--line);
+    background:linear-gradient(180deg,#0e1116,#11161d)}
+  h1{margin:0 0 6px;font-size:24px;letter-spacing:.2px}
+  h2{margin:0 0 4px;font-size:19px}
+  .sub{color:var(--muted);font-size:14px;max-width:900px}
+  main{max-width:1180px;margin:0 auto;padding:24px 28px 80px}
+  section{background:var(--panel);border:1px solid var(--line);border-radius:14px;
+    padding:22px 24px;margin:22px 0;box-shadow:0 1px 0 #00000040}
+  .kicker{color:var(--muted);text-transform:uppercase;font-size:11px;letter-spacing:1.4px;margin:0 0 10px}
+  code{background:#0b0f14;border:1px solid var(--line);border-radius:5px;padding:1px 6px;
+    font:13px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#cdd9e5}
+  .mono{font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+
+  /* node chips */
+  .row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .col{display:flex;flex-direction:column;align-items:center;gap:8px}
+  .node{border-radius:10px;padding:10px 14px;border:1px solid var(--line);
+    background:var(--panel2);min-width:110px;text-align:center;position:relative}
+  .node .t{font-weight:600;font-size:14px}
+  .node .d{color:var(--muted);font-size:12px;margin-top:2px}
+  .node.main{border-color:var(--main);box-shadow:inset 0 0 0 1px #1f6feb33}
+  .node.mtp{border-color:var(--mtp);box-shadow:inset 0 0 0 1px #2ea04333}
+  .node.wire{border-color:var(--wire);box-shadow:inset 0 0 0 1px #d2992233}
+  .node.tensor{border-color:var(--tensor);background:#191427;
+    box-shadow:inset 0 0 0 1px #a371f733;border-radius:24px}
+  .arrow{color:var(--muted);font-size:20px;line-height:1}
+  .arrow.down{transform:rotate(90deg)}
+  .lbl{color:var(--muted);font-size:12px;font-style:italic}
+
+  .legend{display:flex;gap:18px;flex-wrap:wrap;margin-top:12px}
+  .legend .it{display:flex;align-items:center;gap:7px;font-size:13px;color:var(--muted)}
+  .sw{width:13px;height:13px;border-radius:4px;border:1px solid #0006}
+  .pill{display:inline-block;font-size:11px;padding:1px 8px;border-radius:20px;
+    border:1px solid var(--line);color:var(--muted);margin-left:6px;vertical-align:middle}
+
+  table{border-collapse:collapse;width:100%;margin-top:8px;font-size:13.5px}
+  th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}
+  th{background:#10151c;color:var(--muted);font-weight:600}
+  td code{font-size:12px}
+  .tag{font-size:11px;padding:2px 8px;border-radius:20px;white-space:nowrap}
+  .tag.main{background:#0d2a52;color:#9cc4ff;border:1px solid #1f6feb66}
+  .tag.mtp{background:#0d2a16;color:#86e29a;border:1px solid #2ea04366}
+  .tag.wire{background:#2a210a;color:#f1d18a;border:1px solid #d2992266}
+
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+  @media(max-width:880px){.grid2{grid-template-columns:1fr}}
+
+  .step{border-left:3px solid var(--line);padding:4px 0 4px 16px;margin:14px 0}
+  .step.b{border-color:var(--mtp)} .step.a{border-color:var(--main)}
+  .step.c{border-color:var(--wire)}
+  .step h3{margin:0 0 4px;font-size:15px}
+  .step .meta{color:var(--muted);font-size:12.5px}
+
+  .flow{display:flex;flex-direction:column;gap:0;align-items:center}
+  .branch{display:flex;gap:40px;justify-content:center;margin-top:8px;flex-wrap:wrap}
+  .branch .leaf{border-radius:10px;padding:12px 16px;border:1px solid var(--line);max-width:340px}
+  .leaf.ok{border-color:var(--accept);background:#0e1f12}
+  .leaf.no{border-color:var(--reject);background:#22110f}
+  .leaf .h{font-weight:700;margin-bottom:4px}
+  .leaf.ok .h{color:var(--accept)} .leaf.no .h{color:var(--reject)}
+
+  .callout{border:1px solid var(--wire);background:#1d1809;border-radius:10px;padding:14px 16px;margin-top:14px}
+  .callout .h{color:var(--wire);font-weight:700;margin-bottom:4px}
+  .note{color:var(--muted);font-size:13px}
+  .seq{display:flex;gap:6px;flex-wrap:wrap;margin:6px 0}
+  .tok{font:13px ui-monospace,monospace;border:1px solid var(--line);border-radius:6px;
+    padding:3px 8px;background:#0b0f14}
+  .tok.new{border-color:var(--main);color:#9cc4ff}
+  .tok.draft{border-color:var(--mtp);color:#86e29a}
+  .tok.rej{border-color:var(--reject);color:#ff9b94;text-decoration:line-through}
+  .small{font-size:12.5px;color:var(--muted)}
+  .hl{color:#fff}
+</style>
+</head>
+<body>
+<header>
+  <h1>Qwen3.6-35B-A3B — Multi-Token-Prediction (MTP) head</h1>
+  <div class="sub">A visual companion to the implementation plan. The MTP head is a
+  <b>self-speculative drafter</b>: one extra decoder layer that reads the main model's
+  hidden state plus the next token's embedding, and guesses <i>one more token ahead</i>.
+  The main model then verifies that guess in a single batched step.</div>
+  <div class="legend">
+    <div class="it"><span class="sw" style="background:var(--main)"></span>Main model / weights reused (tied)</div>
+    <div class="it"><span class="sw" style="background:var(--mtp)"></span>MTP-specific weights (from <code>mtp.*</code> in checkpoint)</div>
+    <div class="it"><span class="sw" style="background:var(--wire)"></span>New runtime wiring (no new weights)</div>
+    <div class="it"><span class="sw" style="background:var(--tensor)"></span>Activation / tensor</div>
+  </div>
+</header>
+
+<main>
+
+<!-- ============================================================ -->
+<section>
+  <p class="kicker">The idea in one line</p>
+  <h2>Normal decoding makes 1 token per forward pass. MTP makes 2 — then checks.</h2>
+  <p class="note">Each decode round the main model emits token <code>x<sub>t+1</sub></code> as usual.
+  The MTP head <b>cheaply drafts</b> <code>x<sub>t+2</sub></code> by reusing the hidden state the main
+  model already computed. A verify pass confirms or rejects the draft. If accepted, you advanced
+  <b>2 tokens for ~1.x the cost of one</b> — that's the speedup. Greedy output is
+  <b>bit-identical</b> to non-MTP decoding (verification guarantees it).</p>
+  <p class="note" style="margin-top:10px"><b>Notation.</b> <code>h<sub>j</sub></code> is the hidden after
+  reading the token at position <code>j</code>; the main head turns it into the next token
+  <code>x<sub>j+1</sub></code> (so <code>h<sub>j</sub></code> → <code>x<sub>j+1</sub></code>). The MTP head
+  turns <code>(h<sub>j</sub>, embed(x<sub>j+1</sub>))</code> into a draft of <code>x<sub>j+2</sub></code>.
+  <code>S<sub>n</sub></code> = the DeltaNet state after the verify block's first <code>n</code> tokens.</p>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <p class="kicker">Diagram 1 · where the hidden state comes from</p>
+  <h2>The main model (unchanged) — we just tap one extra tensor</h2>
+  <div class="row" style="justify-content:center;margin:18px 0 6px">
+    <div class="node tensor"><div class="t">x₁ … x<sub>t</sub></div><div class="d">context tokens</div></div>
+    <span class="arrow">▶</span>
+    <div class="node main"><div class="t">embed_tokens</div><div class="d">V×H = 248320×2048</div></div>
+    <span class="arrow">▶</span>
+    <div class="node main"><div class="t">40 decoder layers</div><div class="d">30 DeltaNet + 10 GQA, all MoE</div></div>
+    <span class="arrow">▶</span>
+    <div class="node tensor" style="border-color:var(--wire);box-shadow:inset 0 0 0 1px #d2992255">
+      <div class="t">h<sub>t</sub></div><div class="d">last hidden, <b>pre-final-norm</b><br>[B, 1, 2048]</div></div>
+  </div>
+  <div class="row" style="justify-content:center">
+    <div class="col">
+      <span class="arrow down">▶</span>
+      <div class="row">
+        <div class="node main"><div class="t">final norm</div><div class="d">model.norm</div></div>
+        <span class="arrow">▶</span>
+        <div class="node main"><div class="t">lm_head</div><div class="d">H×V → logits</div></div>
+        <span class="arrow">▶</span>
+        <div class="node tensor"><div class="t">x<sub>t+1</sub></div><div class="d">the normal next token</div></div>
+      </div>
+    </div>
+  </div>
+  <div class="callout">
+    <div class="h">The only change to the main model</div>
+    <div class="note">Today the traced <code>forward()</code> returns logits + KV cache + DeltaNet state.
+    We add <b>one extra output</b>: the hidden state <b>before</b> <code>model.norm</code> (the amber tensor
+    above). For prefill that's the last position; for the 2-token verify block it's the hidden at
+    <b>every</b> position (shape <code>[B, n_active, H]</code>) — that's how the host gets both
+    <code>h<sub>t+1</sub></code> and <code>h<sub>t+2</sub></code>. It's appended after the existing outputs
+    so KV/DeltaNet alias offsets don't move. Everything else stays bit-for-bit the same.</div>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <p class="kicker">Diagram 2 · inside the MTP head</p>
+  <h2>It fuses “what I was thinking” (h<sub>t</sub>) with “what I just said” (x<sub>t+1</sub>)</h2>
+  <div class="grid2">
+    <div>
+      <div class="col" style="align-items:stretch;gap:10px">
+        <div class="row" style="justify-content:space-between;gap:18px">
+          <!-- left input: hidden -->
+          <div class="col" style="flex:1">
+            <div class="node tensor" style="border-color:var(--wire)"><div class="t">h<sub>t</sub></div><div class="d">main hidden @ t</div></div>
+            <span class="arrow down">▶</span>
+            <div class="node mtp"><div class="t">pre_fc_norm_hidden</div><div class="d">RMSNorm</div></div>
+          </div>
+          <!-- right input: next embed -->
+          <div class="col" style="flex:1">
+            <div class="node tensor"><div class="t">x<sub>t+1</sub></div><div class="d">token main just produced</div></div>
+            <span class="arrow down">▶</span>
+            <div class="node main"><div class="t">embed_tokens</div><div class="d">reused from main (tied)</div></div>
+            <span class="arrow down">▶</span>
+            <div class="node mtp"><div class="t">pre_fc_norm_embedding</div><div class="d">RMSNorm</div></div>
+          </div>
+        </div>
+
+        <div class="row" style="justify-content:center"><span class="lbl">concat → [B, 1, 2·H = 4096]</span></div>
+        <div class="col">
+          <span class="arrow down">▶</span>
+          <div class="node mtp"><div class="t">fc</div><div class="d">Linear 4096 → 2048</div></div>
+          <span class="arrow down">▶</span>
+          <div class="node mtp" style="min-width:240px">
+            <div class="t">MTP decoder layer ×1</div>
+            <div class="d">full GQA (gated q_proj 8192) + 256-expert MoE<br>own KV cache · partial RoPE</div></div>
+          <span class="arrow down">▶</span>
+          <div class="node mtp"><div class="t">norm</div><div class="d">mtp.norm (RMSNorm)</div></div>
+          <span class="arrow down">▶</span>
+          <div class="node main"><div class="t">lm_head</div><div class="d">reused from main (tied)</div></div>
+          <span class="arrow down">▶</span>
+          <div class="node tensor"><div class="t">x<sub>t+2</sub><sup>draft</sup></div><div class="d">the guessed token</div></div>
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <h3 style="margin-top:0">Why this predicts <code>t+2</code></h3>
+      <p class="note"><code>h<sub>t</sub></code> already encodes everything through position <code>t</code>.
+      The main head turns it into <code>x<sub>t+1</sub></code>. The MTP head is given that answer
+      (<code>x<sub>t+1</sub></code>) <i>plus</i> the rich hidden state, and is trained to jump one
+      further — to <code>x<sub>t+2</sub></code>. One MTP layer ⇒ one extra token per round.</p>
+
+      <h3>Weight provenance</h3>
+      <table>
+        <tr><th>Component</th><th>Source</th></tr>
+        <tr><td><code>fc</code>, <code>pre_fc_norm_hidden</code>, <code>pre_fc_norm_embedding</code>, <code>norm</code></td><td><span class="tag mtp">mtp.* checkpoint</span></td></tr>
+        <tr><td>MTP decoder layer (<code>self_attn</code>, <code>mlp</code>, layernorms)</td><td><span class="tag mtp">mtp.layers.0.*</span></td></tr>
+        <tr><td><code>embed_tokens</code></td><td><span class="tag main">tied to main</span></td></tr>
+        <tr><td><code>lm_head</code></td><td><span class="tag main">tied to main</span></td></tr>
+        <tr><td>extra hidden output · MTP KV cache · draft/verify loop</td><td><span class="tag wire">new wiring</span></td></tr>
+      </table>
+      <p class="small">The checkpoint has <b>no</b> <code>mtp.lm_head</code> or <code>mtp.embed_tokens</code>
+      (<code>mtp_use_dedicated_embeddings=false</code>) — that's why those two are reused from the main model.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <p class="kicker">Diagram 3 · one decode round (k = 1 draft)</p>
+  <h2>Carry → Draft → Verify → Select</h2>
+
+  <p class="note" style="margin-top:0">We always <b>carry</b> three things from prefill or the previous
+  round: the real token <code>x<sub>t+1</sub></code>, the hidden <code>h<sub>t</sub></code> that produced it,
+  and the committed DeltaNet/KV state <b>after</b> <code>x<sub>t</sub></code>.</p>
+
+  <div class="step b"><h3>1 · Draft <span class="pill">cheap: 1 layer</span></h3>
+    <div class="meta"><code>x<sub>t+2</sub><sup>draft</sup> = MTP(h<sub>t</sub>, embed(x<sub>t+1</sub>))</code>
+    — reuse the hidden we already have to guess one token past the real one.</div>
+  </div>
+
+  <div class="step c"><h3>2 · Verify <span class="pill">1 backbone pass · 2 positions</span></h3>
+    <div class="meta">Run the backbone over the block <code>[x<sub>t+1</sub>, x<sub>t+2</sub><sup>draft</sup>]</code>,
+    seeded from the committed state. It emits — at <b>each</b> position — a hidden, a next-token logit, and a
+    DeltaNet state checkpoint:
+    <div class="seq" style="margin-top:8px">
+      <span class="tok">pos t+1 · read x<sub>t+1</sub> → h<sub>t+1</sub> → predicts x<sub>t+2</sub><sup>true</sup> · save S<sub>1</sub></span>
+      <span class="tok">pos t+2 · read x<sub>t+2</sub><sup>draft</sup> → h<sub>t+2</sub> → predicts x<sub>t+3</sub> · save S<sub>2</sub></span>
+    </div></div>
+  </div>
+
+  <div class="step a"><h3>3 · Select <span class="pill">host · plain Python</span></h3>
+    <div class="meta">Is <code>x<sub>t+2</sub><sup>draft</sup> == x<sub>t+2</sub><sup>true</sup></code>
+    (the greedy token from <code>h<sub>t+1</sub></code>)?</div>
+    <div class="branch">
+      <div class="leaf ok"><div class="h">✓ ACCEPT — they match</div>
+        <div class="small">Commit <b>both</b> <code>x<sub>t+1</sub></code> and <code>x<sub>t+2</sub></code>.
+        Free bonus token <code>x<sub>t+3</sub> = argmax(h<sub>t+2</sub>)</code>. Keep state <b>S<sub>2</sub></b>.
+        Carry <code>(x<sub>t+3</sub>, h<sub>t+2</sub>)</code>. Advance <b>2</b>.</div>
+        <div class="seq"><span class="tok new">x<sub>t+1</sub></span><span class="tok draft">x<sub>t+2</sub></span></div>
+      </div>
+      <div class="leaf no"><div class="h">✗ REJECT — they differ</div>
+        <div class="small">Commit <code>x<sub>t+1</sub></code> only; the real token is
+        <code>x<sub>t+2</sub><sup>true</sup></code>. Drop the draft, the bonus, and checkpoint <b>S<sub>2</sub></b>;
+        <b>keep S<sub>1</sub></b>. Carry <code>(x<sub>t+2</sub><sup>true</sup>, h<sub>t+1</sub>)</code>. Advance <b>1</b>.</div>
+        <div class="seq"><span class="tok new">x<sub>t+1</sub></span><span class="tok rej">x<sub>t+2</sub><sup>draft</sup></span><span class="tok new">x<sub>t+2</sub><sup>true</sup></span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="callout">
+    <div class="h">The MTP head runs after Select — never before</div>
+    <div class="note">Its two inputs are <i>both</i> chosen by the outcome: the hidden
+    (<code>h<sub>t+2</sub></code> on accept, <code>h<sub>t+1</sub></code> on reject) and the token to embed
+    (<code>x<sub>t+3</sub></code> vs <code>x<sub>t+2</sub><sup>true</sup></code>). One rule covers both:
+    <b>draft from the hidden at the last accepted position, embedding the new real token.</b> Drafting before
+    the decision would read a hidden that only exists if the draft was right.</div>
+  </div>
+
+  <p class="small" style="margin-top:14px">There is <b>no separate single-token step</b>: the verify pass
+  <i>is</i> the next round's main step. Committed tokens are exactly what plain greedy decoding would produce
+  — speculation changes only the <i>speed</i>: <b>1 or 2 tokens per backbone pass</b>.</p>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <p class="kicker">Diagram 4 · the one tricky part</p>
+  <h2>The DeltaNet state can't be sliced — so we pick a saved checkpoint</h2>
+  <div class="grid2">
+    <div>
+      <p class="note">30 of 40 layers are <b>Gated DeltaNet</b>, a linear recurrence: each token folds
+      <i>irreversibly</i> into a state (a recurrent matrix <code>S</code> plus a small conv window). Unlike a
+      KV cache you can truncate, you cannot peel the draft token back out of <code>S</code>.</p>
+      <div class="callout">
+        <div class="h">Fix: emit a checkpoint per position, select by accept count</div>
+        <div class="note">The verify pass already steps the recurrence once per block position — so have it
+        <b>save the state after each</b>: <code>S<sub>1</sub></code> (after the real token) and
+        <code>S<sub>2</sub></code> (after the draft). The recurrence runs <b>forward only</b>; "rollback" is
+        just choosing <code>S<sub>accept_count</sub></code> — <code>S<sub>2</sub></code> on accept,
+        <code>S<sub>1</sub></code> on reject. No inversion, no recompute. The conv window, GQA KV cache, and
+        MTP KV cache are truncated to the same accept count.</div>
+      </div>
+      <p class="small">This is exactly what mature stacks do for the same Qwen3-Next-style architecture:
+      vLLM (<code>gdn_attn</code> — one state slot per speculative position, indexed by
+      <code>num_accepted_tokens</code>) and SGLang (<code>MambaRadixCache</code> state "sandboxes").</p>
+    </div>
+    <div>
+      <h3 style="margin-top:0">Why not invert the recurrence?</h3>
+      <p class="note">Algebraically <code>S<sub>1</sub></code> is recoverable from <code>S<sub>2</sub></code>,
+      but the gate is <code>exp(cumulative log-decay)</code>, which underflows hard on this checkpoint (the
+      same overflow that forced the chunked DeltaNet kernel over the fused one). Dividing it back out is
+      numerically unsafe — and <b>no production stack does it</b>. Forward-only + checkpoint-select is the standard.</p>
+      <h3>Why it's cheap</h3>
+      <p class="note">At <code>k=1</code> there are only two candidates per layer, so "select" is a Python
+      index, not a gather. One extra state per DeltaNet layer ≈ <code>1&nbsp;MiB</code>; both candidates across
+      all 30 layers ≈ <code>60&nbsp;MiB</code>. The block is 2 tokens, so the verify recurrence is two
+      <b>exact</b> single-step updates — sidestepping the chunked-decay overflow entirely.</p>
+      <p class="small">NxDI's own <code>enable_fused_spec</code> can't be reused: it assumes a <b>separate</b>
+      draft model with its own sliceable KV cache, and the hybrid cache manager
+      <span class="hl">explicitly rejects speculation</span> today. So we trace the MTP head as its own small
+      graph and orchestrate draft/verify on the host.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <p class="kicker">Diagram 5 · why not one fused graph?</p>
+  <h2>The destination <i>is</i> one fused launch — the recurrence is what makes it hard here</h2>
+  <p class="note">Fusing the backbone and the MTP head into a single device launch (no host
+  round-trips) is the right end state. The blocker on this model isn't host overhead — it's that
+  a fused launch must perform two operations <b>inside a static, ahead-of-time-compiled graph</b>
+  that are trivial for a KV cache and genuinely hard for a recurrence.</p>
+
+  <h3>The cost model: only one number matters</h3>
+  <p class="note">A backbone pass (40 layers) is ~45&nbsp;ms here (~22&nbsp;tok/s). The MTP head
+  (1 layer) is ~1/40 of that. So speed = <b>backbone passes per round</b>:</p>
+  <table>
+    <tr><th>Scheme</th><th>backbone passes / round</th><th>tokens / round</th><th>result</th></tr>
+    <tr><td>Plain decoding</td><td>1</td><td>1</td><td>1 tok / pass</td></tr>
+    <tr><td><b>Fuse main+MTP → 2 tokens, then a separate full-model verify</b></td>
+      <td style="color:var(--reject)"><b>2</b></td><td>1–2</td>
+      <td style="color:var(--reject)">≤ 1 tok / pass — <b>slower than plain</b></td></tr>
+    <tr><td>Backbone-over-block (verify + seed) + tiny MTP head</td>
+      <td style="color:var(--accept)"><b>1</b></td><td>1–2</td>
+      <td style="color:var(--accept)">up to 2 tok / pass</td></tr>
+  </table>
+  <p class="small">A separate verify graph is a second full-model forward — you pay for the 40 layers
+  twice. The win comes from making the verify pass <i>double as</i> the next round's main step, which
+  is why the head is the small separable piece, not the verifier.</p>
+
+  <h3>The recurrence tax (paid whether you fuse or not)</h3>
+  <div class="grid2">
+    <div class="node main" style="text-align:left;min-width:0">
+      <div class="t">10 GQA layers — easy</div>
+      <div class="d" style="margin-top:6px">"Keep only the accepted prefix" = scatter K/V for the
+      accepted positions into an addressable cache; ignore the rest. A runtime index into a
+      fixed-size buffer. Standard.</div>
+    </div>
+    <div class="node mtp" style="text-align:left;min-width:0">
+      <div class="t">30 DeltaNet layers — hard</div>
+      <div class="d" style="margin-top:6px">The state is a recurrence:
+      <span class="mono">S₂ = f(f(S_c, x_{t+1}), x_{t+2}ᵈ)</span>. The block <b>irreversibly folds</b>
+      the draft into the state — you can't slice it off. On reject you need "state after 1 token,"
+      so you must compute a candidate end-state for <i>each</i> accept count and select by mask,
+      for all 30 layers.</div>
+    </div>
+  </div>
+
+  <h3>What fusing <i>adds</i> on top of that tax</h3>
+  <div class="grid2">
+    <div class="leaf no"><div class="h">Fused single launch — all in the static graph</div>
+      <ul class="small" style="margin:6px 0 0;padding-left:18px">
+        <li>Dynamic accept/commit as masked selects (graphs are static-shape; no <code>if accepted</code>)</li>
+        <li>Candidate-state select on <code>[B,H,128,128]</code> × 30 DeltaNet layers</li>
+        <li>Reworks the one-transition-per-launch state aliasing (<code>recurrent/conv_state_buffer</code>)</li>
+        <li>Two sub-forwards (block backbone @ n_active=2, MTP head @ n_active=1) in one graph</li>
+        <li>NxDI's fused-spec assumes sliceable KV caches; <code>_validate_hybrid_config</code> <b>raises</b> on spec</li>
+      </ul>
+    </div>
+    <div class="leaf ok"><div class="h">Hot-loop = 2 graphs + host glue (prefill is a 3rd, run once)</div>
+      <div class="small" style="margin-top:6px">
+        <div class="mono">verify backbone (block): logits + per-position hiddens + S₁,S₂</div>
+        <div class="mono">── host ──  accept_count, select S_accept, truncate caches</div>
+        <div class="mono">MTP head: selected hidden + embed → next draft</div>
+        <p style="margin:8px 0 0">Both graphs are clean &amp; static; the <code>if accepted</code> / index
+        math lives in plain Python between launches. The verify graph reuses the existing
+        chunked-prefill-from-committed-state path at <code>n_active = 2</code>.</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="callout">
+    <div class="h">ROI — why we build two graphs first</div>
+    <div class="note">Fusing the two launches into one saves a single tiny kernel dispatch (tens of µs)
+    out of a ~45&nbsp;ms round — about <b>1–2%</b>. The hard recurrence-candidate-state logic is needed
+    either way. So: ship the two-graph + host loop, prove greedy-equivalence and measure acceptance,
+    <i>then</i> fuse for the last ~1–2%. That's the hard 20%, done last, for the smallest slice of the win.</div>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <p class="kicker">Build order</p>
+  <h2>How the plan maps onto this picture</h2>
+  <table>
+    <tr><th>Stage</th><th>What it builds</th><th>Touches which diagram</th></tr>
+    <tr><td><b>0</b> · weights</td><td>Fix the weight converter to the real <code>mtp.*</code> keys, run the
+      MTP layer through the full-attention + MoE transforms, tie <code>lm_head</code>/<code>embed_tokens</code>.
+      Validate <code>draft_step</code> numerically on CPU vs. golden.</td><td>Diagram 2</td></tr>
+    <tr><td><b>1</b> · trace</td><td>Expose <code>h<sub>t</sub></code> as a forward output; trace the MTP head as
+      its own graph; give its attention a dedicated KV cache.</td><td>Diagrams 1 &amp; 2</td></tr>
+    <tr><td><b>2</b> · loop</td><td>Host-side carry → draft → verify → select; DeltaNet
+      per-position checkpoints with select-by-accept-count. Gated behind <code>A3B_ENABLE_MTP=1</code>.</td><td>Diagrams 3 &amp; 4</td></tr>
+    <tr><td><b>3</b> · validate</td><td>Assert greedy-equivalence to non-MTP; measure acceptance rate &amp;
+      tok/s with the new device benchmark.</td><td>Diagram 3</td></tr>
+  </table>
+</section>
+
+<p class="small" style="text-align:center;color:var(--muted)">
+  Numbers shown (H=2048, V=248320, q_proj=8192 gated, 256 experts top-8, 1 MTP layer) are the actual
+  Qwen3.6-35B-A3B config. · Open this file in any browser; it has no external dependencies.
+</p>
+
+</main>
+</body>
+</html>

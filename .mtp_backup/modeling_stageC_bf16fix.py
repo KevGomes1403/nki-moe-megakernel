@@ -114,9 +114,7 @@ except TypeError:
 
     _flash_fwd_call = _torch_xla_nki_jit()(attention_isa_kernel)
 
-# head_dim=256 needs an nkilib flash-attention kernel. Two ways to obtain one:
-# (1) load nkilib's attention_cte directly from a local fork (USE_NKILIB_KERNEL),
-# or (2) detect a global monkeypatch of _pre_prod_kernels (NKILIB_PATCH_ACTIVE).
+# Option B: Direct nkilib flash attention for head_dim > 128
 USE_NKILIB_KERNEL = os.environ.get("USE_NKILIB_KERNEL", "0") == "1"
 
 _nkilib_flash_attn = None
@@ -178,15 +176,15 @@ if USE_NKILIB_KERNEL:
         _nkilib_flash_attn = _enable_stack_allocator(
             _nkilib_flash_attn, log_level=logging.INFO
         )
-        logger.info("nkilib flash attention loaded for head_dim > 128")
+        logger.info("Option B: nkilib flash attention loaded for head_dim > 128")
     except Exception as e:
-        logger.warning(f"Failed to load nkilib flash attention: {e}")
+        logger.warning(f"Option B: Failed to load nkilib flash attention: {e}")
         import traceback as _tb
 
         _tb.print_exc()
         _nkilib_flash_attn = None
 
-# Detect whether _pre_prod_kernels was globally patched with the nkilib kernel.
+# Option A: Detect if patch_attn_kernel was imported
 NKILIB_PATCH_ACTIVE = False
 try:
     from importlib import import_module as _import_module
@@ -194,7 +192,7 @@ try:
     _attn_mod = _import_module("neuronxcc.nki._pre_prod_kernels.attn_fwd")
     if hasattr(_attn_mod, "_original_attention_nki_kernel_adapter"):
         NKILIB_PATCH_ACTIVE = True
-        logger.info("_pre_prod_kernels patched with nkilib kernel")
+        logger.info("Option A detected: _pre_prod_kernels patched with nkilib kernel")
 except Exception:
     pass
 
@@ -239,17 +237,6 @@ def l2norm(x, dim=-1, eps=1e-6):
     return F.normalize(x, p=2, dim=dim, eps=eps)
 
 
-def _select_cand_slice(cand, cand_idx, seed):
-    """Select ``cand[:, cand_idx]`` as a copy source matching ``seed``.
-
-    Materialized through CPU first: a Neuron-device offset strided view copies
-    the wrong dim-1 slice for ``cand_idx > 0`` (``.contiguous()`` / ``.clone()``
-    on the offset view do not fix it). Returns a tensor of ``seed``'s dtype and
-    device. On CPU (state already on host) this is a no-op transfer.
-    """
-    return cand.detach().to("cpu")[:, cand_idx].to(seed.dtype).to(seed.device)
-
-
 def commit_accept(
     accept_count,
     recurrent_candidates,
@@ -257,20 +244,46 @@ def commit_accept(
     gqa_kv_block,
     mtp_kv_block=None,
 ):
-    """Select committed verify-block state by accept count and truncate caches.
+    """Host-side reject/update rule for the multi-token-prediction verify block.
 
-    ``accept_count`` is the number of verified positions to keep (1 = draft
-    rejected, real token only; 2 = draft accepted). Picks candidate state
-    ``S_{accept_count-1}`` per DeltaNet layer (candidate axis-1 removed) and
-    slices the GQA / MTP KV blocks to the first ``accept_count`` positions.
-    Pure tensor indexing, so it runs identically on host and device.
+    Given ``accept_count`` committed positions (``1`` on reject of the draft,
+    ``2`` on accept), select the carried state matching that count and truncate
+    the sliceable caches to it. This is pure tensor indexing with no device
+    specifics so it can run identically on host and device.
 
-    ``recurrent_candidates`` / ``conv_candidates`` are per-layer ``[B, S, ...]``
-    tensors with the candidate on axis-1. ``gqa_kv_block`` / ``mtp_kv_block`` are
-    KV block(s) sliced on the sequence axis. Returns a dict with keys
-    ``accept_count``, ``recurrent_states``, ``conv_states``, ``gqa_kv``,
-    ``mtp_kv`` (the ``*_kv`` entries are ``None`` if not supplied).
+    Parameters
+    ----------
+    accept_count : int
+        Number of verified tokens to commit. ``1`` keeps only the real token
+        (draft rejected); ``2`` keeps real + draft (draft accepted). Generalises
+        to a ``k+1`` block where ``accept_count`` ranges over ``1..k+1``.
+    recurrent_candidates : list of Tensor
+        Per-DeltaNet-layer candidate states from
+        :meth:`NeuronGatedDeltaNet.verify_block_candidates`, each ``[B, S, H,
+        Kd, Vd]`` where axis-1 is the candidate axis (``S_i`` = state after
+        consuming token ``i``).
+    conv_candidates : list of Tensor
+        Per-DeltaNet-layer causal-conv windows from
+        :meth:`NeuronGatedDeltaNet.conv_window_candidates`, each ``[B, S,
+        conv_dim, K-1]`` with the same candidate axis-1.
+    gqa_kv_block : Tensor or sequence of Tensor
+        Full-attention KV cache block(s) spanning the verify positions on the
+        sequence axis (axis -2 in the usual ``[B, n_heads, S, head_dim]``
+        layout). Truncated to the first ``accept_count`` positions.
+    mtp_kv_block : Tensor or sequence of Tensor, optional
+        Draft-head KV cache block(s), sliced the same way when present.
+
+    Returns
+    -------
+    dict
+        ``{"accept_count", "recurrent_states", "conv_states", "gqa_kv",
+        "mtp_kv"}`` where ``recurrent_states``/``conv_states`` are the selected
+        per-layer states (candidate axis removed) and the ``*_kv`` entries are
+        the truncated cache blocks (``None`` if not supplied).
     """
+    # Candidate axis-1 index: accept_count tokens committed -> S_{accept_count-1},
+    # the state after consuming the last committed token. At k=1 this is a plain
+    # index (S_0 on reject, S_1 on accept).
     cand_idx = accept_count - 1
 
     recurrent_states = [cand[:, cand_idx] for cand in recurrent_candidates]
@@ -480,23 +493,47 @@ class NeuronGatedDeltaNet(nn.Module):
         return output.unsqueeze(2), new_state
 
     def verify_block_candidates(self, query, key, value, g, beta, initial_state):
-        """Run the verify block as exact single-step recurrences seeded from
-        ``initial_state``, checkpointing the state after each token so the host
-        can select the carried state by accept count.
+        """Run the k+1 verify block as exact single-step recurrences seeded from
+        ``initial_state``, emitting a per-position state checkpoint after each
+        token so the host can select the carried state by its accept count.
 
-        Inputs are the projected/conv'd/headed block tensors in the
-        ``[B, H, S, dim]`` layout ``_recurrent_step`` expects (g/beta
-        ``[B, H, S]``), sliced one position at a time. Returns
-        ``(out_stack [B, H, S, Vd], S_stack [B, S, H, Kd, Vd])`` where ``S_i``
-        (axis-1) is the recurrent state after consuming token ``i``.
+        For the k=1 (2-token) block the steps are:
+            step 0 from ``initial_state`` over position 0 (the real token),
+            step 1 from step-0's state over position 1 (the draft token).
+
+        Reuses :meth:`_recurrent_step` (the exact single-step recurrence, no
+        chunked-decay split) so there is no decay-window overflow. Inputs are the
+        already projected / conv'd / headed tensors for the block in the same
+        ``[B, H, S, dim]`` layout ``_recurrent_step`` expects (g/beta ``[B, H, S]``);
+        they are sliced one position at a time.
+
+        Returns ``(out_stack, S_stack)`` where
+
+            out_stack : [B, H, S, Vd]  -- per-position recurrence outputs
+            S_stack   : [B, S, H, Kd, Vd]  -- candidate states [S_0, S_1, ...]
+                        stacked on a new axis-1; ``S_i`` is the recurrent state
+                        after consuming token ``i``.
+
+        Generic over block length: with k tokens it stacks k checkpoints; k=1
+        (two candidates) is the current case.
         """
         num_positions = query.shape[2]
         recurrent_state = initial_state
         outputs = []
         states = []
-        # Round the carried state to the buffer dtype between steps so it matches
-        # sequential TKG decode bit-for-bit (TKG writes the state back as bf16
-        # after each token); the next step's math still runs in float32.
+        # GREEDY-EQUIVALENCE (bit-identical state carry vs sequential TKG decode):
+        # the TKG decode path (forward()/is_decode) rounds the recurrent state to
+        # the buffer dtype (bf16) after EVERY token -- it reads recurrent_state_buffer
+        # (bf16) -> float32 -> _recurrent_step -> writes new_state.to(bf16) back. So
+        # in plain greedy decode the state fed into token i+1 is the bf16-ROUNDED
+        # state after token i. If the verify block keeps the intermediate state in
+        # float32 across the 2 block tokens, its S2 (state after the draft token)
+        # differs from TKG's S2 in the low bits; that error compounds across spec
+        # rounds and eventually flips a committed token (the Stage C.1 oracle caught
+        # exactly this: verify's pos-0 logit drifting from reference after ~3 rounds).
+        # Match TKG: round the carried state to the buffer dtype between steps. The
+        # buffer dtype is float32 inside _recurrent_step's math, so cast through bf16
+        # (the recurrent_state_buffer dtype) and back to float32 for the next step.
         carry_dtype = self.recurrent_state_buffer.dtype
         for i in range(num_positions):
             out_i, recurrent_state = self._recurrent_step(
@@ -507,6 +544,10 @@ class NeuronGatedDeltaNet(nn.Module):
                 beta[:, :, i : i + 1],
                 recurrent_state,
             )
+            # Round to the carry (bf16) dtype to match TKG's per-token write-back,
+            # then keep the rounded value in float32 for the next step's math. The
+            # stored candidate is this rounded state (cast to bf16 in the scratch
+            # alias), so the committed seed equals what sequential TKG would carry.
             recurrent_state = recurrent_state.to(carry_dtype).float()
             outputs.append(out_i)
             states.append(recurrent_state)
@@ -539,17 +580,25 @@ class NeuronGatedDeltaNet(nn.Module):
         return torch.stack(windows, dim=1)
 
     def verify_block(self, hidden_states, seq_ids):
-        """Verify-mode forward over the 2-token block.
+        """Verify-mode forward over the k+1 (=2 at k=1) token block.
 
-        Seeded read-only from the committed ``recurrent_state_buffer`` /
-        ``conv_state_buffer`` (never writes them), it reproduces ``forward``'s
-        projection / causal-conv / gating over the block and emits a per-position
-        state checkpoint after each token (exact single-step recurrence, not the
-        chunked kernels) so a host loop can select ``S_{accept_count}`` after verify.
+        Seeded from the COMMITTED state in ``recurrent_state_buffer`` /
+        ``conv_state_buffer`` (read-only — this method never writes them), it
+        reproduces the projection / causal-conv / gating of :meth:`forward` over
+        the short block, then emits a per-position state checkpoint after each
+        token instead of committing a single final state. The exact single-step
+        recurrence (:meth:`verify_block_candidates` -> :meth:`_recurrent_step`) is
+        used rather than the chunked NKI kernels: at 2 tokens it is exact and
+        cheap, and a host loop selects ``S_{accept_count}`` after verify.
 
-        Returns ``(attn_out [B, S, H], S_stack [B, S, num_v_heads, head_k_dim,
-        head_v_dim], conv_cand [B, S, conv_dim, K-1])`` -- the output projection
-        and the per-token candidate recurrent / conv states.
+        Returns
+        -------
+        attn_out : [B, S, H]
+            Output projection per block position (same as ``forward``'s output).
+        S_stack : [B, S, num_v_heads, head_k_dim, head_v_dim]
+            Candidate recurrent states ``[S_1 .. S_S]`` (state after each token).
+        conv_cand : [B, S, conv_dim, K-1]
+            Candidate causal-conv windows after each token.
         """
         batch_size, seq_len, _ = hidden_states.shape
 
@@ -1263,10 +1312,13 @@ class NeuronGatedDeltaNet(nn.Module):
             else:
                 new_rec_state = new_state_bf16 + self.recurrent_state_buffer * 0
         else:
-            # CTE: chunked NKI kernel by default. It forms the within-chunk decay
-            # as exp(gc[i] - gc[j]) (always <= 1), which is numerically stable; the
-            # fused kernel's split form exp(gc[i])*exp(-gc[j]) overflows float32
-            # under this checkpoint's large decays. Env vars override the path.
+            # CTE: chunked NKI kernel by default. It forms the within-chunk
+            # decay as exp(gc[i] - gc[j]) (always <= 1), which is numerically
+            # stable. The fused kernel uses the split form exp(gc[i])*exp(-gc[j]);
+            # with this checkpoint's gating (exp(A_log) up to ~72), a single
+            # token's cumulative log-decay reaches < -88, so exp(-gc) overflows
+            # float32 -> inf -> NaN logits -> degenerate (all-EOS) generation.
+            # Override with env vars for debugging/benchmarking.
             use_nki_fused = os.environ.get("USE_NKI_FUSED") == "1"
             use_nki = os.environ.get("USE_NKI") == "1"
             use_sequential = os.environ.get("DELTANET_SEQUENTIAL") == "1"
@@ -1690,7 +1742,7 @@ class NeuronQwen36A3BAttention(NeuronAttentionBase):
         """Prefill path with NKI flash attention for head_dim=256."""
         head_dim = Q.shape[-1]
 
-        # Fork-loaded nkilib flash attention (head_dim > 128).
+        # Option B: nkilib flash attention for head_dim > 128
         if _nkilib_flash_attn is not None:
             q_contig = Q.contiguous()
             k_contig = K.contiguous()
@@ -1701,7 +1753,7 @@ class NeuronQwen36A3BAttention(NeuronAttentionBase):
             )
             return result, None
 
-        # Globally-patched nkilib kernel.
+        # Option A: kernel patched globally
         if NKILIB_PATCH_ACTIVE:
             return _flash_fwd_call(Q, K, V, use_causal_mask=True), None
 
@@ -1864,7 +1916,9 @@ class NeuronQwen36A3BAttention(NeuronAttentionBase):
         # Apply o_proj
         attn_output = self.get_o_proj()(attn_output, adapter_ids=adapter_ids)
 
-        # Debug knob: zero the attention contribution (K/V/cos/sin stay valid).
+        # DEBUG knob (default off): neutralize the GQA attention contribution
+        # to localize a structural NaN to attention vs. MoE. Keeps K/V/cos/sin
+        # valid so the graph/cache stay well-formed.
         if os.environ.get("A3B_BYPASS_ATTN") == "1":
             attn_output = torch.zeros_like(attn_output)
 
@@ -1913,7 +1967,10 @@ class NeuronMoEBlock(nn.Module):
         hidden_states: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # Debug knob: zero the MoE FFN contribution.
+        # DEBUG knob (default off): neutralize the MoE FFN contribution to
+        # localize a structural NaN to MoE vs. attention. With this set the
+        # decoder layer's FFN branch adds zero, so finite logits => MoE was
+        # the NaN source.
         if os.environ.get("A3B_BYPASS_MOE") == "1":
             return torch.zeros_like(hidden_states)
 
@@ -2107,9 +2164,10 @@ class NeuronQwen36A3BDecoderLayer(nn.Module):
 
         if verify_mode and self.layer_type == "linear_attention":
             # Verify path: run the 2-token block as an exact single-step
-            # recurrence seeded read-only from the live committed DeltaNet buffers.
-            # The recurrent S-candidates and conv windows are collected for the
-            # host's accept/reject state selection.
+            # recurrence seeded read-only from the live committed DeltaNet
+            # buffers. The recurrent S-candidates and conv windows are collected
+            # for the host's accept/reject state selection (Stage B.2); in Stage
+            # B.1 they are surfaced as a side payload but not aliased.
             seq_ids = kwargs.get("seq_ids", None)
             attn_out, S_stack, conv_cand = self.linear_attn.verify_block(
                 hidden_states, seq_ids
@@ -2557,11 +2615,19 @@ class NeuronQwen36A3BModel(NeuronBaseModel):
                 requires_grad=False,
             )
 
-        # Verify-backbone candidate scratch buffers. Registered on the MAIN model
-        # (not only NeuronVerifyModel) so their state keys appear in the CTE
-        # metaneff that NxD's shared StateInitializer zero-allocates from; the main
-        # graphs emit them as inert zero passthrough. The verify graph writes the
-        # real S/conv candidates + per-position trunk hidden into them.
+        # Verify-backbone candidate scratch buffers (Stage B.2). Created on the
+        # MAIN model -- NOT only on NeuronVerifyModel -- when the verify graph is
+        # enabled, because NxD's shared StateInitializer derives its zero-init
+        # state keys from the FIRST traced graph's metaneff only (CTE). A state
+        # key that exists solely in the verify graph (a verify-only nn.Parameter)
+        # is never created, so the verify graph's initialize() fails with
+        # "Missing state tensor". Registering these buffers on the main model too
+        # makes their state keys appear in the CTE/TKG metaneffs (emitted there as
+        # zero passthrough), so the shared StateInitializer allocates them and the
+        # verify graph finds them. The main graphs never write them (passthrough),
+        # so this is byte-identical when the flag is off and inert for decode when
+        # on. These are the dedicated candidate scratch buffers; the verify graph
+        # writes the real S/conv candidates + per-position trunk hidden into them.
         self.recurrent_cand_buffers = None
         self.conv_cand_buffers = None
         self.verify_trunk_buffer = None
@@ -2653,13 +2719,21 @@ class NeuronQwen36A3BModel(NeuronBaseModel):
                 layer_to_cache_size_mapping=self.layer_to_cache_size_mapping,
             )
 
-        # MTP draft-KV placeholder. The MTP draft graph owns a private one-layer
-        # cache named `draft_kv_mgr.past_key_values.*` (distinct from the full
-        # stack's `kv_mgr.*` so it can't clobber the live layer-0 GQA buffer the
-        # verify graph reads). Build a matching one-layer manager on the MAIN model
-        # too so those keys appear in the CTE metaneff and NxD's shared
-        # StateInitializer allocates them; the main forward emits them as inert
-        # zero passthrough for the draft graph to bind to.
+        # MTP draft KV PLACEHOLDER (gotcha #6 again, for the renamed draft cache).
+        # The MTP draft graph (NeuronMTPDraftModel) owns a private one-layer cache
+        # named `draft_kv_mgr.past_key_values.{0,1}` -- a DISTINCT key from the
+        # full stack's `kv_mgr.past_key_values.*` so it cannot clobber the live
+        # layer-0 GQA buffer the verify graph reads. But NxD's shared
+        # StateInitializer zero-allocates state keys from the FIRST traced graph's
+        # (CTE) metaneff only; a key that exists solely in the draft graph is never
+        # allocated -> "Missing state tensor draft_kv_mgr.past_key_values.0" at
+        # load. FIX (mirrors _init_verify_candidate_buffers): build a matching
+        # one-layer KVCacheManager HERE on the MAIN model so its
+        # `draft_kv_mgr.past_key_values.{0,1}` keys/shapes appear in the CTE/TKG
+        # metaneff and get allocated; emit them as zero passthrough in the main
+        # forward and alias them so the draft graph binds to the same HBM. The
+        # main graphs never read/write it (inert passthrough). Gated by MTP only;
+        # flag-off path unchanged.
         self.draft_kv_mgr = None
         if getattr(config, "mtp_num_hidden_layers", 0) > 0 and not getattr(
             config, "use_hybrid_cache_manager", False
@@ -2744,10 +2818,11 @@ class NeuronQwen36A3BModel(NeuronBaseModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        # Zero out embeddings for padding tokens: DeltaNet has no attention mask
-        # (it runs a linear recurrence over every position), so a padding token's
-        # real embedding would corrupt the recurrence state. The mask is [B, S, 1]
-        # float, 1.0 for real tokens and 0.0 for padding.
+        # CRITICAL: Zero out embeddings for padding tokens so DeltaNet recurrence
+        # is not polluted. DeltaNet has no attention mask -- it processes all
+        # sequence positions through a linear recurrence.  Padding tokens have
+        # real embedding vectors which corrupt the recurrence state.
+        # The mask is [B, S, 1] float with 1.0 for real tokens, 0.0 for padding.
         if (
             is_for_context_encoding
             and attention_mask is not None
@@ -3062,10 +3137,13 @@ class NeuronQwen36A3BModel(NeuronBaseModel):
         outputs += updated_kv_cache
 
         # Surface the pre-final-norm trunk hidden (MTP draft input) by appending it
-        # to the DeltaNet state-tensor list, so it rides the same input_output_alias
-        # path as the recurrent/conv states (keeping the NxD output-packer layout
-        # consistent). Slice the last real position -> [B,1,H], mirroring the logits
-        # last-position gather so prefill picks the true last valid token.
+        # to the DeltaNet state-tensor list, so it is carried via the SAME
+        # input_output_alias path as the recurrent/conv states (its buffer is the
+        # last entry of _deltanet_state_params). Routing it through the aliased
+        # path -- instead of a fresh non-aliased output -- keeps the NxD trace
+        # output packer layout consistent. Slice the last real position -> [B,1,H],
+        # mirroring the logits last-position gather so prefill picks the true last
+        # valid token.
         if (
             getattr(self.config, "output_trunk_hidden", False)
             and getattr(self, "trunk_hidden_buffer", None) is not None
@@ -3117,10 +3195,13 @@ class NeuronQwen36A3BModel(NeuronBaseModel):
         ):
             outputs += self._deltanet_updated_states
 
-        # When the verify backbone is enabled, emit its candidate scratch buffers
-        # as trailing zero passthrough here too, so their state keys appear in the
-        # CTE metaneff for the shared StateInitializer to allocate (see
-        # init_inference_optimization). Inert; skipped when the flag is off.
+        # When the verify backbone graph is enabled, emit its candidate scratch
+        # buffers as trailing zero PASSTHROUGH outputs HERE too (CTE/TKG), so
+        # their state keys appear in the first graph's metaneff and NxD's shared
+        # StateInitializer zero-allocates them (see init_inference_optimization).
+        # The main graphs never write candidates -- this is inert passthrough that
+        # keeps the state-key set consistent across graphs. Flag-off: skipped, so
+        # the decode output layout is byte-identical.
         if (
             not getattr(self.config, "use_hybrid_cache_manager", False)
             and getattr(self, "verify_trunk_buffer", None) is not None
@@ -3128,10 +3209,11 @@ class NeuronQwen36A3BModel(NeuronBaseModel):
             for param in self._verify_candidate_params:
                 outputs.append(param + param * 0)
 
-        # MTP draft-KV placeholder passthrough. Same rationale as the verify
-        # candidates above: emit zero passthrough so the draft_kv_mgr.* keys land
-        # in the CTE metaneff for the StateInitializer to allocate for the draft
-        # graph. Inert; skipped when MTP is off.
+        # MTP draft-KV placeholder passthrough (gotcha #6 for draft_kv_mgr). Same
+        # rationale as the verify candidates above: emit zero passthrough so the
+        # `draft_kv_mgr.past_key_values.{0,1}` keys land in the CTE/TKG metaneff and
+        # the shared StateInitializer allocates them for the draft graph. Inert for
+        # decode; flag-off (no MTP) -> skipped, decode output layout unchanged.
         if (
             not getattr(self.config, "use_hybrid_cache_manager", False)
             and getattr(self, "draft_kv_mgr", None) is not None
@@ -3165,22 +3247,33 @@ def _config_for_mtp_draft(config: Qwen36A3BInferenceConfig):
 class NeuronMTPDraftModel(NeuronBaseModel):
     """Traceable wrapper around the MTP draft head for its own compiled graph.
 
-    Reuses the main model's tied embeddings and ``NeuronMTPHead`` (eh_proj +
-    decoder layer + norms + LM head) to draft the t+2 token from the trunk hidden
-    at t and the embedding of the committed token t+1.
+    Reuses the main model's tied embeddings and the `NeuronMTPHead` (one
+    eh_proj + decoder layer + norms + LM head) to draft the t+2 token from the
+    trunk hidden at t and the embedding of the committed token t+1. Carries a
+    private one-layer KV cache so the draft layer's attention can be aliased
+    independently of the main graph.
 
     The forward signature mirrors NeuronQwen36A3BModel.forward's 24 positional
-    args verbatim so the shared NxDModelExecutor sees a uniform input arity across
-    all graphs. Only ``input_ids`` (committed next-token ids [B,1]), ``prev_hidden``
-    (trunk hidden [B,1,H] at idx 5), ``position_ids`` and ``seq_ids`` are read; the
-    rest are empty placeholders. The non-empty prev_hidden at idx 5 (empty on TKG)
-    lets the shape-router disambiguate this graph from token-generation.
+    args verbatim so the shared NxDModelExecutor sees a UNIFORM input arity
+    across all three compiled graphs (CTE/TKG/MTP). Only three slots are read:
+    ``input_ids`` (the committed next-token ids [B,1]), ``prev_hidden`` (the
+    trunk hidden [B,1,H] at arg index 5), and ``position_ids``/``seq_ids``. All
+    other slots are empty placeholders. The non-empty prev_hidden at idx 5 (vs
+    the empty [0] placeholder the TKG path passes there) is what lets the
+    shape-router disambiguate this graph from token-generation.
 
-    Returns ``(draft_logits, draft_k, draft_v)``; the trailing KV is the draft
-    layer's one-layer cache, aliased back into ``self.draft_kv_mgr``. That cache is
-    named ``draft_kv_mgr`` (not ``kv_mgr``) so its state keys stay distinct from the
-    full stack's layer-0 GQA buffer -- a shared name would bind to the same HBM and
-    clobber the live cache the verify graph reads.
+    Returns (draft_logits, draft_k, draft_v) where the trailing KV is the draft
+    layer's updated one-layer cache, aliased back into self.draft_kv_mgr by
+    MTPDraftModelInstance.get().
+
+    The KV cache manager is named ``draft_kv_mgr`` (NOT the base
+    ``kv_mgr``) on purpose. NxD's shared StateInitializer keys every graph's
+    INPUT_STATE by the parameter's dotted checkpoint name, so a draft cache
+    named ``kv_mgr.past_key_values.0/1`` would COLLIDE with the full stack's
+    layer-0 GQA buffer (same name across graphs => same physical HBM). The
+    distinct ``draft_kv_mgr.past_key_values.*`` key gives the draft graph a
+    truly-private one-layer cache that cannot clobber the live GQA cache the
+    verify graph reads.
     """
 
     def setup_attr_for_model(self, config: Qwen36A3BInferenceConfig):
@@ -3213,8 +3306,12 @@ class NeuronMTPDraftModel(NeuronBaseModel):
         self.mrope_emb = Qwen36A3BMRoPEEmbedding(config)
 
     def init_inference_optimization(self, config: Qwen36A3BInferenceConfig):
-        # Private one-layer KV cache, named ``draft_kv_mgr`` so its state keys stay
-        # distinct from the full stack's layer-0 GQA buffer (see class docstring).
+        # Build a private one-layer KV cache manager instead of the full stack's.
+        # Named ``draft_kv_mgr`` so its state keys (draft_kv_mgr.past_key_values.*)
+        # are DISTINCT from the full stack's layer-0 GQA buffer
+        # (kv_mgr.past_key_values.0/1); otherwise the shared StateInitializer
+        # binds them to the same physical HBM and the draft graph clobbers the
+        # live GQA cache the verify graph reads.
         self.draft_kv_mgr = KVCacheManager(
             _config_for_mtp_draft(config),
             num_kv_head=self.num_key_value_heads,
@@ -3270,12 +3367,14 @@ class NeuronMTPDraftModel(NeuronBaseModel):
 
         cos_cache, sin_cache = self.mrope_emb(next_embeds, position_ids)
 
-        # Decode-style causal mask over the prior cache positions only.
-        # compute_for_token_gen splits attention into a prior term (cached KV,
-        # gated by this mask) and an always-attended active term (the current
-        # token). The current token's KV is written only after this forward
-        # (update_cache below), so slots >= the current position are unwritten and
-        # must be masked. Per the NxD contract, mask[..., i] is True iff i < position.
+        # Decode-style causal mask over the PRIOR cache positions only.
+        # compute_for_token_gen decomposes attention into a prior term (the
+        # cached KV, gated by this mask) and an active term (the current token,
+        # always attended). The current token's KV is written to slot
+        # `position_ids` only AFTER this forward (update_cache below), so at
+        # attention time slots >= the current position are unwritten garbage and
+        # must be masked out. Per the NxD contract, mask[..., i] is True iff
+        # i < computed_context_len (== current position).
         cache_positions = torch.arange(
             self.n_positions, device=next_token_ids.device
         ).view(1, -1)
@@ -3311,49 +3410,74 @@ class NeuronMTPDraftModel(NeuronBaseModel):
 class NeuronVerifyModel(NeuronQwen36A3BModel):
     """Traceable full 40-layer backbone over the 2-token verify block.
 
-    Runs ``[x_{t+1}, x_{t+2}^draft]`` (n_active=2) seeded from the committed decode
-    state and emits per-position logits ``[B, 2, vocab]``. Reuses the main model's
-    ``init_model`` so the shared sharded checkpoint loads verbatim.
+    Runs ``[x_{t+1}, x_{t+2}^draft]`` (n_active=2) seeded from the COMMITTED
+    decode state and emits per-position logits ``[B, 2, vocab]``. Reuses the
+    main model's ``init_model`` (embeddings, layers, norm, lm_head, mrope_emb),
+    so the shared sharded checkpoint loads verbatim.
 
     State handling:
-      * DeltaNet layers run ``verify_mode=True``: ``verify_block`` seeds read-only
-        from the live ``recurrent_state_buffer`` / ``conv_state_buffer`` (never
-        writes them, so verify cannot corrupt live decode state) and returns the
-        per-position S/conv candidates.
-      * full_attention layers use the q_len>1 token-generation path against this
-        model's own private ``KVCacheManager`` (built below), so a rejected draft's
-        GQA K/V never touches the live TKG cache. The 2-token block attends to
-        itself via the intra-block causal active mask.
+      * DeltaNet (linear_attention) layers run ``verify_mode=True``: each calls
+        ``NeuronGatedDeltaNet.verify_block`` which seeds READ-ONLY from the live
+        ``recurrent_state_buffer``/``conv_state_buffer`` (the same buffers the
+        TKG graph commits to). verify_block never writes them, so a verify pass
+        cannot corrupt the live recurrent/conv state. The per-position S/conv
+        candidates it returns are collected but DISCARDED in Stage B.1 (the
+        candidate aliasing is Stage B.2).
+      * full_attention layers use the existing q_len>1 token-generation path
+        against this model's OWN private ``KVCacheManager`` (built below), so a
+        rejected draft's GQA K/V never touches the live TKG cache. In Stage B.1
+        the private cache starts zeroed (no committed GQA prior); the 2-token
+        block attends to itself via the intra-block causal active mask.
 
-    The 24-arg forward signature matches NeuronQwen36A3BModel.forward verbatim
-    (uniform input arity for the shared executor). Only idx0 input_ids[B,2], idx2
-    position_ids[B,2], idx3 seq_ids and idx5 prev_hidden (router disambiguator) are
+    The 24-arg forward signature matches NeuronQwen36A3BModel.forward verbatim so
+    the shared NxDModelExecutor sees a uniform input arity across CTE/TKG/MTP/
+    Verify. Only idx0 input_ids[B,2], idx2 position_ids[B,2], idx3 seq_ids, and
+    idx5 prev_hidden (router disambiguator, ignored after set_none_if_empty) are
     read.
 
-    Output layout (index -> meaning). L = #DeltaNet layers, num_kv =
-    2*num_hidden_layers, num_seed = 2*L (+1 for the trunk_hidden_buffer when MTP is
-    enabled):
+    VERIFY-GRAPH OUTPUT LAYOUT (index -> meaning), consumed by the Stage C host
+    loop. Let L = #linear_attention (DeltaNet) layers (=30 at the production
+    config), G = #full_attention layers (=10), num_kv = 2 * num_hidden_layers
+    (=80; K and V per layer, including dummy zeros for DeltaNet slots),
+    num_seed = 2*L + (1 if trunk_hidden_buffer else 0) (=60 standalone; +1 under
+    A3B_ENABLE_MTP because the inherited trunk_hidden_buffer joins
+    _deltanet_state_params). All shapes at TP4/B1; alloc_bs=1, seq_len=2.
 
-      idx 0                  : logits      [B, 2, vocab] (float)
-      idx 1 .. num_kv        : *updated_kv  K,V per layer (private GQA cache;
-                               DeltaNet slots dummy 0)
-      next num_seed entries  : SEED passthrough (recurrent/conv buffers per
-                               DeltaNet layer, then trunk_hidden_buffer if present),
-                               returned unchanged.
-      next (2*L + 1) entries : CANDIDATES, per DeltaNet layer in order:
-                               recurrent_cand [B, 2, num_v_heads, head_k_dim,
-                               head_v_dim] ([:,0]=state after pos 0, [:,1]=after
-                               pos 1), conv_cand [B, 2, conv_dim, K-1]; then one
-                               verify_trunk [B, 2, H] (pre-final-norm trunk hidden,
-                               both positions, no last-position gather).
+      idx 0                       : logits          [B, 2, vocab]   (float)
+      idx 1 .. num_kv             : *updated_kv     K,V per layer [B, kv, 2, hd]
+                                    (private GQA cache; DeltaNet slots dummy 0)
+      next num_seed entries       : SEED passthrough (recurrent_state_buffer /
+                                    conv_state_buffer per DeltaNet layer, then the
+                                    inherited trunk_hidden_buffer if present) --
+                                    returned UNCHANGED (read-only seeding).
+      next (2*L + 1) entries      : CANDIDATES (Stage B.2), in this order:
+          for each DeltaNet layer (layer order):
+            recurrent_cand  [B, 2, num_v_heads, head_k_dim, head_v_dim]
+                            (=[1,2,8,128,128]); [:,0]=S1 (state after pos 0),
+                            [:,1]=S2 (state after pos 1)
+            conv_cand       [B, 2, conv_dim, K-1] (=[1,2,2560,3]); per-position
+                            causal-conv windows
+          then 1x verify_trunk  [B, 2, H] (=[1,2,2048]); pre-final-norm trunk
+                            hidden, BOTH positions (no last-position gather):
+                            [:,0]=h_{t+1}, [:,1]=h_{t+2}
+
+    So the candidate block begins at index 1 + num_kv + num_seed and has
+    2*L recurrent/conv entries (interleaved per layer) followed by 1 trunk entry.
     """
 
     def init_inference_optimization(self, config: Qwen36A3BInferenceConfig):
-        # Private full-stack KV cache, isolated from the main graph's kv_mgr so a
-        # rejected draft never corrupts the live TKG cache. DeltaNet slots get dummy
-        # zeros in verify mode; full_attention layers write real GQA K/V. (The
-        # candidate scratch buffers are created on the shared base model so their
-        # state keys land in the CTE metaneff -- see init_model.)
+        # Private full-stack KV cache manager (default, non-hybrid). The DeltaNet
+        # layers write dummy zeros into their slots in verify mode; full_attention
+        # layers write real GQA K/V. Isolated from the main graph's kv_mgr so a
+        # rejected draft never corrupts the live TKG cache.
+        #
+        # The candidate scratch buffers (recurrent_cand_buffers / conv_cand_buffers
+        # / verify_trunk_buffer) are created in NeuronQwen36A3BModel.__init__ (the
+        # shared base), gated by enable_verify_backbone, so they are ALSO present
+        # on the CTE/TKG graphs. NxD's StateInitializer only zero-inits state keys
+        # found in the FIRST graph's metaneff, so a verify-only state key would
+        # fail with "Missing state tensor"; registering them on the main model
+        # (emitted there as zero passthrough) puts their keys in the CTE metaneff.
         self.kv_mgr = KVCacheManager(
             config,
             num_kv_head=self.num_key_value_heads,
@@ -3408,18 +3532,14 @@ class NeuronVerifyModel(NeuronQwen36A3BModel):
             is_for_context_encoding=False,
         )
 
-        # Prior mask over the committed cache positions (0..t), shared by both
-        # block tokens -- use the first block token's position (the committed
-        # length) for all rows. Intra-block causality is verify_active_mask's job;
-        # the in-block tokens' K/V is not in the cache yet, so the prior must
-        # exclude them.
+        # Prior mask over cached positions for compute_for_token_gen: True iff a
+        # cache slot was written before this token's position. In Stage B.1 the
+        # private cache is zeroed so there is no real prior, but the mask is per
+        # the NxD contract (mask[..., i] True iff i < computed_context_len).
         cache_positions = torch.arange(
             self.n_positions, device=input_ids.device
         ).view(1, 1, 1, -1)
-        committed_len = position_ids[:, 0:1].view(batch_size, 1, 1, 1)
-        prior_mask = (cache_positions < committed_len).expand(
-            batch_size, 1, seq_len, self.n_positions
-        )
+        prior_mask = cache_positions < position_ids.view(batch_size, 1, seq_len, 1)
 
         # Intra-block causal active mask [B, 1, 2, 2] over the 2 active tokens:
         # token i attends to active tokens j <= i.
@@ -3467,9 +3587,11 @@ class NeuronVerifyModel(NeuronQwen36A3BModel):
             seq_len=self.n_positions,
         )
 
-        # Pre-final-norm trunk hidden, both block positions (the MTP draft input;
+        # Pre-final-norm trunk hidden, BOTH block positions (the MTP draft input;
         # the draft head applies its own pre_fc norm). No last-position gather --
-        # the host needs h_{t+1} and h_{t+2}. Captured before self.norm.
+        # the host needs h_{t+1} (pos 0) and h_{t+2} (pos 1) per the verify block
+        # semantics. Captured before self.norm to mirror the main stack's
+        # _mtp_prenorm_hidden.
         verify_trunk_hidden = hidden_states
 
         hidden_states = self.norm(hidden_states)
@@ -3496,22 +3618,32 @@ class NeuronVerifyModel(NeuronQwen36A3BModel):
                 logits, rank_id, world_size, pad_size=self.lm_head.pad_size
             )
 
-        # Surface the DeltaNet SEED buffers (recurrent + conv) as trailing aliased
-        # passthrough outputs, returned unchanged. Aliasing marks them as
-        # zero-initialized device state (not checkpoint weights); verify_block reads
-        # them read-only, so emitting them unchanged keeps the pass non-destructive.
+        # Surface the DeltaNet SEED buffers (recurrent + conv) as trailing
+        # input_output-aliased PASSTHROUGH outputs, returned UNCHANGED. These
+        # buffers are not in the checkpoint -- aliasing them marks them as
+        # zero-initialized device STATE (like the main stack's
+        # _deltanet_state_params) so NxD does not try to load them as weights.
+        # verify_block reads them read-only; emitting them unchanged keeps the
+        # verify pass non-destructive (the returned values are the same zeros the
+        # buffers already hold; the host discards them). These are the SEED
+        # buffers only -- the S/conv candidates go to their own scratch buffers
+        # below.
         passthrough_states = []
         for param in self._deltanet_state_params:
             passthrough_states.append(param + param * 0)
 
-        # Surface the per-position S/conv candidates + per-position trunk hidden.
-        # Each candidate is routed into its own dedicated scratch buffer and
-        # surfaced as an aliased output: ``cand + scratch * 0`` adds the alias
-        # dependency without reading the buffer's contents. Candidates alias only
-        # these scratch buffers, never the live/seed recurrent/conv buffers above.
-        # Cast to the buffer dtype (candidates are float32) and pad to alloc_bs so
-        # the alias shapes match; layer_candidates is in the same order as
-        # recurrent_cand_buffers / conv_cand_buffers.
+        # Surface the per-position S/conv CANDIDATES + per-position trunk hidden
+        # (Stage B.2). Each candidate is routed into its OWN dedicated scratch
+        # buffer and surfaced as an input_output-aliased output -- a candidate is
+        # both returned to the host AND written in place to that scratch buffer.
+        # ``cand + scratch * 0`` adds the alias dependency (matching value, marks
+        # the buffer as the alias target) WITHOUT reading the buffer's contents
+        # into the candidate. Risk #1: candidates alias ONLY these scratch
+        # buffers, never the live/seed recurrent/conv buffers above. Cast to the
+        # buffer dtype (S_stack/conv_cand are computed in float32 inside
+        # verify_block) and pad to alloc_bs so the alias shapes match exactly.
+        # The number/order of layer_candidates matches recurrent_cand_buffers /
+        # conv_cand_buffers (both built by iterating self.layers' linear_attn).
         alloc_bs = self.verify_trunk_buffer.shape[0]
 
         def _alias_cand(value, scratch):
@@ -3860,18 +3992,21 @@ class Qwen36A3BDecoderModelInstance(DecoderModelInstance):
             for i, param in enumerate(seed_params):
                 input_output_aliases[param] = state_start_idx + i
 
-            # Verify candidate scratch buffers (zero passthrough from the main
-            # forward), aliased after the seed states so their state keys register
-            # on CTE/TKG too. Empty / no-op when verify is disabled.
+            # Verify candidate scratch buffers, emitted by the main forward as
+            # trailing zero passthrough when the verify graph is enabled. Aliased
+            # AFTER the seed states so their state keys are registered on CTE/TKG
+            # too (NxD's StateInitializer only zero-inits keys from the first
+            # graph's metaneff). Empty / no-op when verify is disabled.
             cand_start_idx = state_start_idx + len(seed_params)
             cand_params = list(module._verify_candidate_params)
             for i, param in enumerate(cand_params):
                 input_output_aliases[param] = cand_start_idx + i
 
-            # MTP draft-KV placeholder buffers (zero passthrough from the main
-            # forward), aliased after the verify candidates so the shared
-            # StateInitializer allocates them for the draft graph. No-op when MTP
-            # is disabled.
+            # MTP draft-KV placeholder buffers, emitted by the main forward as
+            # trailing zero passthrough when MTP is enabled. Aliased AFTER the
+            # verify candidates so their state keys (draft_kv_mgr.past_key_values.*)
+            # are registered on CTE/TKG and the shared StateInitializer allocates
+            # them for the draft graph. Empty / no-op when MTP is disabled.
             draft_start_idx = cand_start_idx + len(cand_params)
             for i, param in enumerate(module._draft_kv_placeholder_params):
                 input_output_aliases[param] = draft_start_idx + i
@@ -4084,14 +4219,25 @@ class MTPHeadModelWrapper(ModelWrapper):
         )
 
     def input_generator(self):
-        """Produce the same 24-arg positional layout as the main model wrapper.
+        """Produce the SAME 24-arg positional layout as the main model wrapper.
 
         The shared NxDModelExecutor requires a uniform input arity across all
-        compiled graphs, and NxD's runtime router selects a graph by matching the
-        full example-input shape signature, so input_generator() and draft() must
-        be shape-identical in all 24 slots. NeuronMTPDraftModel.forward reads only
-        idx0/2/3/5, so every other slot is an empty placeholder built explicitly
-        here (the base wrapper's non-empty idx1/idx4 would misroute at runtime).
+        compiled graphs, so this draft graph must take the identical 24 args as
+        NeuronQwen36A3BModel.forward (input_ids, attention_mask, position_ids,
+        seq_ids, sampling_params, prev_hidden, adapter_ids, 14 empty
+        placeholders, rotary_position_id, vision_embeddings, vision_mask).
+
+        NxD's runtime router selects a graph by matching the FULL example-input
+        shape signature (built here at trace time) against the runtime call's
+        shapes, so input_generator() and draft() MUST be shape-identical in ALL
+        24 slots. Since NeuronMTPDraftModel.forward reads ONLY idx0 (input_ids),
+        idx2 (position_ids), idx3 (seq_ids) and idx5 (prev_hidden) -- it builds
+        its own attention_mask internally and never touches sampling_params --
+        every other slot (idx1, idx4, idx6..23) is an EMPTY placeholder here, and
+        draft() emits the byte-identical layout. We therefore build the 24-tuple
+        explicitly rather than reuse the base ModelWrapper 7-tuple (whose idx1
+        attention_mask = ones([B,bucket]) and idx4 sampling_params = ones([B,S])
+        would NOT match draft()'s empties and would misroute at runtime).
 
         Slot layout (index -> contents):
             0  input_ids        ones([B,1] int32)  -- dummy committed token
@@ -4099,7 +4245,8 @@ class MTPHeadModelWrapper(ModelWrapper):
             2  position_ids     ones([B,1] int32)
             3  seq_ids          arange(B) int32
             4  sampling_params  empty (never read; on_device_sampling False)
-            5  prev_hidden      zeros([B,1,H] torch_dtype)  -- distinguishing input
+            5  prev_hidden      zeros([B,1,H] torch_dtype)  -- the DISTINGUISHING
+                                input (non-empty here vs empty [0] on TKG)
             6..20  empty int32 placeholders (adapter_ids + 14 unused slots)
             21 rotary_position_id  empty int32
             22 vision_embeddings   empty torch_dtype
@@ -4111,9 +4258,11 @@ class MTPHeadModelWrapper(ModelWrapper):
 
             torch_dtype = self.config.neuron_config.torch_dtype
 
-            # Fresh empty object per slot: extract() dedups tensors by identity, so
-            # reusing one empty would collapse the placeholders and break the
-            # flattener's layout assert.
+            # Fresh empty object PER slot. extract() dedups tensors by identity;
+            # XLA tracing gives every slot a distinct input (HLO-gen flattener
+            # layout = 24 uniques), so reusing one empty object would dedup the
+            # placeholders and break the flattener's `assert self.layout ==
+            # layout` at build_flattener_map. CTE/TKG do the same (fresh per slot).
             def _empty_i32():
                 return torch.zeros((0,), dtype=torch.int32)
 
@@ -4169,10 +4318,12 @@ class MTPHeadModelWrapper(ModelWrapper):
 class VerifyModelInstance(DecoderModelInstance):
     """DecoderModelInstance for the verify backbone graph.
 
-    The verify forward returns ``[logits, *updated_kv, *seed_passthrough,
-    *candidates]``. Alias the KV back into ``module.kv_mgr.past_key_values`` (in
-    place, isolated from the main graph's caches), then the DeltaNet seed buffers
-    and the candidate scratch buffers.
+    The verify forward returns ``[logits, *updated_kv]`` -- a single trace
+    output (the per-position logits [B,2,vocab]) followed by this graph's own
+    full-stack private KV cache. Alias that KV back into
+    ``module.kv_mgr.past_key_values`` so the runtime updates it in place,
+    isolated from the main graph's caches. No DeltaNet state buffer is aliased
+    in Stage B.1 (verify_block is read-only; candidate aliasing is Stage B.2).
     """
 
     def get(self, bucket_rank, **kwargs):
@@ -4180,35 +4331,43 @@ class VerifyModelInstance(DecoderModelInstance):
             self.module.n_positions = self.neuron_config.buckets[bucket_rank]
 
         self.input_output_aliases = {}
-        # One non-KV output (the logits), followed by this graph's private KV
-        # cache, then the DeltaNet seed + candidate buffers as passthrough.
+        # The verify forward emits exactly one non-KV output (the logits),
+        # followed by this graph's private KV cache, then the DeltaNet state
+        # buffers (recurrent + conv) as passthrough outputs.
         num_output_from_trace = 1
 
         past_key_values = self.module.kv_mgr.past_key_values
         for i in range(len(past_key_values)):
             self.input_output_aliases[past_key_values[i]] = num_output_from_trace + i
 
-        # Alias the DeltaNet SEED buffers after the KV. The verify forward emits
-        # them unchanged (read-only seeding); aliasing marks them as
-        # zero-initialized device state so they are not loaded from the checkpoint.
+        # Alias the DeltaNet SEED buffers AFTER the KV. The verify forward emits
+        # them unchanged (read-only seeding); aliasing them marks them as
+        # zero-initialized device STATE so they are not required from the
+        # checkpoint (they hold carry-over state, not trained weights). These are
+        # this verify graph's OWN buffers (separate from the live TKG/CTE graph),
+        # so aliasing them cannot corrupt live decode state. NO live state buffer
+        # from another graph appears here.
         state_start_idx = num_output_from_trace + len(past_key_values)
         seed_params = list(self.module._deltanet_state_params)
         seed_ids = set(id(p) for p in seed_params)
         for i, param in enumerate(seed_params):
             self.input_output_aliases[param] = state_start_idx + i
 
-        # Alias the S/conv candidate scratch buffers + per-position trunk-hidden
-        # buffer after the seed buffers (output layout is [logits, *KV,
-        # *seed_passthrough, *candidates]).
+        # Stage B.2: alias the S/conv CANDIDATE scratch buffers + per-position
+        # trunk-hidden buffer AFTER the seed buffers. Output layout (per the
+        # verify forward) is [logits, *KV, *seed_passthrough, *candidates], so the
+        # candidate output indices start right after the seed passthrough block.
         cand_start_idx = state_start_idx + len(seed_params)
         cand_params = list(self.module._verify_candidate_params)
-        # A candidate must alias only its dedicated scratch buffer, never a
-        # live/seed recurrent/conv buffer -- aliasing a live buffer would silently
-        # commit the candidate and corrupt decode. Assert they are disjoint.
+        # Risk #1: a candidate must alias ONLY its dedicated scratch buffer, never
+        # a live/seed recurrent/conv buffer -- aliasing a live buffer would
+        # silently commit a candidate and corrupt decode. Assert the candidate
+        # buffers are disjoint from the seed buffers before wiring them.
         for param in cand_params:
             assert id(param) not in seed_ids, (
                 "verify candidate buffer aliases a live/seed DeltaNet state "
-                "buffer; candidates must use dedicated scratch buffers only"
+                "buffer; candidates MUST use dedicated scratch buffers only "
+                "(Risk #1)"
             )
         for i, param in enumerate(cand_params):
             self.input_output_aliases[param] = cand_start_idx + i
@@ -4235,14 +4394,18 @@ class VerifyModelWrapper(ModelWrapper):
         )
 
     def input_generator(self):
-        """Produce the same 24-arg positional layout as the main model wrapper, at
-        n_active=2.
+        """Produce the SAME 24-arg positional layout as the main model wrapper,
+        at n_active=2.
 
-        Like the MTP draft wrapper, the verify graph must be shape-identical to
-        NeuronQwen36A3BModel.forward in all 24 slots so the shared executor's router
-        can match it. NeuronVerifyModel.forward reads only idx0 (input_ids[B,2]),
-        idx2 (position_ids[B,2]), idx3 (seq_ids) and idx5 (prev_hidden[B,2,H], router
-        disambiguator); every other slot is an empty placeholder.
+        The shared NxDModelExecutor requires a uniform input arity across all
+        compiled graphs, so this verify graph takes the identical 24 args as
+        NeuronQwen36A3BModel.forward. NxD's runtime router selects a graph by
+        matching the FULL example-input shape signature against the runtime
+        call, so input_generator() and verify() MUST be byte-shape-identical in
+        ALL 24 slots. NeuronVerifyModel.forward reads ONLY idx0 (input_ids[B,2]),
+        idx2 (position_ids[B,2]), idx3 (seq_ids) and idx5 (prev_hidden[B,2,H],
+        router disambiguator), so every other slot is an EMPTY placeholder, and
+        verify() emits the byte-identical layout.
 
         Slot layout (index -> contents):
             0  input_ids        ones([B,2] int32)
@@ -4250,7 +4413,7 @@ class VerifyModelWrapper(ModelWrapper):
             2  position_ids     ones([B,2] int32)
             3  seq_ids          arange(B) int32
             4  sampling_params  empty (never read; on_device_sampling off)
-            5  prev_hidden      zeros([B,2,H] torch_dtype)  -- distinguishing input
+            5  prev_hidden      zeros([B,2,H] torch_dtype)  -- DISTINGUISHING
             6..20  empty int32 placeholders
             21 rotary_position_id  empty int32
             22 vision_embeddings   empty torch_dtype
@@ -4472,11 +4635,21 @@ class NeuronQwen36A3BForCausalLM(NeuronBaseForCausalLM):
                 "mtp_num_hidden_layers > 0 (A3B_ENABLE_MTP=1)."
             )
 
-        # Build the same 24-arg tuple the MTP graph was traced with (see
-        # MTPHeadModelWrapper.input_generator): committed next-token ids in idx0,
-        # position_ids idx2, seq_ids idx3, trunk hidden idx5; every other slot an
-        # empty placeholder. The non-empty prev_hidden at idx5 is the shape-router
-        # disambiguator. Fresh empty object per slot (extract() dedups by identity).
+        # Build the SAME 24-arg positional tuple the MTP graph was traced with
+        # (see MTPHeadModelWrapper.input_generator). The committed next-token
+        # ids go in idx 0 (input_ids), position_ids in idx 2, seq_ids in idx 3,
+        # and the trunk hidden in idx 5 (prev_hidden); every other slot is an
+        # empty placeholder. The non-empty prev_hidden at idx 5 distinguishes
+        # this graph from the token-generation graph for the shape-router.
+        #
+        # NxD's runtime router matches the FULL per-slot shape signature against
+        # the traced example inputs, so these slots must be byte-identical in
+        # shape/dtype to MTPHeadModelWrapper.input_generator(). idx1
+        # (attention_mask) and idx4 (sampling_params) are therefore both EMPTY
+        # int32 here: the draft forward builds its own mask and never reads
+        # sampling_params (on_device_sampling is False for this model).
+        # Fresh empty object per slot (see input_generator): extract() dedups by
+        # identity, so reusing one empty would diverge from the traced layout.
         torch_dtype = self.config.neuron_config.torch_dtype
 
         def _empty_i32():
@@ -4554,99 +4727,26 @@ class NeuronQwen36A3BForCausalLM(NeuronBaseForCausalLM):
         return [outputs]
 
     # ------------------------------------------------------------------
-    # Spec-decode host-loop state access helpers
+    # Stage C host-loop state access helpers
     #
     # NxD's runtime state lives in ``NxDModel.state`` = ``List[Dict[str,
-    # Tensor]]`` -- one dict per local rank, keyed by the parameter's dotted
-    # checkpoint name. Buffers with the same name across graphs bind to the SAME
-    # physical HBM and are passed by reference into every bucket model, so an
-    # in-place ``.copy_()`` into ``state[rank][key]`` mutates the exact HBM the
-    # next forward reads. The helpers below expose this for the host loop:
+    # Tensor]]`` -- one dict per LOCAL rank, keyed by the parameter's dotted
+    # checkpoint name. ``ModelBuilder.build_state_initializer`` builds ONE state
+    # dict (from the first graph's metaneff) and binds every graph's INPUT_STATE
+    # by checkpoint key, so buffers with the same name across graphs are the SAME
+    # physical HBM. The buffers are passed BY REFERENCE into every SPMD bucket
+    # model, so an in-place ``.copy_()`` into ``state[rank][key]`` mutates the
+    # exact HBM the next forward reads -- writes persist.
+    #
+    # The helpers below give the Stage C loop:
     #   * _loop_state_dicts(): the per-rank state dicts (resolved once);
-    #   * read_loop_state(key): a buffer as one CPU tensor (for host argmax);
-    #   * write_loop_state(key, value): in-place .copy_() into every rank's buffer
-    #     (used to zero buffers between prompts);
-    #   * commit_specdec(cand_idx, num_dn): rank-local copy of the accepted
-    #     DeltaNet candidate into the live seed buffer.
+    #   * read_loop_state(key): the buffer as one CPU tensor (rank 0; the
+    #     candidate/trunk buffers are the values the host inspects with argmax);
+    #   * write_loop_state(key, value): in-place .copy_() into every rank's
+    #     buffer (used to zero buffers between prompts);
+    #   * commit_specdec(cand_idx, num_dn): the rank-LOCAL device-to-device copy
+    #     that selects the accepted DeltaNet candidate into the live seed buffer.
     # ------------------------------------------------------------------
-    def spec_prefill(self, prompt_ids):
-        """Context-encode the prompt; return (first_token_id, trunk_hidden [1,1,H]).
-
-        Runs CTE over the padded prompt (writing the live DeltaNet/conv/GQA seed
-        buffers) and reads the aliased pre-final-norm trunk hidden h_{p-1} back
-        from device state (it is not a host-returned trace output).
-        """
-        cte = self.context_encoding_model
-        ctx_bs = cte.neuron_config.batch_size
-        seq_len = self.neuron_config.seq_len
-        H = self.config.hidden_size
-        dtype = self.config.neuron_config.torch_dtype
-        L = len(prompt_ids)
-
-        # position_ids carry the true (unpadded) positions; the mask zeroes the pad tail.
-        input_ids = torch.zeros((ctx_bs, seq_len), dtype=torch.int32)
-        input_ids[0, :L] = torch.tensor(prompt_ids, dtype=torch.int32)
-        attention_mask = torch.zeros((ctx_bs, seq_len), dtype=torch.int32)
-        attention_mask[0, :L] = 1
-        position_ids = torch.zeros((ctx_bs, seq_len), dtype=torch.int32)
-        position_ids[0, :L] = torch.arange(L, dtype=torch.int32)
-        seq_ids = torch.zeros((ctx_bs,), dtype=torch.int32)
-        sampling_params = torch.ones((ctx_bs, 3), dtype=torch.float32)
-        # idx5/idx6 (prev_hidden/adapter_ids) are [B] int32 placeholders on CTE.
-        prev_hidden = torch.zeros((ctx_bs,), dtype=torch.int32)
-        adapter_ids = torch.zeros((ctx_bs,), dtype=torch.int32)
-        empties = [torch.empty(0) for _ in range(14)]
-        mrope_position_ids = (
-            torch.arange(0, seq_len, dtype=torch.int32)
-            .view(1, 1, -1)
-            .expand(3, ctx_bs, -1)
-            .contiguous()
-        )
-        vision_embeddings = torch.zeros((ctx_bs, seq_len, H), dtype=dtype)
-        vision_mask = torch.full((ctx_bs, seq_len, 1), seq_len - 1, dtype=torch.int32)
-
-        out = cte(
-            input_ids, attention_mask, position_ids, seq_ids, sampling_params,
-            prev_hidden, adapter_ids, *empties,
-            mrope_position_ids, vision_embeddings, vision_mask,
-        )
-        logits = (out[0] if isinstance(out, (list, tuple)) else out).float()
-        last_logits = logits[0, -1, :] if logits.ndim == 3 else logits[0]
-        first_token = int(last_logits.argmax(-1))
-
-        trunk = self.read_loop_state("trunk_hidden_buffer")
-        if trunk is None:  # fall back to a substring match on the state key
-            for rs in self._loop_state_dicts():
-                for k, v in rs.items():
-                    if "trunk_hidden" in k.lower():
-                        trunk = v.detach().to("cpu").float()
-                        break
-                if trunk is not None:
-                    break
-        if trunk is None:
-            raise RuntimeError("spec_prefill: trunk_hidden_buffer not found in device state")
-        return first_token, trunk.reshape(-1, 1, H)[:1].to(dtype)
-
-    def reset_spec_state(self):
-        """Zero the live KV + DeltaNet seed/scratch buffers before a prompt.
-
-        reset() only clears the populated flag; stale buffer values would
-        otherwise corrupt the next prefill.
-        """
-        self.reset()
-        for rs in self._loop_state_dicts():
-            for key, buf in rs.items():
-                if (
-                    key.endswith(".linear_attn.recurrent_state_buffer")
-                    or key.endswith(".linear_attn.conv_state_buffer")
-                    or key.startswith("recurrent_cand_buffers.")
-                    or key.startswith("conv_cand_buffers.")
-                    or key == "verify_trunk_buffer"
-                    or key.startswith("kv_mgr.past_key_values")
-                    or key.startswith("draft_kv_mgr.past_key_values")
-                ):
-                    buf.zero_()
-
     def _loop_state_dicts(self):
         """Return NxDModel.state (List[Dict[str, Tensor]] per local rank).
 
@@ -4710,19 +4810,20 @@ class NeuronQwen36A3BForCausalLM(NeuronBaseForCausalLM):
     def commit_specdec(self, cand_idx, num_dn):
         """Commit the accepted DeltaNet candidate into the live seed buffers.
 
-        Per DeltaNet layer ``i`` and local rank, a rank-local copy:
+        Per DeltaNet layer ``i`` and per local rank ``r``, a rank-LOCAL
+        device-to-device copy:
 
             recurrent_state_buffer <- recurrent_cand_buffers.i[:, cand_idx]
             conv_state_buffer      <- conv_cand_buffers.i[:, cand_idx]
 
-        Source (candidate scratch) and destination (live seed buffer) share the
-        same rank and shard layout, so this is a pure rank-local copy.
-        ``cand_idx`` = accept_count - 1 (0 on reject, 1 on accept). The dim-1 slice
-        is selected via a CPU round-trip (``_select_cand_slice``) -- a direct device
-        strided-view copy reads the wrong offset for ``cand_idx > 0``.
+        Both source (verify-only candidate scratch) and destination (live seed
+        buffer the next forward reads) live on the SAME rank with the SAME shard
+        layout, so this is a pure rank-local copy -- never a cross-rank gather.
+        ``cand_idx`` = accept_count - 1 (0 on reject -> S1, 1 on accept -> S2).
 
-        GQA needs no commit here: the verify graph already wrote the block KV into
-        the shared live cache. Returns the number of (layer, rank) copies.
+        GQA needs NO commit here: the verify graph already wrote the block KV
+        into the shared live cache (it is the sole loop writer). Returns the
+        number of (layer, rank) copies performed.
         """
         state = self._loop_state_dicts()
         rec_seed_keys, conv_seed_keys = self._dn_seed_keys(state)
@@ -4742,19 +4843,23 @@ class NeuronQwen36A3BForCausalLM(NeuronBaseForCausalLM):
                     continue
                 # rec_cand [B,2,Hd,Kd,Vd] -> [:, cand_idx] [B,Hd,Kd,Vd] == seed
                 # conv_cand [B,2,conv_dim,K-1] -> [:, cand_idx] == seed shape
-                rec_seed.copy_(_select_cand_slice(rec_cand, cand_idx, rec_seed))
-                conv_seed.copy_(_select_cand_slice(conv_cand, cand_idx, conv_seed))
+                rec_seed.copy_(rec_cand[:, cand_idx].to(rec_seed.dtype))
+                conv_seed.copy_(conv_cand[:, cand_idx].to(conv_seed.dtype))
                 n += 1
         return n
 
     def _dn_seed_keys(self, state=None):
         """Resolve the per-DeltaNet-layer seed-buffer state keys, in layer order.
 
-        Returns ``(recurrent_state_keys, conv_state_keys)``, each indexed by
-        DeltaNet ordinal. The keys are discovered from the live state dict (sorted
-        by absolute layer index) rather than hardcoded, so this is robust to any
-        wrapping NxD adds. Candidate and seed buffers share the same DeltaNet layer
-        order, so ordinal ``i`` lines up across both. Cached after first call.
+        Returns ``(recurrent_state_keys, conv_state_keys)``, each a list indexed
+        by DeltaNet ordinal (0..num_dn-1). The seed buffers are nn.Parameters on
+        each layer's ``linear_attn`` so their state key is the dotted module path
+        ``layers.{N}.linear_attn.{recurrent,conv}_state_buffer``; we DISCOVER the
+        keys from the live state dict (sorted by absolute layer index) rather
+        than hardcoding the prefix, so this is robust to any wrapping NxD adds.
+        The recurrent/conv candidate buffers and the seed buffers share the same
+        DeltaNet layer order (both iterate self.layers' linear_attn), so ordinal
+        i lines up across candidate and seed lists. Cached after first call.
         """
         cache = getattr(self, "_dn_seed_keys_cache", None)
         if cache is not None:

@@ -1,0 +1,199 @@
+/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:100: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+  component, error = import_nki(config)
+/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:102: UserWarning: Warning: Failed to import blockwise_mm_baseline_shard_hidden: No module named 'neuronxcc.nki._private.blockwise_mm'
+  warnings.warn(f"Warning: {error}")
+/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:102: UserWarning: Warning: Failed to import blockwise_mm_bwd: No module named 'neuronxcc.nki._private.blockwise_mm_bwd'
+  warnings.warn(f"Warning: {error}")
+/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:102: UserWarning: Warning: Failed to import blockwise_mm_bwd_baseline_shard_hidden: No module named 'neuronxcc.nki._private.blockwise_mm_bwd'
+  warnings.warn(f"Warning: {error}")
+/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed_inference/utils/constants.py:1: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+  from neuronx_distributed_inference.models.dbrx.modeling_dbrx import NeuronDbrxForCausalLM
+/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed_inference/utils/constants.py:6: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+  from neuronx_distributed_inference.models.mixtral.modeling_mixtral import NeuronMixtralForCausalLM
+/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed_inference/utils/constants.py:14: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+  from neuronx_distributed_inference.models.qwen3_moe.modeling_qwen3_moe import NeuronQwen3MoeForCausalLM
+config: mtp_num_hidden_layers=1 enable_verify_backbone=True output_trunk_hidden=True num_dn=30
+Found compiled artifacts at /home/ubuntu/models/qwen36_a3b_specdec_traced; skipping compile.
+Loading compiled model from /home/ubuntu/models/qwen36_a3b_specdec_traced...
+WARNING:root:NeuronConfig init: Unexpected keyword arguments: {'enable_long_context_mode': False, 'enable_token_tree': False, 'is_chunked_prefill': False, 'is_hidden_dim_shuffled': False, 'is_intermediate_dim_shuffled': False, 'is_prefill_stage': None, 'kv_cache_tiling': False, 'kv_cache_update_with_kernel': False, 'normalize_top_k_affinities': True, 'tile_cc': False}
+INFO:Neuron:Loading presharded checkpoints for ranks: 0...3
+INFO:Neuron:Finished weights loading in 13.577791603049263 seconds
+INFO:Neuron:Warming up the model.
+2026-Jun-07 16:04:10.0630 713393:713491 [2] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):219 CCOM WARN NET/OFI Failed to initialize rdma protocol
+2026-Jun-07 16:04:10.0632 713393:713491 [2] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):354 CCOM WARN NET/OFI aws-ofi-nccl initialization failed
+2026-Jun-07 16:04:10.0635 713393:713491 [2] ncclResult_t nccl_net_ofi_init_no_atexit_fini_v6(ncclDebugLogger_t):183 CCOM WARN NET/OFI Initializing plugin failed
+2026-Jun-07 16:04:10.0637 713393:713491 [2] net_plugin.cc:97 CCOM WARN OFI plugin initNet() failed is EFA enabled?
+INFO:Neuron:Warmup completed in 0.6572046279907227 seconds.
+graphs: 4 -> ['context_encoding_model', 'token_generation_model', 'mtp_draft_head_model', 'verify_backbone_model']
+
+==========================================================================
+STAGE C.1 -- GREEDY-EQUIVALENCE GATE (spec-loop committed ids == generate())
+==========================================================================
+`generation_config` default values have been modified to match model-specific defaults: {'bos_token_id': 248044}. If this is not desired, please set these values explicitly.
+
+=== prompt: 'The capital of France is' ===
+  reference (21 ids, p=5): [760, 6511, 314, 9338, 369, 11751, 11, 264, 3177, 34756, 364, 1141, 8807, 3712, 11, 7431, 11, 321, 25438, 57902, 13]
+  decoded: 'The capital of France is Paris, a city renowned for its rich history, culture, and iconic landmarks.'
+  [state] 204 state tensors; trunk candidates=['trunk_hidden_buffer']
+    round  1: t->  6 draft=     11 true=     11 accept=1 committed_gen=2
+    round  2: t->  8 draft=   3177 true=   3177 accept=1 committed_gen=4
+    round  3: t-> 10 draft=    682 true=    682 accept=1 committed_gen=6
+    round  4: t-> 11 draft=    264 true=    978 accept=0 committed_gen=7
+    round  5: t-> 12 draft=    264 true=    854 accept=0 committed_gen=8
+    round  6: t-> 13 draft=    303 true=    310 accept=0 committed_gen=9
+    round  7: t-> 14 draft=    854 true=    271 accept=0 committed_gen=10
+    round  8: t-> 15 draft=  57590 true= 248068 accept=0 committed_gen=11
+    round  9: t-> 16 draft=    271 true=    264 accept=0 committed_gen=12
+    round 10: t-> 17 draft=  16629 true=   3177 accept=0 committed_gen=13
+    round 11: t-> 19 draft=    421 true=    421 accept=1 committed_gen=15
+    round 12: t-> 21 draft=    978 true=    978 accept=1 committed_gen=17
+  committed (22 ids): [760, 6511, 314, 9338, 369, 11751, 11, 264, 3177, 421, 682, 978, 978, 854, 310, 271, 248068, 264, 3177, 421, 682]
+  BIT-IDENTICAL (first 21 ids): FAIL  first_divergence@idx=9
+    ref[7:12] = [264, 3177, 34756, 364, 1141]
+    com[7:12] = [264, 3177, 421, 682, 978]
+    mismatches (12): [9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+      @pos 9: verify top1=421 top2=34756 |gap|=1.0000 -> SYSTEMATIC (ref=34756 com=421)
+      @pos 10: verify top1=682 top2=369 |gap|=0.3750 -> SYSTEMATIC (ref=364 com=682)
+      @pos 11: verify top1=978 top2=264 |gap|=1.0000 -> SYSTEMATIC (ref=1141 com=978)
+      @pos 12: verify top1=978 top2=264 |gap|=0.8750 -> SYSTEMATIC (ref=8807 com=978)
+      @pos 13: verify top1=854 top2=978 |gap|=0.2500 -> SYSTEMATIC (ref=3712 com=854)
+      @pos 14: verify top1=310 top2=13 |gap|=0.6250 -> SYSTEMATIC (ref=11 com=310)
+      @pos 15: verify top1=271 top2=381 |gap|=0.0625 -> SYSTEMATIC (ref=7431 com=271)
+      @pos 16: verify top1=248068 top2=57590 |gap|=2.5625 -> SYSTEMATIC (ref=11 com=248068)
+      @pos 17: verify top1=264 top2=271 |gap|=0.5625 -> SYSTEMATIC (ref=321 com=264)
+      @pos 18: verify top1=3177 top2=6511 |gap|=0.0625 -> SYSTEMATIC (ref=25438 com=3177)
+      @pos 19: verify top1=421 top2=440 |gap|=2.3750 -> SYSTEMATIC (ref=57902 com=421)
+      @pos 20: verify top1=682 top2=369 |gap|=3.1250 -> SYSTEMATIC (ref=13 com=682)
+  per-round ORACLE (argmax(vlog[:,0])==reference[t+2]): 2/11 FAIL
+  rounds=12 accepts=5 accept_rate=41.7%
+
+=== prompt: 'List the first five prime numbers:' ===
+  reference (23 ids, p=7): [826, 279, 1118, 4097, 9944, 4947, 25, 220, 16, 11, 220, 17, 11, 220, 18, 11, 220, 19, 11, 220, 11, 220, 20]
+  decoded: 'List the first five prime numbers: 1, 2, 3, 4, , 5'
+    round  1: t->  8 draft=     16 true=     16 accept=1 committed_gen=2
+    round  2: t-> 10 draft=    220 true=    220 accept=1 committed_gen=4
+    round  3: t-> 12 draft=     11 true=     11 accept=1 committed_gen=6
+    round  4: t-> 14 draft=     19 true=     19 accept=1 committed_gen=8
+    round  5: t-> 16 draft=    220 true=    220 accept=1 committed_gen=10
+    round  6: t-> 18 draft=     11 true=     11 accept=1 committed_gen=12
+    round  7: t-> 20 draft=     21 true=     21 accept=1 committed_gen=14
+    round  8: t-> 22 draft=    220 true=    220 accept=1 committed_gen=16
+  committed (23 ids): [826, 279, 1118, 4097, 9944, 4947, 25, 220, 16, 11, 220, 17, 11, 220, 19, 11, 220, 20, 11, 220, 21, 11, 220]
+  BIT-IDENTICAL (first 23 ids): FAIL  first_divergence@idx=14
+    ref[12:17] = [11, 220, 18, 11, 220]
+    com[12:17] = [11, 220, 19, 11, 220]
+    mismatches (5): [14, 17, 20, 21, 22]
+      @pos 14: verify top1=19 top2=16 |gap|=2.5000 -> SYSTEMATIC (ref=18 com=19)
+      @pos 17: verify top1=20 top2=21 |gap|=1.0000 -> SYSTEMATIC (ref=19 com=20)
+      @pos 20: verify top1=21 top2=22 |gap|=0.2500 -> SYSTEMATIC (ref=11 com=21)
+      @pos 21: verify top1=11 top2=13 |gap|=1.7500 -> SYSTEMATIC (ref=220 com=11)
+      @pos 22: verify top1=220 top2=321 |gap|=2.2500 -> SYSTEMATIC (ref=20 com=220)
+  per-round ORACLE (argmax(vlog[:,0])==reference[t+2]): 5/8 FAIL
+  rounds=8 accepts=8 accept_rate=100.0%
+
+=== prompt: 'Once upon a time,' ===
+  reference (21 ids, p=5): [12162, 5028, 264, 854, 11, 1017, 557, 264, 3777, 15019, 58763, 6725, 8105, 13, 8105, 557, 2098, 1083, 6165, 15019, 321]
+  decoded: 'Once upon a time, there was a young programming enthusiast named Tom. Tom was really into computer programming and'
+    round  1: t->  6 draft=    557 true=    557 accept=1 committed_gen=2
+    round  2: t->  8 draft=   3777 true=   3777 accept=1 committed_gen=4
+    round  3: t-> 10 draft=  58763 true=  58763 accept=1 committed_gen=6
+    round  4: t-> 12 draft=   8105 true=   8105 accept=1 committed_gen=8
+    round  5: t-> 13 draft=    557 true=   9939 accept=0 committed_gen=9
+    round  6: t-> 15 draft=    310 true=    310 accept=1 committed_gen=11
+    round  7: t-> 17 draft=    279 true=    279 accept=1 committed_gen=13
+    round  8: t-> 19 draft=    314 true=    314 accept=1 committed_gen=15
+    round  9: t-> 21 draft=     13 true=     13 accept=1 committed_gen=17
+  committed (22 ids): [12162, 5028, 264, 854, 11, 1017, 557, 264, 3777, 15019, 58763, 6725, 8105, 852, 9939, 310, 12804, 279, 1814, 314, 15019]
+  BIT-IDENTICAL (first 21 ids): FAIL  first_divergence@idx=13
+    ref[11:16] = [6725, 8105, 13, 8105, 557]
+    com[11:16] = [6725, 8105, 852, 9939, 310]
+    mismatches (8): [13, 14, 15, 16, 17, 18, 19, 20]
+      @pos 13: verify top1=852 top2=13 |gap|=0.3750 -> SYSTEMATIC (ref=13 com=852)
+      @pos 14: verify top1=9939 top2=557 |gap|=0.1250 -> SYSTEMATIC (ref=8105 com=9939)
+      @pos 15: verify top1=310 top2=15019 |gap|=1.4375 -> SYSTEMATIC (ref=557 com=310)
+      @pos 16: verify top1=12804 top2=3827 |gap|=0.5000 -> SYSTEMATIC (ref=2098 com=12804)
+      @pos 17: verify top1=279 top2=321 |gap|=1.5625 -> SYSTEMATIC (ref=1083 com=279)
+      @pos 18: verify top1=1814 top2=5629 |gap|=2.0625 -> SYSTEMATIC (ref=6165 com=1814)
+      @pos 19: verify top1=314 top2=13 |gap|=5.6250 -> SYSTEMATIC (ref=15019 com=314)
+      @pos 20: verify top1=15019 top2=5269 |gap|=0.5000 -> SYSTEMATIC (ref=321 com=15019)
+  per-round ORACLE (argmax(vlog[:,0])==reference[t+2]): 4/8 FAIL
+  rounds=9 accepts=8 accept_rate=88.9%
+
+=== prompt: 'In computer science, a binary search tree is a data structure that' ===
+  reference (29 ids, p=13): [623, 6165, 7785, 11, 264, 7620, 2624, 4757, 369, 264, 795, 5759, 421, 369, 1429, 310, 28750, 2624, 364, 264, 3050, 2315, 303, 264, 10300, 1103, 314, 5255, 13]
+  decoded: 'In computer science, a binary search tree is a data structure that is used to efficiently search for a specific element in a sorted list of elements.'
+    round  1: t-> 14 draft=   1429 true=   1429 accept=1 committed_gen=2
+    round  2: t-> 15 draft=   3875 true=  28750 accept=0 committed_gen=3
+    round  3: t-> 16 draft=   3436 true=   2624 accept=0 committed_gen=4
+    round  4: t-> 18 draft=    364 true=    364 accept=1 committed_gen=6
+    round  5: t-> 20 draft=   3050 true=   3050 accept=1 committed_gen=8
+    round  6: t-> 21 draft=    303 true=     13 accept=0 committed_gen=9
+    round  7: t-> 22 draft=    198 true=   1049 accept=0 committed_gen=10
+    round  8: t-> 24 draft=    369 true=    369 accept=1 committed_gen=12
+    round  9: t-> 25 draft=   7620 true=    913 accept=0 committed_gen=13
+    round 10: t-> 27 draft=    314 true=    314 accept=1 committed_gen=15
+    round 11: t-> 29 draft=   4757 true=   4757 accept=1 committed_gen=17
+  committed (30 ids): [623, 6165, 7785, 11, 264, 7620, 2624, 4757, 369, 264, 795, 5759, 421, 369, 1429, 310, 28750, 2624, 364, 264, 3050, 869, 13, 1049, 369, 264, 913, 314, 7620]
+  BIT-IDENTICAL (first 29 ids): FAIL  first_divergence@idx=21
+    ref[19:24] = [264, 3050, 2315, 303, 264]
+    com[19:24] = [264, 3050, 869, 13, 1049]
+    mismatches (8): [21, 22, 23, 24, 25, 26, 27, 28]
+      @pos 21: verify top1=869 top2=1328 |gap|=0.1250 -> SYSTEMATIC (ref=2315 com=869)
+      @pos 22: verify top1=13 top2=303 |gap|=0.3750 -> SYSTEMATIC (ref=303 com=13)
+      @pos 23: verify top1=1049 top2=198 |gap|=0.8750 -> SYSTEMATIC (ref=264 com=1049)
+      @pos 24: verify top1=369 top2=16661 |gap|=1.8750 -> SYSTEMATIC (ref=10300 com=369)
+      @pos 25: verify top1=264 top2=7695 |gap|=1.8750 -> SYSTEMATIC (ref=1103 com=264)
+      @pos 26: verify top1=913 top2=4757 |gap|=0.1250 -> SYSTEMATIC (ref=314 com=913)
+      @pos 27: verify top1=314 top2=328 |gap|=6.0625 -> SYSTEMATIC (ref=5255 com=314)
+      @pos 28: verify top1=7620 top2=795 |gap|=0.6250 -> SYSTEMATIC (ref=13 com=7620)
+  per-round ORACLE (argmax(vlog[:,0])==reference[t+2]): 5/10 FAIL
+  rounds=11 accepts=6 accept_rate=54.5%
+
+=== prompt: 'The three primary colors are red, green, and' ===
+  reference (26 ids, p=10): [760, 2250, 5839, 7736, 513, 2438, 11, 5983, 11, 321, 6105, 13, 198, 760, 2250, 5839, 7736, 513, 2438, 11, 5983, 11, 321, 6105, 13, 198]
+  decoded: 'The three primary colors are red, green, and blue.\nThe three primary colors are red, green, and blue.\n'
+    round  1: t-> 11 draft=     13 true=     13 accept=1 committed_gen=2
+    round  2: t-> 13 draft=    760 true=    760 accept=1 committed_gen=4
+    round  3: t-> 14 draft=   4346 true=    444 accept=0 committed_gen=5
+    round  4: t-> 15 draft=   2978 true=   3651 accept=0 committed_gen=6
+    round  5: t-> 17 draft=     11 true=     11 accept=1 committed_gen=8
+    round  6: t-> 19 draft=   2250 true=   2250 accept=1 committed_gen=10
+    round  7: t-> 20 draft=   4105 true=     11 accept=0 committed_gen=11
+    round  8: t-> 21 draft=    279 true=    198 accept=0 committed_gen=12
+    round  9: t-> 23 draft=    760 true=    760 accept=1 committed_gen=14
+    round 10: t-> 24 draft=     11 true=    198 accept=0 committed_gen=15
+    round 11: t-> 25 draft=  26952 true=    760 accept=0 committed_gen=16
+  committed (26 ids): [760, 2250, 5839, 7736, 513, 2438, 11, 5983, 11, 321, 6105, 13, 198, 760, 2250, 444, 3651, 11, 279, 2250, 1330, 11, 198, 760, 2250, 198]
+  BIT-IDENTICAL (first 26 ids): FAIL  first_divergence@idx=15
+    ref[13:18] = [760, 2250, 5839, 7736, 513]
+    com[13:18] = [760, 2250, 444, 3651, 11]
+    mismatches (9): [15, 16, 17, 18, 19, 20, 22, 23, 24]
+      @pos 15: verify top1=444 top2=2640 |gap|=1.4375 -> SYSTEMATIC (ref=5839 com=444)
+      @pos 16: verify top1=3651 top2=11 |gap|=0.1875 -> SYSTEMATIC (ref=7736 com=3651)
+      @pos 17: verify top1=11 top2=310 |gap|=0.6250 -> SYSTEMATIC (ref=513 com=11)
+      @pos 18: verify top1=279 top2=321 |gap|=1.0000 -> SYSTEMATIC (ref=2438 com=279)
+      @pos 19: verify top1=2250 top2=1330 |gap|=0.1250 -> SYSTEMATIC (ref=11 com=2250)
+      @pos 20: verify top1=1330 top2=2250 |gap|=1.5625 -> SYSTEMATIC (ref=5983 com=1330)
+      @pos 22: verify top1=198 top2=271 |gap|=0.8750 -> SYSTEMATIC (ref=321 com=198)
+      @pos 23: verify top1=760 top2=16 |gap|=1.9375 -> SYSTEMATIC (ref=6105 com=760)
+      @pos 24: verify top1=2250 top2=2943 |gap|=0.1875 -> SYSTEMATIC (ref=13 com=2250)
+  per-round ORACLE (argmax(vlog[:,0])==reference[t+2]): 4/10 FAIL
+  rounds=11 accepts=5 accept_rate=45.5%
+
+==========================================================================
+SUMMARY
+==========================================================================
+  'The capital of France is'                              ids=FAIL (SYSTEMATIC 12 mism) oracle=FAIL acc=5/12
+  'List the first five prime numbers:'                    ids=FAIL (SYSTEMATIC 5 mism) oracle=FAIL acc=8/8
+  'Once upon a time,'                                     ids=FAIL (SYSTEMATIC 8 mism) oracle=FAIL acc=8/9
+  'In computer science, a binary search tree is a data structure that' ids=FAIL (SYSTEMATIC 8 mism) oracle=FAIL acc=6/11
+  'The three primary colors are red, green, and'          ids=FAIL (SYSTEMATIC 9 mism) oracle=FAIL acc=5/11
+
+mismatch verify-logit |gap| over 42 mismatches: min=0.0625 max=6.0625 median=0.8750 (NEAR_TIE_THRESH=0.05)
+
+GATE: bit-identical=FAIL  per-round-oracle=FAIL  systematic-divergence=YES
+(informational) overall draft-accepts 32/51 = 62.7%
+
+STAGE C.1 EQUIVALENCE (bit-identical modulo bf16 near-ties): FAIL
+
+[C.2 skipped: equivalence gate did not pass]

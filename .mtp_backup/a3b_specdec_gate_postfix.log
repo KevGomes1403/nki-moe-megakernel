@@ -1,0 +1,147 @@
+/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:100: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+  component, error = import_nki(config)
+/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:102: UserWarning: Warning: Failed to import blockwise_mm_baseline_shard_hidden: No module named 'neuronxcc.nki._private.blockwise_mm'
+  warnings.warn(f"Warning: {error}")
+/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:102: UserWarning: Warning: Failed to import blockwise_mm_bwd: No module named 'neuronxcc.nki._private.blockwise_mm_bwd'
+  warnings.warn(f"Warning: {error}")
+/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:102: UserWarning: Warning: Failed to import blockwise_mm_bwd_baseline_shard_hidden: No module named 'neuronxcc.nki._private.blockwise_mm_bwd'
+  warnings.warn(f"Warning: {error}")
+/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed_inference/utils/constants.py:1: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+  from neuronx_distributed_inference.models.dbrx.modeling_dbrx import NeuronDbrxForCausalLM
+/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed_inference/utils/constants.py:6: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+  from neuronx_distributed_inference.models.mixtral.modeling_mixtral import NeuronMixtralForCausalLM
+/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed_inference/utils/constants.py:14: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+  from neuronx_distributed_inference.models.qwen3_moe.modeling_qwen3_moe import NeuronQwen3MoeForCausalLM
+WARNING:root:NeuronConfig init: Unexpected keyword arguments: {'enable_long_context_mode': False, 'enable_token_tree': False, 'is_chunked_prefill': False, 'is_hidden_dim_shuffled': False, 'is_intermediate_dim_shuffled': False, 'is_prefill_stage': None, 'kv_cache_tiling': False, 'kv_cache_update_with_kernel': False, 'normalize_top_k_affinities': True, 'tile_cc': False}
+INFO:Neuron:Loading presharded checkpoints for ranks: 0...3
+INFO:Neuron:Finished weights loading in 13.487478469032794 seconds
+INFO:Neuron:Warming up the model.
+2026-Jun-07 16:26:54.0175 716349:716376 [1] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):219 CCOM WARN NET/OFI Failed to initialize rdma protocol
+2026-Jun-07 16:26:54.0178 716349:716376 [1] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):354 CCOM WARN NET/OFI aws-ofi-nccl initialization failed
+2026-Jun-07 16:26:54.0180 716349:716376 [1] ncclResult_t nccl_net_ofi_init_no_atexit_fini_v6(ncclDebugLogger_t):183 CCOM WARN NET/OFI Initializing plugin failed
+2026-Jun-07 16:26:54.0183 716349:716376 [1] net_plugin.cc:97 CCOM WARN OFI plugin initNet() failed is EFA enabled?
+INFO:Neuron:Warmup completed in 0.6705484390258789 seconds.
+`generation_config` default values have been modified to match model-specific defaults: {'bos_token_id': 248044}. If this is not desired, please set these values explicitly.
+config: mtp_num_hidden_layers=1 enable_verify_backbone=True output_trunk_hidden=True num_dn=30
+Found compiled artifacts at /home/ubuntu/models/qwen36_a3b_specdec_traced; skipping compile.
+Loading compiled model from /home/ubuntu/models/qwen36_a3b_specdec_traced...
+graphs: 4 -> ['context_encoding_model', 'token_generation_model', 'mtp_draft_head_model', 'verify_backbone_model']
+
+==========================================================================
+STAGE C.1 -- GREEDY-EQUIVALENCE GATE (spec-loop committed ids == generate())
+==========================================================================
+
+=== prompt: 'The capital of France is' ===
+  reference (21 ids, p=5): [760, 6511, 314, 9338, 369, 11751, 11, 264, 3177, 34756, 364, 1141, 8807, 3712, 11, 7431, 11, 321, 25438, 57902, 13]
+  decoded: 'The capital of France is Paris, a city renowned for its rich history, culture, and iconic landmarks.'
+  [state] 204 state tensors; trunk candidates=['trunk_hidden_buffer']
+    round  1: t->  6 draft=     11 true=     11 accept=1 committed_gen=2
+    round  2: t->  8 draft=   3177 true=   3177 accept=1 committed_gen=4
+    round  3: t-> 10 draft=    364 true=    364 accept=1 committed_gen=6
+    round  4: t-> 11 draft=   8807 true=  25438 accept=0 committed_gen=7
+    round  5: t-> 13 draft=  57902 true=  57902 accept=1 committed_gen=9
+    round  6: t-> 14 draft=    279 true=    430 accept=0 committed_gen=10
+    round  7: t-> 16 draft=    279 true=    279 accept=1 committed_gen=12
+    round  8: t-> 18 draft=    300 true=    300 accept=1 committed_gen=14
+    round  9: t-> 20 draft=     11 true=     11 accept=1 committed_gen=16
+  committed (21 ids): [760, 6511, 314, 9338, 369, 11751, 11, 264, 3177, 34756, 364, 1141, 25438, 57902, 1680, 430, 279, 242476, 300, 21262, 11]
+  BIT-IDENTICAL (first 21 ids): FAIL  first_divergence@idx=12
+    ref[10:15] = [364, 1141, 8807, 3712, 11]
+    com[10:15] = [364, 1141, 25438, 57902, 1680]
+    mismatches (9): [12, 13, 14, 15, 16, 17, 18, 19, 20]
+      @pos 12: verify top1=25438 top2=8807 |gap|=0.1250 -> SYSTEMATIC (ref=8807 com=25438)
+      @pos 13: verify top1=57902 top2=37214 |gap|=3.5000 -> SYSTEMATIC (ref=3712 com=57902)
+      @pos 14: verify top1=1680 top2=1040 |gap|=0.5000 -> SYSTEMATIC (ref=11 com=1680)
+      @pos 15: verify top1=430 top2=279 |gap|=10.3750 -> SYSTEMATIC (ref=7431 com=430)
+      @pos 16: verify top1=279 top2=42027 |gap|=6.6250 -> SYSTEMATIC (ref=11 com=279)
+      @pos 17: verify top1=242476 top2=9440 |gap|=5.7500 -> SYSTEMATIC (ref=321 com=242476)
+      @pos 18: verify top1=300 top2=21262 |gap|=11.8750 -> SYSTEMATIC (ref=25438 com=300)
+      @pos 19: verify top1=21262 top2=20618 |gap|=8.5000 -> SYSTEMATIC (ref=57902 com=21262)
+      @pos 20: verify top1=11 top2=321 |gap|=0.5000 -> SYSTEMATIC (ref=13 com=11)
+  per-round ORACLE (argmax(vlog[:,0])==reference[t+2]): 3/9 FAIL
+  rounds=9 accepts=7 accept_rate=77.8%
+
+=== prompt: 'List the first five prime numbers:' ===
+  reference (23 ids, p=7): [826, 279, 1118, 4097, 9944, 4947, 25, 220, 17, 11, 220, 18, 11, 220, 20, 11, 220, 22, 11, 220, 16, 16, 13]
+  decoded: 'List the first five prime numbers: 2, 3, 5, 7, 11.'
+    round  1: t->  8 draft=     17 true=     17 accept=1 committed_gen=2
+    round  2: t-> 10 draft=    220 true=    220 accept=1 committed_gen=4
+    round  3: t-> 12 draft=     11 true=     11 accept=1 committed_gen=6
+    round  4: t-> 14 draft=     20 true=     20 accept=1 committed_gen=8
+    round  5: t-> 16 draft=    220 true=    220 accept=1 committed_gen=10
+    round  6: t-> 18 draft=     11 true=     11 accept=1 committed_gen=12
+    round  7: t-> 20 draft=     16 true=     16 accept=1 committed_gen=14
+    round  8: t-> 22 draft=     13 true=     13 accept=1 committed_gen=16
+  committed (23 ids): [826, 279, 1118, 4097, 9944, 4947, 25, 220, 17, 11, 220, 18, 11, 220, 20, 11, 220, 22, 11, 220, 16, 16, 13]
+  BIT-IDENTICAL (first 23 ids): PASS
+  per-round ORACLE (argmax(vlog[:,0])==reference[t+2]): 8/8 PASS
+  rounds=8 accepts=8 accept_rate=100.0%
+
+=== prompt: 'Once upon a time,' ===
+  reference (21 ids, p=5): [12162, 5028, 264, 854, 11, 1017, 557, 264, 3777, 95704, 6725, 8254, 852, 9939, 23218, 279, 1814, 314, 15019, 13, 3648]
+  decoded: 'Once upon a time, there was a young adventurer named Alex who loved exploring the world of programming. One'
+    round  1: t->  6 draft=    557 true=    557 accept=1 committed_gen=2
+    round  2: t->  8 draft=   3777 true=   3777 accept=1 committed_gen=4
+    round  3: t-> 10 draft=   6725 true=   6725 accept=1 committed_gen=6
+    round  4: t-> 12 draft=    852 true=    852 accept=1 committed_gen=8
+    round  5: t-> 13 draft=    310 true=  23218 accept=0 committed_gen=9
+    round  6: t-> 15 draft=    279 true=    279 accept=1 committed_gen=11
+    round  7: t-> 17 draft=    314 true=    314 accept=1 committed_gen=13
+    round  8: t-> 19 draft=     13 true=     13 accept=1 committed_gen=15
+    round  9: t-> 21 draft=   1834 true=   1834 accept=1 committed_gen=17
+  committed (22 ids): [12162, 5028, 264, 854, 11, 1017, 557, 264, 3777, 95704, 6725, 8254, 852, 9939, 23218, 279, 1814, 314, 15019, 13, 3648]
+  BIT-IDENTICAL (first 21 ids): PASS
+  per-round ORACLE (argmax(vlog[:,0])==reference[t+2]): 8/8 PASS
+  rounds=9 accepts=8 accept_rate=88.9%
+
+=== prompt: 'In computer science, a binary search tree is a data structure that' ===
+  reference (29 ids, p=13): [623, 6165, 7785, 11, 264, 7620, 2624, 4757, 369, 264, 795, 5759, 421, 369, 1429, 310, 3436, 795, 303, 264, 10300, 11233, 13, 1049, 369, 264, 4757, 795, 5759]
+  decoded: 'In computer science, a binary search tree is a data structure that is used to store data in a sorted manner. It is a tree data structure'
+    round  1: t-> 13 draft=    264 true=   1429 accept=0 committed_gen=1
+    round  2: t-> 15 draft=    310 true=    310 accept=1 committed_gen=3
+    round  3: t-> 16 draft=    321 true=    795 accept=0 committed_gen=4
+    round  4: t-> 18 draft=    303 true=    303 accept=1 committed_gen=6
+    round  5: t-> 20 draft=  10300 true=  10300 accept=1 committed_gen=8
+    round  6: t-> 22 draft=     13 true=     13 accept=1 committed_gen=10
+    round  7: t-> 24 draft=    369 true=    369 accept=1 committed_gen=12
+    round  8: t-> 26 draft=   4757 true=   4757 accept=1 committed_gen=14
+    round  9: t-> 28 draft=   5759 true=   5759 accept=1 committed_gen=16
+  committed (29 ids): [623, 6165, 7785, 11, 264, 7620, 2624, 4757, 369, 264, 795, 5759, 421, 369, 1429, 310, 3436, 795, 303, 264, 10300, 11233, 13, 1049, 369, 264, 4757, 795, 5759]
+  BIT-IDENTICAL (first 29 ids): PASS
+  per-round ORACLE (argmax(vlog[:,0])==reference[t+2]): 9/9 PASS
+  rounds=9 accepts=7 accept_rate=77.8%
+
+=== prompt: 'The three primary colors are red, green, and' ===
+  reference (26 ids, p=10): [760, 2250, 5839, 7736, 513, 2438, 11, 5983, 11, 321, 6105, 13, 3095, 1439, 7736, 513, 9238, 3658, 11, 781, 7936, 4022, 3000, 13, 1061, 369]
+  decoded: 'The three primary colors are red, green, and blue. When these colors are mixed together, they produce white light. This is'
+    round  1: t-> 11 draft=     13 true=     13 accept=1 committed_gen=2
+    round  2: t-> 13 draft=   1439 true=   1439 accept=1 committed_gen=4
+    round  3: t-> 15 draft=    513 true=    513 accept=1 committed_gen=6
+    round  4: t-> 16 draft=    440 true=   3658 accept=0 committed_gen=7
+    round  5: t-> 18 draft=     11 true=     11 accept=1 committed_gen=9
+    round  6: t-> 19 draft=   1304 true=   7936 accept=0 committed_gen=10
+    round  7: t-> 21 draft=   4022 true=   4022 accept=1 committed_gen=12
+    round  8: t-> 23 draft=     13 true=     13 accept=1 committed_gen=14
+    round  9: t-> 25 draft=    369 true=    369 accept=1 committed_gen=16
+  committed (26 ids): [760, 2250, 5839, 7736, 513, 2438, 11, 5983, 11, 321, 6105, 13, 3095, 1439, 7736, 513, 9238, 3658, 11, 781, 7936, 4022, 3000, 13, 1061, 369]
+  BIT-IDENTICAL (first 26 ids): PASS
+  per-round ORACLE (argmax(vlog[:,0])==reference[t+2]): 9/9 PASS
+  rounds=9 accepts=7 accept_rate=77.8%
+
+==========================================================================
+SUMMARY
+==========================================================================
+  'The capital of France is'                              ids=FAIL (SYSTEMATIC 9 mism) oracle=FAIL acc=7/9
+  'List the first five prime numbers:'                    ids=PASS (exact      0 mism) oracle=PASS acc=8/8
+  'Once upon a time,'                                     ids=PASS (exact      0 mism) oracle=PASS acc=8/9
+  'In computer science, a binary search tree is a data structure that' ids=PASS (exact      0 mism) oracle=PASS acc=7/9
+  'The three primary colors are red, green, and'          ids=PASS (exact      0 mism) oracle=PASS acc=7/9
+
+mismatch verify-logit |gap| over 9 mismatches: min=0.1250 max=11.8750 median=5.7500 (NEAR_TIE_THRESH=0.05)
+
+GATE: bit-identical=FAIL  per-round-oracle=FAIL  systematic-divergence=YES
+(informational) overall draft-accepts 37/44 = 84.1%
+
+STAGE C.1 EQUIVALENCE (bit-identical modulo bf16 near-ties): FAIL
+
+[C.2 skipped: equivalence gate did not pass]
