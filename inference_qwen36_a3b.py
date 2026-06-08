@@ -44,6 +44,7 @@ import neuronx_distributed.modules.moe.expert_mlps_v2 as _expert_mlps_v2  # noqa
 _expert_mlps_v2.DEFAULT_SELECTIVE_LOADING_THRESHOLD = 0.0
 
 from neuronx_distributed_inference.models.config import (  # noqa: E402
+    FusedSpecNeuronConfig,
     MoENeuronConfig,
     OnDeviceSamplingConfig,
 )
@@ -55,14 +56,18 @@ from neuronx_distributed_inference.modules.generation.sampling import (  # noqa:
 )
 from neuronx_distributed_inference.utils.benchmark import (  # noqa: E402
     Benchmark,
+    LatencyCollector,
     create_submodule_latency_collectors,
     generate_report,
+    register_forward_latency_collector,
     register_latency_collectors,
 )
 
 from models.qwen3_6_moe.modeling_qwen36_a3b import (  # noqa: E402
     NeuronQwen36A3BForCausalLM,
+    NeuronQwen36MTPDraftForCausalLM,
     Qwen36A3BInferenceConfig,
+    Qwen36SpecTarget,
 )
 
 
@@ -74,13 +79,43 @@ DEFAULT_PROMPTS = [
 ]
 
 
+def _make_neuron_config(tp_degree, seq_len, blockwise_block_size, spec_decode):
+    """MoENeuronConfig shared by the target and draft; adds the EAGLE fused-spec
+    flags (speculation_length=2 == k=1) when speculating."""
+    spec_kwargs = (
+        dict(enable_eagle_speculation=True, speculation_length=2, is_eagle3=False)
+        if spec_decode
+        else {}
+    )
+    return MoENeuronConfig(
+        tp_degree=tp_degree,
+        batch_size=1,
+        ctx_batch_size=1,
+        tkg_batch_size=1,
+        seq_len=seq_len,
+        torch_dtype=torch.bfloat16,
+        on_device_sampling_config=OnDeviceSamplingConfig(top_k=1),  # greedy
+        enable_bucketing=False,
+        flash_decoding_enabled=False,
+        logical_nc_config=2,
+        save_sharded_checkpoint=True,
+        blockwise_matmul_config={"block_size": blockwise_block_size},
+        **spec_kwargs,
+    )
+
+
 def build_inference_config(
     model_path: str,
     tp_degree: int,
     seq_len: int,
-    mtp_spec_decode: bool = False,
+    spec_decode: bool = False,
 ) -> Qwen36A3BInferenceConfig:
-    """Build the NxDI config from the HF config.json on disk."""
+    """Build the NxDI config from the HF config.json on disk.
+
+    ``spec_decode`` builds the fused EAGLE speculation config: the backbone is the
+    verify-mode target and the MTP head is a separate self-speculative draft
+    (shared checkpoint). One CTE graph + one fused-speculation graph.
+    """
     with open(os.path.join(model_path, "config.json")) as f:
         full_config = json.load(f)
     text_config = full_config.get("text_config", full_config)
@@ -98,41 +133,33 @@ def build_inference_config(
     # kernel is not bundled in this SDK build).
     blockwise_block_size = max(2048, seq_len * 8 * 2)
 
-    # MTP self-speculative decoding enables the draft head + verify backbone
-    # graphs and host-side argmax. Controlled by the mtp_spec_decode flag; the
-    # legacy A3B_ENABLE_* env vars still work for the dev/diagnostic scripts.
-    enable_mtp = mtp_spec_decode or os.environ.get("A3B_ENABLE_MTP") == "1"
-    enable_verify = mtp_spec_decode or os.environ.get("A3B_ENABLE_VERIFY") == "1"
-    host_argmax = mtp_spec_decode or os.environ.get("A3B_RETURN_LOGITS") == "1"
+    fused_spec_config = None
+    if spec_decode:
+        # Draft owns the MTP head (mtp_num_hidden_layers=1); same checkpoint.
+        draft_dict = dict(config_dict)
+        draft_dict["mtp_num_hidden_layers"] = 1
+        draft_config = Qwen36A3BInferenceConfig(
+            neuron_config=_make_neuron_config(
+                tp_degree, seq_len, blockwise_block_size, spec_decode=True
+            ),
+            **draft_dict,
+        )
+        fused_spec_config = FusedSpecNeuronConfig(
+            worker_cls=Qwen36SpecTarget,
+            draft_config=draft_config,
+            draft_model_path=model_path,
+            draft_model_cls=NeuronQwen36MTPDraftForCausalLM,
+        )
 
-    on_device_sampling = None if host_argmax else OnDeviceSamplingConfig(top_k=1)
-
-    neuron_config = MoENeuronConfig(
-        tp_degree=tp_degree,
-        batch_size=1,
-        ctx_batch_size=1,
-        tkg_batch_size=1,
-        seq_len=seq_len,
-        torch_dtype=torch.bfloat16,
-        on_device_sampling_config=on_device_sampling,
-        enable_bucketing=False,
-        flash_decoding_enabled=False,
-        logical_nc_config=2,
-        save_sharded_checkpoint=True,
-        blockwise_matmul_config={"block_size": blockwise_block_size},
+    # The target backbone carries no MTP head (the draft does).
+    config_dict["mtp_num_hidden_layers"] = 0
+    return Qwen36A3BInferenceConfig(
+        neuron_config=_make_neuron_config(
+            tp_degree, seq_len, blockwise_block_size, spec_decode=spec_decode
+        ),
+        fused_spec_config=fused_spec_config,
+        **config_dict,
     )
-
-    # Draft head (3rd graph) + verify backbone (4th graph, n_active=2). Enabling
-    # MTP disables NxD weight-layout optimization (priority_model_idx cleared in
-    # enable_token_generation) -- the WLO hlo-opt pass crashes on the draft HLO.
-    config_dict["mtp_num_hidden_layers"] = 1 if enable_mtp else 0
-    config_dict["output_trunk_hidden"] = (
-        enable_mtp or os.environ.get("A3B_OUTPUT_TRUNK_HIDDEN") == "1"
-    )
-    if enable_verify:
-        config_dict["enable_verify_backbone"] = True
-
-    return Qwen36A3BInferenceConfig(neuron_config=neuron_config, **config_dict)
 
 
 def maybe_compile(model_path: str, compiled_path: str, inf_config) -> None:
@@ -189,11 +216,18 @@ def generate(
     inputs = tokenizer(prompt, padding=True, return_tensors="pt")
     new_tokens = resolve_max_new_tokens(model, inputs.input_ids.shape[1], max_new_tokens)
 
+    # Fused speculation runs through HF assisted decoding; prompt_lookup_num_tokens
+    # selects that generation mode (NxDI then dispatches to _fused_assisted_decoding).
+    spec_kwargs = {}
+    if model.neuron_config.enable_fused_speculation:
+        spec_kwargs["prompt_lookup_num_tokens"] = model.neuron_config.speculation_length
+
     out_ids = adapter.generate(
         inputs.input_ids,
         generation_config=gen_config,
         attention_mask=inputs.attention_mask,
         max_new_tokens=new_tokens,
+        **spec_kwargs,
     )
 
     full_ids = out_ids[0].tolist()
@@ -253,12 +287,24 @@ def benchmark_device(
         "do_sample": False,
         "sampling_params": sampling_params,
     }
+    # Fused speculation runs through HF assisted decoding (see generate());
+    # prompt_lookup_num_tokens selects that mode so the benchmark exercises the
+    # fused graph instead of crashing in the plain _sample path.
+    if neuron_config.enable_fused_speculation:
+        input_param["prompt_lookup_num_tokens"] = neuron_config.speculation_length
 
     latency_collectors = create_submodule_latency_collectors(model)
+    # NxDI's helper doesn't cover the fused-spec decode graph; collect it too.
+    if neuron_config.enable_fused_speculation and hasattr(model, "fused_spec_model"):
+        latency_collectors["fused_speculation_model"] = LatencyCollector()
 
     def post_warmup_func():
         # Register after warm-up so one-time costs aren't recorded.
         register_latency_collectors(latency_collectors, model)
+        if "fused_speculation_model" in latency_collectors:
+            register_forward_latency_collector(
+                latency_collectors["fused_speculation_model"], model.fused_spec_model
+            )
 
     adapter = HuggingFaceGenerationAdapter(model)
     adapter.generation_config.transformers_version = transformers.__version__
@@ -280,12 +326,13 @@ def benchmark_device(
             n_runs=bench.num_runs,
         )
     }
-    # Per-submodule reports keyed by the wrapper tag strings.
+    # Per-submodule reports keyed by the wrapper tag strings. The fused-spec graph
+    # is the decode submodule (replaces token_generation_model).
     for key, collector in latency_collectors.items():
         tokens_len = neuron_config.max_length
         if key == "context_encoding_model":
             tokens_len = prompt_len
-        elif key == "token_generation_model":
+        elif key in ("token_generation_model", "fused_speculation_model"):
             tokens_len = new_tokens
         report[key] = generate_report(
             collector.latency_list,
@@ -293,6 +340,14 @@ def benchmark_device(
             neuron_config.max_batch_size,
             n_runs=bench.num_runs,
         )
+
+    # Realized speculation gain: tokens committed per fused-graph round (1..spec_len).
+    # The fused collector records one latency per round, so rounds = entries/run.
+    if neuron_config.enable_fused_speculation:
+        fused = latency_collectors.get("fused_speculation_model")
+        if fused is not None and len(fused.latency_list):
+            rounds_per_run = len(fused.latency_list) / bench.num_runs
+            report["e2e_model"]["tokens_per_round"] = round(new_tokens / rounds_per_run, 3)
 
     model.reset()
     return report
@@ -342,12 +397,7 @@ def main():
     parser.add_argument(
         "--mtp-spec-decode",
         action="store_true",
-        help="Generate with MTP self-speculative decoding (draft + verify graphs)",
-    )
-    parser.add_argument(
-        "--check-equivalence",
-        action="store_true",
-        help="With --mtp-spec-decode: also run plain greedy and report any divergence",
+        help="Build/run with fused MTP self-speculative decoding (one fused graph)",
     )
     args = parser.parse_args()
 
@@ -358,14 +408,14 @@ def main():
     )
 
     compiled_path = args.compiled_path or (
-        "/home/ubuntu/models/qwen36_a3b_specdec_traced"
+        "/home/ubuntu/models/qwen36_a3b_fused_traced"
         if args.mtp_spec_decode
         else "/home/ubuntu/models/qwen36_a3b_traced"
     )
 
     inf_config = build_inference_config(
         args.model_path, args.tp_degree, args.seq_len,
-        mtp_spec_decode=args.mtp_spec_decode,
+        spec_decode=args.mtp_spec_decode,
     )
     maybe_compile(args.model_path, compiled_path, inf_config)
     model = load_model(compiled_path)
@@ -374,52 +424,18 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    if args.mtp_spec_decode:
-        from models.qwen3_6_moe.mtp_spec_decode import spec_decode
-
-        print("\n" + "=" * 70)
-        print(f"MTP SPECULATIVE DECODE")
-        print("=" * 70)
-        for prompt in args.prompts:
-            prompt_len = len(tokenizer(prompt).input_ids)
-            new_tokens = resolve_max_new_tokens(model, prompt_len, args.max_new_tokens)
-            ids, accept_rate = spec_decode(
-                model, tokenizer, inf_config, prompt, new_tokens
-            )
-            new_ids = ids[len(tokenizer(prompt).input_ids):]
-            print(f"\n--- prompt ---\n{prompt}")
-            print(f"--- completion ({len(new_ids)} tok, accept_rate={accept_rate:.1%}) ---")
-            print(f"decoded: {tokenizer.decode(new_ids, skip_special_tokens=True)!r}")
-            if args.check_equivalence:
-                ref_ids, _ = generate(model, tokenizer, prompt, args.max_new_tokens)
-                ref_new = ref_ids[len(tokenizer(prompt).input_ids):]
-                # The loop may overshoot by one (an accept commits 2 tokens), so
-                # compare over the common length, not the exact count.
-                n = min(len(new_ids), len(ref_new))
-                div = next((i for i in range(n) if new_ids[i] != ref_new[i]), None)
-                if div is None:
-                    print(f"  equivalence vs plain greedy: bit-identical ({n} tokens)")
-                else:
-                    print(
-                        f"  equivalence vs plain greedy: diverges at new-token idx {div} "
-                        "(may be a bf16 near-tie)"
-                    )
-        return
-
+    # Fused spec decode dispatches through the same generate() path (NxDI's
+    # _fused_assisted_decoding); only the build differs.
+    mode = "FUSED SPEC DECODE" if args.mtp_spec_decode else "GREEDY"
     print("\n" + "=" * 70)
-    print(f"GENERATING (max_new_tokens={mnt_desc}, greedy)")
+    print(f"GENERATING (max_new_tokens={mnt_desc}, {mode})")
     print("=" * 70)
     for prompt in args.prompts:
-        token_ids, text = generate(model, tokenizer, prompt, args.max_new_tokens)
-        prompt_ids = tokenizer(prompt).input_ids
-        new_ids = token_ids[len(prompt_ids):]
-        n_new = len(new_ids)
-        print(f"\n--- prompt ---\n{prompt}")
-        print(f"--- completion ({n_new} tok) ---")
-        print(f"new_ids: {new_ids}")
-        print(f"new_tokens: {tokenizer.convert_ids_to_tokens(new_ids)}")
-        print(f"decoded (raw): {tokenizer.decode(new_ids, skip_special_tokens=False)!r}")
-        print(f"decoded (clean): {tokenizer.decode(new_ids, skip_special_tokens=True)!r}")
+        token_ids, _ = generate(model, tokenizer, prompt, args.max_new_tokens)
+        new_ids = token_ids[len(tokenizer(prompt).input_ids):]
+        response = tokenizer.decode(new_ids, skip_special_tokens=True)
+        print(f"\n{prompt}")
+        print(response)
 
     if args.skip_benchmark:
         return
@@ -446,6 +462,12 @@ def main():
             f"p99={sub['latency_ms_p99']:8.2f}ms  "
             f"avg={sub['latency_ms_avg']:8.2f}ms  "
             f"throughput={sub['throughput']:7.1f} tok/s"
+        )
+    tokens_per_round = report["e2e_model"].get("tokens_per_round")
+    if tokens_per_round is not None:
+        print(
+            f"\nfused speculation: {tokens_per_round:.2f} tokens/round "
+            f"(spec_len={model.neuron_config.speculation_length}; 1.0 = no acceptance)"
         )
     print("\n(full report)")
     print(json.dumps(report, indent=2))
