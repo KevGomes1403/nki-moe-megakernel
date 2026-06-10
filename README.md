@@ -39,8 +39,12 @@ Mixture-of-Experts feed-forward (every layer):
 - One always-on shared expert whose output is scaled by a per-token sigmoid gate.
 - `moe_intermediate_size` and `shared_expert_intermediate_size` are both 512.
 
-A multi-token-prediction (MTP) head exists in the checkpoint but is disabled in this
-deployment (`mtp_num_hidden_layers` is set to 0).
+A multi-token-prediction (MTP) head (one extra decoder layer over the concatenated
+last hidden and next-token embedding) is used for self-speculative decoding via
+NxDI's fused EAGLE speculation: the MTP head is the draft, the backbone verifies,
+and the draft-verify-accept loop runs in one fused on-device graph
+(`speculation_length` 2, k=1). The plain non-speculative build keeps it disabled
+(`mtp_num_hidden_layers` 0).
 
 ## Hardware and parallelism
 
@@ -74,42 +78,47 @@ device at a time. To run isolated single-core kernel work in parallel, set
 
 ## Running inference
 
-The driver compiles the model on the first run if the compiled directory is empty,
-then loads it and generates greedily for a set of prompts. If the directory already
-contains `model.pt`, the compile step is skipped.
+The driver compiles the model on the first run if the compiled directory has no
+`model.pt`, then loads it, generates greedily for a set of prompts, and runs the
+on-device benchmark. The primary mode is fused MTP speculative decoding:
 
 ```bash
-A3B_RETURN_LOGITS=1 python -m models.qwen3_6_moe.inference_qwen36_a3b \
+python -m models.qwen3_6_moe.inference_qwen36_a3b \
   --model-path /home/ubuntu/models/Qwen3.6-35B-A3B \
-  --compiled-path /home/ubuntu/models/qwen36_a3b_traced \
-  --max-new-tokens 24
+  --mtp-spec-decode
 ```
 
+This defaults to the prebuilt selective-decode directory
+`/home/ubuntu/models/qwen36_a3b_fused_selective`. Omit `--mtp-spec-decode` for the
+plain greedy build (defaults to `/home/ubuntu/models/qwen36_a3b_traced`).
+
 Expected behavior:
-- First run: compilation takes roughly 20 minutes and writes a presharded checkpoint
-  (about 65 GB) into the compiled directory.
-- Subsequent runs: weight loading takes about 8 to 9 minutes, then generation runs at
-  roughly 20 to 22 tokens per second.
+- First run: compilation takes roughly 10-20 minutes (plus presharding, about 65 GB,
+  unless `A3B_SKIP_SHARD=1` reuses an existing `weights/`).
+- Subsequent runs: weight loading takes about 6 to 9 minutes, then generation.
 
 Useful flags and variables:
 - `--prompts "Prompt one" "Prompt two"`: override the built-in sanity prompts.
-- `--max-new-tokens N`: number of tokens to generate per prompt.
+- `--max-new-tokens N`: tokens per prompt (default fills the window).
+- `--skip-benchmark`: sanity generations only.
+- `--num-runs N` / `A3B_BENCH_RUNS`: timed benchmark runs (default 10).
 - `A3B_SEQ_LEN`: compiled sequence length (default 128).
 - `A3B_TP_DEGREE`: tensor parallel degree (default 4).
-- `A3B_RETURN_LOGITS=1`: build with on-device sampling disabled, so the model returns
-  logits and greedy selection is done on the host. This matches how the current
-  compiled directory was built. Omit it to build an on-device-sampling variant, which
-  forces a one-time recompile into the target directory.
+- `A3B_SKIP_SHARD=1`: trace graphs only; reuse an existing `weights/` dir.
 
-Example with custom prompts:
+## Performance
 
-```bash
-A3B_RETURN_LOGITS=1 python -m models.qwen3_6_moe.inference_qwen36_a3b \
-  --model-path /home/ubuntu/models/Qwen3.6-35B-A3B \
-  --compiled-path /home/ubuntu/models/qwen36_a3b_traced \
-  --prompts "The capital of France is" "Explain gravity in one sentence." \
-  --max-new-tokens 32
-```
+Measured with the on-device benchmark (`--mtp-spec-decode`, prompt "The capital of
+France is", 123 new tokens filling the 128-token window, 10 timed runs after one
+warm-up, greedy):
+
+| Metric | Value |
+| --- | --- |
+| End-to-end p50 (123 new tokens) | 1033 ms (124 tok/s) |
+| Prefill (context encoding) p50 | 295 ms |
+| Fused speculation round p50 | 10.6 ms |
+| Decode throughput | 173 tok/s |
+| Acceptance | 1.84 tokens/round (spec_len 2) |
 
 ## Implementation notes
 
@@ -121,14 +130,16 @@ which overflows float32 for this checkpoint's gating magnitude and produces NaN
 logits. Do not select the fused path for this model. Token generation (decode) uses a
 single-step recurrence that is stable by construction.
 
-MoE execution. The selective-loading and blockwise MoE paths are not used. Decode and
-prefill both route through `forward_all_experts`, which is set up in the inference
-driver and config. This avoids an out-of-bounds gather in selective loading and a
-blockwise kernel that is not available in this SDK build.
+MoE execution. Prefill routes through `forward_all_experts` (128 tokens x top-8 touches
+4x the expert count, so all-experts is optimal). Decode uses NxDI's default selective
+loading: the fused decode graph gathers only the routed experts (~16/256 slices per layer
+per round), about 3x faster per round than streaming all experts, with token-identical
+output. The blockwise kernel is not available in this SDK build.
 
 Storage. Each presharded TP=4 build is about 65 GB. Compile into a single directory
-and reuse it. Do not create a separate compiled directory per experiment, since
-several builds will exhaust local disk.
+and reuse it. New graph variants over identical weights can skip resharding: pass
+`A3B_SKIP_SHARD=1` and symlink an existing `weights/` into the new compiled directory
+(see `/home/ubuntu/models/qwen36_a3b_fused_selective`).
 
 The NKI kernels in `nki_kernels/` are taken unmodified from a Neuron Distributed
 Inference (NxDI) pull request authored by an AWS engineer
@@ -138,14 +149,15 @@ They are treated as validated code and are not edited.
 ## Files
 
 - `modeling_qwen36_a3b.py`: configuration, DeltaNet, GQA, MoE block, MTP head, hybrid
-  cache manager, decoder layer, model, causal LM wrapper, and the weight converter.
+  cache manager, decoder layer, model, causal LM wrapper, fused-speculation classes,
+  and the weight converter.
 - `nki_kernels/`: DeltaNet NKI kernels (`nki_deltanet.py` recurrent,
   `nki_deltanet_chunked.py` per-chunk and stable, `nki_deltanet_fused.py` fused).
-- `inference_qwen36_a3b.py`: end-to-end driver (compile, load, greedy generate).
-- `diag_logits.py`: prefill logits and top-k diagnostic.
+- `inference_qwen36_a3b.py`: end-to-end driver (compile, load, generate, benchmark).
 - `tests/`: CPU weight-conversion tests, hardware block tests for the MoE and DeltaNet
-  blocks, and kernel and decay diagnostics (`probe_kernel_padding.py`,
-  `probe_real_decay.py`, `scan_weights_finite.py`, `diag_bisect.py`).
+  blocks, the MTP state-rule oracle (`test_mtp_state_rule.py`), and kernel/decay
+  diagnostics (`probe_kernel_padding.py`, `probe_real_decay.py`,
+  `scan_weights_finite.py`).
 
 ## Tests
 

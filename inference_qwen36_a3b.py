@@ -11,9 +11,13 @@ Usage:
 
     --max-new-tokens defaults to filling the window (seq_len - prompt_len).
 
+Decode/spec graphs gather only the routed experts (NxDI selective loading);
+prefill streams all experts, which is optimal at 128 tokens x top-8.
+
 Environment variables (override defaults without flags):
     A3B_TP_DEGREE   : tensor-parallel degree (default 4)
     A3B_SEQ_LEN     : max sequence length (default 128)
+    A3B_SKIP_SHARD=1 : trace graphs only; reuse an existing weights/ dir
     USE_PYTORCH_CHUNK=1 : fall back to PyTorch DeltaNet path (debugging)
 """
 
@@ -34,14 +38,6 @@ from transformers import AutoTokenizer, GenerationConfig
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
-
-# Route decode through `forward_all_experts` instead of `forward_selective_loading`.
-# Selective loading does an indirect gather over expert weights that hits an OOB
-# DMA on trn3 for our 256-expert / batch=1 / top_k=8 shape; all-experts is
-# equivalent in FLOPs but uses a contiguous batched matmul. This mirrors the
-# upstream qwen3_moe demo which picks tkg_batch_size so the same branch fires.
-import neuronx_distributed.modules.moe.expert_mlps_v2 as _expert_mlps_v2  # noqa: E402
-_expert_mlps_v2.DEFAULT_SELECTIVE_LOADING_THRESHOLD = 0.0
 
 from neuronx_distributed_inference.models.config import (  # noqa: E402
     FusedSpecNeuronConfig,
@@ -99,6 +95,9 @@ def _make_neuron_config(tp_degree, seq_len, blockwise_block_size, spec_decode):
         flash_decoding_enabled=False,
         logical_nc_config=2,
         save_sharded_checkpoint=True,
+        # A3B_SKIP_SHARD=1: trace graphs only; reuse an existing weights/ dir
+        # (e.g. symlinked from another build with identical sharding).
+        skip_sharding=os.environ.get("A3B_SKIP_SHARD") == "1",
         blockwise_matmul_config={"block_size": blockwise_block_size},
         **spec_kwargs,
     )
@@ -408,7 +407,7 @@ def main():
     )
 
     compiled_path = args.compiled_path or (
-        "/home/ubuntu/models/qwen36_a3b_fused_traced"
+        "/home/ubuntu/models/qwen36_a3b_fused_selective"
         if args.mtp_spec_decode
         else "/home/ubuntu/models/qwen36_a3b_traced"
     )
