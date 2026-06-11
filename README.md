@@ -114,11 +114,11 @@ warm-up, greedy):
 
 | Metric | Value |
 | --- | --- |
-| End-to-end p50 (123 new tokens) | 1033 ms (124 tok/s) |
-| Prefill (context encoding) p50 | 295 ms |
-| Fused speculation round p50 | 10.6 ms |
-| Decode throughput | 173 tok/s |
-| Acceptance | 1.84 tokens/round (spec_len 2) |
+| End-to-end p50 (123 new tokens) | 990 ms (129 tok/s) |
+| Prefill (context encoding) p50 | 301 ms |
+| Fused speculation round p50 | 9.4 ms |
+| Decode throughput | 186 tok/s |
+| Acceptance | 1.76 tokens/round (spec_len 2) |
 
 ## Implementation notes
 

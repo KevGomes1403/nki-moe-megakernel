@@ -23,6 +23,7 @@ DeltaNet layers carry their recurrent state + 1-D conv state as nn.Parameter
 buffers and return dummy KV tuples from forward.
 """
 
+import contextlib
 import copy
 import gc
 import math
@@ -39,6 +40,7 @@ from neuronx_distributed_inference.models.model_base import (
     NeuronBaseForCausalLM,
     NeuronBaseModel,
     NeuronFusedSpecModel,
+    mask_padded_logits,
 )
 from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm
 
@@ -47,12 +49,13 @@ try:
 except ImportError:
     from neuronxcc.nki.kernels.attention import attention_isa_kernel
 
-from neuronx_distributed.parallel_layers import parallel_state
+from neuronx_distributed.parallel_layers import mappings, parallel_state
 from neuronx_distributed.parallel_layers.layers import (
     ColumnParallelLinear,
     ParallelEmbedding,
     RowParallelLinear,
 )
+from neuronx_distributed.operators.argmax import argmax as nxd_argmax
 from neuronx_distributed.utils import cpu_mode
 
 try:
@@ -1807,6 +1810,21 @@ class NeuronQwen36A3BAttention(NeuronAttentionBase):
 # ============================================================
 
 
+@contextlib.contextmanager
+def _defer_moe_allreduce():
+    """Make the MoE's trailing all-reduce a no-op so its routed local partial can
+    be fused with the gated shared-expert partial and reduced once (3 -> 2
+    collectives/layer). Targets the only reduce both MoE paths share, so it holds
+    regardless of `init_tkg_module`; `RowParallelLinear` reduces via a separate
+    import and is unaffected."""
+    orig = mappings.reduce_from_tensor_model_parallel_region
+    mappings.reduce_from_tensor_model_parallel_region = lambda input_, *a, **k: input_
+    try:
+        yield
+    finally:
+        mappings.reduce_from_tensor_model_parallel_region = orig
+
+
 class NeuronMoEBlock(nn.Module):
     """Routed top-k experts + sigmoid-gated shared expert.
 
@@ -1816,9 +1834,11 @@ class NeuronMoEBlock(nn.Module):
         moe                      : NxDI MoE module, routed-only (n_shared=0)
         shared_expert.gate_proj  : (H -> shared_I)  column-parallel
         shared_expert.up_proj    : (H -> shared_I)  column-parallel
-        shared_expert.down_proj  : (shared_I -> H)  row-parallel
+        shared_expert.down_proj  : (shared_I -> H)  row-parallel, no reduce
         shared_expert_gate       : (H -> 1)         column-parallel
-    Forward: routed(x) + sigmoid(shared_expert_gate(x)) * shared_expert(x).
+    Forward: routed and shared down-projections return local partials; their
+    gated sum is reduced once. Valid because the gate is rank-replicated:
+    AR(routed) + gate*AR(shared) == AR(routed + gate*shared).
     """
 
     def __init__(self, config: "Qwen36A3BInferenceConfig"):
@@ -1847,12 +1867,20 @@ class NeuronMoEBlock(nn.Module):
             self.config.neuron_config.enable_fused_speculation
             and not self.config.neuron_config.is_prefill_stage
         )
-        routed = self.moe(
-            hidden_states, padding_mask, is_speculative_decoding=is_spec,
-        )[0]
-        shared = self.shared_expert(hidden_states)
+        # Routed and shared down-projections both return un-reduced local
+        # partials (MoE reduce deferred below; shared_expert.down_proj has
+        # reduce_output=False); their gated sum is all-reduced once.
+        with _defer_moe_allreduce():
+            routed_local = self.moe(
+                hidden_states, padding_mask, is_speculative_decoding=is_spec,
+            )[0]
+        shared_local = self.shared_expert(hidden_states)
         gate = torch.sigmoid(self.shared_expert_gate(hidden_states))
-        return routed + gate * shared
+        combined_local = routed_local + gate * shared_local
+        return mappings.reduce_from_tensor_model_parallel_region(
+            combined_local,
+            process_group=parallel_state.get_tensor_model_parallel_group(),
+        )
 
 
 class SharedExpertMLP(nn.Module):
@@ -1866,8 +1894,11 @@ class SharedExpertMLP(nn.Module):
         self.up_proj = ColumnParallelLinear(
             hidden_size, intermediate_size, bias=False, gather_output=False,
         )
+        # reduce_output=False: return the local partial so NeuronMoEBlock can
+        # fuse it (gated) with the routed partial under a single all-reduce.
         self.down_proj = RowParallelLinear(
             intermediate_size, hidden_size, bias=False, input_is_parallel=True,
+            reduce_output=False,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -1932,8 +1963,10 @@ class NeuronMTPHead(nn.Module):
         self.decoder_layer = NeuronQwen36A3BDecoderLayer(layer_config, self.layer_idx)
 
         self.final_norm = rms_cls(h, eps=eps)
+        # Sharded: the draft token is a sharded vocab-parallel argmax, so the
+        # full-vocab logits are never gathered.
         self.mtp_lm_head = ColumnParallelLinear(
-            h, config.vocab_size, bias=False, gather_output=True,
+            h, config.vocab_size, bias=False, gather_output=False,
         )
 
     def draft_step(
@@ -3363,15 +3396,32 @@ class Qwen36A3BModelWrapper(ModelWrapper):
 # the draft->verify->accept loop runs device-side. See FUSED_SPEC_PLAN.md.
 
 
-def _mask_vocab_padding(lm_head, logits):
-    """Zero a full-vocab (gather_output=True) head's padding columns so a pad
-    column can't win the on-device argmax. No-op when the vocab isn't padded."""
-    if not hasattr(lm_head, "pad_size"):
-        return logits
-    from neuronx_distributed_inference.models.model_base import mask_padded_logits
-
-    rank_id = torch.tensor(0, device=logits.device, dtype=torch.int32)
-    return mask_padded_logits(logits, rank_id, 1, pad_size=lm_head.pad_size)
+def _greedy_argmax(lm_head, logits, rank_util, disable_argmax_kernel=False):
+    """Per-position greedy token id over a vocab head, masking padding columns
+    first so a pad column can't win. For a sharded head (gather_output=False)
+    the argmax is a vocab-parallel reduction (NxD ``nxd_argmax`` gathers only the
+    per-rank max value+index), so the full-vocab logits are never materialized."""
+    logits = logits.float()
+    if hasattr(lm_head, "pad_size"):
+        if lm_head.gather_output:
+            rank_id = torch.tensor(0, device=logits.device, dtype=torch.int32)
+            world_size = 1
+        else:
+            rank_id = rank_util.get_rank()
+            world_size = lm_head.tensor_parallel_group.size()
+        logits = mask_padded_logits(
+            logits, rank_id, world_size, pad_size=lm_head.pad_size
+        )
+    if lm_head.gather_output:
+        return torch.argmax(logits, dim=-1).to(torch.int32)
+    return nxd_argmax(
+        tensor=logits,
+        dim=-1,
+        gather_dim=-1,
+        keepdim=False,
+        process_group=lm_head.tensor_parallel_group,
+        disable_argmax_kernel=disable_argmax_kernel,
+    ).to(torch.int32)
 
 
 class Qwen36MTPDraft(NeuronBaseModel):
@@ -3501,8 +3551,10 @@ class Qwen36MTPDraft(NeuronBaseModel):
             seq_len=self.n_positions,
         )
 
-        draft_logits = _mask_vocab_padding(self.mtp_head.mtp_lm_head, draft_logits)
-        sampled = torch.argmax(draft_logits, dim=-1).to(torch.int32)  # [B, q]
+        sampled = _greedy_argmax(  # [B, q]
+            self.mtp_head.mtp_lm_head, draft_logits, self.rank_util,
+            disable_argmax_kernel=self.neuron_config.disable_argmax_kernel,
+        )
         return [sampled, *updated_kv, hidden]
 
 
@@ -3513,8 +3565,8 @@ class Qwen36SpecTarget(NeuronQwen36A3BModel):
     live DeltaNet + GQA state. Verify block (n_active == spec_len): the spec block
     with DeltaNet layers in verify_mode (read-only seed + per-position S/conv
     candidates) and GQA against the live KV; the candidates are stashed on
-    ``self._verify_candidates`` for the in-graph commit. lm_head is full-vocab
-    (gather_output=True) so the per-position argmax is global.
+    ``self._verify_candidates`` for the in-graph commit. The per-position greedy
+    argmax is a sharded vocab-parallel reduction (lm_head stays sharded).
     """
 
     def __init__(self, *args, **kwargs):
@@ -3524,18 +3576,6 @@ class Qwen36SpecTarget(NeuronQwen36A3BModel):
         # buffer seed) via a forward pre-hook on the final norm.
         self._captured_prenorm = None
         self.norm.register_forward_pre_hook(self._capture_prenorm)
-
-    def init_model(self, config: "Qwen36A3BInferenceConfig"):
-        super().init_model(config)
-        # Force full-vocab logits so the verify/prefill greedy argmax is global
-        # (the base sets gather_output=False under on-device sampling).
-        if self.on_device_sampling:
-            self.lm_head = ColumnParallelLinear(
-                config.hidden_size,
-                config.vocab_size,
-                gather_output=True,
-                bias=False,
-            )
 
     def _capture_prenorm(self, module, args):
         self._captured_prenorm = args[0]
@@ -3614,8 +3654,10 @@ class Qwen36SpecTarget(NeuronQwen36A3BModel):
 
         verify_trunk_hidden = hidden_states  # pre-final-norm, both positions
         logits = self.lm_head(self.norm(hidden_states)).float()
-        logits = _mask_vocab_padding(self.lm_head, logits)
-        tokens = torch.argmax(logits, dim=-1).to(torch.int32)  # [B, spec_len]
+        tokens = _greedy_argmax(  # [B, spec_len]
+            self.lm_head, logits, self.rank_util,
+            disable_argmax_kernel=self.neuron_config.disable_argmax_kernel,
+        )
 
         self._verify_candidates = layer_candidates
         return [tokens, *updated_kv, verify_trunk_hidden]
