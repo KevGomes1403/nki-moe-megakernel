@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Qwen 3.6 MTP Draft+Verify Megakernel — Scoping &amp; Roadmap</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #161a22; --panel2: #1c212c; --ink: #d7dce4;
+    --dim: #8b93a3; --accent: #5cc8ff; --green: #6fd388; --red: #f0716e;
+    --amber: #f0b86e; --purple: #b18cff; --line: #2a3140; --code: #9fd6ff;
+  }
+  body { background: var(--bg); color: var(--ink); font: 15px/1.65 "Segoe UI", system-ui, sans-serif;
+         margin: 0; padding: 0 0 80px 0; }
+  .wrap { max-width: 1060px; margin: 0 auto; padding: 0 28px; }
+  h1 { font-size: 30px; margin: 44px 0 4px; color: #fff; }
+  h2 { font-size: 22px; margin: 48px 0 12px; color: var(--accent); border-bottom: 1px solid var(--line); padding-bottom: 8px;}
+  h3 { font-size: 17px; margin: 28px 0 8px; color: #fff; }
+  h4 { font-size: 15px; margin: 20px 0 6px; color: var(--amber); }
+  p, li { color: var(--ink); }
+  .sub { color: var(--dim); margin-top: 0; }
+  code { font: 13px/1.5 "JetBrains Mono", Consolas, monospace; color: var(--code);
+         background: #11151d; padding: 1px 5px; border-radius: 4px; }
+  pre { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+        padding: 14px 16px; overflow-x: auto; font: 13px/1.55 "JetBrains Mono", Consolas, monospace; color: #cfe6ff;}
+  pre code { background: none; padding: 0; }
+  .ref { color: var(--purple); font: 12.5px "JetBrains Mono", monospace; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 18px 22px; margin: 16px 0; }
+  .tldr { border-left: 4px solid var(--accent); }
+  .warn { border-left: 4px solid var(--red); }
+  .ok   { border-left: 4px solid var(--green); }
+  .note { border-left: 4px solid var(--amber); }
+  table { border-collapse: collapse; width: 100%; margin: 14px 0; font-size: 14px; }
+  th { text-align: left; color: var(--dim); font-weight: 600; padding: 6px 10px; border-bottom: 1px solid var(--line);}
+  td { padding: 6px 10px; border-bottom: 1px solid #1d2330; vertical-align: top;}
+  .num { text-align: right; font-family: "JetBrains Mono", monospace; }
+  .tag { display: inline-block; font-size: 11px; font-weight: 700; border-radius: 4px; padding: 1px 7px; margin-right: 6px; letter-spacing: .4px;}
+  .t-red { background: #3a2024; color: var(--red);} .t-amb { background: #3a3120; color: var(--amber);}
+  .t-grn { background: #1f3326; color: var(--green);} .t-blu { background: #1a2c3a; color: var(--accent);}
+  .phase { display: flex; gap: 16px; margin: 14px 0; }
+  .phase .pnum { flex: 0 0 52px; height: 52px; border-radius: 50%; background: var(--panel2);
+                 border: 2px solid var(--accent); color: var(--accent); font: 700 19px/48px monospace; text-align: center;}
+  .phase .pbody { flex: 1; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 18px;}
+  .phase .pbody h3 { margin-top: 0; }
+  svg text { font: 12px "Segoe UI", sans-serif; fill: var(--ink); }
+  svg .small { font-size: 10.5px; fill: var(--dim); }
+  svg .mono { font-family: "JetBrains Mono", monospace; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 800px){ .grid2 { grid-template-columns: 1fr; } }
+  a { color: var(--accent); }
+  .toc { columns: 2; font-size: 14px; }
+  .toc a { text-decoration: none; color: var(--ink); }
+  .toc a:hover { color: var(--accent); }
+</style>
+</head>
+<body><div class="wrap">
+
+<h1>Qwen 3.6 A3B — MTP Draft+Verify Megakernel</h1>
+<p class="sub">Scoping, first-principles analysis, roadmap, and risk register · June 2026<br>
+Fusing one full speculation round — draft → verify → accept → state commit — into a single NKI invocation,
+on a 40-layer hybrid DeltaNet/GQA MoE backbone.</p>
+
+<div class="panel toc">
+<b>Contents</b><br>
+<a href="#tldr">0 · TL;DR</a><br>
+<a href="#first">1 · First principles: why decode is DMA-bound</a><br>
+<a href="#today">2 · What runs today: anatomy of one fused-spec round</a><br>
+<a href="#prior">3 · Prior art you already own</a><br>
+<a href="#scale">4 · Sizing: is the megakernel even bigger than what's been done?</a><br>
+<a href="#design">5 · Target design: one round, one kernel</a><br>
+<a href="#challenges">6 · Key challenges &amp; blockers, ranked</a><br>
+<a href="#roadmap">7 · Roadmap</a><br>
+<a href="#perf">8 · Performance model &amp; success criteria</a><br>
+<a href="#risk">9 · Risk register</a>
+</div>
+
+<!-- ============================ TLDR ============================ -->
+<h2 id="tldr">0 · TL;DR</h2>
+<div class="panel tldr">
+<p><b>Feasible, and smaller than it sounds.</b> One speculation round (spec_len=2, k=1) is
+1 draft layer + 40 verify layers (×2 tokens) + 2 LM-head passes ≈ <b>~41 fused layer instances</b> — the same order as
+the 48-layer Qwen3-30B megakernel that already ships at <b>1.76×</b> over XLA. The hard part is not scale; it is
+<b>heterogeneity and in-kernel control flow</b>: DeltaNet recurrence with candidate-state checkpointing, a 248k-vocab
+argmax across TP ranks <em>inside</em> the kernel, a data-dependent embedding gather (draft token → verify input), and a
+greedy accept/commit select — none of which appear in the existing kernels.</p>
+<p><b>Headroom:</b> rounds currently run at <b>9.4&nbsp;ms p50</b> (186 tok/s decode). A bandwidth roofline on the
+per-round weight traffic (~2 GB/rank) puts the floor near <b>2–3&nbsp;ms</b>. Realistic target: <b>~4–5&nbsp;ms/round
+(≈ 350–450 tok/s)</b> after Phase 3.</p>
+<p><b>Plan:</b> 5 phases. The first two — DeltaNet decode block in NKI, then a T=2 hybrid verify megakernel with the
+draft/accept/commit still in XLA — deliver most of the win at a fraction of the risk. Whole-round fusion (in-kernel
+argmax, embedding gather, accept, state select) lands in Phases 3–4.</p>
+</div>
+
+<!-- ============================ FIRST PRINCIPLES ============================ -->
+<h2 id="first">1 · First principles: why decode is DMA-bound and why a megakernel helps</h2>
+
+<p>Three facts drive everything in single-stream decode at bs=1 on Trainium:</p>
+
+<h3>1.1 Arithmetic intensity ≈ 1 flop/byte</h3>
+<p>Every weight matrix used at decode is touched by exactly one (or here, two–three) token rows. A matmul
+<code>[1, H] @ [H, N]</code> does 2·H·N flops over 2·H·N weight bytes (bf16) — ratio ≈ 1. Trainium3's PE arrays
+need hundreds of flops/byte to saturate. So the decode floor is HBM bandwidth, not compute:</p>
+<pre>round_time_floor = bytes_streamed_per_round / sustained_HBM_BW</pre>
+<p>The XLA baseline pays additionally for: per-graph launch/sync, fragmented small DMAs, HBM round-trips of activations
+between fused regions, and serialized layers. The whole megakernel value proposition is to take
+<code>bytes_streamed</code> to its model-defined minimum and overlap 100% of compute under the DMA stream — exactly
+the win seen in your profiles: 43% fewer DMA packets, 2.7× larger packets, hidden-state HBM writes
+10× lower (gpt-oss: 0.14 MB vs 1.4 MB/token).</p>
+
+<h3>1.2 SBUF as the layer-to-layer register file</h3>
+<p>The residual <code>[B, S, H]</code> at H=2048, S≤2, bf16 is ≈ 8 KB — trivially SBUF-resident for the whole round.
+That is the structural trick of <span class="ref">~/nki-moe/megakernels/qwen3_moe/transformer_qwen.py:160</span>
+(<code>residual_sb</code> lives in SBUF across all 48 layers). New here: <b>DeltaNet recurrent state per rank is
+[B, 8, 128, 128] bf16 = 256 KB/layer × 30 layers ≈ 7.7 MB</b> (<span class="ref">modeling_qwen36_a3b.py:376</span>),
+which fits in SBUF (~24 MB/core) — meaning live + candidate states can stay on-chip for the entire round and only
+the committed state needs an HBM write.</p>
+
+<h3>1.3 What changes with speculation</h3>
+<p>Speculation converts 1 round = 1 token (avg 1.76 here) into 1 round = ~1.76 tokens for ~3 tokens of compute —
+profitable because the verify (2 tokens) streams weights once. The XLA fused-spec graph already exploits this; the
+megakernel's job is to remove the remaining sync/DMA tax across draft + 40 verify layers + LM heads + state commit,
+all chained inside one NEFF.</p>
+
+<!-- ============================ TODAY ============================ -->
+<h2 id="today">2 · What runs today: anatomy of one fused-spec round (XLA)</h2>
+
+<p>The fused round is a single XLA graph built by
+<code>Qwen36FusedSpecModel._eagle_token_gen_forward</code>
+(<span class="ref">modeling_qwen36_a3b.py:3691–3775</span>), an override of NxDI's
+<code>NeuronFusedSpecModel</code> (<span class="ref">neuronx_distributed_inference/models/model_base.py:1598</span>).
+Two graphs exist: CTE prefill and the TKG round; we replace the round body.</p>
+
+<svg viewBox="0 0 1000 250" style="width:100%; background:var(--panel); border:1px solid var(--line); border-radius:10px;">
+  <text x="20" y="26" style="font-weight:700; fill:#fff;">One fused-spec round, spec_len=2 (k=1)</text>
+  <!-- draft -->
+  <rect x="20" y="50" width="170" height="80" rx="8" fill="#1a2c3a" stroke="#5cc8ff"/>
+  <text x="32" y="74">① Draft (MTP head)</text>
+  <text x="32" y="92" class="small">1 GQA layer + eh_proj</text>
+  <text x="32" y="108" class="small">LM head → argmax → t̂</text>
+  <text x="32" y="124" class="small mono">:3714–3732</text>
+  <!-- verify -->
+  <rect x="230" y="50" width="220" height="80" rx="8" fill="#1f3326" stroke="#6fd388"/>
+  <text x="242" y="74">② Verify (target, T=2)</text>
+  <text x="242" y="92" class="small">40 layers · DeltaNet read-only seed</text>
+  <text x="242" y="108" class="small">candidates S₁,S₂ + LM head ×2</text>
+  <text x="242" y="124" class="small mono">:3735–3741, verify_block :485</text>
+  <!-- final draft -->
+  <rect x="490" y="50" width="170" height="80" rx="8" fill="#1a2c3a" stroke="#5cc8ff"/>
+  <text x="502" y="74">③ Draft replay</text>
+  <text x="502" y="92" class="small">repopulate draft KV</text>
+  <text x="502" y="108" class="small">with verified block</text>
+  <text x="502" y="124" class="small mono">:3746–3750</text>
+  <!-- accept -->
+  <rect x="700" y="50" width="130" height="80" rx="8" fill="#3a3120" stroke="#f0b86e"/>
+  <text x="712" y="74">④ Accept</text>
+  <text x="712" y="92" class="small">greedy cumsum</text>
+  <text x="712" y="108" class="small">index ∈ {0,1}</text>
+  <text x="712" y="124" class="small mono">:3753–3757</text>
+  <!-- commit -->
+  <rect x="860" y="50" width="120" height="80" rx="8" fill="#2a2040" stroke="#b18cff"/>
+  <text x="872" y="74">⑤ Commit</text>
+  <text x="872" y="92" class="small">where(S₁,S₂)</text>
+  <text x="872" y="108" class="small">×30 layers</text>
+  <text x="872" y="124" class="small mono">:3675–3689</text>
+  <!-- arrows -->
+  <line x1="190" y1="90" x2="230" y2="90" stroke="#8b93a3" marker-end="url(#a)"/>
+  <line x1="450" y1="90" x2="490" y2="90" stroke="#8b93a3"/>
+  <line x1="660" y1="90" x2="700" y2="90" stroke="#8b93a3"/>
+  <line x1="830" y1="90" x2="860" y2="90" stroke="#8b93a3"/>
+  <text x="20" y="185" class="small">All five stages are one XLA graph (one NEFF) — the host only manages I/O aliasing</text>
+  <text x="20" y="202" class="small">(Qwen36FusedSpecModelInstance :3826 aliases 60 DeltaNet state tensors + rolling-buffer hidden at fixed output offsets).</text>
+  <text x="20" y="232" style="fill:#f0b86e">p50 = 9.4 ms/round · 1.76 tok/round → 186 tok/s decode (README.md)</text>
+</svg>
+
+<h3>2.1 The pieces the megakernel must reproduce</h3>
+<table>
+<tr><th>Stage</th><th>Today</th><th>Code</th></tr>
+<tr><td>Draft step</td><td>MTP head = RMSNorm(embed)‖RMSNorm(hidden) → <code>eh_proj</code> [2H→H] → 1 GQA decoder layer → norm → vocab-sharded LM head</td><td><span class="ref">modeling_qwen36_a3b.py:1927–2010</span></td></tr>
+<tr><td>Verify trunk</td><td>40 layers; DeltaNet layers run <code>verify_block</code> seeded read-only from committed buffers, return per-position candidates</td><td><span class="ref">:485–577, :3596</span></td></tr>
+<tr><td>DeltaNet candidates</td><td>Exact 1-step recurrence ×2: <code>out_stack [B,H,2,Vd]</code>, <code>S_stack [B,2,H,128,128]</code>, conv windows <code>[B,2,2560,3]</code>; bf16 carry rounding for bit-exactness with TKG</td><td><span class="ref">:426–483, :441–444</span></td></tr>
+<tr><td>Accept</td><td><code>(~(cand[:,1:]==target[:,:-1])).cumsum&lt;1 → sum</code> — for k=1 it degenerates to one int compare</td><td><span class="ref">:3753–3757</span></td></tr>
+<tr><td>Commit</td><td><code>torch.where(idx==1, S₂, S₁)</code> per layer; rides aliased outputs back into live buffers</td><td><span class="ref">:3675–3689, :3847–3851</span></td></tr>
+<tr><td>GQA KV</td><td>Scattered at the two verify positions; rejected slot is masked next round and overwritten</td><td>NxDI <span class="ref">kv_cache_manager.py:369</span></td></tr>
+</table>
+
+<div class="panel note">
+<b>Note on the draft layer type.</b> The MTP decoder layer is full attention with its own KV cache
+(<span class="ref">modeling_qwen36_a3b.py:3427–3558</span>, <code>Qwen36MTPDraft</code>), so the draft side
+fuses with the existing GQA machinery — DeltaNet only appears in the verify trunk. That is a major simplification.
+</div>
+
+<!-- ============================ PRIOR ART ============================ -->
+<h2 id="prior">3 · Prior art you already own</h2>
+<div class="grid2">
+<div class="panel ok">
+<h3>Qwen3-30B-A3B (48L, TP=4, LNC=2)</h3>
+<ul>
+<li><span class="ref">~/nki-moe/megakernels/qwen3_moe/transformer_qwen.py:103–436</span> — full decode step in one
+<code>nki.jit</code>; SBUF-resident residual; double-buffered weight ring; hoisted per-layer norms/RoPE
+(<span class="ref">:178–227</span>); SB2SB all-reduce + LNC gather.</li>
+<li><b>T&gt;1 speculative variant exists</b> — <span class="ref">transformer_qwen3_moe_speculative.py:49–53</span>:
+per-slot RoPE <code>[d/2,B,T]</code>, causal verify mask, consecutive KV scatter from base position.
+This is the direct skeleton for the verify trunk.</li>
+<li>8.15 ms vs 14.37 ms XLA (1.76×).</li>
+</ul></div>
+<div class="panel ok">
+<h3>GPT-OSS-20B (24L, TP=8) + vendored nkilib</h3>
+<ul>
+<li>Alternating mask schedules per layer (<span class="ref">transformer_gpt_oss.py:309–364</span>) — direct precedent
+for the 3:1 DeltaNet/GQA alternation.</li>
+<li>Vendored, validated subkernels: <code>attention_block_tkg</code>, <code>router_topk</code> (top-k over E in-kernel),
+<code>moe_tkg</code> + <code>selective_expert_impl</code> with <b>index-driven indirect weight DMA</b>
+(<span class="ref">~/nki-moe/nki_kernels/moe/selective_expert_impl.py</span>) — the same primitive the embedding gather
+and selective experts need here.</li>
+<li>Lesson learned: HBM round-trips between subkernels (MXFP4 path) eat the win — keep everything SBUF-in/SBUF-out.</li>
+</ul></div>
+</div>
+<p>Integration pattern is proven: layer 0 dispatches the kernel, layers 1..L−1 pass through, KV aliased in-place
+(<span class="ref">qwen_with_megakernel.py:434–486</span>). Reusable verbatim under <code>Qwen36FusedSpecModel</code>.</p>
+
+<!-- ============================ SCALE ============================ -->
+<h2 id="scale">4 · Sizing: is this bigger than what's been done?</h2>
+<table>
+<tr><th>Quantity (per round, TP=4, LNC=2)</th><th class="num">Qwen3-30B kernel</th><th class="num">Qwen3.6 round kernel</th></tr>
+<tr><td>Fused layer instances</td><td class="num">48</td><td class="num">1 draft + 40 verify ≈ 41</td></tr>
+<tr><td>Distinct layer types</td><td class="num">1 (GQA+MoE)</td><td class="num">3 (DeltaNet+MoE, GQA+MoE, draft GQA)</td></tr>
+<tr><td>Tokens per layer</td><td class="num">1 (T&gt;1 in spec variant)</td><td class="num">2 (verify), 1 (draft)</td></tr>
+<tr><td>LM-head passes in kernel</td><td class="num">0</td><td class="num">2 (vocab 248,320; 254 MB/rank/pass)</td></tr>
+<tr><td>In-kernel control flow</td><td class="num">none</td><td class="num">argmax, gather, select-by-accept</td></tr>
+<tr><td>State outputs aliased</td><td class="num">2L KV</td><td class="num">2·40 KV + 60 DeltaNet + draft KV + hidden</td></tr>
+</table>
+<p><b>Conclusion:</b> instruction-count scale is comparable to what you've already compiled. Effort concentrates on the
+right column's bottom three rows.</p>
+
+<!-- ============================ DESIGN ============================ -->
+<h2 id="design">5 · Target design: one round, one kernel</h2>
+<pre><code>qwen36_round_megakernel(hidden_seed, last_token_id, embed_table, mtp_weights,
+                        per-layer {Wqkvz/Wo, conv_w, A_log/dt_bias, router, gate_up, down, norms},
+                        K/V caches[10+1], deltanet S/conv buffers[30], lm_head_T, cos/sin, pos_id):
+  # ① DRAFT  — embed(last_token)‖hidden_seed → eh_proj → GQA layer → norm → lm_head ⊗ x
+  draft_logits → TP-global argmax → t̂  (idx + offset all-gather, 4 ranks)
+  # ② EMBED  — indirect DMA: embed_table[t̂] → SBUF (selective_expert-style gather)
+  # ③ VERIFY — 40 layers, T=2 [t₀, t̂]; DeltaNet: seed→step→S₁(keep)→step→S₂(keep)
+  #            GQA: scatter K/V @ pos, pos+1; MoE: router_topk T=2, selective experts
+  # ④ HEADS  — lm_head over 2 positions → argmax ×2 → target tokens
+  # ⑤ ACCEPT — accept = (t̂ == target₀);  S* = select(accept, S₂, S₁) per layer (SBUF)
+  # ⑥ WRITE  — S*, conv* → HBM state buffers; chosen hidden → rolling buffer slot
+  return tokens(2), accept_idx   # host: position_ids += 1+accept, mask update only</code></pre>
+<p>The host's per-round work drops to incrementing positions and the attention mask — identical to the contract NxDI's
+fused-spec runtime already exposes (<span class="ref">model_base.py:2799</span>).</p>
+<p>The draft-replay stage (③ in today's graph) can stay in the kernel as one extra GQA layer over T=2, or remain in XLA
+in early phases; for k=1, drafting from the chosen hidden next round is equivalent — to be confirmed against the
+<code>test_mtp_state_rule.py</code> oracle before any deletion.</p>
+
+<!-- ============================ CHALLENGES ============================ -->
+<h2 id="challenges">6 · Key challenges &amp; blockers, ranked</h2>
+
+<h3><span class="tag t-red">C1</span>DeltaNet decode block in NKI with candidate states</h3>
+<p>Per token, per head: decay <code>S·e^{g}</code>, read <code>k·S</code>, rank-1 update <code>S += kᵀδ</code>, read
+<code>q·S</code> on a [128,128] state (<span class="ref">modeling_qwen36_a3b.py:405–424</span>) — vectorE-heavy, near-zero
+tensorE use; plus L2-norm, gating (<code>exp·softplus</code>), and the causal conv (4-tap, window <code>[2560,3]</code>).
+Existing NKI kernels (<span class="ref">nki_kernels/nki_deltanet.py</span>) are prefill-shaped (per-(B,H), full sequence).
+Needed: a TKG-shaped fused block — projections + conv + 2 steps + checkpoint S₁/S₂ in SBUF — with the bf16 carry rounding
+(<span class="ref">:441–444</span>) preserved or it breaks bit-exactness with the oracle. <b>Largest single line item; no precedent.</b></p>
+
+<h3><span class="tag t-red">C2</span>In-kernel LM head + TP-global argmax over 248,320 vocab</h3>
+<p>Two passes/round at 254 MB/rank ≈ ~36% of the round's HBM floor. Argmax over 62k local logits is a cheap vectorE
+reduction; the global step is a 4-rank all-gather of (max, idx) + offset compare —
+<code>router_topk</code> proves top-k in NKI, <code>nccl.all_reduce/sb2sb</code> exists in your kernels. Risk is plumbing,
+not concept. Sampled (non-greedy) decode is explicitly out of scope (greedy round is what ships today,
+<span class="ref">:3667–3672</span>).</p>
+
+<h3><span class="tag t-amb">C3</span>Token-dependent embedding gather inside the kernel</h3>
+<p>Verify needs <code>embed[t̂]</code> where t̂ is computed in ②. With untied embeddings (table 248320×2048, row 4 KB)
+this is one indirect HWDGE descriptor keyed by an SBUF index — the exact mechanism of
+<span class="ref">selective_expert_impl.py</span>'s router-indexed weight loads. Sequential dependency adds latency but it's one row.</p>
+
+<h3><span class="tag t-amb">C4</span>Conditional commit & KV semantics on reject</h3>
+<p>State commit is a per-layer select between SBUF-resident S₁/S₂ — replicating <span class="ref">:3675–3689</span>
+without HBM bounce (the XLA graph already proves select semantics; never strided views). GQA KV needs no rollback:
+write both slots, mask the rejected one next round, as fused spec does today. Draft KV equivalence on reject is the
+subtle bit — gate Phase 4 on the CPU oracle (<span class="ref">tests/test_mtp_state_rule.py</span>).</p>
+
+<h3><span class="tag t-amb">C5</span>GQA specifics: head_dim 256, partial mRoPE</h3>
+<p>head_dim 256 &gt; PMAX 128 (your nkilib fork handles it) and partial rotary 64/256 with interleaved mRoPE [11,11,10]
+(<span class="ref">:1389–1396</span>) must be reproduced in the attention subkernel — table-driven cos/sin keeps it simple.
+Per-slot RoPE/masks for T=2 are solved (<span class="ref">transformer_qwen3_moe_speculative.py:49–53</span>).</p>
+
+<h3><span class="tag t-grn">C6</span>MoE at E=256/K=8 + shared expert; compile/aliasing scale</h3>
+<p>Same selective machinery at half the per-rank intermediate (I=128); legacy-load constraint I%128==0 holds. Shared expert
++ three sigmoid gates are minor vectorE additions. ~145 aliased outputs and the exec()-generated signature need extension,
+plus fp32 router softmax with normalized top-k (<span class="ref">:1410–1413</span>). Tedious, low risk; budget compile-time wrestling.</p>
+
+<!-- ============================ ROADMAP ============================ -->
+<h2 id="roadmap">7 · Roadmap</h2>
+
+<div class="phase"><div class="pnum">0</div><div class="pbody"><h3>Profile &amp; pin baseline — ~2 days</h3>
+Profile the 9.4 ms round (NEFF+NTFF, neuron-explorer): bytes/round, engine actives, draft/verify/heads split.
+Freeze token-identical reference outputs (greedy, oracle prompts). <b>Exit:</b> validated bandwidth budget per stage.</div></div>
+
+<div class="phase"><div class="pnum">1</div><div class="pbody"><h3>DeltaNet TKG block in NKI (C1) — 2–3 wks · critical path</h3>
+Standalone: projections + conv + 2 recurrent steps + S₁/S₂ checkpoint, SBUF-in/out, bf16 carry.
+Validate vs <code>verify_block</code> per-(B,H) bit-exact. <b>Exit:</b> green vs CPU oracle.</div></div>
+
+<div class="phase"><div class="pnum">2</div><div class="pbody"><h3>T=2 verify trunk megakernel — 2–3 wks</h3>
+Fork the speculative skeleton; alternate [Δ,Δ,Δ,GQA]; head_dim-256 attention + mRoPE; E=256 MoE + shared expert;
+candidates/hidden out. Draft, LM heads, accept, commit stay XLA. <b>Exit:</b> token-identical; verify ≲5 ms.</div></div>
+
+<div class="phase"><div class="pnum">3</div><div class="pbody"><h3>Heads in: draft + LM heads + argmax + embed gather (C2, C3) — 2 wks</h3>
+Two sequential megakernel calls; activations HBM-handed once each. <b>Exit:</b> ≤6 ms round.</div></div>
+
+<div class="phase"><div class="pnum">4</div><div class="pbody"><h3>Whole-round fusion (C4) — 1–2 wks</h3>
+Accept + select + state write in-kernel; collapse to one NEFF; host = pos/mask only. Gate on oracle.
+<b>Exit:</b> ≈4–5 ms, ~350–450 tok/s.</div></div>
+
+<div class="phase"><div class="pnum">5</div><div class="pbody"><h3>Optimize</h3>
+Weight ring across heterogeneous layers, LNC=2 DeltaNet head split, LM-head dominance (quantized head / shortlist), bs&gt;1.</div></div>
+
+<!-- ============================ PERF ============================ -->
+<h2 id="perf">8 · Performance model (estimates to validate in Phase 0)</h2>
+<table>
+<tr><th>Stream (per rank/round, bf16)</th><th class="num">~MB</th></tr>
+<tr><td>LM head ×2 (62,080×2048)</td><td class="num">508</td></tr>
+<tr><td>MoE selective, 40L × T2 union ~14 experts</td><td class="num">~800</td></tr>
+<tr><td>DeltaNet proj 30L + GQA 10L + draft + misc</td><td class="num">~700</td></tr>
+<tr><td><b>Total ≈ 2.0 GB → floor 2–3 ms @ sustained BW; target 4–5 ms vs 9.4 today</b></td><td class="num"></td></tr>
+</table>
+
+<!-- ============================ RISK ============================ -->
+<h2 id="risk">9 · Risk register</h2>
+<table>
+<tr><th>Risk</th><th>Sev</th><th>Mitigation</th></tr>
+<tr><td>DeltaNet block bit-mismatch (decay exp form — fused-kernel instability precedent, README)</td><td><span class="tag t-red">H</span></td><td>Chunked-stable decay form; bf16 carry; per-(B,H) oracle gate</td></tr>
+<tr><td>Compiler/scheduler blowup (40L hetero + 60 state outputs)</td><td><span class="tag t-amb">M</span></td><td>Phase split keeps each NEFF ≈ known-good size; reuse env hoist flags</td></tr>
+<tr><td>SBUF pressure: states 7.7 MB + ring + caches</td><td><span class="tag t-amb">M</span></td><td>Stream states per layer; checkpoint only S₁/S₂</td></tr>
+<tr><td>LM head bandwidth dominates post-fusion</td><td><span class="tag t-amb">M</span></td><td>Quantized head; vocab shortlist; later</td></tr>
+<tr><td>Argmax/gather plumbing across LNC=2</td><td><span class="tag t-grn">L</span></td><td>router_topk + sb2sb precedent</td></tr>
+</table>
+
+<p class="sub" style="margin-top:36px">References: <span class="ref">models/qwen3_6_moe/modeling_qwen36_a3b.py</span> ·
+<span class="ref">README.md</span> · <span class="ref">~/nki-moe/megakernels/{qwen3_moe,gpt_oss}/</span> ·
+<span class="ref">~/nki-moe/nki_kernels/</span> · NxDI <span class="ref">models/model_base.py</span>. All performance
+floors are pre-Phase-0 estimates.</p>
+
+</div></body></html>
