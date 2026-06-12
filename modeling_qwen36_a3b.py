@@ -79,6 +79,10 @@ from .nki_kernels.nki_deltanet_fused import (
     _make_lower_mask_diag,
     _make_identity,
 )
+from .nki_kernels.nki_deltanet_tkg import (
+    deltanet_tkg_fwd as deltanet_tkg_kernel,
+    deltanet_tkg_fwd_state as deltanet_tkg_kernel_state,
+)
 
 from neuronx_distributed_inference.models.config import (
     FusedSpecNeuronConfig,
@@ -292,6 +296,9 @@ class NeuronGatedDeltaNet(nn.Module):
         self.use_qwen_hybrid_chunked_prefill_nki = getattr(
             tc, "use_qwen_hybrid_chunked_prefill_nki", False
         )
+        self.use_tkg_attention_kernel = getattr(
+            tc, "use_tkg_attention_kernel", False
+        )
 
         # KV cache dummy shape info
         self.head_dim = tc.head_dim  # 256
@@ -423,6 +430,31 @@ class NeuronGatedDeltaNet(nn.Module):
 
         return output.unsqueeze(2), new_state
 
+    def recurrent_step_nki(self, query, key, value, g, beta, recurrent_state):
+        """Single gated-delta-rule step via the batched DeltaNet TKG NKI kernel.
+
+        Drop-in for _recurrent_step at decode: same [B,H,S,dim] inputs and
+        [B,H,K,V] state, same returns. The kernel runs all heads in one launch
+        and exp's g internally, but expects query l2-normed+scaled and key
+        l2-normed (done here, as in _recurrent_step).
+        """
+        query = l2norm(query, dim=-1)
+        key = l2norm(key, dim=-1)
+        B, H, S, k_dim = query.shape
+        v_dim = value.shape[-1]
+        query = query * (1.0 / (k_dim ** 0.5))
+
+        BH = B * H
+        q = query.reshape(BH, S, k_dim)
+        k = key.reshape(BH, S, k_dim)
+        v = value.reshape(BH, S, v_dim)
+        g_in = g.reshape(BH, S, 1)
+        beta_in = beta.reshape(BH, S, 1)
+        init = recurrent_state.reshape(BH, k_dim, v_dim)
+
+        out, final_state = deltanet_tkg_kernel(q, k, v, g_in, beta_in, init)
+        return out.reshape(B, H, S, v_dim), final_state.reshape(B, H, k_dim, v_dim)
+
     def verify_block_candidates(self, query, key, value, g, beta, initial_state):
         """Run the verify block as exact single-step recurrences seeded from
         ``initial_state``, checkpointing the state after each token so the host
@@ -459,6 +491,36 @@ class NeuronGatedDeltaNet(nn.Module):
         out_stack = torch.cat(outputs, dim=2)
         # Each state is [B, H, Kd, Vd]; stack on a new candidate axis-1.
         S_stack = torch.stack(states, dim=1)
+        return out_stack, S_stack
+
+    def verify_block_candidates_nki(self, query, key, value, g, beta, initial_state):
+        """Per-position candidate states via the DeltaNet TKG NKI kernel.
+
+        Drop-in for verify_block_candidates: same [B,H,S,dim] / [B,H,S] inputs and
+        [B,H,Kd,Vd] initial_state, returns the same (out_stack [B,H,S,Vd], S_stack
+        [B,S,H,Kd,Vd]) where S_i (axis-1) is the state after consuming block token
+        i. The kernel keeps the recurrent state in f32 across the block (unlike the
+        PyTorch loop, which rounds to the buffer dtype between tokens).
+        """
+        query = l2norm(query, dim=-1)
+        key = l2norm(key, dim=-1)
+        B, H, S, k_dim = query.shape
+        v_dim = value.shape[-1]
+        query = query * (1.0 / (k_dim ** 0.5))
+
+        BH = B * H
+        q = query.reshape(BH, S, k_dim)
+        k = key.reshape(BH, S, k_dim)
+        v = value.reshape(BH, S, v_dim)
+        g_in = g.reshape(BH, S, 1)
+        beta_in = beta.reshape(BH, S, 1)
+        init = initial_state.reshape(BH, k_dim, v_dim)
+
+        out, cand = deltanet_tkg_kernel_state(q, k, v, g_in, beta_in, init)
+        out_stack = out.reshape(B, H, S, v_dim)
+        # cand (BH,S,Kd,Vd) -> [B,H,S,Kd,Vd] -> [B,S,H,Kd,Vd], matching
+        # torch.stack(states, dim=1). _commit_deltanet indexes axis-1 (S).
+        S_stack = cand.reshape(B, H, S, k_dim, v_dim).permute(0, 2, 1, 3, 4)
         return out_stack, S_stack
 
     def conv_window_candidates(self, conv_seed, mixed):
@@ -559,9 +621,14 @@ class NeuronGatedDeltaNet(nn.Module):
             self.recurrent_state_buffer, 0, seq_ids
         ).float()
 
-        out_stack, S_stack = self.verify_block_candidates(
-            query, key, value, g, beta, initial_state
-        )
+        if self.use_tkg_attention_kernel:
+            out_stack, S_stack = self.verify_block_candidates_nki(
+                query, key, value, g, beta, initial_state
+            )
+        else:
+            out_stack, S_stack = self.verify_block_candidates(
+                query, key, value, g, beta, initial_state
+            )
 
         # Output: norm, z-gate, project (mirrors forward()).
         output = out_stack.to(hidden_states.dtype)
@@ -1185,9 +1252,14 @@ class NeuronGatedDeltaNet(nn.Module):
             else:
                 recurrent_state = self.recurrent_state_buffer[:batch_size].float()
 
-            output, new_state = self._recurrent_step(
-                query, key, value, g, beta, recurrent_state
-            )
+            if self.use_tkg_attention_kernel:
+                output, new_state = self.recurrent_step_nki(
+                    query, key, value, g, beta, recurrent_state
+                )
+            else:
+                output, new_state = self._recurrent_step(
+                    query, key, value, g, beta, recurrent_state
+                )
             new_state_bf16 = new_state.to(self.recurrent_state_buffer.dtype)
             alloc_bs = self.recurrent_state_buffer.shape[0]
             if hybrid_cache_active:
@@ -1365,6 +1437,7 @@ class Qwen36A3BInferenceConfig(InferenceConfig):
         kwargs.setdefault("use_hybrid_cache_manager", False)
         kwargs.setdefault("use_qwen_hybrid_chunked_prefill", False)
         kwargs.setdefault("use_qwen_hybrid_chunked_prefill_nki", False)
+        kwargs.setdefault("use_tkg_attention_kernel", False)
 
         # MoE
         kwargs.setdefault("num_experts", 256)

@@ -65,12 +65,13 @@ on a 40-layer hybrid DeltaNet/GQA MoE backbone.</p>
 <a href="#first">1 · First principles: why decode is DMA-bound</a><br>
 <a href="#today">2 · What runs today: anatomy of one fused-spec round</a><br>
 <a href="#prior">3 · Prior art you already own</a><br>
-<a href="#scale">4 · Sizing: is the megakernel even bigger than what's been done?</a><br>
-<a href="#design">5 · Target design: one round, one kernel</a><br>
-<a href="#challenges">6 · Key challenges &amp; blockers, ranked</a><br>
-<a href="#roadmap">7 · Roadmap</a><br>
-<a href="#perf">8 · Performance model &amp; success criteria</a><br>
-<a href="#risk">9 · Risk register</a>
+<a href="#nkilib">4 · nkilib inventory, TP=4 shapes &amp; compatibility</a><br>
+<a href="#scale">5 · Sizing: is the megakernel even bigger than what's been done?</a><br>
+<a href="#design">6 · Target design: one round, one kernel</a><br>
+<a href="#challenges">7 · Key challenges &amp; blockers, ranked</a><br>
+<a href="#roadmap">8 · Roadmap</a><br>
+<a href="#perf">9 · Performance model &amp; success criteria</a><br>
+<a href="#risk">10 · Risk register</a>
 </div>
 
 <!-- ============================ TLDR ============================ -->
@@ -217,8 +218,192 @@ and selective experts need here.</li>
 <p>Integration pattern is proven: layer 0 dispatches the kernel, layers 1..L−1 pass through, KV aliased in-place
 (<span class="ref">qwen_with_megakernel.py:434–486</span>). Reusable verbatim under <code>Qwen36FusedSpecModel</code>.</p>
 
+<!-- ============================ NKILIB ============================ -->
+<h2 id="nkilib">4 · nkilib inventory, TP=4 shapes &amp; megakernel compatibility</h2>
+<p class="sub">Deep kernel-level pass (3 NKI subagents reading the installed
+<code>nkilib</code> at <code>.../site-packages/nkilib/</code> + NKI ISA docs), framed against
+<b>one fused round as a single kernel</b>: draft (T=1) → verify (T=2) → accept → state commit →
+2nd draft. Target: <b>TP=4 · LNC=2 · bf16 · bs=1</b>, spec depth k → <b>T=k+1</b> tokens/verify
+(primary T=2; scaling to T=3–4 analyzed). "nkilib" below = the installed AWS package, distinct from
+your <code>~/nki-moe</code> fork.</p>
+
+<div class="panel note">
+<b>Re-verified against nkilib <code>0.1.0+g1a95891</code></b> (SDK update 2026-06-12): <b>every core verdict
+below is unchanged</b> — the head_dim=256 attention wall, the conv gap, the DeltaNet "no library analog",
+and the MoE shared-expert gap all re-confirm against the grown source. The update <em>added</em> a Mamba
+<b>SSM <code>scan/</code> family</b> (adjacent to linear attention but <em>not</em> the gated delta rule) and a
+clean <b><code>experimental/primitives/</code></b> BLAS+DMA layer that eases writing the custom pieces — see §4.5.
+Line citations refreshed for drift.</div>
+
+<div class="panel tldr">
+<b>Headline — the reusable surface is real but smaller than §3 implied.</b> nkilib ships
+decode-shaped (<code>_tkg</code>) kernels for most blocks, and the router / selective-experts /
+norms / a RoPE helper / the TP all-reduce are genuinely reusable. But the deep pass overturns two
+optimistic §3 calls and confirms one gap:
+<ul style="margin:8px 0 0">
+<li><span class="tag t-red">✗</span><b>GQA attention TKG is hard-blocked at head_dim=256.</b> Every
+post-projection step (Q/K/V transpose, q/k-norm, QK<sup>T</sup>, P·V, o_proj) pins
+<code>d_head ≤ 128</code> on the partition axis with <em>no</em> 2×128 split — the same wall as your
+prefill flash-attn fork. <span class="ref">attention_tkg.py:50,787 · attention_block_tkg.py:1054,1269 · output_projection_tkg.py:698</span></li>
+<li><span class="tag t-red">✗</span><b>The fused <code>moe_block_tkg</code> has no shared expert</b> —
+Step 3 is a literal <code>pass</code> (<span class="ref">:386</span>) and a hard assert rejects shared-expert weights.
+<span class="ref">moe_block_tkg.py:386 · moe_block_tkg_utils.py:231</span></li>
+<li><span class="tag t-grn">✓</span>Router (<code>router_topk</code>), selective experts
+(<code>moe_tkg</code>, I=128/rank is one clean tile), input RMSNorm, and the <code>nki.collectives.all_reduce</code>
+collective are drop-in / proven.</li>
+</ul>
+The <b>DeltaNet gated-delta recurrence remains the one block with no library analog</b> — and is the
+most megakernel-ready of the custom pieces (math/limits/T-scaling done; only the SBUF I/O boundary is missing).</div>
+
+<h3>4.1 Ground-truth shapes (config.json, TP=4 per-rank)</h3>
+<p>40 layers = <code>[Δ, Δ, Δ, GQA] × 10</code> → 30 DeltaNet + 10 GQA; <b>every</b> layer also carries
+a 256-expert MoE. (Note: real config has <code>linear_num_value_heads=32</code> → 8 v-heads/rank;
+the modeling "1536" comment is stale — value_dim is 1024, conv_dim 2560.)</p>
+<table>
+<tr><th>Block (per rank)</th><th>Key tensors &amp; shapes (bf16 unless noted)</th><th class="num">Notes</th></tr>
+<tr><td><b>Residual</b></td><td><code>[bs·T, H=2048]</code></td><td class="num">SBUF-resident, ~8–16 KB</td></tr>
+<tr><td><b>GQA</b> (10×)</td><td>q=4 heads, kv=1 head (2→4 replicated), <b>head_dim=256</b>. W_qkv <code>[2048, 1536]</code>; W_gate <code>[2048,1024]</code>; KV-cache <code>[1, S_ctx, 256]</code>; o_proj <code>[1024, 2048]</code></td><td class="num">head_dim 256 &gt; PMAX 128; partial RoPE 64/256; mRoPE [11,11,10]; sigmoid out-gate</td></tr>
+<tr><td><b>DeltaNet</b> (30×)</td><td>v=8, k=4 heads (k→v ×2), head=128. in_proj_qkv <code>[2048,2048]</code> (q512·k512·v1024); in_proj_z <code>[2048,1024]</code>; a/b <code>[2048,8]</code>; conv_dim=2560,k=4, state <code>[2560,3]</code>; recurrent state <code>[8,128,128]</code> (packed <code>[128, W=1024]</code>); out_proj <code>[1024,2048]</code></td><td class="num">state 512 KB f32 / 256 KB bf16 per layer; ×30 = 7.5 MB bf16 live</td></tr>
+<tr><td><b>MoE</b> (40×)</td><td>E=256, K=8, I=128/rank. router W <code>[2048,256]</code>; gate_up <code>[256, 2048, 2, 128]</code>; down <code>[256, 128, 2048]</code>; shared gate_up <code>[2048,2·128]</code>, down <code>[128,2048]</code></td><td class="num">I=128 → one PSUM-clean 128-tile; selective union ≤ T·K = 16 @ T=2</td></tr>
+<tr><td><b>Draft</b> (MTP, 1×)</td><td>eh_proj <code>[4096,2048]</code> + embed/hidden RMSNorm + 1 GQA layer (head_dim=256), own KV-cache, T=1</td><td class="num">same 256 wall as verify GQA</td></tr>
+<tr><td><b>Spec candidates</b></td><td>DeltaNet candidate stack <code>[8, T, 128, 128]</code> f32 per layer = T·512 KB</td><td class="num">T2→1.0 MB, T4→2.0 MB f32 (½ in bf16)</td></tr>
+</table>
+
+<h3>4.2 The fused round, stage by stage</h3>
+<p>What each stage needs and whether nkilib covers it. Tokens: draft T=1, verify T=2 (q·T·bs = 4·2 = 8 ≤ 128
+→ single free-axis tile; clean through T=4, i.e. 16 ≤ 128).</p>
+<table>
+<tr><th>Stage (per round)</th><th>nkilib coverage</th><th class="num">Verdict</th></tr>
+<tr><td>① Draft: eh_proj + RMSNorm + 1 GQA(T=1) + LM-head + argmax</td><td>GQA attention ✗ (256 wall); eh_proj/RMSNorm reusable; LM-head/argmax out of core scope</td><td class="num"><span class="tag t-red">custom attn</span></td></tr>
+<tr><td>② Embed gather <code>embed[t̂]</code></td><td>indirect-DMA primitive exists (<code>selective_expert</code> <code>TensorView.select</code>); embeddings out of scope</td><td class="num"><span class="tag t-amb">mech ✓</span></td></tr>
+<tr><td>③ Verify ×30 DeltaNet (T=2): conv → recurrence+S₁..S_T → gated norm → out_proj+AR</td><td>recurrence = your kernel ⚠; conv ✗; gated-norm ⚠; out_proj(D=128) ⚠ +AR</td><td class="num"><span class="tag t-amb">mostly custom</span></td></tr>
+<tr><td>④ Verify ×10 GQA (T=2): qkv → attn(256) → o-gate → o_proj+AR</td><td>qkv ✓; attn ✗(256); gate ✗; o_proj ✗(256)+AR</td><td class="num"><span class="tag t-red">custom attn</span></td></tr>
+<tr><td>⑤ MoE ×40 (T=2): RMSNorm → router top-8 → selective experts + shared → down+AR</td><td>router ✓; selective ✓; RMSNorm ✓; shared expert ✗; down-AR external</td><td class="num"><span class="tag t-grn">mostly ✓</span></td></tr>
+<tr><td>⑥ LM-head ×T + argmax → target tokens</td><td>out of core scope (vocab 248k); TP-global (val,idx) merge ✗</td><td class="num"><span class="tag t-amb">scope</span></td></tr>
+<tr><td>⑦ Accept (greedy run-length) → index</td><td>no kernel; tiny <code>tensor_tensor(equal)</code> + scan</td><td class="num"><span class="tag t-red">custom</span></td></tr>
+<tr><td>⑧ Commit: select candidate state by accept-count, write S/conv</td><td>in-kernel select-by-index over SBUF candidates; not in lib</td><td class="num"><span class="tag t-red">custom</span></td></tr>
+<tr><td>⑨ 2nd draft pass (repopulate draft KV, T)</td><td>same GQA path as ①</td><td class="num"><span class="tag t-red">custom attn</span></td></tr>
+</table>
+
+<h3>4.3 Core-compute compatibility matrix</h3>
+<p>Per building block: the nkilib kernel, the verdict, and exactly what the caller must add. ✓ drop-in ·
+⚠ usable with adaptation · ✗ gap (build custom).</p>
+<table>
+<tr><th>Building block</th><th>nkilib kernel <span class="ref">(file:line)</span></th><th class="num">Verdict</th><th>Caller must add / why</th></tr>
+<tr><td colspan="4" style="color:var(--accent);font-weight:600;padding-top:10px">GQA attention (10 verify + draft)</td></tr>
+<tr><td>QKV projection (+X-RMSNorm)</td><td><code>qkv_tkg</code> <span class="ref">qkv_tkg.py</span></td><td class="num"><span class="tag t-grn">✓</span></td><td>d_head-agnostic (contracts H, emits I on free); SBUF-out @ bs·T≤128</td></tr>
+<tr><td>Attention core QK<sup>T</sup>/softmax/P·V @ <b>head_dim=256</b></td><td><code>attention_tkg</code> / <code>attention_block_tkg</code> <span class="ref">attention_tkg.py:787</span></td><td class="num"><span class="tag t-red">✗</span></td><td>d_head pinned ≤128 on partition axis, no 2×128 split → <b>fork the kernel</b> (PSUM-accumulate 2×128 partial QK), mirror your prefill fork</td></tr>
+<tr><td>q/k RMSNorm over full head_dim 256 (pre-RoPE)</td><td><code>_rms_norm_inplace</code> <span class="ref">attention_block_tkg.py:1269</span></td><td class="num"><span class="tag t-red">✗</span></td><td>asserts <code>d_head==128</code> exactly → custom 2×128 partition reduce</td></tr>
+<tr><td>Partial RoPE (rotate 64/256) + interleaved mRoPE [11,11,10]</td><td><code>rope.py</code> ✗ / <code>_apply_rope_single</code> <span class="ref">rope_hf.py:269</span></td><td class="num"><span class="tag t-amb">⚠</span></td><td>top-level RoPE rejects 256; vendor the free-axis helper, run on a 64-dim slice, concat 192 pass-through, bake mRoPE sections into the host cos/sin table</td></tr>
+<tr><td>Sigmoid attention-output gate</td><td>— none —</td><td class="num"><span class="tag t-red">✗</span></td><td><code>g=σ(W_gate·h)</code> elementwise on attn out before o_proj — caller op</td></tr>
+<tr><td>o_proj (in 1024→H) @ head_dim 256</td><td><code>output_projection_tkg</code> <span class="ref">output_projection_tkg.py:698</span></td><td class="num"><span class="tag t-red">✗</span></td><td>asserts D≤128; no sigmoid gate, no TP reduce → custom + AR</td></tr>
+<tr><td>KV-cache scatter at T verify positions</td><td><code>_update_flat_cache</code> (scalar path) <span class="ref">attention_block_tkg.py:1534</span></td><td class="num"><span class="tag t-grn">✓</span></td><td>per-batch scalar path supports S_tkg&gt;1 (batched path is T==1-only); reject via mask, no rollback</td></tr>
+<tr><td colspan="4" style="color:var(--accent);font-weight:600;padding-top:10px">DeltaNet linear attention (30)</td></tr>
+<tr><td>Causal depthwise conv (4-tap, 3-wide decode state)</td><td><code>depthwise_conv1d</code> / <code>conv1d</code> <span class="ref">depthwise_conv1d.py:25</span></td><td class="num"><span class="tag t-red">✗</span></td><td>prefill im2col, no state-window ingest / no silu / HBM-only → hand-write 4-tap MAC + silu + state-roll (small: ~4 vec ops × 20 channel-tiles × T)</td></tr>
+<tr><td>Gated delta-rule recurrence + per-token candidate states</td><td><b>your</b> <code>nki_deltanet_tkg.py</code></td><td class="num"><span class="tag t-amb">⚠</span></td><td>math/limits/T-scaling ready (W=1024≤32k; cost linear in T); add <b>SBUF-input</b> path, keep candidates in SBUF, in-kernel select-by-accept</td></tr>
+<tr><td>SSM/Mamba scan (recurrence alternative) <span class="tag t-blu">NEW</span></td><td><code>scan/{ssd,selective_scan,linear_scan}</code> <span class="ref">ssd.py:29 · selective_scan.py:29 · linear_scan.py:29</span></td><td class="num"><span class="tag t-red">✗</span></td><td>SDK-new Mamba SSM; scalar/diagonal decay + read-out <code>C·h</code> only — <em>no</em> <code>(v−kS)</code> read-back, <em>no</em> rank-1 <code>kᵀδ</code> → not the delta rule. <code>linear_scan</code> reusable for the scalar-decay leg only; <code>ssd</code>'s chunk template only helps DeltaNet <em>prefill</em></td></tr>
+<tr><td>Output gated RMSNorm (norm·silu(z))</td><td><code>rmsnorm_tkg</code> (no gate variant) <span class="ref">rmsnorm_tkg.py:306</span></td><td class="num"><span class="tag t-amb">⚠</span></td><td>reuse norm tile math (H-on-partition layout), append silu-gate multiply</td></tr>
+<tr><td>out_proj (value_dim 1024→H, D=head_v 128)</td><td><code>output_projection_tkg</code> <span class="ref">output_projection_tkg.py:69</span></td><td class="num"><span class="tag t-amb">⚠</span></td><td>D=128 fits (folds 8 v-heads as N matmuls); add TP all-reduce</td></tr>
+<tr><td colspan="4" style="color:var(--accent);font-weight:600;padding-top:10px">MoE (40)</td></tr>
+<tr><td>Router: fp32 softmax + normalized top-8 over E=256</td><td><code>router_topk</code> <span class="ref">router_topk.py:55</span></td><td class="num"><span class="tag t-grn">✓</span></td><td>single <code>max8</code> (K=8, E=256 within limits); fp32 internal; keep <code>skip_router_logits=False</code></td></tr>
+<tr><td>Routed experts: SwiGLU, selective, I=128/rank</td><td><code>moe_tkg</code>→<code>selective_expert_impl</code> <span class="ref">selective_expert_impl.py:45</span></td><td class="num"><span class="tag t-grn">✓</span></td><td>I=128 one clean tile (no remainder, no I%512 on bf16); index-driven indirect weight DMA gather; cost ~T·K (no dedup)</td></tr>
+<tr><td>Shared expert + sigmoid gate</td><td>— none (<code>moe_block_tkg</code> is a <code>pass</code>) — <span class="ref">moe_block_tkg.py:386</span></td><td class="num"><span class="tag t-red">✗</span></td><td>compute shared MLP + σ-gate externally, add into routed output before AR</td></tr>
+<tr><td>Fused MoE block wrapper</td><td><code>moe_block_tkg</code> <span class="ref">moe_block_tkg.py:38</span></td><td class="num"><span class="tag t-amb">⚠</span></td><td>forces HBM output (use <code>moe_tkg</code> directly for SBUF-out), LNC-2 pinned, no shared expert, no AR</td></tr>
+<tr><td colspan="4" style="color:var(--accent);font-weight:600;padding-top:10px">Shared glue &amp; spec control flow</td></tr>
+<tr><td>Input layernorm RMSNorm (H=2048)</td><td><code>rmsnorm_tkg</code> <span class="ref">rmsnorm_tkg.py:37</span></td><td class="num"><span class="tag t-grn">✓</span></td><td>H%128==0; H-on-partition <code>[128, bs·T, H/128]</code> layout</td></tr>
+<tr><td>TP=4 all-reduce (o_proj / out_proj / down_proj)</td><td><code>nki.collectives.all_reduce</code> (SBUF), proven in <code>transformer_tkg</code> <span class="ref">transformer_tkg.py:62,67</span></td><td class="num"><span class="tag t-amb">⚠</span></td><td>use the fused reduce + <code>sendrecv</code>/<code>core_barrier</code> LNC idiom; the 6 nkilib <code>collectives/</code> files are gather/transpose, not reduce</td></tr>
+<tr><td>Fusion skeleton (SBUF residual, weight ring, sb2sb, barrier)</td><td><code>transformer_tkg</code> <span class="ref">transformer_tkg.py:61,220,273</span></td><td class="num"><span class="tag t-amb">⚠</span></td><td>harvest the scaffold; replace the dense attn+MLP body with Δ/GQA/MoE; spec orchestration is new</td></tr>
+<tr><td>TP-global argmax over sharded vocab + accept (run-length)</td><td><code>cascaded_max</code> gives local argmax <span class="ref">cascaded_max.py:288</span></td><td class="num"><span class="tag t-red">✗</span></td><td>HBM-boundary + no cross-rank (val,idx) merge; build 4-rank argmax merge + greedy accept (tiny). LM-head/vocab out of core scope</td></tr>
+</table>
+
+<h3>4.4 The three load-bearing gaps</h3>
+<div class="grid2">
+<div class="panel warn">
+<h4>head_dim=256 attention wall <span class="tag t-red">biggest surprise</span></h4>
+<p>The TKG attention path is <em>structurally</em> ≤128-headed: <code>_MAX_D_HEAD=128</code>
+(<span class="ref">attention_tkg.py:50</span>), d_head is the MM1 contraction <em>and</em> MM2 output
+partition, the Q/K transpose targets a 256-partition PSUM, and q/k-norm asserts <code>==128</code>. No
+internal split exists. <b>This is the identical fork you already did for prefill flash-attn.</b> The
+projection (<code>qkv_tkg</code>) and KV-scatter are fine; the fork is only the attention inner
+(2×128 partial-QK with PSUM accumulation) + the o_proj 256-split. Applies to verify GQA, draft, and
+2nd-draft alike. Supersedes the optimistic parenthetical in <a href="#challenges">§7 C5</a>.</p>
+</div>
+<div class="panel warn">
+<h4>MoE shared-expert gap <span class="tag t-red">caller-side</span></h4>
+<p><code>moe_block_tkg</code> Step 3 is a <code>pass</code> (<span class="ref">:386</span>) and <code>moe_block_tkg_utils.py:231</code>
+hard-asserts no shared expert (re-confirmed on the SDK update — the <code>shared_expert_mlp</code> at :188 is
+docstring pseudocode, not code). Qwen3.6's always-on shared expert (gate_up→SiLU·up→down→σ-gate, I=128/rank)
+must be a separate matmul chain summed into the routed output before the down-proj all-reduce. Cheap
+(~one extra expert's worth of FLOPs), but it is not free and not in the fused block.</p>
+</div>
+<div class="panel warn">
+<h4>DeltaNet conv has no decode kernel <span class="tag t-red">greenfield</span></h4>
+<p>Both <code>conv1d</code> (dense, cross-channel) and <code>depthwise_conv1d</code> (correct depthwise,
+but prefill im2col) miss the decode contract: 4-tap windowed MAC over <code>cat[state(3), mixed(T)]</code>,
+per-channel, + silu, + state roll, SBUF-resident. It's a trivial hand-written kernel (~4 FMAs × 20
+channel-tiles × T) — just absent from the library.</p>
+</div>
+<div class="panel ok">
+<h4>What genuinely drops in</h4>
+<p><code>router_topk</code> (fp32 softmax + norm top-8, K=8/E=256 in one max8), <code>moe_tkg</code>
+selective experts (I=128/rank = one clean tile, indirect weight-DMA gather), <code>rmsnorm_tkg</code>
+(input norm), <code>qkv_tkg</code> (projection), the KV scatter scalar path (T&gt;1), and
+<code>nki.collectives.all_reduce</code> + the <code>transformer_tkg</code> SBUF-residual / weight-ring / LNC scaffold.
+All scale cleanly T=2→4 (bs·T·heads stays ≤128; selective cost grows ~T·K with no tiling change).</p>
+</div>
+</div>
+
+<div class="panel note">
+<b>Build-vs-reuse for the megakernel.</b> <u>Custom</u>: (1) head_dim-256 TKG attention fork (verify+draft);
+(2) DeltaNet decode conv; (3) SBUF I/O boundary + in-kernel candidate-select on your recurrence kernel;
+(4) gated wrapper on DeltaNet output RMSNorm; (5) shared-expert chain; (6) cross-rank argmax + greedy
+accept + state commit; (7) the spec orchestration itself. <u>Reuse</u>: router, selective experts, input
+RMSNorm, qkv projection, KV scatter, the all-reduce, and the fusion scaffold. <b>SBUF budget correction:</b>
+real SBUF is <b>28 MiB (trn2) / 32 MiB (trn3)</b> per core — not the 24 MB in <a href="#first">§1.2</a>.
+DeltaNet states (7.5 MB bf16 if all 30 held live; or commit per-layer and hold only the active T-candidate
+stack) are affordable; the true pressure is <b>MoE expert-weight streaming</b>, which needs the per-layer
+double-buffered weight ring.</p>
+</div>
+
+<h3>4.5 SDK <code>0.1.0+g1a95891</code> update — new modules (and what they don't change)</h3>
+<p>The re-verification found two new modules. Neither closes a core gap, but the second materially eases
+building the custom pieces.</p>
+<div class="grid2">
+<div class="panel warn">
+<h4>Mamba SSM <code>scan/</code> — not a DeltaNet analog <span class="tag t-blu">NEW</span></h4>
+<p>The new <code>experimental/scan/</code> ships <code>ssd</code> (Mamba-2 SSD, chunk-parallel),
+<code>selective_scan</code> (Mamba-1 SSM) and <code>linear_scan</code> (<code>r[t]=decay·r[t-1]+data</code>).
+The §4 "no library analog" claim <b>still holds</b>: DeltaNet's defining move is a state <em>read-back</em>
+<code>δ=(v−kS)·β</code> feeding a rank-1 update <code>S+=kᵀδ</code>; in all three, the update input never depends
+on the current state (decay is scalar/diagonal; the <code>C·h</code> term is a read-<em>out</em>, not feedback).
+<code>ssd</code> alone carries a true matrix state across chunks — a <em>partial</em> template for the DeltaNet
+<em>prefill</em> chunked form (still missing the <code>(v−kS)</code> term + the per-chunk triangular inverse);
+<code>linear_scan</code> is reusable only as the scalar-decay accumulator.
+<span class="ref">scan/ssd.py:29,178,382 · selective_scan.py:29 · linear_scan.py:29</span></p>
+</div>
+<div class="panel ok">
+<h4>New <code>experimental/primitives/</code> BLAS+DMA layer <span class="tag t-grn">eases the custom work</span></h4>
+<p>Clean SBUF-in/out building blocks for the custom kernels: <code>blas.Matmul</code> /
+<code>blas.Transpose</code> (PSUM-fused SBUF matmul/transpose for the 256-head fork &amp; DeltaNet),
+<code>blas.Activation</code> (<code>silu/exp/rsqrt</code> with broadcast scale — gates/norms), and
+<code>dma.Load</code> with <b>indexed DGE</b>: <em>vector-DGE</em> is the right tool for the embedding gather
+<code>embed[t̂]</code>, <em>scalar-DGE</em> for the MoE expert-weight gather.
+<code>attention_reduce.reduce_attention_stats</code> is a ready flash-softmax reduction core for the 256-head
+fork; <code>TiledTensor</code> is a cleaner static-grid tiling view.
+<span class="ref">primitives/blas/{matmul:44,transpose:34,activation:33} · dma/load.py:206 · utils/attention_reduce.py:40 · utils/tiled_tensor.py:73</span></p>
+</div>
+</div>
+<div class="panel note">
+<b>Negative results worth recording.</b> <code>experimental/foreach/foreach_norm.py</code> is vector
+L1/L2/Linf reduction (grad-clip), <em>not</em> a gated layer-norm — the DeltaNet output gate stays caller-side.
+<code>blas.Gather</code>/<code>LocalGather</code> are MoE-routing within-partition gathers, <em>not</em> table
+row-lookup — use vector-DGE <code>dma.Load</code> for <code>embed[t̂]</code>. The new
+<code>core/attention/*segmented*</code> kernels are all prefill and still assert <code>head_dim≤128</code>
+(<span class="ref">attention_segmented_cte.py:1213</span>) — they do not break the GQA-256 wall.</p>
+</div>
+
 <!-- ============================ SCALE ============================ -->
-<h2 id="scale">4 · Sizing: is this bigger than what's been done?</h2>
+<h2 id="scale">5 · Sizing: is this bigger than what's been done?</h2>
 <table>
 <tr><th>Quantity (per round, TP=4, LNC=2)</th><th class="num">Qwen3-30B kernel</th><th class="num">Qwen3.6 round kernel</th></tr>
 <tr><td>Fused layer instances</td><td class="num">48</td><td class="num">1 draft + 40 verify ≈ 41</td></tr>
@@ -232,7 +417,7 @@ and selective experts need here.</li>
 right column's bottom three rows.</p>
 
 <!-- ============================ DESIGN ============================ -->
-<h2 id="design">5 · Target design: one round, one kernel</h2>
+<h2 id="design">6 · Target design: one round, one kernel</h2>
 <pre><code>qwen36_round_megakernel(hidden_seed, last_token_id, embed_table, mtp_weights,
                         per-layer {Wqkvz/Wo, conv_w, A_log/dt_bias, router, gate_up, down, norms},
                         K/V caches[10+1], deltanet S/conv buffers[30], lm_head_T, cos/sin, pos_id):
@@ -252,7 +437,7 @@ in early phases; for k=1, drafting from the chosen hidden next round is equivale
 <code>test_mtp_state_rule.py</code> oracle before any deletion.</p>
 
 <!-- ============================ CHALLENGES ============================ -->
-<h2 id="challenges">6 · Key challenges &amp; blockers, ranked</h2>
+<h2 id="challenges">7 · Key challenges &amp; blockers, ranked</h2>
 
 <h3><span class="tag t-red">C1</span>DeltaNet decode block in NKI with candidate states</h3>
 <p>Per token, per head: decay <code>S·e^{g}</code>, read <code>k·S</code>, rank-1 update <code>S += kᵀδ</code>, read
@@ -291,7 +476,7 @@ Per-slot RoPE/masks for T=2 are solved (<span class="ref">transformer_qwen3_moe_
 plus fp32 router softmax with normalized top-k (<span class="ref">:1410–1413</span>). Tedious, low risk; budget compile-time wrestling.</p>
 
 <!-- ============================ ROADMAP ============================ -->
-<h2 id="roadmap">7 · Roadmap</h2>
+<h2 id="roadmap">8 · Roadmap</h2>
 
 <div class="phase"><div class="pnum">0</div><div class="pbody"><h3>Profile &amp; pin baseline — ~2 days</h3>
 Profile the 9.4 ms round (NEFF+NTFF, neuron-explorer): bytes/round, engine actives, draft/verify/heads split.
@@ -316,7 +501,7 @@ Accept + select + state write in-kernel; collapse to one NEFF; host = pos/mask o
 Weight ring across heterogeneous layers, LNC=2 DeltaNet head split, LM-head dominance (quantized head / shortlist), bs&gt;1.</div></div>
 
 <!-- ============================ PERF ============================ -->
-<h2 id="perf">8 · Performance model (estimates to validate in Phase 0)</h2>
+<h2 id="perf">9 · Performance model (estimates to validate in Phase 0)</h2>
 <table>
 <tr><th>Stream (per rank/round, bf16)</th><th class="num">~MB</th></tr>
 <tr><td>LM head ×2 (62,080×2048)</td><td class="num">508</td></tr>
@@ -326,7 +511,7 @@ Weight ring across heterogeneous layers, LNC=2 DeltaNet head split, LM-head domi
 </table>
 
 <!-- ============================ RISK ============================ -->
-<h2 id="risk">9 · Risk register</h2>
+<h2 id="risk">10 · Risk register</h2>
 <table>
 <tr><th>Risk</th><th>Sev</th><th>Mitigation</th></tr>
 <tr><td>DeltaNet block bit-mismatch (decay exp form — fused-kernel instability precedent, README)</td><td><span class="tag t-red">H</span></td><td>Chunked-stable decay form; bf16 carry; per-(B,H) oracle gate</td></tr>

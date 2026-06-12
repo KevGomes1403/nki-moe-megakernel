@@ -108,6 +108,7 @@ def build_inference_config(
     tp_degree: int,
     seq_len: int,
     spec_decode: bool = False,
+    tkg_attention_kernel: bool = False,
 ) -> Qwen36A3BInferenceConfig:
     """Build the NxDI config from the HF config.json on disk.
 
@@ -126,6 +127,9 @@ def build_inference_config(
             "rope_theta", 10_000_000
         )
     config_dict.setdefault("tie_word_embeddings", False)
+    # Route the DeltaNet verify/decode recurrence through the TKG NKI kernel.
+    # Carried by both the target and (harmlessly) the draft config below.
+    config_dict["use_tkg_attention_kernel"] = tkg_attention_kernel
 
     # block_size must exceed (seq_len * num_experts_per_tok) so prefill takes
     # forward_all_experts instead of forward_blockwise (the NKI blockwise
@@ -398,6 +402,12 @@ def main():
         action="store_true",
         help="Build/run with fused MTP self-speculative decoding (one fused graph)",
     )
+    parser.add_argument(
+        "--tkg-attention-kernel",
+        action="store_true",
+        help="Use the DeltaNet TKG NKI kernel for the verify/decode recurrence "
+        "(default: PyTorch). Pair with --mtp-spec-decode to exercise verify.",
+    )
     args = parser.parse_args()
 
     # Header label only; the real per-prompt budget is seq_len - prompt_len when
@@ -415,6 +425,7 @@ def main():
     inf_config = build_inference_config(
         args.model_path, args.tp_degree, args.seq_len,
         spec_decode=args.mtp_spec_decode,
+        tkg_attention_kernel=args.tkg_attention_kernel,
     )
     maybe_compile(args.model_path, compiled_path, inf_config)
     model = load_model(compiled_path)
@@ -426,6 +437,8 @@ def main():
     # Fused spec decode dispatches through the same generate() path (NxDI's
     # _fused_assisted_decoding); only the build differs.
     mode = "FUSED SPEC DECODE" if args.mtp_spec_decode else "GREEDY"
+    if args.tkg_attention_kernel:
+        mode += " + TKG-KERNEL"
     print("\n" + "=" * 70)
     print(f"GENERATING (max_new_tokens={mnt_desc}, {mode})")
     print("=" * 70)
