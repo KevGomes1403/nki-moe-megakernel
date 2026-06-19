@@ -177,7 +177,7 @@ Two graphs exist: CTE prefill and the TKG round; we replace the round body.</p>
 <tr><th>Stage</th><th>Today</th><th>Code</th></tr>
 <tr><td>Draft step</td><td>MTP head = RMSNorm(embed)‖RMSNorm(hidden) → <code>eh_proj</code> [2H→H] → 1 GQA decoder layer → norm → vocab-sharded LM head</td><td><span class="ref">modeling_qwen36_a3b.py:1927–2010</span></td></tr>
 <tr><td>Verify trunk</td><td>40 layers; DeltaNet layers run <code>verify_block</code> seeded read-only from committed buffers, return per-position candidates</td><td><span class="ref">:485–577, :3596</span></td></tr>
-<tr><td>DeltaNet candidates</td><td>Exact 1-step recurrence ×2: <code>out_stack [B,H,2,Vd]</code>, <code>S_stack [B,2,H,128,128]</code>, conv windows <code>[B,2,2560,3]</code>; bf16 carry rounding for bit-exactness with TKG</td><td><span class="ref">:426–483, :441–444</span></td></tr>
+<tr><td>DeltaNet candidates</td><td>Exact 1-step recurrence ×2: <code>out_stack [B,H,2,Vd]</code>, <code>S_stack [B,2,H,128,128]</code>, conv windows <code>[B,2,2048,3]</code>; bf16 carry rounding for bit-exactness with TKG</td><td><span class="ref">:426–483, :441–444</span></td></tr>
 <tr><td>Accept</td><td><code>(~(cand[:,1:]==target[:,:-1])).cumsum&lt;1 → sum</code> — for k=1 it degenerates to one int compare</td><td><span class="ref">:3753–3757</span></td></tr>
 <tr><td>Commit</td><td><code>torch.where(idx==1, S₂, S₁)</code> per layer; rides aliased outputs back into live buffers</td><td><span class="ref">:3675–3689, :3847–3851</span></td></tr>
 <tr><td>GQA KV</td><td>Scattered at the two verify positions; rejected slot is masked next round and overwritten</td><td>NxDI <span class="ref">kv_cache_manager.py:369</span></td></tr>
@@ -258,12 +258,12 @@ most megakernel-ready of the custom pieces (math/limits/T-scaling done; only the
 <h3>4.1 Ground-truth shapes (config.json, TP=4 per-rank)</h3>
 <p>40 layers = <code>[Δ, Δ, Δ, GQA] × 10</code> → 30 DeltaNet + 10 GQA; <b>every</b> layer also carries
 a 256-expert MoE. (Note: real config has <code>linear_num_value_heads=32</code> → 8 v-heads/rank;
-the modeling "1536" comment is stale — value_dim is 1024, conv_dim 2560.)</p>
+the modeling "1536"/"2560" comments are stale — value_dim is 1024, <b>conv_dim 2048</b> (= 2·key_dim + value_dim = 512+512+1024 → 16 channel-tiles); confirmed against the deployed <code>config.json</code> (32 v / 16 k heads).)</p>
 <table>
 <tr><th>Block (per rank)</th><th>Key tensors &amp; shapes (bf16 unless noted)</th><th class="num">Notes</th></tr>
 <tr><td><b>Residual</b></td><td><code>[bs·T, H=2048]</code></td><td class="num">SBUF-resident, ~8–16 KB</td></tr>
 <tr><td><b>GQA</b> (10×)</td><td>q=4 heads, kv=1 head (2→4 replicated), <b>head_dim=256</b>. W_qkv <code>[2048, 1536]</code>; W_gate <code>[2048,1024]</code>; KV-cache <code>[1, S_ctx, 256]</code>; o_proj <code>[1024, 2048]</code></td><td class="num">head_dim 256 &gt; PMAX 128; partial RoPE 64/256; mRoPE [11,11,10]; sigmoid out-gate</td></tr>
-<tr><td><b>DeltaNet</b> (30×)</td><td>v=8, k=4 heads (k→v ×2), head=128. in_proj_qkv <code>[2048,2048]</code> (q512·k512·v1024); in_proj_z <code>[2048,1024]</code>; a/b <code>[2048,8]</code>; conv_dim=2560,k=4, state <code>[2560,3]</code>; recurrent state <code>[8,128,128]</code> (packed <code>[128, W=1024]</code>); out_proj <code>[1024,2048]</code></td><td class="num">state 512 KB f32 / 256 KB bf16 per layer; ×30 = 7.5 MB bf16 live</td></tr>
+<tr><td><b>DeltaNet</b> (30×)</td><td>v=8, k=4 heads (k→v ×2), head=128. in_proj_qkv <code>[2048,2048]</code> (q512·k512·v1024); in_proj_z <code>[2048,1024]</code>; a/b <code>[2048,8]</code>; conv_dim=2048,k=4, state <code>[2048,3]</code>; recurrent state <code>[8,128,128]</code> (packed <code>[128, W=1024]</code>); out_proj <code>[1024,2048]</code></td><td class="num">state 512 KB f32 / 256 KB bf16 per layer; ×30 = 7.5 MB bf16 live</td></tr>
 <tr><td><b>MoE</b> (40×)</td><td>E=256, K=8, I=128/rank. router W <code>[2048,256]</code>; gate_up <code>[256, 2048, 2, 128]</code>; down <code>[256, 128, 2048]</code>; shared gate_up <code>[2048,2·128]</code>, down <code>[128,2048]</code></td><td class="num">I=128 → one PSUM-clean 128-tile; selective union ≤ T·K = 16 @ T=2</td></tr>
 <tr><td><b>Draft</b> (MTP, 1×)</td><td>eh_proj <code>[4096,2048]</code> + embed/hidden RMSNorm + 1 GQA layer (head_dim=256), own KV-cache, T=1</td><td class="num">same 256 wall as verify GQA</td></tr>
 <tr><td><b>Spec candidates</b></td><td>DeltaNet candidate stack <code>[8, T, 128, 128]</code> f32 per layer = T·512 KB</td><td class="num">T2→1.0 MB, T4→2.0 MB f32 (½ in bf16)</td></tr>
@@ -299,7 +299,7 @@ the modeling "1536" comment is stale — value_dim is 1024, conv_dim 2560.)</p>
 <tr><td>o_proj (in 1024→H) @ head_dim 256</td><td><code>output_projection_tkg</code> <span class="ref">output_projection_tkg.py:698</span></td><td class="num"><span class="tag t-red">✗</span></td><td>asserts D≤128; no sigmoid gate, no TP reduce → custom + AR</td></tr>
 <tr><td>KV-cache scatter at T verify positions</td><td><code>_update_flat_cache</code> (scalar path) <span class="ref">attention_block_tkg.py:1534</span></td><td class="num"><span class="tag t-grn">✓</span></td><td>per-batch scalar path supports S_tkg&gt;1 (batched path is T==1-only); reject via mask, no rollback</td></tr>
 <tr><td colspan="4" style="color:var(--accent);font-weight:600;padding-top:10px">DeltaNet linear attention (30)</td></tr>
-<tr><td>Causal depthwise conv (4-tap, 3-wide decode state)</td><td><code>depthwise_conv1d</code> / <code>conv1d</code> <span class="ref">depthwise_conv1d.py:25</span></td><td class="num"><span class="tag t-red">✗</span></td><td>prefill im2col, no state-window ingest / no silu / HBM-only → hand-write 4-tap MAC + silu + state-roll (small: ~4 vec ops × 20 channel-tiles × T)</td></tr>
+<tr><td>Causal depthwise conv (4-tap, 3-wide decode state)</td><td><code>depthwise_conv1d</code> / <code>conv1d</code> <span class="ref">depthwise_conv1d.py:25</span></td><td class="num"><span class="tag t-red">✗</span></td><td>prefill im2col, no state-window ingest / no silu / HBM-only → hand-write 4-tap MAC + silu + state-roll (small: ~4 vec ops × 16 channel-tiles × T) — spec'd in <span class="ref">nki_kernels/deltanet_conv_tkg_spec.md</span></td></tr>
 <tr><td>Gated delta-rule recurrence + per-token candidate states</td><td><b>your</b> <code>nki_deltanet_tkg.py</code></td><td class="num"><span class="tag t-amb">⚠</span></td><td>math/limits/T-scaling ready (W=1024≤32k; cost linear in T); add <b>SBUF-input</b> path, keep candidates in SBUF, in-kernel select-by-accept</td></tr>
 <tr><td>SSM/Mamba scan (recurrence alternative) <span class="tag t-blu">NEW</span></td><td><code>scan/{ssd,selective_scan,linear_scan}</code> <span class="ref">ssd.py:29 · selective_scan.py:29 · linear_scan.py:29</span></td><td class="num"><span class="tag t-red">✗</span></td><td>SDK-new Mamba SSM; scalar/diagonal decay + read-out <code>C·h</code> only — <em>no</em> <code>(v−kS)</code> read-back, <em>no</em> rank-1 <code>kᵀδ</code> → not the delta rule. <code>linear_scan</code> reusable for the scalar-decay leg only; <code>ssd</code>'s chunk template only helps DeltaNet <em>prefill</em></td></tr>
 <tr><td>Output gated RMSNorm (norm·silu(z))</td><td><code>rmsnorm_tkg</code> (no gate variant) <span class="ref">rmsnorm_tkg.py:306</span></td><td class="num"><span class="tag t-amb">⚠</span></td><td>reuse norm tile math (H-on-partition layout), append silu-gate multiply</td></tr>
@@ -340,8 +340,10 @@ must be a separate matmul chain summed into the routed output before the down-pr
 <h4>DeltaNet conv has no decode kernel <span class="tag t-red">greenfield</span></h4>
 <p>Both <code>conv1d</code> (dense, cross-channel) and <code>depthwise_conv1d</code> (correct depthwise,
 but prefill im2col) miss the decode contract: 4-tap windowed MAC over <code>cat[state(3), mixed(T)]</code>,
-per-channel, + silu, + state roll, SBUF-resident. It's a trivial hand-written kernel (~4 FMAs × 20
-channel-tiles × T) — just absent from the library.</p>
+per-channel, + silu, + state roll, SBUF-resident. It's a trivial hand-written kernel (~4 FMAs × 16
+channel-tiles × T) — just absent from the library. <b>Full spec:</b>
+<span class="ref">nki_kernels/deltanet_conv_tkg_spec.md</span> — decode T=1 + verify T=2, channel-on-partition,
+per-position candidate windows for reject rollback, SBUF-in/out, bf16-carry numerics, 3 entrypoints.</p>
 </div>
 <div class="panel ok">
 <h4>What genuinely drops in</h4>
@@ -442,7 +444,7 @@ in early phases; for k=1, drafting from the chosen hidden next round is equivale
 <h3><span class="tag t-red">C1</span>DeltaNet decode block in NKI with candidate states</h3>
 <p>Per token, per head: decay <code>S·e^{g}</code>, read <code>k·S</code>, rank-1 update <code>S += kᵀδ</code>, read
 <code>q·S</code> on a [128,128] state (<span class="ref">modeling_qwen36_a3b.py:405–424</span>) — vectorE-heavy, near-zero
-tensorE use; plus L2-norm, gating (<code>exp·softplus</code>), and the causal conv (4-tap, window <code>[2560,3]</code>).
+tensorE use; plus L2-norm, gating (<code>exp·softplus</code>), and the causal conv (4-tap, window <code>[2048,3]</code>).
 Existing NKI kernels (<span class="ref">nki_kernels/nki_deltanet.py</span>) are prefill-shaped (per-(B,H), full sequence).
 Needed: a TKG-shaped fused block — projections + conv + 2 steps + checkpoint S₁/S₂ in SBUF — with the bf16 carry rounding
 (<span class="ref">:441–444</span>) preserved or it breaks bit-exactness with the oracle. <b>Largest single line item; no precedent.</b></p>
@@ -484,6 +486,7 @@ Freeze token-identical reference outputs (greedy, oracle prompts). <b>Exit:</b> 
 
 <div class="phase"><div class="pnum">1</div><div class="pbody"><h3>DeltaNet TKG block in NKI (C1) — 2–3 wks · critical path</h3>
 Standalone: projections + conv + 2 recurrent steps + S₁/S₂ checkpoint, SBUF-in/out, bf16 carry.
+Conv sub-block spec'd in <span class="ref">nki_kernels/deltanet_conv_tkg_spec.md</span> (decode T=1 + verify T=2 + candidate windows).
 Validate vs <code>verify_block</code> per-(B,H) bit-exact. <b>Exit:</b> green vs CPU oracle.</div></div>
 
 <div class="phase"><div class="pnum">2</div><div class="pbody"><h3>T=2 verify trunk megakernel — 2–3 wks</h3>
@@ -523,7 +526,8 @@ Weight ring across heterogeneous layers, LNC=2 DeltaNet head split, LM-head domi
 
 <p class="sub" style="margin-top:36px">References: <span class="ref">models/qwen3_6_moe/modeling_qwen36_a3b.py</span> ·
 <span class="ref">README.md</span> · <span class="ref">~/nki-moe/megakernels/{qwen3_moe,gpt_oss}/</span> ·
-<span class="ref">~/nki-moe/nki_kernels/</span> · NxDI <span class="ref">models/model_base.py</span>. All performance
+<span class="ref">~/nki-moe/nki_kernels/</span> · NxDI <span class="ref">models/model_base.py</span> ·
+<span class="ref">nki_kernels/deltanet_conv_tkg_spec.md</span>. All performance
 floors are pre-Phase-0 estimates.</p>
 
 </div></body></html>

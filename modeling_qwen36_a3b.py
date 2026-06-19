@@ -83,6 +83,10 @@ from .nki_kernels.nki_deltanet_tkg import (
     deltanet_tkg_fwd as deltanet_tkg_kernel,
     deltanet_tkg_fwd_state as deltanet_tkg_kernel_state,
 )
+from .nki_kernels.nki_deltanet_conv_tkg import (
+    deltanet_conv_tkg_fwd as deltanet_conv_kernel,
+    deltanet_conv_tkg_fwd_cand as deltanet_conv_kernel_cand,
+)
 
 from neuronx_distributed_inference.models.config import (
     FusedSpecNeuronConfig,
@@ -430,30 +434,148 @@ class NeuronGatedDeltaNet(nn.Module):
 
         return output.unsqueeze(2), new_state
 
-    def recurrent_step_nki(self, query, key, value, g, beta, recurrent_state):
-        """Single gated-delta-rule step via the batched DeltaNet TKG NKI kernel.
+    def conv_attn_nki(self, qkv, conv_seed, decode):
+        """Causal conv + silu + per-head q/k/v split via the conv TKG NKI kernel.
 
-        Drop-in for _recurrent_step at decode: same [B,H,S,dim] inputs and
-        [B,H,K,V] state, same returns. The kernel runs all heads in one launch
-        and exp's g internally, but expects query l2-normed+scaled and key
-        l2-normed (done here, as in _recurrent_step).
+        ``qkv`` [B, S, conv_dim] is the raw ``in_proj_qkv`` output (token-major); ``conv_seed``
+        [B, conv_dim, K-1] is the carried window. The kernel consumes them directly (no
+        cat/transpose), runs the depthwise conv + silu, and emits the q/k/v segments already
+        split into the recurrence's head layout (q/k [Hk, S, d], v [Hv, S, d]). Returns those
+        plus -- per ``decode`` -- the new conv state [B, conv_dim, K-1] or the per-position
+        candidate windows [B, S, conv_dim, K-1]. bs=1.
         """
-        query = l2norm(query, dim=-1)
-        key = l2norm(key, dim=-1)
-        B, H, S, k_dim = query.shape
-        v_dim = value.shape[-1]
-        query = query * (1.0 / (k_dim ** 0.5))
+        w = self._conv1d_weight().squeeze(1).float()
+        qkv2d = qkv[0].float()
+        seed2d = conv_seed[0].float()
+        hk = self.key_dim // 128  # conv kernel returns a unified qkv_out [NT,T,128]; slice q/k/v
+        # [2]: SPMD launch splits the conv_dim channel-tiles across both LNC=2 cores.
+        if decode:
+            qkv_out, new_state = deltanet_conv_kernel[2](qkv2d, seed2d, w, self.key_dim)
+            q, k, v = qkv_out[0:hk], qkv_out[hk : 2 * hk], qkv_out[2 * hk :]
+            return q, k, v, new_state.unsqueeze(0)
+        qkv_out, cand = deltanet_conv_kernel_cand[2](qkv2d, seed2d, w, self.key_dim)
+        q, k, v = qkv_out[0:hk], qkv_out[hk : 2 * hk], qkv_out[2 * hk :]
+        return q, k, v, cand.unsqueeze(0)
 
-        BH = B * H
-        q = query.reshape(BH, S, k_dim)
-        k = key.reshape(BH, S, k_dim)
-        v = value.reshape(BH, S, v_dim)
-        g_in = g.reshape(BH, S, 1)
-        beta_in = beta.reshape(BH, S, 1)
-        init = recurrent_state.reshape(BH, k_dim, v_dim)
+    def deltanet_attn_nki(self, q, k, v, a, b, init_state, decode):
+        """Gated delta-rule recurrence via the DeltaNet TKG NKI kernel (raw output).
 
-        out, final_state = deltanet_tkg_kernel(q, k, v, g_in, beta_in, init)
-        return out.reshape(B, H, S, v_dim), final_state.reshape(B, H, k_dim, v_dim)
+        ``q, k, v`` are in the conv kernel's head layout; ``a, b`` [B, S, num_v_heads] are the raw
+        ``in_proj_a``/``in_proj_b`` outputs; ``init_state`` [B, num_v_heads, Kd, Vd] is the state
+        seed. The kernel folds in l2norm/scale of q/k, GQA head replication, beta=sigmoid(b),
+        g=-exp(A_log)*softplus(a+dt_bias), and returns the raw recurrence output [B, S, value_dim]
+        (head-major; the caller applies the output RMSNorm + z-gate) plus the final state
+        [B, num_v_heads, Kd, Vd] (decode) or the per-position candidate states
+        [B, S, num_v_heads, Kd, Vd] (verify, candidate axis = S).
+        """
+        A_log = self._A_log().float()
+        dt_bias = self._dt_bias().float()
+        a2d = a[0].float()
+        b2d = b[0].float()
+        init2d = init_state[0].float()
+        if decode:
+            attn, final_state = deltanet_tkg_kernel(q, k, v, a2d, b2d, A_log, dt_bias, init2d)
+            return attn.unsqueeze(0), final_state.unsqueeze(0)
+        attn, cand = deltanet_tkg_kernel_state(q, k, v, a2d, b2d, A_log, dt_bias, init2d)
+        return attn.unsqueeze(0), cand.unsqueeze(0)
+
+    def attn_output(self, attn_raw, z, dtype):
+        """Output RMSNorm + z-gate + projection for the kernel attention path.
+
+        ``attn_raw`` [B, S, value_dim] is the raw recurrence output (head-major); ``z``
+        [B, S, value_dim] is the raw ``in_proj_z``. The kernel already emits head-major output,
+        so the per-head norm is a free reshape -- no transpose.
+        """
+        batch_size, seq_len, _ = attn_raw.shape
+        output = attn_raw.to(dtype)
+        output = output.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
+        output = self.norm(output)
+        z_gate = z.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
+        output = output * F.silu(z_gate)
+        output = output.reshape(batch_size, seq_len, self.value_dim)
+        return self.out_proj(output)
+
+    def _commit_conv_state(self, new_conv_state, batch_size, seq_ids, hybrid_cache_active):
+        """Cast the kernel's new conv window to the buffer dtype and wire the input_output_alias
+        dependency (mirrors the decode forward commit)."""
+        new_conv_state = new_conv_state.to(self.conv_state_buffer.dtype)
+        alloc_bs = self.conv_state_buffer.shape[0]
+        if hybrid_cache_active:
+            return new_conv_state
+        if seq_ids is not None:
+            return new_conv_state + self.conv_state_buffer * 0
+        if batch_size < alloc_bs:
+            return torch.cat(
+                [new_conv_state, self.conv_state_buffer[batch_size:] * 0], dim=0
+            )
+        return new_conv_state + self.conv_state_buffer * 0
+
+    def _commit_rec_state(self, final_state, batch_size, seq_ids, hybrid_cache_active):
+        """Cast the kernel's final recurrent state to the buffer dtype and wire the
+        input_output_alias dependency (mirrors the decode forward commit)."""
+        final_state = final_state.to(self.recurrent_state_buffer.dtype)
+        alloc_bs = self.recurrent_state_buffer.shape[0]
+        if hybrid_cache_active:
+            return final_state
+        if seq_ids is not None:
+            return final_state + self.recurrent_state_buffer * 0
+        if batch_size < alloc_bs:
+            return torch.cat(
+                [final_state, self.recurrent_state_buffer[batch_size:] * 0], dim=0
+            )
+        return final_state + self.recurrent_state_buffer * 0
+
+    def _forward_decode_tkg(
+        self, hidden_states, qkv, z, a, b, seq_ids,
+        conv_state_cache, recurrent_state_cache, hybrid_cache_active,
+        batch_size, seq_len,
+    ):
+        """Single-token decode (T=1) attention through the conv + DeltaNet TKG NKI kernels.
+
+        Glue-free counterpart to the decode branch of ``forward``: conv kernel -> recurrence
+        kernel -> output projection, with no host-side transpose / reshape / head replication.
+        Returns the same ``(output, past_kv, new_rec_state, new_conv_state)`` tuple ``forward``
+        emits for the decode path.
+        """
+        if conv_state_cache is not None:
+            conv_state = conv_state_cache[:batch_size]
+        elif seq_ids is not None:
+            conv_state = torch.index_select(self.conv_state_buffer, 0, seq_ids)
+        else:
+            conv_state = self.conv_state_buffer[:batch_size]
+        q, k, v, new_conv_state = self.conv_attn_nki(qkv, conv_state, decode=True)
+        new_conv_state = self._commit_conv_state(
+            new_conv_state, batch_size, seq_ids, hybrid_cache_active
+        )
+
+        if recurrent_state_cache is not None:
+            init_state = recurrent_state_cache[:batch_size]
+        elif seq_ids is not None:
+            init_state = torch.index_select(self.recurrent_state_buffer, 0, seq_ids)
+        else:
+            init_state = self.recurrent_state_buffer[:batch_size]
+        attn_raw, final_state = self.deltanet_attn_nki(
+            q, k, v, a, b, init_state, decode=True
+        )
+        new_rec_state = self._commit_rec_state(
+            final_state, batch_size, seq_ids, hybrid_cache_active
+        )
+
+        output = self.attn_output(attn_raw, z, hidden_states.dtype)
+
+        if hybrid_cache_active:
+            return output, (new_rec_state, new_conv_state), new_rec_state, new_conv_state
+        # Dummy KV for the KVCacheManager (DeltaNet carries state in the buffers, not KV).
+        dummy_k = torch.zeros(
+            batch_size,
+            self.kv_heads_per_rank,
+            seq_len,
+            self.head_dim,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        dummy_v = torch.zeros_like(dummy_k)
+        return output, (dummy_k, dummy_v), new_rec_state, new_conv_state
 
     def verify_block_candidates(self, query, key, value, g, beta, initial_state):
         """Run the verify block as exact single-step recurrences seeded from
@@ -491,36 +613,6 @@ class NeuronGatedDeltaNet(nn.Module):
         out_stack = torch.cat(outputs, dim=2)
         # Each state is [B, H, Kd, Vd]; stack on a new candidate axis-1.
         S_stack = torch.stack(states, dim=1)
-        return out_stack, S_stack
-
-    def verify_block_candidates_nki(self, query, key, value, g, beta, initial_state):
-        """Per-position candidate states via the DeltaNet TKG NKI kernel.
-
-        Drop-in for verify_block_candidates: same [B,H,S,dim] / [B,H,S] inputs and
-        [B,H,Kd,Vd] initial_state, returns the same (out_stack [B,H,S,Vd], S_stack
-        [B,S,H,Kd,Vd]) where S_i (axis-1) is the state after consuming block token
-        i. The kernel keeps the recurrent state in f32 across the block (unlike the
-        PyTorch loop, which rounds to the buffer dtype between tokens).
-        """
-        query = l2norm(query, dim=-1)
-        key = l2norm(key, dim=-1)
-        B, H, S, k_dim = query.shape
-        v_dim = value.shape[-1]
-        query = query * (1.0 / (k_dim ** 0.5))
-
-        BH = B * H
-        q = query.reshape(BH, S, k_dim)
-        k = key.reshape(BH, S, k_dim)
-        v = value.reshape(BH, S, v_dim)
-        g_in = g.reshape(BH, S, 1)
-        beta_in = beta.reshape(BH, S, 1)
-        init = initial_state.reshape(BH, k_dim, v_dim)
-
-        out, cand = deltanet_tkg_kernel_state(q, k, v, g_in, beta_in, init)
-        out_stack = out.reshape(B, H, S, v_dim)
-        # cand (BH,S,Kd,Vd) -> [B,H,S,Kd,Vd] -> [B,S,H,Kd,Vd], matching
-        # torch.stack(states, dim=1). _commit_deltanet indexes axis-1 (S).
-        S_stack = cand.reshape(B, H, S, k_dim, v_dim).permute(0, 2, 1, 3, 4)
         return out_stack, S_stack
 
     def conv_window_candidates(self, conv_seed, mixed):
@@ -565,6 +657,19 @@ class NeuronGatedDeltaNet(nn.Module):
         b = self.in_proj_b(hidden_states)
         a = self.in_proj_a(hidden_states)
 
+        if self.use_tkg_attention_kernel:
+            # Kernel path: conv + recurrence + gating folded into two NKI launches; no host-side
+            # transpose / reshape / head replication. Seeded read-only from the committed buffers.
+            conv_seed = torch.index_select(self.conv_state_buffer, 0, seq_ids)
+            init_state = torch.index_select(self.recurrent_state_buffer, 0, seq_ids)
+            q, k, v, conv_cand = self.conv_attn_nki(qkv, conv_seed, decode=False)
+            attn_raw, S_stack = self.deltanet_attn_nki(
+                q, k, v, a, b, init_state, decode=False
+            )
+            output = self.attn_output(attn_raw, z, hidden_states.dtype)
+            return output, S_stack, conv_cand
+
+        # PyTorch fallback (reference path): explicit conv + per-token single-step recurrences.
         query = qkv[..., : self.key_dim]
         key = qkv[..., self.key_dim : self.key_dim * 2]
         value = qkv[..., self.key_dim * 2 :]
@@ -580,9 +685,7 @@ class NeuronGatedDeltaNet(nn.Module):
                 :, :, k : k + seq_len
             ]
         mixed_post_conv = F.silu(conv_out)
-
-        # Per-position conv windows (candidate conv states) -- needs the
-        # channels-first `mixed` and the seed, before transposing back.
+        # Per-position conv windows (candidate conv states).
         conv_cand = self.conv_window_candidates(conv_seed, mixed)
 
         mixed_post_conv = mixed_post_conv.transpose(1, 2)  # [B, S, conv_dim]
@@ -621,14 +724,9 @@ class NeuronGatedDeltaNet(nn.Module):
             self.recurrent_state_buffer, 0, seq_ids
         ).float()
 
-        if self.use_tkg_attention_kernel:
-            out_stack, S_stack = self.verify_block_candidates_nki(
-                query, key, value, g, beta, initial_state
-            )
-        else:
-            out_stack, S_stack = self.verify_block_candidates(
-                query, key, value, g, beta, initial_state
-            )
+        out_stack, S_stack = self.verify_block_candidates(
+            query, key, value, g, beta, initial_state
+        )
 
         # Output: norm, z-gate, project (mirrors forward()).
         output = out_stack.to(hidden_states.dtype)
@@ -1061,6 +1159,14 @@ class NeuronGatedDeltaNet(nn.Module):
             b = self.in_proj_b(hidden_states)
             a = self.in_proj_a(hidden_states)
 
+        if is_decode and self.use_tkg_attention_kernel:
+            # Glue-free decode attention through the conv + DeltaNet TKG NKI kernels.
+            return self._forward_decode_tkg(
+                hidden_states, qkv, z, a, b, seq_ids,
+                conv_state_cache, recurrent_state_cache, hybrid_cache_active,
+                batch_size, seq_len,
+            )
+
         # Split QKV
         query = qkv[..., : self.key_dim]
         key = qkv[..., self.key_dim : self.key_dim * 2]
@@ -1084,10 +1190,10 @@ class NeuronGatedDeltaNet(nn.Module):
             for k in range(4):
                 conv_out = (
                     conv_out
-                    + w[:, k].unsqueeze(0).unsqueeze(-1) * conv_input[:, :, k : k + 1]
+                    + w[:, k].unsqueeze(0).unsqueeze(-1)
+                    * conv_input[:, :, k : k + 1]
                 )
             mixed_post_conv = F.silu(conv_out)
-
             new_conv_state = torch.cat([conv_state[:, :, 1:], mixed], dim=-1)
             alloc_bs = self.conv_state_buffer.shape[0]
             if hybrid_cache_active:
@@ -1252,14 +1358,9 @@ class NeuronGatedDeltaNet(nn.Module):
             else:
                 recurrent_state = self.recurrent_state_buffer[:batch_size].float()
 
-            if self.use_tkg_attention_kernel:
-                output, new_state = self.recurrent_step_nki(
-                    query, key, value, g, beta, recurrent_state
-                )
-            else:
-                output, new_state = self._recurrent_step(
-                    query, key, value, g, beta, recurrent_state
-                )
+            output, new_state = self._recurrent_step(
+                query, key, value, g, beta, recurrent_state
+            )
             new_state_bf16 = new_state.to(self.recurrent_state_buffer.dtype)
             alloc_bs = self.recurrent_state_buffer.shape[0]
             if hybrid_cache_active:

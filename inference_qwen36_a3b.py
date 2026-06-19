@@ -1,6 +1,6 @@
 """End-to-end inference driver for Qwen3.6-35B-A3B on Trainium.
 
-Default config: trn3, TP=4, LNC=2, bf16, seq_len=128, greedy sampling.
+Default config: trn3pre, TP=4, LNC=2, bf16, seq_len=128, greedy sampling.
 Compiles once into --compiled-path, then loads and generates for a few
 short prompts to validate that the port produces sensible tokens.
 
@@ -29,6 +29,9 @@ import sys
 import time
 from pathlib import Path
 from typing import Optional
+
+# Pre-release trn3 silicon reports its platform as "trn3pre"
+os.environ.setdefault("NEURON_PLATFORM_TARGET_OVERRIDE", "trn3pre")
 
 import torch
 import transformers
@@ -165,19 +168,52 @@ def build_inference_config(
     )
 
 
+def _presharded_weights_complete(compiled_path: str, tp_degree: int) -> bool:
+    """True iff every rank's sharded checkpoint is present. Sharding runs at the
+    tail of compile() and can be killed partway, leaving e.g. tp0/tp1 but not
+    tp2/tp3."""
+    weights_dir = os.path.join(compiled_path, "weights")
+    return all(
+        os.path.exists(os.path.join(weights_dir, f"tp{rank}_sharded_checkpoint.safetensors"))
+        for rank in range(tp_degree)
+    )
+
+
 def maybe_compile(model_path: str, compiled_path: str, inf_config) -> None:
-    """Compile only if no model.pt is already present."""
+    """Compile if no model.pt is present; re-shard if the presharded set is
+    incomplete.
+
+    Sharding doesn't need the NEFFs, so an interrupted shard (model.pt plus a
+    partial weights/ dir) is recovered by re-sharding alone -- no recompile.
+    Delete weights/ to force a re-shard even when complete (model.pt stays, so
+    no graph rebuild).
+    """
+    neuron_config = inf_config.neuron_config
     neff_path = os.path.join(compiled_path, "model.pt")
-    if os.path.exists(neff_path):
-        print(f"Found compiled artifacts at {compiled_path}; skipping compile.")
+
+    if not os.path.exists(neff_path):
+        print(f"Compiling Qwen3.6-A3B to {compiled_path} (this can take 10-20 minutes)...")
+        t0 = time.time()
+        model = NeuronQwen36A3BForCausalLM(model_path, inf_config)
+        model.compile(compiled_path)
+        del model
+        gc.collect()
+        print(f"  compile done in {time.time() - t0:.1f}s")
         return
-    print(f"Compiling Qwen3.6-A3B to {compiled_path} (this can take 10-20 minutes)...")
-    t0 = time.time()
-    model = NeuronQwen36A3BForCausalLM(model_path, inf_config)
-    model.compile(compiled_path)
-    del model
-    gc.collect()
-    print(f"  compile done in {time.time() - t0:.1f}s")
+
+    print(f"Found compiled artifacts at {compiled_path}; skipping compile.")
+    if (
+        neuron_config.save_sharded_checkpoint
+        and not neuron_config.skip_sharding
+        and not _presharded_weights_complete(compiled_path, neuron_config.tp_degree)
+    ):
+        print(f"Presharded weights incomplete; re-sharding into {compiled_path}/weights/ ...")
+        t0 = time.time()
+        model = NeuronQwen36A3BForCausalLM(model_path, inf_config)
+        model.shard_weights(compiled_path)
+        del model
+        gc.collect()
+        print(f"  re-shard done in {time.time() - t0:.1f}s")
 
 
 def load_model(compiled_path: str) -> NeuronQwen36A3BForCausalLM:
@@ -427,6 +463,19 @@ def main():
         spec_decode=args.mtp_spec_decode,
         tkg_attention_kernel=args.tkg_attention_kernel,
     )
+    if args.tkg_attention_kernel:
+        # Hard-fail if the flag didn't reach the configs, so we never silently
+        # benchmark the PyTorch fallback while believing we tested the kernel.
+        assert getattr(inf_config, "use_tkg_attention_kernel", False), (
+            "use_tkg_attention_kernel did not propagate to the target config"
+        )
+        if inf_config.fused_spec_config is not None:
+            assert getattr(
+                inf_config.fused_spec_config.draft_config,
+                "use_tkg_attention_kernel",
+                False,
+            ), "use_tkg_attention_kernel did not propagate to the draft (MTP) config"
+        print("[assert] TKG attention kernel ENABLED on target + draft configs")
     maybe_compile(args.model_path, compiled_path, inf_config)
     model = load_model(compiled_path)
 

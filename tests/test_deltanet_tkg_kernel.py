@@ -1,22 +1,29 @@
-"""Isolated correctness test for the batched DeltaNet TKG NKI kernel.
+"""Isolated correctness test for the batched DeltaNet TKG NKI kernel (new I/O contract).
 
-Calls `deltanet_tkg_fwd` / `deltanet_tkg_fwd_state` DIRECTLY (no
-NeuronGatedDeltaNet module) and compares against a float64 sequential
-gated-delta recurrence (ground truth) that mirrors
-`NeuronGatedDeltaNet._recurrent_step`.
+Calls `deltanet_tkg_fwd` / `deltanet_tkg_fwd_state` DIRECTLY (no NeuronGatedDeltaNet module) and
+compares against a float64 sequential gated-delta recurrence (ground truth) that folds in the glue
+the kernel absorbs: l2norm+scale of q/k, GQA head replication (value-head h <- k-head h//rep),
+beta=sigmoid(b), g=-exp(A_log)*softplus(a+dt_bias). The kernel emits the RAW per-token recurrence
+output (head-major); the output RMSNorm over j and the z-gate (*silu(z)) are now the CALLER's job
+(applied in PyTorch downstream) and are NOT part of this golden.
 
-Staged from simplest to hardest so a failure localizes:
-  1. one head, S=1            -> single-step decode == reference
-  2. one head, S=2, states    -> per-position candidate states == reference
-  3. all heads (BH=12), S=2   -> batched-over-heads correctness + isolation
-  4. batch B>1 (BH=8), S=3    -> multi-batch path
+New contract (per rank, bs=1): q,k are [Hk,T,d]; v is [Hv,T,d]; a,b are [T,Hv]; A_log,dt_bias are
+[Hv]; init_state is [Hv,d,d]. Outputs: attn_out [T,Hv*d] head-major (raw recurrence output), and
+state ([Hv,d,d] final / [T,Hv,d,d] candidates).
 
-Tolerance: atol=1e-5, rtol=1e-2 on every output (per-token output AND every
-candidate state).
+Staged simplest -> hardest so a failure localizes:
+  1. Hk=Hv=1, S=1            -> single-step decode (rep=1)
+  2. Hk=Hv=2, S=2, candidates -> per-position candidate states (rep=1 sanity, isolates GQA)
+  3. Hk=4, Hv=8, S=2, cand    -> real GQA shapes (rep=2)
+  4. Hk=4, Hv=8, S=3, cand    -> longer block, GQA
 
-Run:
+Tolerance: atol=1e-5, rtol=1e-2 on every output.
+
+Run (pin to core 0):
     cd /home/ubuntu/trainium-model-translation && \
     source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate && \
+    NEURON_RT_VISIBLE_CORES=0 NEURON_PLATFORM_TARGET_OVERRIDE=trn3pre \
+    NEURON_CC_FLAGS="--target trn3pre --lnc 2" \
     python -m models.qwen3_6_moe.tests.test_deltanet_tkg_kernel
 """
 
@@ -32,64 +39,76 @@ if str(_REPO_ROOT) not in sys.path:
 
 from models.qwen3_6_moe.nki_kernels.nki_deltanet_tkg import (  # noqa: E402
     deltanet_tkg_fwd,
-    deltanet_tkg_fwd_sbuf,
     deltanet_tkg_fwd_state,
 )
 
-DIM = 128  # k_dim = v_dim = P_MAX (kernel constraint)
+DIM = 128  # d = P_MAX (kernel constraint)
 ATOL = 1e-5
 RTOL = 1e-2
 
 
 # ---------------------------------------------------------------------------
-# float64 ground truth: per-(batch, head) sequential gated delta rule.
-# Mirrors NeuronGatedDeltaNet._recurrent_step exactly.
+# float64 ground truth: per-(value-head) recurrence with the input glue folded in.
+# Emits the RAW head-major recurrence output (no output RMSNorm, no z-gate).
 # ---------------------------------------------------------------------------
-def ref_recurrence(q, k, v, g, beta, init):
-    """q,k,v: (S, dim); g,beta: (S,); init: (dim, dim). All comparisons in f64.
+def ref_full(q, k, v, a, b, A_log, dt_bias, init):
+    """Reference for the kernel's raw recurrence output, in f64.
 
-    Returns (out (S, dim), states (S, dim, dim)) where states[t] is the
-    recurrent state AFTER consuming token t.
+    Shapes: q,k (Hk,T,d); v (Hv,T,d); a,b (T,Hv); A_log,dt_bias (Hv,); init (Hv,d,d).
+    Returns attn_out (T, Hv*d) head-major and states (T, Hv, d, d). The output RMSNorm over j and
+    the z-gate are NOT applied here -- they are the caller's job (PyTorch downstream).
     """
-    S, dim = q.shape
+    Hk, T, d = q.shape
+    Hv = v.shape[0]
+    rep = Hv // Hk
     qd, kd, vd = q.double(), k.double(), v.double()
-    gd, bd = g.double(), beta.double()
-    state = init.double().clone()
-    out = torch.zeros(S, dim, dtype=torch.float64)
-    states = torch.zeros(S, dim, dim, dtype=torch.float64)
-    for t in range(S):
-        state = state * torch.exp(gd[t])
-        kv = kd[t] @ state  # (dim,) : sum_i k[i] * state[i, j]
-        delta = (vd[t] - kv) * bd[t]
-        state = state + torch.outer(kd[t], delta)  # state[i,j] += k[i]*delta[j]
-        out[t] = qd[t] @ state  # sum_i q[i] * state[i, j]
-        states[t] = state
-    return out, states
+    ad, bd = a.double(), b.double()
+    A_logd, dtb = A_log.double(), dt_bias.double()
+
+    # l2norm + scale.
+    qn = torch.nn.functional.normalize(qd, p=2, dim=-1) / math.sqrt(d)
+    kn = torch.nn.functional.normalize(kd, p=2, dim=-1)
+    # gating.
+    beta = torch.sigmoid(bd)  # (T, Hv)
+    g = -torch.exp(A_logd) * torch.nn.functional.softplus(ad + dtb)  # (T, Hv)
+
+    states = torch.zeros(Hv, T, d, d, dtype=torch.float64)
+    out_raw = torch.zeros(Hv, T, d, dtype=torch.float64)
+    for h in range(Hv):
+        kh = h // rep
+        state = init[h].double().clone()
+        for t in range(T):
+            state = state * torch.exp(g[t, h])
+            kv = kn[kh, t] @ state
+            delta = (vd[h, t] - kv) * beta[t, h]
+            state = state + torch.outer(kn[kh, t], delta)
+            out_raw[h, t] = qn[kh, t] @ state
+            states[h, t] = state
+
+    # Raw head-major output: (Hv, T, d) -> (T, Hv, d) -> (T, Hv*d). No RMSNorm, no z-gate.
+    attn_out = out_raw.permute(1, 0, 2).contiguous().reshape(T, Hv * d)  # (T, Hv*d)
+    states = states.permute(1, 0, 2, 3).contiguous()  # (T, Hv, d, d)
+    return attn_out, states
 
 
-def make_inputs(BH, S, seed, dim=DIM):
-    """Batched, kernel-contract inputs.
-
-    Returns q,k,v,g_bc,beta_bc (BH,S,dim) and init (BH,dim,dim) for the kernel,
-    plus scalar g,beta (BH,S) for the reference. q is l2-normed and scaled by
-    1/sqrt(dim); k is l2-normed; g is raw per-token log-decay (<=0).
-    """
+def make_inputs(Hk, Hv, S, seed, d=DIM):
+    """Raw, new-contract inputs (pre-glue). Realistic ranges: g via the real formula (<=0 region),
+    beta via sigmoid, small init."""
     torch.manual_seed(seed)
-    q = torch.randn(BH, S, dim)
-    k = torch.randn(BH, S, dim)
-    v = torch.randn(BH, S, dim) * 0.5
-    q = torch.nn.functional.normalize(q, p=2, dim=-1) / math.sqrt(dim)
-    k = torch.nn.functional.normalize(k, p=2, dim=-1)
-    g = -torch.nn.functional.softplus(torch.randn(BH, S))  # raw log-decay <= 0
-    beta = torch.sigmoid(torch.randn(BH, S))
-    init = torch.randn(BH, dim, dim) * 0.1
-    # Kernel contract: g/beta are one scalar per (head, token) -> (BH, S, 1).
-    g_s = g.unsqueeze(-1).contiguous()
-    beta_s = beta.unsqueeze(-1).contiguous()
-    return q, k, v, g_s, beta_s, init, g, beta
+    rep = Hv // Hk
+    assert Hv % Hk == 0 and rep >= 1
+    q = torch.randn(Hk, S, d)
+    k = torch.randn(Hk, S, d)
+    v = torch.randn(Hv, S, d) * 0.5
+    a = torch.randn(S, Hv)
+    b = torch.randn(S, Hv)
+    A_log = torch.randn(Hv) * 0.5  # exp(A_log) ~ O(1)
+    dt_bias = torch.randn(Hv) * 0.5
+    init = torch.randn(Hv, d, d) * 0.1
+    return q, k, v, a, b, A_log, dt_bias, init
 
 
-def run_kernel(fn, q, k, v, g_bc, beta_bc, init):
+def run_kernel(fn, q, k, v, a, b, A_log, dt_bias, init):
     """Move inputs to the Neuron device, call the @nki.jit kernel, return CPU tensors."""
     import torch_xla.core.xla_model as xm
 
@@ -98,12 +117,14 @@ def run_kernel(fn, q, k, v, g_bc, beta_bc, init):
         q.float().contiguous().to(dev),
         k.float().contiguous().to(dev),
         v.float().contiguous().to(dev),
-        g_bc.float().contiguous().to(dev),
-        beta_bc.float().contiguous().to(dev),
+        a.float().contiguous().to(dev),
+        b.float().contiguous().to(dev),
+        A_log.float().contiguous().to(dev),
+        dt_bias.float().contiguous().to(dev),
         init.float().contiguous().to(dev),
     ]
-    out, state = fn(*args)
-    return out.cpu(), state.cpu()
+    attn_out, state = fn(*args)
+    return attn_out.cpu(), state.cpu()
 
 
 def _metrics(ker, ref):
@@ -121,79 +142,48 @@ def _check(name, ker, ref):
     assert ok, f"{name}: max_abs={max_abs:.3e} max_rel={max_rel:.3e} exceeds atol={ATOL} rtol={RTOL}"
 
 
-def _ref_batched(q, k, v, g, beta, init):
-    """Run ref_recurrence per bh; return (out (BH,S,dim), states (BH,S,dim,dim))."""
-    BH = q.shape[0]
-    outs, sts = [], []
-    for bh in range(BH):
-        o, s = ref_recurrence(q[bh], k[bh], v[bh], g[bh], beta[bh], init[bh])
-        outs.append(o)
-        sts.append(s)
-    return torch.stack(outs, 0), torch.stack(sts, 0)
+def run_stage_final(name, Hk, Hv, S, seed):
+    """deltanet_tkg_fwd: check attn_out and the final state."""
+    inp = make_inputs(Hk, Hv, S, seed)
+    ker_out, ker_final = run_kernel(deltanet_tkg_fwd, *inp)
+    ref_out, ref_states = ref_full(*inp)
+    _check(f"{name}:attn_out", ker_out, ref_out)
+    _check(f"{name}:final_state", ker_final, ref_states[-1])
 
 
-def run_stage_final(name, BH, S, seed):
-    """deltanet_tkg_fwd: check per-token output and the final state."""
-    q, k, v, g_bc, beta_bc, init, g, beta = make_inputs(BH, S, seed)
-    ker_out, ker_final = run_kernel(deltanet_tkg_fwd, q, k, v, g_bc, beta_bc, init)
-    ref_out, ref_states = _ref_batched(q, k, v, g, beta, init)
-    _check(f"{name}:output", ker_out, ref_out)
-    _check(f"{name}:final_state", ker_final, ref_states[:, -1])
-
-
-def run_stage_candidates(name, BH, S, seed):
-    """deltanet_tkg_fwd_state: check output and EVERY per-position candidate state."""
-    q, k, v, g_bc, beta_bc, init, g, beta = make_inputs(BH, S, seed)
-    ker_out, ker_states = run_kernel(
-        deltanet_tkg_fwd_state, q, k, v, g_bc, beta_bc, init
-    )
-    ref_out, ref_states = _ref_batched(q, k, v, g, beta, init)
-    _check(f"{name}:output", ker_out, ref_out)
+def run_stage_candidates(name, Hk, Hv, S, seed):
+    """deltanet_tkg_fwd_state: check attn_out and EVERY per-position candidate state."""
+    inp = make_inputs(Hk, Hv, S, seed)
+    ker_out, ker_states = run_kernel(deltanet_tkg_fwd_state, *inp)
+    ref_out, ref_states = ref_full(*inp)
+    _check(f"{name}:attn_out", ker_out, ref_out)
     _check(f"{name}:candidate_states", ker_states, ref_states)
-
-
-def run_stage_sbuf(name, BH, S, seed):
-    """deltanet_tkg_fwd_sbuf: SBUF-output path. Output is the packed (S, BH*dim)
-    SBUF layout: element [t, h*dim + j] holds token (bh=h, t)'s output[j].
-    Compare to the same-laid-out ref."""
-    q, k, v, g_bc, beta_bc, init, g, beta = make_inputs(BH, S, seed)
-    ker_out, ker_final = run_kernel(deltanet_tkg_fwd_sbuf, q, k, v, g_bc, beta_bc, init)
-    ref_out, ref_states = _ref_batched(q, k, v, g, beta, init)
-    # ref_out (BH,S,dim) -> (S, BH*dim): element [t, h*dim + j] = ref_out[h, t, j].
-    ref_packed = ref_out.permute(1, 0, 2).reshape(S, BH * ref_out.shape[-1])
-    _check(f"{name}:output_sbuf", ker_out, ref_packed)
-    _check(f"{name}:final_state", ker_final, ref_states[:, -1])
 
 
 # ---------------------------------------------------------------------------
 # pytest entrypoints
 # ---------------------------------------------------------------------------
 def test_stage1_single_head_s1():
-    run_stage_final("stage1_BH1_S1", BH=1, S=1, seed=0)
+    run_stage_final("stage1_Hk1Hv1_S1", Hk=1, Hv=1, S=1, seed=0)
 
 
-def test_stage2_single_head_s2_candidates():
-    run_stage_candidates("stage2_BH1_S2", BH=1, S=2, seed=1)
+def test_stage2_rep1_s2_candidates():
+    run_stage_candidates("stage2_Hk2Hv2_S2", Hk=2, Hv=2, S=2, seed=1)
 
 
-def test_stage3_all_heads_s2():
-    run_stage_candidates("stage3_BH12_S2", BH=12, S=2, seed=2)
+def test_stage3_gqa_s2_candidates():
+    run_stage_candidates("stage3_Hk4Hv8_S2", Hk=4, Hv=8, S=2, seed=2)
 
 
-def test_stage4_batch_s3():
-    run_stage_candidates("stage4_BH8_S3", BH=8, S=3, seed=3)
-
-
-def test_stage5_sbuf_output():
-    run_stage_sbuf("stage5_BH12_S2_sbuf", BH=12, S=2, seed=4)
+def test_stage4_gqa_s3_candidates():
+    run_stage_candidates("stage4_Hk4Hv8_S3", Hk=4, Hv=8, S=3, seed=3)
 
 
 def main():
-    run_stage_final("stage1_BH1_S1", BH=1, S=1, seed=0)
-    run_stage_candidates("stage2_BH1_S2", BH=1, S=2, seed=1)
-    run_stage_candidates("stage3_BH12_S2", BH=12, S=2, seed=2)
-    run_stage_candidates("stage4_BH8_S3", BH=8, S=3, seed=3)
-    run_stage_sbuf("stage5_BH12_S2_sbuf", BH=12, S=2, seed=4)
+    run_stage_final("stage1_Hk1Hv1_S1", Hk=1, Hv=1, S=1, seed=0)
+    run_stage_candidates("stage2_Hk2Hv2_S2", Hk=2, Hv=2, S=2, seed=1)
+    run_stage_candidates("stage3_Hk4Hv8_S2", Hk=4, Hv=8, S=2, seed=2)
+    run_stage_candidates("stage4_Hk4Hv8_S3", Hk=4, Hv=8, S=3, seed=3)
     print("ALL STAGES PASSED")
 
 
