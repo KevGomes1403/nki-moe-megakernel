@@ -12,11 +12,17 @@ the value-head-sharded fused entrypoints (all f32):
     A_log       (Hv,)             per-head decay param
     dt_bias     (Hv,)             per-head decay bias
     init_state  (Hv, 128, 128)    carried recurrent state
+    z           (T, Hv*128)       optional in_proj_z gate -> enables gated per-head RMSNorm
+    gamma       (128,)            optional per-head norm weight -> enables gated per-head RMSNorm
+
+By default this exercises the gated per-head RMSNorm path (z/gamma passed). Pass
+"raw" as the 3rd arg to profile the bare recurrence (z/gamma None) for an A/B baseline.
 
 Usage:
-    python -m models.qwen3_6_moe.tests.profile_fused_kernel <decode|verify> <outdir>
+    python -m models.qwen3_6_moe.tests.profile_fused_kernel <decode|verify> <outdir> [raw]
       decode -> deltanet_fused_tkg_fwd        (T=1 commit)
       verify -> deltanet_fused_tkg_fwd_state  (T=2 verify)
+      raw    -> skip z/gamma (no gated RMSNorm) for an A/B baseline
 """
 
 import os
@@ -59,10 +65,12 @@ K = 4  # linear_conv_kernel_dim
 STATE_W = K - 1  # carried conv window width
 HV = (CONV_DIM - 2 * KEY_DIM) // 128  # value-head count (8)
 D = 128  # head_dim
+VALUE_DIM = HV * D  # 1024
 
 
 def main():
     mode = sys.argv[1]  # decode | verify
+    raw = len(sys.argv) > 3 and sys.argv[3] == "raw"
     T = 1 if mode == "decode" else 2
 
     torch.manual_seed(0)
@@ -75,12 +83,25 @@ def main():
     A_log = torch.randn(HV).float()
     dt_bias = torch.randn(HV).float()
     init_state = torch.randn(HV, D, D).float()
+    # Gated per-head RMSNorm inputs (the "with rmsnorm" path): z token-major
+    # [T, Hv*128], gamma per-head [128]. Skipped under `raw` for an A/B baseline.
+    z = torch.randn(T, VALUE_DIM).float()
+    gamma = torch.randn(D).float()
 
     dev = xm.xla_device()
-    host = (qkv, conv_state, conv_weight, a, b, A_log, dt_bias, init_state)
-    qkv_d, conv_state_d, conv_weight_d, a_d, b_d, A_log_d, dt_bias_d, init_state_d = (
-        t.contiguous().to(dev) for t in host
-    )
+    host = (qkv, conv_state, conv_weight, a, b, A_log, dt_bias, init_state, z, gamma)
+    (
+        qkv_d,
+        conv_state_d,
+        conv_weight_d,
+        a_d,
+        b_d,
+        A_log_d,
+        dt_bias_d,
+        init_state_d,
+        z_d,
+        gamma_d,
+    ) = (t.contiguous().to(dev) for t in host)
     if mode == "decode":
         fn = deltanet_fused_tkg_fwd
     else:
@@ -88,13 +109,37 @@ def main():
 
     # A couple of executions so the NEFF is emitted and warm. [2] shards across both cores.
     for _ in range(3):
-        outs = fn[2](
-            qkv_d, conv_state_d, conv_weight_d, KEY_DIM,
-            a_d, b_d, A_log_d, dt_bias_d, init_state_d,
-        )
+        if raw:
+            outs = fn[2](
+                qkv_d,
+                conv_state_d,
+                conv_weight_d,
+                KEY_DIM,
+                a_d,
+                b_d,
+                A_log_d,
+                dt_bias_d,
+                init_state_d,
+            )
+        else:
+            outs = fn[2](
+                qkv_d,
+                conv_state_d,
+                conv_weight_d,
+                KEY_DIM,
+                a_d,
+                b_d,
+                A_log_d,
+                dt_bias_d,
+                init_state_d,
+                z=z_d,
+                gamma=gamma_d,
+                eps=1e-6,
+            )
         xm.mark_step()
     _ = [o.cpu() for o in outs]
-    print(f"[profile_fused] emitted NEFF for {mode} T={T} -> {_OUTDIR}")
+    path = "raw" if raw else "rmsnorm"
+    print(f"[profile_fused] emitted NEFF for {mode} T={T} ({path}) -> {_OUTDIR}")
 
 
 if __name__ == "__main__":

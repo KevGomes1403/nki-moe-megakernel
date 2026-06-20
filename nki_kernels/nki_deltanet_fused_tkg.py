@@ -40,6 +40,11 @@ Inputs (qkv f32, as today):
     A_log      (Hv,)            per-head decay param
     dt_bias    (Hv,)            per-head decay bias
     init_state (Hv, 128, 128)   carried recurrent state
+    z          (T, Hv*128)      optional in_proj_z gate (head-major); enables the gated per-head RMSNorm
+    gamma      (128,)           optional per-head norm weight (replicated); enables the gated norm
+    eps        python float     RMSNorm epsilon (default 1e-6)
+With ``z``/``gamma`` provided, ``attn_out`` is the gated per-head RMSNorm'd output (norm over head_dim
+* silu(z)); with them None it is the raw head-major recurrence output (caller applies the norm/gate).
 Outputs are FULL-shape in shared_hbm; each core writes its disjoint head/column/channel slice.
 """
 
@@ -55,7 +60,8 @@ from models.qwen3_6_moe.nki_kernels.nki_deltanet_tkg import gated_delta_rule_tkg
 
 
 def fused_compose(qkv, conv_state, conv_weight, key_dim, a, b, A_log, dt_bias, init_state,
-                  attn_out, state_hbm, conv_cand, write_candidates, cand_is_3d):
+                  attn_out, state_hbm, conv_cand, write_candidates, cand_is_3d,
+                  z=None, gamma=None, eps=None):
     """Compose the per-core conv -> recurrence pipeline (shared by both entrypoints).
 
     Derives the value-head shard once (the conv and recurrence both fold ``program_id``/``num_programs``
@@ -63,6 +69,9 @@ def fused_compose(qkv, conv_state, conv_weight, key_dim, a, b, A_log, dt_bias, i
     scatter its conv-state slices, then drives the recurrence straight off those tiles. Hk_full /
     Hv_full are passed explicitly because the SBUF tiles carry only local heads (Hv_full from the state
     output's head axis, Hk_full from key_dim).
+
+    When ``z``/``gamma`` are provided the recurrence emits the gated per-head RMSNorm'd output (norm
+    over head_dim * silu(z)); with them None it emits the raw head-major output exactly as before.
     """
     conv_dim = qkv.shape[1]
     Hk_full = key_dim // P_MAX
@@ -76,16 +85,19 @@ def fused_compose(qkv, conv_state, conv_weight, key_dim, a, b, A_log, dt_bias, i
         None, None, None, a, b, A_log, dt_bias, init_state,
         attn_out, state_hbm, write_candidates,
         q_sbuf=q_sbuf, k_sbuf=k_sbuf, v_sbuf=v_sbuf, Hk_full=Hk_full, Hv_full=Hv_full,
+        z=z, gamma=gamma, eps=eps,
     )
 
 
 @nki.jit
 def deltanet_fused_tkg_fwd(qkv, conv_state, conv_weight, key_dim,
-                           a, b, A_log, dt_bias, init_state):
+                           a, b, A_log, dt_bias, init_state,
+                           z=None, gamma=None, eps=1e-6):
     """Decode / commit (T=1): fused conv + recurrence in one launch.
 
     Returns:
-        attn_out       (T, Hv*128) f32 -- raw head-major recurrence output (caller RMSNorms/z-gates)
+        attn_out       (T, Hv*128) f32 -- recurrence output; gated per-head RMSNorm'd when z/gamma are
+                       given, else raw head-major (caller RMSNorms/z-gates)
         final_state    (Hv, 128, 128) f32 -- recurrent state after the block token
         new_conv_state (conv_dim, K-1) -- committed new conv window (== conv_cand[0])
     Value-head sharded across cores; launch ``deltanet_fused_tkg_fwd[2](...)``.
@@ -100,18 +112,21 @@ def deltanet_fused_tkg_fwd(qkv, conv_state, conv_weight, key_dim,
     fused_compose(
         qkv, conv_state, conv_weight, key_dim, a, b, A_log, dt_bias, init_state,
         attn_out, final_state, new_conv_state, write_candidates=False, cand_is_3d=False,
+        z=z, gamma=gamma, eps=eps,
     )
     return attn_out, final_state, new_conv_state
 
 
 @nki.jit
 def deltanet_fused_tkg_fwd_state(qkv, conv_state, conv_weight, key_dim,
-                                 a, b, A_log, dt_bias, init_state):
+                                 a, b, A_log, dt_bias, init_state,
+                                 z=None, gamma=None, eps=1e-6):
     """Speculative verify (T>=2): fused conv + recurrence in one launch.
 
     ``candidate_states[t]`` / ``conv_cand[t]`` are the recurrent / conv state after consuming block
     token t; on a reject the host selects ``[accept_count - 1]``. Returns:
-        attn_out         (T, Hv*128) f32 -- raw head-major recurrence output
+        attn_out         (T, Hv*128) f32 -- recurrence output; gated per-head RMSNorm'd when z/gamma
+                         are given, else raw head-major
         candidate_states (T, Hv, 128, 128) f32 -- recurrent state after each token
         conv_cand        (T, conv_dim, K-1) -- conv window after each token
     Value-head sharded across cores; launch ``deltanet_fused_tkg_fwd_state[2](...)``.
@@ -128,5 +143,6 @@ def deltanet_fused_tkg_fwd_state(qkv, conv_state, conv_weight, key_dim,
     fused_compose(
         qkv, conv_state, conv_weight, key_dim, a, b, A_log, dt_bias, init_state,
         attn_out, candidate_states, conv_cand, write_candidates=True, cand_is_3d=True,
+        z=z, gamma=gamma, eps=eps,
     )
     return attn_out, candidate_states, conv_cand

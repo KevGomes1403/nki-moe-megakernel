@@ -69,6 +69,8 @@ import nki
 import nki.isa as nisa
 import nki.language as nl
 
+from models.qwen3_6_moe.nki_kernels.nki_deltanet_norm_gate import norm_gate_row
+
 # Partition dimension max (NeuronCore SBUF tile width) = d.
 P_MAX = 128
 
@@ -198,6 +200,7 @@ def gated_delta_rule_tkg(
     q, k, v, a, b, A_log, dt_bias, init_state,
     attn_out, state_hbm, write_candidates,
     q_sbuf=None, k_sbuf=None, v_sbuf=None, Hk_full=None, Hv_full=None,
+    z=None, gamma=None, eps=None,
 ):
     """Value-head-sharded gated delta-rule recurrence with the input glue folded in.
 
@@ -218,6 +221,13 @@ def gated_delta_rule_tkg(
     / attn_out columns / state heads stay FULL HBM tensors sliced by ``vh_off``/``col_off``/``W_full``.
     With these None the behavior is byte-identical to the HBM path. ``Hk_full``/``Hv_full`` must be
     passed in this variant (the SBUF tiles carry only local heads); ``T``/``dim`` come from ``attn_out``.
+
+    Gated-norm (optional): when ``z``/``gamma`` are provided, the per-token output is gated per-head
+    RMSNorm'd (``norm_gate_row``: per-head RMSNorm over dim * silu(z)) before the ``attn_out`` write;
+    ``z`` is the FULL [T, W_full] head-major gate sliced by ``col_off`` (matching the output columns)
+    and ``gamma`` is the replicated [dim] norm weight (loaded once per core). With these None the raw
+    recurrence output is written exactly as before -- the norm seam is opt-in and leaves the state /
+    candidate outputs untouched.
     """
     from_sbuf = q_sbuf != None
     if from_sbuf:
@@ -332,6 +342,12 @@ def gated_delta_rule_tkg(
         k_t = _load_normed_qk(k, Hk, T, dim, 1.0, qk_off)
         q_t = _load_normed_qk(q, Hk, T, dim, inv_sqrt_d, qk_off)
 
+    # Optional gated per-head RMSNorm at the output seam: load the replicated [dim] gamma once.
+    apply_norm = gamma != None
+    if apply_norm:
+        gamma_sb = nl.ndarray((1, dim), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=gamma_sb, src=gamma.ap(pattern=[[dim, 1], [1, dim]], offset=0))
+
     # Reusable per-token PSUM tiles (matmul outputs; alloc once).
     eg_p = nl.ndarray((P_MAX, Hv), dtype=nl.float32, buffer=nl.psum)
     beta_p = nl.ndarray((P_MAX, Hv), dtype=nl.float32, buffer=nl.psum)
@@ -425,11 +441,23 @@ def gated_delta_rule_tkg(
             dst=O_row[0:1, 0:W], src=red_p[0:1, 0:W], engine=nisa.scalar_engine
         )
 
+        # Optional gated per-head RMSNorm of the raw row: norm over dim * silu(z), Layout A (free-axis
+        # reduce, no transpose). z is sliced by the same col_off the output write uses.
+        if apply_norm:
+            z_row = nl.ndarray((1, W), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(
+                dst=z_row[0:1, 0:W],
+                src=z.ap(pattern=[[W_full, 1], [1, W]], offset=t * W_full + col_off),
+            )
+            out_row = norm_gate_row(O_row, z_row, gamma_sb, eps, dim)
+        else:
+            out_row = O_row
+
         # Write this core's columns of the full-shape attn_out [T, W_full] head-major:
-        # attn_out[t, col_off + h*dim+j] = O_row[0, h*dim+j].
+        # attn_out[t, col_off + h*dim+j] = out_row[0, h*dim+j] (gated when apply_norm, raw otherwise).
         nisa.dma_copy(
             dst=attn_out.ap(pattern=[[W_full, 1], [1, W]], offset=t * W_full + col_off),
-            src=O_row[0:1, 0:W],
+            src=out_row[0:1, 0:W],
         )
 
         # Candidate state after token t (speculation): candidate_states[t, vh_off+h, i, j] <- Sp.

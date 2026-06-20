@@ -37,6 +37,12 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+# Vendored HF reference on sys.path so the gated norm imports as a top-level module (the package
+# __init__ is a transformers-style lazy loader that doesn't resolve from the repo root).
+_HF_REF = Path(__file__).resolve().parent.parent / "_hf_reference"
+if str(_HF_REF) not in sys.path:
+    sys.path.insert(0, str(_HF_REF))
+
 from models.qwen3_6_moe.nki_kernels.nki_deltanet_fused_tkg import (  # noqa: E402
     deltanet_fused_tkg_fwd,
     deltanet_fused_tkg_fwd_state,
@@ -50,14 +56,17 @@ from models.qwen3_6_moe.tests.test_deltanet_conv_tkg_kernel import (  # noqa: E4
     ref_conv,
 )
 from models.qwen3_6_moe.tests.test_deltanet_tkg_kernel import ref_full  # noqa: E402
+from modeling_qwen3_5_moe import Qwen3_5MoeRMSNormGated  # noqa: E402
 
 STATE_W = K - 1
 ATOL = 1e-5
 RTOL = 1e-2
+EPS = 1e-6  # config rms_norm_eps
 
 
 def make_inputs(T, seed):
-    """Random fp32 inputs for the fused kernel (conv inputs + recurrence gating/state inputs)."""
+    """Random fp32 inputs for the fused kernel (conv inputs + recurrence gating/state inputs +
+    the gated-norm z gate and gamma weight)."""
     torch.manual_seed(seed)
     qkv = torch.randn(T, CONV_DIM)
     conv_state = torch.randn(CONV_DIM, STATE_W)
@@ -67,23 +76,38 @@ def make_inputs(T, seed):
     A_log = torch.randn(HV) * 0.5
     dt_bias = torch.randn(HV) * 0.5
     init_state = torch.randn(HV, HEAD_DIM, HEAD_DIM) * 0.1
-    return qkv, conv_state, conv_weight, a, b, A_log, dt_bias, init_state
+    z = torch.randn(T, HV * HEAD_DIM)
+    gamma = torch.randn(HEAD_DIM)  # random (not ones) to exercise the norm weight
+    return qkv, conv_state, conv_weight, a, b, A_log, dt_bias, init_state, z, gamma
 
 
 def golden(inp):
-    """Chained reference: conv golden -> recurrence golden. Returns the three fused outputs (f64)."""
-    qkv, conv_state, conv_weight, a, b, A_log, dt_bias, init_state = inp
+    """Chained reference: conv golden -> recurrence golden -> gated per-head RMSNorm.
+
+    ``ref_attn`` is the raw [T, HV*HEAD_DIM] head-major recurrence output; the HF gated norm
+    (``Qwen3_5MoeRMSNormGated``: per-head RMSNorm over HEAD_DIM * silu(z)) is then applied to match
+    the kernel's gated output. Returns the three fused outputs (the gated attn_out, the states, the
+    conv candidates) plus ref_v."""
+    qkv, conv_state, conv_weight, a, b, A_log, dt_bias, init_state, z, gamma = inp
     ref_q, ref_k, ref_v, ref_cand = ref_conv(qkv, conv_state, conv_weight)
     ref_attn, ref_states = ref_full(ref_q, ref_k, ref_v, a, b, A_log, dt_bias, init_state)
-    return ref_attn, ref_states, ref_cand, ref_v
+
+    # Per-head gated RMSNorm: reshape [T, HV*HEAD_DIM] -> [T, HV, HEAD_DIM], norm over HEAD_DIM, gate.
+    T = ref_attn.shape[0]
+    norm = Qwen3_5MoeRMSNormGated(HEAD_DIM, eps=EPS)
+    norm.weight.data = gamma.to(ref_attn.dtype).clone()
+    ref_attn_r = ref_attn.reshape(T, HV, HEAD_DIM).to(ref_attn.dtype)
+    z_r = z.reshape(T, HV, HEAD_DIM).to(ref_attn.dtype)
+    gated = norm(ref_attn_r, gate=z_r).reshape(T, HV * HEAD_DIM)
+    return gated, ref_states, ref_cand, ref_v
 
 
 def run_kernel(fn, inp, cores=2):
     """Move inputs to the Neuron device, launch the @nki.jit kernel on ``cores`` cores (value-head
-    SPMD shard), return CPU tensors."""
+    SPMD shard) with the gated-norm z/gamma/eps, return CPU tensors."""
     import torch_xla.core.xla_model as xm
 
-    qkv, conv_state, conv_weight, a, b, A_log, dt_bias, init_state = inp
+    qkv, conv_state, conv_weight, a, b, A_log, dt_bias, init_state, z, gamma = inp
     dev = xm.xla_device()
     args = [
         qkv.float().contiguous().to(dev),
@@ -96,8 +120,10 @@ def run_kernel(fn, inp, cores=2):
         A_log.float().contiguous().to(dev),
         dt_bias.float().contiguous().to(dev),
         init_state.float().contiguous().to(dev),
+        z.float().contiguous().to(dev),
+        gamma.float().contiguous().to(dev),
     ]
-    outs = fn[cores](args[0], args[1], args[2], KEY_DIM, *tail)
+    outs = fn[cores](args[0], args[1], args[2], KEY_DIM, *tail, EPS)
     return tuple(o.cpu() for o in outs)
 
 
