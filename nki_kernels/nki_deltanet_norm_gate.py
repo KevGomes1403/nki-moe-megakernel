@@ -1,21 +1,12 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Gated per-head RMSNorm for the DeltaNet recurrence output.
+"""Gated per-head RMSNorm for the DeltaNet recurrence output (matches Qwen3_5MoeRMSNormGated).
 
-Applies a per-head RMSNorm over the 128-wide value-head dim followed by a SiLU gate, matching
-``Qwen3_5MoeRMSNormGated``: for each (token ``t``, value-head ``h``) over ``j = 0..d-1``::
-
-    var = mean_j(x_j^2)
-    y_j = x_j * rsqrt(var + eps)
-    n_j = y_j * gamma_j                    # gamma shape [d], shared across heads
-    o_j = n_j * silu(z_{t,h,j})            # silu(u) = u * sigmoid(u)
-
-Layout A: ``head_dim`` lives on the FREE axis, so the per-head statistic is a free-axis reduce over
-``d`` with no transpose. A token's head-major row ``[1, W]`` (W = Hv*d) reshapes for free to
-``[1, Hv, d]``. ``norm_gate_row`` is a composable SBUF helper consumed by the fused recurrence at its
-per-token output seam; ``deltanet_gated_rmsnorm`` is a thin standalone harness over HBM that exposes
-the same math for unit testing.
+Per (token, value-head): out = (x * rsqrt(mean(x^2) + eps)) * gamma * silu(z), normalized over the
+128-wide head_dim. Layout A keeps head_dim on the free axis so the per-head reduce needs no transpose.
+norm_gate_row is the composable SBUF helper used at the recurrence's per-token output seam;
+deltanet_gated_rmsnorm is a thin HBM harness exposing the same math for unit testing.
 """
 
 import nki
@@ -28,21 +19,13 @@ P_MAX = 128
 
 def kernel_assert(condition, error_text):
     """Assert with an NKI-formatted error message (identifies kernel-origin failures)."""
-    assert condition, f"[INTERNAL_ERROR] [NCC_INKI016] Kernel validation exception: {error_text}"
+    assert condition, (
+        f"[INTERNAL_ERROR] [NCC_INKI016] Kernel validation exception: {error_text}"
+    )
 
 
 def norm_gate_row(o_row, z_row, gamma_sb, eps, d):
-    """Gated per-head RMSNorm of ONE token's recurrence output (Layout A, no transpose).
-
-    o_row    [1, W_core] f32  -- this token's head-major output (W_core = Hv_core*d), in SBUF
-    z_row    [1, W_core] f32  -- this token's in_proj_z slice (same head-major layout), in SBUF
-    gamma_sb [1, d]      f32  -- per-head norm weight, shared across heads (loaded once)
-    eps      python float
-    d        python int       -- head_dim (== P_MAX)
-
-    Returns gated [1, W_core] f32 -- viewed as [1, Hv_core, d], per-head RMSNorm * silu(z).
-    The per-head reduce is a free-axis reduce over the innermost ``d`` on a 3D [1, Hv_core, d] view.
-    """
+    """One token's gated per-head RMSNorm (Layout A): o_row/z_row [1,W_core] SBUF, gamma_sb [1,d] -> gated [1,W_core] = RMSNorm(o_row)*silu(z)."""
     W = o_row.shape[1]
     kernel_assert(W % d == 0, "W_core must be a multiple of head_dim")
     kernel_assert(d == P_MAX, "head_dim must equal P_MAX")
@@ -51,8 +34,7 @@ def norm_gate_row(o_row, z_row, gamma_sb, eps, d):
     # 3D head-major views of the [1, W] rows: [partition=1, head, j].
     o_3d = o_row.ap(pattern=[[W, 1], [d, Hv], [1, d]], offset=0)
 
-    # Sum of squares per head over the innermost d. activation_reduce reduces the WHOLE free dim, so
-    # the per-head reduce is a separate tensor_reduce over axis=(2,) of the 3D [1, Hv, d] view.
+    # Per-head sum-of-squares: free-axis reduce over the innermost d (activation_reduce can't do sub-block reduces).
     sq = nl.ndarray((1, Hv, d), dtype=nl.float32, buffer=nl.sbuf)
     nisa.activation(dst=sq, op=nl.square, data=o_3d, bias=None, scale=1.0)
     sumsq = nl.ndarray((1, Hv, 1), dtype=nl.float32, buffer=nl.sbuf)
@@ -80,15 +62,7 @@ def norm_gate_row(o_row, z_row, gamma_sb, eps, d):
 
 @nki.jit
 def deltanet_gated_rmsnorm(attn_raw, gamma, z, eps):
-    """Standalone gated per-head RMSNorm harness (HBM in/out) for unit testing.
-
-    attn_raw (T, W) f32   -- raw head-major recurrence output (W = Hv*d)
-    gamma    (d,)   f32   -- per-head norm weight, shared across heads
-    z        (T, W) f32   -- in_proj_z gate, same head-major layout
-    eps      python float
-
-    Returns out (T, W) f32 -- per-head RMSNorm(attn_raw) * silu(z). Value-head sharded; launch [n].
-    """
+    """Standalone HBM harness for testing: attn_raw/z (T,W) head-major, gamma (d,) -> (T,W) = RMSNorm(attn_raw)*silu(z). Launch [n]."""
     T, W_full = attn_raw.shape
     d = gamma.shape[0]
     Hv_full = W_full // d

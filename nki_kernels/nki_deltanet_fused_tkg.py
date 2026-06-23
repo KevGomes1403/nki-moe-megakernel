@@ -31,6 +31,11 @@ Entrypoints (head_dim d=128), launched ``[2]``:
   deltanet_fused_tkg_fwd_state  -> (attn_out, candidate_states [T,Hv,128,128],
                                     conv_cand [T,conv_dim,K-1])             speculative verify (T>=2)
 
+The ``deltanet_attention_layer`` / ``deltanet_attention_layer_state`` entrypoints run the whole layer
+(input RMSNorm + in_proj + conv + recurrence + gated norm + output projection) in one launch and return
+the per-rank projected output ``o_out [T, hidden]`` plus the unchanged recurrent-state / conv-state
+outputs (the projection only touches the attention output).
+
 Inputs (qkv f32, as today):
     qkv        (T, conv_dim)    raw in_proj_qkv output, token-major: cat(q,k,v) on free axis
     conv_state (conv_dim, K-1)  carried conv window
@@ -55,13 +60,32 @@ from models.qwen3_6_moe.nki_kernels.nki_deltanet_conv_tkg import (
     P_MAX,
     conv_qkv_sbuf,
     kernel_assert,
+    qkv_to_channel_partition,
 )
+from models.qwen3_6_moe.nki_kernels.nki_deltanet_in_proj import in_proj_compose
+from models.qwen3_6_moe.nki_kernels.nki_deltanet_out_proj import out_proj_compose
 from models.qwen3_6_moe.nki_kernels.nki_deltanet_tkg import gated_delta_rule_tkg
 
 
-def fused_compose(qkv, conv_state, conv_weight, key_dim, a, b, A_log, dt_bias, init_state,
-                  attn_out, state_hbm, conv_cand, write_candidates, cand_is_3d,
-                  z=None, gamma=None, eps=None):
+def fused_compose(
+    qkv,
+    conv_state,
+    conv_weight,
+    key_dim,
+    a,
+    b,
+    A_log,
+    dt_bias,
+    init_state,
+    attn_out,
+    state_hbm,
+    conv_cand,
+    write_candidates,
+    cand_is_3d,
+    z=None,
+    gamma=None,
+    eps=None,
+):
     """Compose the per-core conv -> recurrence pipeline (shared by both entrypoints).
 
     Derives the value-head shard once (the conv and recurrence both fold ``program_id``/``num_programs``
@@ -82,17 +106,43 @@ def fused_compose(qkv, conv_state, conv_weight, key_dim, a, b, A_log, dt_bias, i
         qkv, conv_state, conv_weight, key_dim, conv_cand, cand_is_3d
     )
     gated_delta_rule_tkg(
-        None, None, None, a, b, A_log, dt_bias, init_state,
-        attn_out, state_hbm, write_candidates,
-        q_sbuf=q_sbuf, k_sbuf=k_sbuf, v_sbuf=v_sbuf, Hk_full=Hk_full, Hv_full=Hv_full,
-        z=z, gamma=gamma, eps=eps,
+        None,
+        None,
+        None,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        init_state,
+        attn_out,
+        state_hbm,
+        write_candidates,
+        q_sbuf=q_sbuf,
+        k_sbuf=k_sbuf,
+        v_sbuf=v_sbuf,
+        Hk_full=Hk_full,
+        Hv_full=Hv_full,
+        z=z,
+        gamma=gamma,
+        eps=eps,
     )
 
 
 @nki.jit
-def deltanet_fused_tkg_fwd(qkv, conv_state, conv_weight, key_dim,
-                           a, b, A_log, dt_bias, init_state,
-                           z=None, gamma=None, eps=1e-6):
+def deltanet_fused_tkg_fwd(
+    qkv,
+    conv_state,
+    conv_weight,
+    key_dim,
+    a,
+    b,
+    A_log,
+    dt_bias,
+    init_state,
+    z=None,
+    gamma=None,
+    eps=1e-6,
+):
     """Decode / commit (T=1): fused conv + recurrence in one launch.
 
     Returns:
@@ -107,20 +157,49 @@ def deltanet_fused_tkg_fwd(qkv, conv_state, conv_weight, key_dim,
     Hv_full = (conv_dim - 2 * key_dim) // P_MAX
     W_full = Hv_full * P_MAX
     attn_out = nl.ndarray((T, W_full), dtype=nl.float32, buffer=nl.shared_hbm)
-    final_state = nl.ndarray((Hv_full, P_MAX, P_MAX), dtype=nl.float32, buffer=nl.shared_hbm)
-    new_conv_state = nl.ndarray((conv_dim, state_w), dtype=qkv.dtype, buffer=nl.shared_hbm)
+    final_state = nl.ndarray(
+        (Hv_full, P_MAX, P_MAX), dtype=nl.float32, buffer=nl.shared_hbm
+    )
+    new_conv_state = nl.ndarray(
+        (conv_dim, state_w), dtype=qkv.dtype, buffer=nl.shared_hbm
+    )
     fused_compose(
-        qkv, conv_state, conv_weight, key_dim, a, b, A_log, dt_bias, init_state,
-        attn_out, final_state, new_conv_state, write_candidates=False, cand_is_3d=False,
-        z=z, gamma=gamma, eps=eps,
+        qkv,
+        conv_state,
+        conv_weight,
+        key_dim,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        init_state,
+        attn_out,
+        final_state,
+        new_conv_state,
+        write_candidates=False,
+        cand_is_3d=False,
+        z=z,
+        gamma=gamma,
+        eps=eps,
     )
     return attn_out, final_state, new_conv_state
 
 
 @nki.jit
-def deltanet_fused_tkg_fwd_state(qkv, conv_state, conv_weight, key_dim,
-                                 a, b, A_log, dt_bias, init_state,
-                                 z=None, gamma=None, eps=1e-6):
+def deltanet_fused_tkg_fwd_state(
+    qkv,
+    conv_state,
+    conv_weight,
+    key_dim,
+    a,
+    b,
+    A_log,
+    dt_bias,
+    init_state,
+    z=None,
+    gamma=None,
+    eps=1e-6,
+):
     """Speculative verify (T>=2): fused conv + recurrence in one launch.
 
     ``candidate_states[t]`` / ``conv_cand[t]`` are the recurrent / conv state after consuming block
@@ -139,10 +218,405 @@ def deltanet_fused_tkg_fwd_state(qkv, conv_state, conv_weight, key_dim,
     candidate_states = nl.ndarray(
         (T, Hv_full, P_MAX, P_MAX), dtype=nl.float32, buffer=nl.shared_hbm
     )
-    conv_cand = nl.ndarray((T, conv_dim, state_w), dtype=qkv.dtype, buffer=nl.shared_hbm)
+    conv_cand = nl.ndarray(
+        (T, conv_dim, state_w), dtype=qkv.dtype, buffer=nl.shared_hbm
+    )
     fused_compose(
-        qkv, conv_state, conv_weight, key_dim, a, b, A_log, dt_bias, init_state,
-        attn_out, candidate_states, conv_cand, write_candidates=True, cand_is_3d=True,
-        z=z, gamma=gamma, eps=eps,
+        qkv,
+        conv_state,
+        conv_weight,
+        key_dim,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        init_state,
+        attn_out,
+        candidate_states,
+        conv_cand,
+        write_candidates=True,
+        cand_is_3d=True,
+        z=z,
+        gamma=gamma,
+        eps=eps,
     )
     return attn_out, candidate_states, conv_cand
+
+
+def in_proj_fused_compose(
+    hidden,
+    proj_w,
+    gamma,
+    eps,
+    conv_state,
+    conv_weight,
+    key_dim,
+    A_log,
+    dt_bias,
+    init_state,
+    attn_out,
+    state_hbm,
+    conv_cand,
+    write_candidates,
+    cand_is_3d,
+    z_gamma,
+    z_eps,
+):
+    """Compose in_proj -> conv -> recurrence with qkv/z/a/b kept in SBUF (no HBM round-trip).
+
+    Stage 0 leaves the full projection proj_sb [T, I] in SBUF (segments at free offsets 0/qkv, conv_dim/z,
+    +value_dim/a, +Hv_full/b). Bridge 1: qkv_to_channel_partition transposes qkv to the conv's
+    channel-on-partition layout, fed via conv_qkv_sbuf(qkv=None). Bridge 2: gated_delta_rule_tkg sources
+    a/b/z from proj_sb (SBUF->SBUF gathers) instead of HBM. in_proj is contraction-sharded while
+    conv+recurrence are value-head-sharded; the full-per-core projection bridges the two.
+    """
+    conv_dim = conv_weight.shape[0]
+    value_dim = conv_dim - 2 * key_dim
+    Hk_full = key_dim // P_MAX
+    Hv_full = value_dim // P_MAX
+    kernel_assert(state_hbm.shape[-3] == Hv_full, "state head count must equal Hv")
+    # Free-axis offsets of the projection segments (qkv | z | a | b, in that order).
+    z_off = conv_dim
+    a_off = conv_dim + value_dim
+    b_off = a_off + Hv_full
+
+    # Stage 0: fused input RMSNorm + 4-projection, kept in SBUF [T, I].
+    proj_sb = in_proj_compose(hidden, proj_w, gamma, eps, output_in_sbuf=True)
+    T = proj_sb.shape[0]
+
+    # Bridge 1: transpose the qkv sub-block to channel-on-partition, then run the conv off SBUF.
+    qkv_cp = qkv_to_channel_partition(proj_sb, conv_dim, T)
+    q_sbuf, k_sbuf, v_sbuf = conv_qkv_sbuf(
+        None,
+        conv_state,
+        conv_weight,
+        key_dim,
+        conv_cand,
+        cand_is_3d,
+        qkv_cp_sbuf=qkv_cp,
+    )
+
+    # Bridge 2: drive the recurrence off the conv SBUF tiles + source a/b/z from proj_sb.
+    gated_delta_rule_tkg(
+        None,
+        None,
+        None,
+        None,
+        None,
+        A_log,
+        dt_bias,
+        init_state,
+        attn_out,
+        state_hbm,
+        write_candidates,
+        q_sbuf=q_sbuf,
+        k_sbuf=k_sbuf,
+        v_sbuf=v_sbuf,
+        Hk_full=Hk_full,
+        Hv_full=Hv_full,
+        z=None,
+        gamma=z_gamma,
+        eps=z_eps,
+        proj_sb=proj_sb,
+        a_off=a_off,
+        b_off=b_off,
+        z_off=z_off,
+    )
+
+
+@nki.jit
+def deltanet_in_proj_fused_tkg_fwd(
+    hidden,
+    proj_w,
+    gamma,
+    eps,
+    conv_state,
+    conv_weight,
+    key_dim,
+    A_log,
+    dt_bias,
+    init_state,
+    z_gamma,
+    z_eps=1e-6,
+):
+    """Decode/commit (T=1): in_proj + conv + recurrence + gated norm in one SBUF-resident launch.
+
+    gamma/eps = input RMSNorm; z_gamma/z_eps = gated per-head RMSNorm. Returns (attn_out [T,Hv*128] gated,
+    final_state [Hv,128,128], new_conv_state [conv_dim,K-1]). Value-head sharded; launch [2].
+    """
+    conv_dim = conv_weight.shape[0]
+    state_w = conv_weight.shape[1] - 1
+    T = hidden.shape[0] * hidden.shape[1]
+    Hv_full = (conv_dim - 2 * key_dim) // P_MAX
+    W_full = Hv_full * P_MAX
+    attn_out = nl.ndarray((T, W_full), dtype=nl.float32, buffer=nl.shared_hbm)
+    final_state = nl.ndarray(
+        (Hv_full, P_MAX, P_MAX), dtype=nl.float32, buffer=nl.shared_hbm
+    )
+    new_conv_state = nl.ndarray(
+        (conv_dim, state_w), dtype=conv_weight.dtype, buffer=nl.shared_hbm
+    )
+    in_proj_fused_compose(
+        hidden,
+        proj_w,
+        gamma,
+        eps,
+        conv_state,
+        conv_weight,
+        key_dim,
+        A_log,
+        dt_bias,
+        init_state,
+        attn_out,
+        final_state,
+        new_conv_state,
+        write_candidates=False,
+        cand_is_3d=False,
+        z_gamma=z_gamma,
+        z_eps=z_eps,
+    )
+    return attn_out, final_state, new_conv_state
+
+
+@nki.jit
+def deltanet_in_proj_fused_tkg_fwd_state(
+    hidden,
+    proj_w,
+    gamma,
+    eps,
+    conv_state,
+    conv_weight,
+    key_dim,
+    A_log,
+    dt_bias,
+    init_state,
+    z_gamma,
+    z_eps=1e-6,
+):
+    """Speculative verify (T>=2): like the decode path but emits per-token candidate states.
+
+    Returns (attn_out [T,Hv*128] gated, candidate_states [T,Hv,128,128] after each token,
+    conv_cand [T,conv_dim,K-1]); on reject the host selects [accept_count-1]. Value-head sharded; launch [2].
+    """
+    conv_dim = conv_weight.shape[0]
+    state_w = conv_weight.shape[1] - 1
+    T = hidden.shape[0] * hidden.shape[1]
+    Hv_full = (conv_dim - 2 * key_dim) // P_MAX
+    W_full = Hv_full * P_MAX
+    attn_out = nl.ndarray((T, W_full), dtype=nl.float32, buffer=nl.shared_hbm)
+    candidate_states = nl.ndarray(
+        (T, Hv_full, P_MAX, P_MAX), dtype=nl.float32, buffer=nl.shared_hbm
+    )
+    conv_cand = nl.ndarray(
+        (T, conv_dim, state_w), dtype=conv_weight.dtype, buffer=nl.shared_hbm
+    )
+    in_proj_fused_compose(
+        hidden,
+        proj_w,
+        gamma,
+        eps,
+        conv_state,
+        conv_weight,
+        key_dim,
+        A_log,
+        dt_bias,
+        init_state,
+        attn_out,
+        candidate_states,
+        conv_cand,
+        write_candidates=True,
+        cand_is_3d=True,
+        z_gamma=z_gamma,
+        z_eps=z_eps,
+    )
+    return attn_out, candidate_states, conv_cand
+
+
+def out_proj_from_recurrence(attn_sb, out_w, T, W_core):
+    """Project this core's SBUF gated output [T, W_core] through out_proj_compose; returns o_out [T, hidden]."""
+    return out_proj_compose(attn_sb[0:T, 0:W_core], out_w)
+
+
+def attention_layer_compose(
+    hidden,
+    proj_w,
+    gamma,
+    eps,
+    conv_state,
+    conv_weight,
+    key_dim,
+    A_log,
+    dt_bias,
+    init_state,
+    out_w,
+    state_hbm,
+    conv_cand,
+    write_candidates,
+    cand_is_3d,
+    z_gamma,
+    z_eps,
+):
+    """Compose in_proj -> conv -> recurrence -> gated norm into SBUF, then project to o_out [T, hidden]."""
+    conv_dim = conv_weight.shape[0]
+    value_dim = conv_dim - 2 * key_dim
+    Hk_full = key_dim // P_MAX
+    Hv_full = value_dim // P_MAX
+    kernel_assert(state_hbm.shape[-3] == Hv_full, "state head count must equal Hv")
+    z_off = conv_dim
+    a_off = conv_dim + value_dim
+    b_off = a_off + Hv_full
+
+    n = nl.num_programs(0)
+    Hv_core = Hv_full // n
+    W_core = Hv_core * P_MAX
+    W_full = Hv_full * P_MAX
+
+    proj_sb = in_proj_compose(hidden, proj_w, gamma, eps, output_in_sbuf=True)
+    T = proj_sb.shape[0]
+
+    attn_shape = nl.ndarray((T, W_full), dtype=nl.float32, buffer=nl.sbuf)
+    attn_sb = nl.ndarray((T, W_core), dtype=out_w.dtype, buffer=nl.sbuf)
+
+    qkv_cp = qkv_to_channel_partition(proj_sb, conv_dim, T)
+    q_sbuf, k_sbuf, v_sbuf = conv_qkv_sbuf(
+        None,
+        conv_state,
+        conv_weight,
+        key_dim,
+        conv_cand,
+        cand_is_3d,
+        qkv_cp_sbuf=qkv_cp,
+    )
+    gated_delta_rule_tkg(
+        None,
+        None,
+        None,
+        None,
+        None,
+        A_log,
+        dt_bias,
+        init_state,
+        attn_shape,
+        state_hbm,
+        write_candidates,
+        q_sbuf=q_sbuf,
+        k_sbuf=k_sbuf,
+        v_sbuf=v_sbuf,
+        Hk_full=Hk_full,
+        Hv_full=Hv_full,
+        z=None,
+        gamma=z_gamma,
+        eps=z_eps,
+        proj_sb=proj_sb,
+        a_off=a_off,
+        b_off=b_off,
+        z_off=z_off,
+        attn_sb_out=attn_sb,
+    )
+    return out_proj_from_recurrence(attn_sb, out_w, T, W_core)
+
+
+@nki.jit
+def deltanet_attention_layer(
+    hidden,
+    proj_w,
+    gamma,
+    eps,
+    conv_state,
+    conv_weight,
+    key_dim,
+    A_log,
+    dt_bias,
+    init_state,
+    z_gamma,
+    out_w,
+    z_eps=1e-6,
+):
+    """Decode/commit (T=1): in_proj + conv + recurrence + gated norm + output projection in one launch.
+
+    gamma/eps = input RMSNorm; z_gamma/z_eps = gated per-head RMSNorm; out_w = [value_dim, hidden]
+    o_proj weight transpose. Returns (o_out [T, hidden] per-rank partial, final_state [Hv,128,128],
+    new_conv_state [conv_dim,K-1]). Value-head sharded; launch [2].
+    """
+    conv_dim = conv_weight.shape[0]
+    state_w = conv_weight.shape[1] - 1
+    Hv_full = (conv_dim - 2 * key_dim) // P_MAX
+    final_state = nl.ndarray(
+        (Hv_full, P_MAX, P_MAX), dtype=nl.float32, buffer=nl.shared_hbm
+    )
+    new_conv_state = nl.ndarray(
+        (conv_dim, state_w), dtype=conv_weight.dtype, buffer=nl.shared_hbm
+    )
+    o_out = attention_layer_compose(
+        hidden,
+        proj_w,
+        gamma,
+        eps,
+        conv_state,
+        conv_weight,
+        key_dim,
+        A_log,
+        dt_bias,
+        init_state,
+        out_w,
+        final_state,
+        new_conv_state,
+        write_candidates=False,
+        cand_is_3d=False,
+        z_gamma=z_gamma,
+        z_eps=z_eps,
+    )
+    return o_out, final_state, new_conv_state
+
+
+@nki.jit
+def deltanet_attention_layer_state(
+    hidden,
+    proj_w,
+    gamma,
+    eps,
+    conv_state,
+    conv_weight,
+    key_dim,
+    A_log,
+    dt_bias,
+    init_state,
+    z_gamma,
+    out_w,
+    z_eps=1e-6,
+):
+    """Speculative verify (T>=2): like the decode path but emits per-token candidate states.
+
+    Returns (o_out [T, hidden] per-rank partial, candidate_states [T,Hv,128,128], conv_cand
+    [T,conv_dim,K-1]); the state outputs are unchanged. Value-head sharded; launch [2].
+    """
+    conv_dim = conv_weight.shape[0]
+    state_w = conv_weight.shape[1] - 1
+    T = hidden.shape[0] * hidden.shape[1]
+    Hv_full = (conv_dim - 2 * key_dim) // P_MAX
+    candidate_states = nl.ndarray(
+        (T, Hv_full, P_MAX, P_MAX), dtype=nl.float32, buffer=nl.shared_hbm
+    )
+    conv_cand = nl.ndarray(
+        (T, conv_dim, state_w), dtype=conv_weight.dtype, buffer=nl.shared_hbm
+    )
+    o_out = attention_layer_compose(
+        hidden,
+        proj_w,
+        gamma,
+        eps,
+        conv_state,
+        conv_weight,
+        key_dim,
+        A_log,
+        dt_bias,
+        init_state,
+        out_w,
+        candidate_states,
+        conv_cand,
+        write_candidates=True,
+        cand_is_3d=True,
+        z_gamma=z_gamma,
+        z_eps=z_eps,
+    )
+    return o_out, candidate_states, conv_cand

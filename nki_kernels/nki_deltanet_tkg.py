@@ -86,7 +86,9 @@ def div_ceil(n, d):
 
 def kernel_assert(condition, error_text):
     """Assert with an NKI-formatted error message (identifies kernel-origin failures)."""
-    assert condition, f"[INTERNAL_ERROR] [NCC_INKI016] Kernel validation exception: {error_text}"
+    assert condition, (
+        f"[INTERNAL_ERROR] [NCC_INKI016] Kernel validation exception: {error_text}"
+    )
 
 
 def partition_broadcast_psum(row_1W, width, ones_row, psum):
@@ -106,7 +108,9 @@ def partition_broadcast_psum(row_1W, width, ones_row, psum):
         )
 
 
-def mul_then_reduce_tiled(Sp, mat_t, t, T, Hk, Hv, rep, dim, W, mul_buf, ones_col, red_p):
+def mul_then_reduce_tiled(
+    Sp, mat_t, t, T, Hk, Hv, rep, dim, W, mul_buf, ones_col, red_p
+):
     """Partition-reduce of ``Sp * free_broadcast(GQA-mapped mat)``, pipelined over 512-wide tiles.
 
     Computes ``red_p[0, h*dim+j] = sum_i Sp[i, h*dim+j] * mat_t[i, (h//rep)*T + t]`` (read uses
@@ -120,7 +124,9 @@ def mul_then_reduce_tiled(Sp, mat_t, t, T, Hk, Hv, rep, dim, W, mul_buf, ones_co
         c0 = c * _PSUM_FMAX
         tile_w = min(_PSUM_FMAX, W - c0)
         vh0 = c0 // dim  # first value-head in this tile
-        nvh = tile_w // dim  # value-heads in this tile (multiple of rep when rep>1 and tile>=rep*dim)
+        nvh = (
+            tile_w // dim
+        )  # value-heads in this tile (multiple of rep when rep>1 and tile>=rep*dim)
         kh0 = vh0 // rep  # first k-head in this tile
         ngrp = nvh // rep  # k-head groups in this tile
         # mat_view[i, ((g*rep + r)*dim) + j] = mat_t[i, (kh0+g)*T + t]: groups stride T, the rep
@@ -168,17 +174,22 @@ def _load_normed_qk(src, heads, T, dim, scale, src_off, x_f_in=None):
     dim lands on the 128 partitions the reduce contracts over. Off the per-token critical path.
     The transposed ``x_t`` is sized at the local PS (nc_transpose data-AP partition stride).
 
-    SBUF-input variant: when ``x_f_in`` is given it IS the pre-loaded ``[PS, dim]`` tile
-    (partition = head*T+t, free = dim -- exactly the conv's silu'd q/k sub-block), so the HBM DMA is
-    skipped and the conv tile feeds the recurrence directly. l2norm mutates it in place (the conv
-    tile is not reused), so ``src``/``src_off`` are ignored in that case.
+    SBUF-input variant: when ``x_f_in`` is given it is the pre-loaded ``[PS, dim]`` conv q/k tile
+    (partition = head*T+t, free = dim -- exactly the conv's silu'd q/k sub-block); it is upcast-copied
+    into the fp32 working buffer in place of the HBM DMA, so ``src``/``src_off`` are ignored. The
+    fp32 buffer is required because gen3 nc_transpose needs dst dtype == input dtype and the recurrence
+    matmuls consume fp32 q/k (the conv tile is bf16); the conv tile itself is left unmutated.
     """
     PS = heads * T
+    x_f = nl.ndarray((PS, dim), dtype=nl.float32, buffer=nl.sbuf)
     if x_f_in != None:
-        x_f = x_f_in
+        nisa.tensor_copy(
+            dst=x_f, src=x_f_in
+        )  # upcast the bf16 conv tile into the fp32 buffer
     else:
-        x_f = nl.ndarray((PS, dim), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.dma_copy(dst=x_f, src=src.ap(pattern=[[dim, PS], [1, dim]], offset=src_off))
+        nisa.dma_copy(
+            dst=x_f, src=src.ap(pattern=[[dim, PS], [1, dim]], offset=src_off)
+        )
     # l2norm over d (free axis): sum of squares -> rsqrt -> scale rows.
     sq = nl.ndarray((PS, dim), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_tensor(dst=sq, data1=x_f, data2=x_f, op=nl.multiply)
@@ -197,10 +208,30 @@ def _load_normed_qk(src, heads, T, dim, scale, src_off, x_f_in=None):
 
 
 def gated_delta_rule_tkg(
-    q, k, v, a, b, A_log, dt_bias, init_state,
-    attn_out, state_hbm, write_candidates,
-    q_sbuf=None, k_sbuf=None, v_sbuf=None, Hk_full=None, Hv_full=None,
-    z=None, gamma=None, eps=None,
+    q,
+    k,
+    v,
+    a,
+    b,
+    A_log,
+    dt_bias,
+    init_state,
+    attn_out,
+    state_hbm,
+    write_candidates,
+    q_sbuf=None,
+    k_sbuf=None,
+    v_sbuf=None,
+    Hk_full=None,
+    Hv_full=None,
+    z=None,
+    gamma=None,
+    eps=None,
+    proj_sb=None,
+    a_off=None,
+    b_off=None,
+    z_off=None,
+    attn_sb_out=None,
 ):
     """Value-head-sharded gated delta-rule recurrence with the input glue folded in.
 
@@ -228,15 +259,29 @@ def gated_delta_rule_tkg(
     and ``gamma`` is the replicated [dim] norm weight (loaded once per core). With these None the raw
     recurrence output is written exactly as before -- the norm seam is opt-in and leaves the state /
     candidate outputs untouched.
+
+    in_proj-SBUF gating (Bridge 2, no HBM round-trip): when ``proj_sb`` (the full in_proj output
+    [T, I] in SBUF, token on partition, channel on free) is given, a/b/z are sourced from it instead of
+    from the HBM ``a``/``b``/``z`` tensors. ``a_off``/``b_off``/``z_off`` are the free-axis offsets of
+    the a/b/z segments in the projection (a/b are [T, Hv_full] head-on-free, z is [T, W_full]
+    head-major). a/b are gathered to the LOCAL (1, T*Hv) gating rows and z per token to (1, W) with
+    cross-partition SBUF->SBUF DMAs (proj token t lives on partition t). With ``proj_sb`` None the
+    gating loads from HBM exactly as before.
+
+    SBUF output collection (o_proj fusion): when ``attn_sb_out`` (a [T, W] SBUF tile) is given, each
+    token's gated output row is copied into ``attn_sb_out[t]`` and the ``attn_out`` HBM write is
+    skipped, leaving the gated tensor SBUF-resident for the output projection.
     """
     from_sbuf = q_sbuf != None
+    gate_from_proj = proj_sb != None
+    collect_sbuf = attn_sb_out != None
     if from_sbuf:
         T = attn_out.shape[0]
         dim = attn_out.shape[1] // Hv_full
     else:
         Hk_full, T, dim = q.shape
         Hv_full = v.shape[0]
-    inv_sqrt_d = 1.0 / (dim ** 0.5)
+    inv_sqrt_d = 1.0 / (dim**0.5)
 
     # Value-head SPMD shard: this core owns 1/n of the heads. nl.num_programs/program_id fold to
     # trace-time ints, so all of the shard math (LOCAL counts, FULL strides, per-core offsets) runs
@@ -250,7 +295,9 @@ def gated_delta_rule_tkg(
     Hv = Hv_full // n
     rep = Hv // Hk
     W = Hv * dim
-    kernel_assert(Hv % rep == 0, "whole GQA groups per core (Hv_loc must be a multiple of rep)")
+    kernel_assert(
+        Hv % rep == 0, "whole GQA groups per core (Hv_loc must be a multiple of rep)"
+    )
     # FULL strides (for indexing the full input/output HBM tensors).
     W_full = Hv_full * dim
     # Per-core offsets: q/k head offset, v head offset, attn_out column offset.
@@ -286,18 +333,29 @@ def gated_delta_rule_tkg(
     # stays on partition 0 for the partition-broadcast matmuls. dt_bias/A_log (per head, constant
     # over t) are a free-axis stride-0 broadcast over t.
     TH = T * Hv
-    # a/b are the full [T, Hv_full] token-major tables; load this core's per-head column slice
-    # (token stride Hv_full, count Hv, offset vh_off) into the LOCAL packed (1, T*Hv) row.
+    # Pack this core's per-head a/b slice into the LOCAL (1, T*Hv) row: from the HBM token-major tables,
+    # or (in_proj fusion) gathered per-token from proj_sb onto partition 0 (same SBUF->SBUF gather as the v-bridge).
     a_sb = nl.ndarray((1, TH), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.dma_copy(
-        dst=a_sb.ap(pattern=[[TH, 1], [Hv, T], [1, Hv]], offset=0),
-        src=a.ap(pattern=[[1, 1], [Hv_full, T], [1, Hv]], offset=vh_off),
-    )
     b_sb = nl.ndarray((1, TH), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.dma_copy(
-        dst=b_sb.ap(pattern=[[TH, 1], [Hv, T], [1, Hv]], offset=0),
-        src=b.ap(pattern=[[1, 1], [Hv_full, T], [1, Hv]], offset=vh_off),
-    )
+    if gate_from_proj:
+        for t in range(T):
+            nisa.dma_copy(
+                dst=a_sb[0:1, t * Hv : (t + 1) * Hv],
+                src=proj_sb[t : t + 1, a_off + vh_off : a_off + vh_off + Hv],
+            )
+            nisa.dma_copy(
+                dst=b_sb[0:1, t * Hv : (t + 1) * Hv],
+                src=proj_sb[t : t + 1, b_off + vh_off : b_off + vh_off + Hv],
+            )
+    else:
+        nisa.dma_copy(
+            dst=a_sb.ap(pattern=[[TH, 1], [Hv, T], [1, Hv]], offset=0),
+            src=a.ap(pattern=[[1, 1], [Hv_full, T], [1, Hv]], offset=vh_off),
+        )
+        nisa.dma_copy(
+            dst=b_sb.ap(pattern=[[TH, 1], [Hv, T], [1, Hv]], offset=0),
+            src=b.ap(pattern=[[1, 1], [Hv_full, T], [1, Hv]], offset=vh_off),
+        )
     # dt_bias / exp(A_log) are full [Hv_full]; take this core's contiguous head slice (offset vh_off,
     # count Hv) as (1, Hv) rows, free-broadcast across t (stride 0 over t, 1 over h).
     dtb = nl.ndarray((1, Hv), dtype=nl.float32, buffer=nl.sbuf)
@@ -346,7 +404,9 @@ def gated_delta_rule_tkg(
     apply_norm = gamma != None
     if apply_norm:
         gamma_sb = nl.ndarray((1, dim), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.dma_copy(dst=gamma_sb, src=gamma.ap(pattern=[[dim, 1], [1, dim]], offset=0))
+        nisa.dma_copy(
+            dst=gamma_sb, src=gamma.ap(pattern=[[dim, 1], [1, dim]], offset=0)
+        )
 
     # Reusable per-token PSUM tiles (matmul outputs; alloc once).
     eg_p = nl.ndarray((P_MAX, Hv), dtype=nl.float32, buffer=nl.psum)
@@ -366,7 +426,7 @@ def gated_delta_rule_tkg(
         src=init_state.ap(
             pattern=[[dim, P_MAX], [dim * dim, Hv], [1, dim]], offset=vh_off * dim * dim
         ),
-    )
+    )  # 512 B DMA
 
     for t in nl.static_range(T):
         # Ping-pong (t % 2 is compile-time): src = previous final state, Sp = this token's working
@@ -376,9 +436,7 @@ def gated_delta_rule_tkg(
 
         # Per-token GQA key view from the transposed Hk-head tile, value-head-expanded:
         # k_mat[i, h] = k_t[i, (h//rep)*T + t]  (h in [0,Hv)). For the beta-fold only.
-        k_mat = k_t.ap(
-            pattern=[[Hk * T, P_MAX], [T, Hk], [0, rep]], offset=t
-        )
+        k_mat = k_t.ap(pattern=[[Hk * T, P_MAX], [T, Hk], [0, rep]], offset=t)
         # v_row [1, W]: [0, h*dim+j] <- value[h, t, j]  (this core's Hv heads, v on the free axis:
         # kv/delta index j). HBM path loads from the full [Hv_full,T,dim] tensor (offset by vh_off).
         # SBUF path gathers from the conv v tile (already this core's local heads, partition =
@@ -393,12 +451,13 @@ def gated_delta_rule_tkg(
                 nisa.dma_copy(
                     dst=v_row[0:1, h * dim : (h + 1) * dim],
                     src=v_sbuf[h * T + t : h * T + t + 1, 0:dim],
-                ) # 4 B DMA packets
+                )  # 4 B DMA packets
         else:
             nisa.dma_copy(
                 dst=v_row.ap(pattern=[[W, 1], [dim, Hv], [1, dim]], offset=0),
                 src=v.ap(
-                    pattern=[[W, 1], [T * dim, Hv], [1, dim]], offset=vh_off * T * dim + t * dim
+                    pattern=[[W, 1], [T * dim, Hv], [1, dim]],
+                    offset=vh_off * T * dim + t * dim,
                 ),
             )
         # Per-token slices of the precomputed gating tables (partition 0, free cols t*Hv:(t+1)*Hv).
@@ -441,31 +500,49 @@ def gated_delta_rule_tkg(
             dst=O_row[0:1, 0:W], src=red_p[0:1, 0:W], engine=nisa.scalar_engine
         )
 
-        # Optional gated per-head RMSNorm of the raw row: norm over dim * silu(z), Layout A (free-axis
-        # reduce, no transpose). z is sliced by the same col_off the output write uses.
+        # Optional gated per-head RMSNorm of the raw row (norm over dim * silu(z)); z comes from HBM or,
+        # under in_proj fusion, from proj_sb's z slice (gathered onto partition 0, no HBM round-trip).
         if apply_norm:
             z_row = nl.ndarray((1, W), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.dma_copy(
-                dst=z_row[0:1, 0:W],
-                src=z.ap(pattern=[[W_full, 1], [1, W]], offset=t * W_full + col_off),
-            )
+            if gate_from_proj:
+                nisa.dma_copy(
+                    dst=z_row[0:1, 0:W],
+                    src=proj_sb[t : t + 1, z_off + col_off : z_off + col_off + W],
+                )
+            else:
+                nisa.dma_copy(
+                    dst=z_row[0:1, 0:W],
+                    src=z.ap(
+                        pattern=[[W_full, 1], [1, W]], offset=t * W_full + col_off
+                    ),
+                )
             out_row = norm_gate_row(O_row, z_row, gamma_sb, eps, dim)
         else:
             out_row = O_row
 
-        # Write this core's columns of the full-shape attn_out [T, W_full] head-major:
-        # attn_out[t, col_off + h*dim+j] = out_row[0, h*dim+j] (gated when apply_norm, raw otherwise).
-        nisa.dma_copy(
-            dst=attn_out.ap(pattern=[[W_full, 1], [1, W]], offset=t * W_full + col_off),
-            src=out_row[0:1, 0:W],
-        )
+        if collect_sbuf:
+            # Keep the gated row SBUF-resident for the output projection (DMA places it on partition t).
+            nisa.dma_copy(dst=attn_sb_out[t : t + 1, 0:W], src=out_row[0:1, 0:W])
+        else:
+            # Write this core's head-major columns of the full-shape attn_out [T, W_full].
+            nisa.dma_copy(
+                dst=attn_out.ap(
+                    pattern=[[W_full, 1], [1, W]], offset=t * W_full + col_off
+                ),
+                src=out_row[0:1, 0:W],
+            )
 
         # Candidate state after token t (speculation): candidate_states[t, vh_off+h, i, j] <- Sp.
         # Full per-token block stride is Hv_full*dim*dim; this core's heads start at vh_off.
         if write_candidates:
             _write_state(
-                state_hbm, Sp, Hv, dim, W,
-                base_off=t * Hv_full * dim * dim + vh_off * dim * dim, head_stride=dim * dim,
+                state_hbm,
+                Sp,
+                Hv,
+                dim,
+                W,
+                base_off=t * Hv_full * dim * dim + vh_off * dim * dim,
+                head_stride=dim * dim,
             )
 
     if not write_candidates:
@@ -473,8 +550,13 @@ def gated_delta_rule_tkg(
         # Iteration t=T-1 wrote bufs[T % 2].
         final_buf = bufs[T % 2]
         _write_state(
-            state_hbm, final_buf, Hv, dim, W,
-            base_off=vh_off * dim * dim, head_stride=dim * dim,
+            state_hbm,
+            final_buf,
+            Hv,
+            dim,
+            W,
+            base_off=vh_off * dim * dim,
+            head_stride=dim * dim,
         )
 
 
@@ -493,10 +575,21 @@ def deltanet_tkg_fwd(q, k, v, a, b, A_log, dt_bias, init_state):
     Hv_full = v.shape[0]
     W_full = Hv_full * dim
     attn_out = nl.ndarray((T, W_full), dtype=nl.float32, buffer=nl.shared_hbm)
-    final_state = nl.ndarray((Hv_full, dim, dim), dtype=nl.float32, buffer=nl.shared_hbm)
+    final_state = nl.ndarray(
+        (Hv_full, dim, dim), dtype=nl.float32, buffer=nl.shared_hbm
+    )
     gated_delta_rule_tkg(
-        q, k, v, a, b, A_log, dt_bias, init_state,
-        attn_out, final_state, write_candidates=False,
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        init_state,
+        attn_out,
+        final_state,
+        write_candidates=False,
     )
     return attn_out, final_state
 
@@ -522,7 +615,16 @@ def deltanet_tkg_fwd_state(q, k, v, a, b, A_log, dt_bias, init_state):
         (T, Hv_full, dim, dim), dtype=nl.float32, buffer=nl.shared_hbm
     )
     gated_delta_rule_tkg(
-        q, k, v, a, b, A_log, dt_bias, init_state,
-        attn_out, candidate_states, write_candidates=True,
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        init_state,
+        attn_out,
+        candidate_states,
+        write_candidates=True,
     )
     return attn_out, candidate_states

@@ -82,6 +82,7 @@ from .nki_kernels.nki_deltanet_fused import (
 from .nki_kernels.nki_deltanet_fused_tkg import (
     deltanet_fused_tkg_fwd as deltanet_fused_kernel,
     deltanet_fused_tkg_fwd_state as deltanet_fused_kernel_state,
+    deltanet_attention_layer_state,
 )
 
 from neuronx_distributed_inference.models.config import (
@@ -101,7 +102,9 @@ from neuronx_distributed_inference.modules.attention.attention_base import (
     NeuronAttentionBase,
 )
 from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
-from neuronx_distributed_inference.modules.kvcache.kv_cache_manager import KVCacheManager
+from neuronx_distributed_inference.modules.kvcache.kv_cache_manager import (
+    KVCacheManager,
+)
 from neuronx_distributed_inference.models.layer_boundary_marker import (
     ModuleMarkerEndWrapper,
     ModuleMarkerStartWrapper,
@@ -245,6 +248,7 @@ def l2norm(x, dim=-1, eps=1e-6):
 # Gated DeltaNet Module (Linear Recurrent Attention)
 # ============================================================
 
+
 class NeuronGatedDeltaNet(nn.Module):
     """Gated DeltaNet linear-recurrent attention.
 
@@ -296,9 +300,7 @@ class NeuronGatedDeltaNet(nn.Module):
         self.use_qwen_hybrid_chunked_prefill_nki = getattr(
             tc, "use_qwen_hybrid_chunked_prefill_nki", False
         )
-        self.use_tkg_attention_kernel = getattr(
-            tc, "use_tkg_attention_kernel", False
-        )
+        self.use_tkg_attention_kernel = getattr(tc, "use_tkg_attention_kernel", False)
 
         # KV cache dummy shape info
         self.head_dim = tc.head_dim  # 256
@@ -323,33 +325,16 @@ class NeuronGatedDeltaNet(nn.Module):
             gather_output=False,
         )
 
-        # Input/output projections are the large DeltaNet tensors.  Shard them
-        # with tensor parallelism; convert_qwen36_a3b_hf_to_neuron_state_dict()
-        # reorders in_proj_qkv into per-rank [Q_local | K_local | V_local]
-        # blocks before NxD slices the output dimension.
-        self.in_proj_qkv = ColumnParallelLinear(
+        # The four input projections (qkv|z|a|b) are fused into one weight stored
+        # contraction-first ([hidden, I]) so the TKG kernel needs no runtime
+        # cat/transpose. A RowParallelLinear container shards the output axis I
+        # (dim 1); convert_qwen36_a3b_hf_to_neuron_state_dict() builds the global
+        # weight with per-rank column order [qkv_r | z_r | a_r | b_r].
+        self.in_proj_fused = RowParallelLinear(
+            self.global_conv_dim + self.global_value_dim + 2 * self.global_num_v_heads,
             self.hidden_size,
-            self.global_key_dim * 2 + self.global_value_dim,
             bias=False,
-            gather_output=False,
-        )
-        self.in_proj_z = ColumnParallelLinear(
-            self.hidden_size,
-            self.global_value_dim,
-            bias=False,
-            gather_output=False,
-        )
-        self.in_proj_b = ColumnParallelLinear(
-            self.hidden_size,
-            self.global_num_v_heads,
-            bias=False,
-            gather_output=False,
-        )
-        self.in_proj_a = ColumnParallelLinear(
-            self.hidden_size,
-            self.global_num_v_heads,
-            bias=False,
-            gather_output=False,
+            input_is_parallel=True,
         )
 
         # Same parameter-container pattern for per-value-head decay vectors.
@@ -370,11 +355,14 @@ class NeuronGatedDeltaNet(nn.Module):
 
         # Output norm and projection
         self.norm = Qwen3MoeRMSNorm(self.head_v_dim, eps=self.rms_norm_eps)
-        self.out_proj = RowParallelLinear(
-            self.global_value_dim,
+        # o_proj weight stored transposed ([value_dim, hidden], sharded on
+        # value_dim) so the TKG kernel needs no runtime .t(); _output_project()
+        # supplies the TP all-reduce that RowParallelLinear would have done.
+        self.out_proj = ColumnParallelLinear(
             self.hidden_size,
+            self.global_value_dim,
             bias=False,
-            input_is_parallel=True,
+            gather_output=False,
         )
 
         # State buffers for CTE -> TKG carry-over
@@ -408,6 +396,27 @@ class NeuronGatedDeltaNet(nn.Module):
 
     def _A_log(self):
         return self.A_log_weight.weight.squeeze(1)
+
+    def _project_inputs(self, hidden_states):
+        """Fused input projection: one [hidden, I] matmul, sliced into qkv/z/a/b.
+        No transpose -- in_proj_fused.weight is stored contraction-first at load."""
+        proj = torch.matmul(hidden_states, self.in_proj_fused.weight)
+        z_end = self.conv_dim + self.value_dim
+        a_end = z_end + self.num_v_heads
+        return (
+            proj[..., : self.conv_dim],
+            proj[..., self.conv_dim : z_end],
+            proj[..., z_end:a_end],
+            proj[..., a_end:],
+        )
+
+    def _output_project(self, x):
+        """o_proj: per-rank (x @ [value_dim, hidden]) then TP all-reduce.
+        out_proj.weight is stored transposed at load, so no runtime .t()."""
+        out = torch.matmul(x, self.out_proj.weight)
+        return mappings.reduce_from_tensor_model_parallel_region(
+            out, process_group=parallel_state.get_tensor_model_parallel_group()
+        )
 
     def _recurrent_step(self, query, key, value, g, beta, recurrent_state):
         """Single-step recurrent update for token generation."""
@@ -445,7 +454,7 @@ class NeuronGatedDeltaNet(nn.Module):
         [B, S, num_v_heads, Kd, Vd], candidate axis = S). bs=1; [2] shards the value-heads across
         both LNC=2 cores.
         """
-        w = self._conv1d_weight().squeeze(1).float()
+        w = self.conv1d_weight.weight.float()
         qkv2d = qkv[0].float()
         seed2d = conv_seed[0].float()
         A_log = self._A_log().float()
@@ -457,7 +466,11 @@ class NeuronGatedDeltaNet(nn.Module):
             attn, final_state, new_conv_state = deltanet_fused_kernel[2](
                 qkv2d, seed2d, w, self.key_dim, a2d, b2d, A_log, dt_bias, init2d
             )
-            return attn.unsqueeze(0), final_state.unsqueeze(0), new_conv_state.unsqueeze(0)
+            return (
+                attn.unsqueeze(0),
+                final_state.unsqueeze(0),
+                new_conv_state.unsqueeze(0),
+            )
         attn, cand_states, conv_cand = deltanet_fused_kernel_state[2](
             qkv2d, seed2d, w, self.key_dim, a2d, b2d, A_log, dt_bias, init2d
         )
@@ -477,9 +490,11 @@ class NeuronGatedDeltaNet(nn.Module):
         z_gate = z.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
         output = output * F.silu(z_gate)
         output = output.reshape(batch_size, seq_len, self.value_dim)
-        return self.out_proj(output)
+        return self._output_project(output)
 
-    def _commit_conv_state(self, new_conv_state, batch_size, seq_ids, hybrid_cache_active):
+    def _commit_conv_state(
+        self, new_conv_state, batch_size, seq_ids, hybrid_cache_active
+    ):
         """Cast the kernel's new conv window to the buffer dtype and wire the input_output_alias
         dependency (mirrors the decode forward commit)."""
         new_conv_state = new_conv_state.to(self.conv_state_buffer.dtype)
@@ -510,9 +525,18 @@ class NeuronGatedDeltaNet(nn.Module):
         return final_state + self.recurrent_state_buffer * 0
 
     def _forward_decode_tkg(
-        self, hidden_states, qkv, z, a, b, seq_ids,
-        conv_state_cache, recurrent_state_cache, hybrid_cache_active,
-        batch_size, seq_len,
+        self,
+        hidden_states,
+        qkv,
+        z,
+        a,
+        b,
+        seq_ids,
+        conv_state_cache,
+        recurrent_state_cache,
+        hybrid_cache_active,
+        batch_size,
+        seq_len,
     ):
         """Single-token decode (T=1) attention through the fused DeltaNet TKG NKI kernel.
 
@@ -547,7 +571,12 @@ class NeuronGatedDeltaNet(nn.Module):
         output = self.attn_output(attn_raw, z, hidden_states.dtype)
 
         if hybrid_cache_active:
-            return output, (new_rec_state, new_conv_state), new_rec_state, new_conv_state
+            return (
+                output,
+                (new_rec_state, new_conv_state),
+                new_rec_state,
+                new_conv_state,
+            )
         # Dummy KV for the KVCacheManager (DeltaNet carries state in the buffers, not KV).
         dummy_k = torch.zeros(
             batch_size,
@@ -619,54 +648,63 @@ class NeuronGatedDeltaNet(nn.Module):
         ]
         return torch.stack(windows, dim=1)
 
-    def verify_block(self, hidden_states, seq_ids):
-        """Verify-mode forward over the 2-token block.
+    def verify_block(self, hidden_states, seq_ids, input_layernorm):
+        """Verify-mode forward over the block, seeded read-only from the committed buffers.
 
-        Seeded read-only from the committed ``recurrent_state_buffer`` /
-        ``conv_state_buffer`` (never writes them), it reproduces ``forward``'s
-        projection / causal-conv / gating over the block and emits a per-position
-        state checkpoint after each token (exact single-step recurrence, not the
-        chunked kernels) so a host loop can select ``S_{accept_count}`` after verify.
-
-        Returns ``(attn_out [B, S, H], S_stack [B, S, num_v_heads, head_k_dim,
-        head_v_dim], conv_cand [B, S, conv_dim, K-1])`` -- the output projection
-        and the per-token candidate recurrent / conv states.
+        ``hidden_states`` is pre-input-norm. Returns ``(output [B, S, H], S_stack [B, S, num_v_heads,
+        head_k_dim, head_v_dim], conv_cand [B, S, conv_dim, K-1])`` -- the all-reduced layer output and
+        the per-token candidate recurrent / conv states.
         """
         batch_size, seq_len, _ = hidden_states.shape
 
-        # Projections (mirrors forward()'s standard path).
-        qkv = self.in_proj_qkv(hidden_states)
-        z = self.in_proj_z(hidden_states)
-        b = self.in_proj_b(hidden_states)
-        a = self.in_proj_a(hidden_states)
-
         if self.use_tkg_attention_kernel:
-            # Kernel path: conv + recurrence + gating folded into one fused NKI launch (q/k/v stay
-            # in SBUF); no host-side transpose / reshape / head replication. Seeded read-only from
-            # the committed buffers.
+            # Whole layer in one launch: input RMSNorm + in_proj + conv + recurrence + gated norm + o_proj.
             conv_seed = torch.index_select(self.conv_state_buffer, 0, seq_ids)
             init_state = torch.index_select(self.recurrent_state_buffer, 0, seq_ids)
-            attn_raw, S_stack, conv_cand = self.fused_attn_nki(
-                qkv, conv_seed, a, b, init_state, decode=False
+            gamma = input_layernorm.weight.reshape(1, self.hidden_size)
+            o_out, S_stack, conv_cand = deltanet_attention_layer_state[2](
+                hidden_states,
+                self.in_proj_fused.weight,
+                gamma,
+                self.rms_norm_eps,
+                conv_seed[0],
+                self.conv1d_weight.weight,
+                self.key_dim,
+                self._A_log(),
+                self._dt_bias(),
+                init_state[0],
+                self.norm.weight,
+                self.out_proj.weight,
+                self.rms_norm_eps,
             )
-            output = self.attn_output(attn_raw, z, hidden_states.dtype)
-            return output, S_stack, conv_cand
+            # o_out is the per-rank output-projection partial; all-reduce across tensor-parallel ranks.
+            output = o_out.unsqueeze(0).to(hidden_states.dtype)
+            output = mappings.reduce_from_tensor_model_parallel_region(
+                output,
+                process_group=parallel_state.get_tensor_model_parallel_group(),
+            )
+            return output, S_stack.unsqueeze(0), conv_cand.unsqueeze(0)
 
-        # PyTorch fallback (reference path): explicit conv + per-token single-step recurrences.
+        # PyTorch fallback (reference path): apply input norm, then explicit conv + per-token recurrences.
+        hidden_states = input_layernorm(hidden_states)
+        qkv, z, a, b = self._project_inputs(hidden_states)
         query = qkv[..., : self.key_dim]
         key = qkv[..., self.key_dim : self.key_dim * 2]
         value = qkv[..., self.key_dim * 2 :]
 
         # Causal conv over the block, seeded from the committed conv window.
-        mixed = torch.cat([query, key, value], dim=-1).transpose(1, 2)  # [B, conv_dim, S]
+        mixed = torch.cat([query, key, value], dim=-1).transpose(
+            1, 2
+        )  # [B, conv_dim, S]
         conv_seed = torch.index_select(self.conv_state_buffer, 0, seq_ids)
         conv_input = torch.cat([conv_seed, mixed], dim=-1)
         w = self._conv1d_weight().squeeze(1)  # [conv_dim, K]
         conv_out = torch.zeros_like(mixed)
         for k in range(self.conv_kernel_size):
-            conv_out = conv_out + w[:, k].unsqueeze(0).unsqueeze(-1) * conv_input[
-                :, :, k : k + seq_len
-            ]
+            conv_out = (
+                conv_out
+                + w[:, k].unsqueeze(0).unsqueeze(-1) * conv_input[:, :, k : k + seq_len]
+            )
         mixed_post_conv = F.silu(conv_out)
         # Per-position conv windows (candidate conv states).
         conv_cand = self.conv_window_candidates(conv_seed, mixed)
@@ -719,7 +757,7 @@ class NeuronGatedDeltaNet(nn.Module):
         z_gate = z.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
         output = output * F.silu(z_gate)
         output = output.reshape(batch_size, seq_len, self.value_dim)
-        output = self.out_proj(output)
+        output = self._output_project(output)
 
         return output, S_stack, conv_cand
 
@@ -828,7 +866,9 @@ class NeuronGatedDeltaNet(nn.Module):
 
         initial_state_flat = None
         if initial_state is not None:
-            initial_state_flat = initial_state.reshape(BH, k_dim, v_dim).float().contiguous()
+            initial_state_flat = (
+                initial_state.reshape(BH, k_dim, v_dim).float().contiguous()
+            )
 
         all_outputs = []
         all_states = []
@@ -1127,27 +1167,22 @@ class NeuronGatedDeltaNet(nn.Module):
             recurrent_state_cache, conv_state_cache = past_key_value
 
         # Project inputs
-        deltanet_fp32 = os.environ.get("DELTANET_FP32") == "1"
-        if deltanet_fp32 and isinstance(self.in_proj_qkv, nn.Linear):
-            hs_f32 = hidden_states.float()
-            qkv = F.linear(hs_f32, self.in_proj_qkv.weight.float()).to(
-                hidden_states.dtype
-            )
-            z = F.linear(hs_f32, self.in_proj_z.weight.float()).to(hidden_states.dtype)
-            b = F.linear(hs_f32, self.in_proj_b.weight.float()).to(hidden_states.dtype)
-            a = F.linear(hs_f32, self.in_proj_a.weight.float()).to(hidden_states.dtype)
-        else:
-            qkv = self.in_proj_qkv(hidden_states)
-            z = self.in_proj_z(hidden_states)
-            b = self.in_proj_b(hidden_states)
-            a = self.in_proj_a(hidden_states)
+        qkv, z, a, b = self._project_inputs(hidden_states)
 
         if is_decode and self.use_tkg_attention_kernel:
             # Glue-free decode attention through the conv + DeltaNet TKG NKI kernels.
             return self._forward_decode_tkg(
-                hidden_states, qkv, z, a, b, seq_ids,
-                conv_state_cache, recurrent_state_cache, hybrid_cache_active,
-                batch_size, seq_len,
+                hidden_states,
+                qkv,
+                z,
+                a,
+                b,
+                seq_ids,
+                conv_state_cache,
+                recurrent_state_cache,
+                hybrid_cache_active,
+                batch_size,
+                seq_len,
             )
 
         # Split QKV
@@ -1173,8 +1208,7 @@ class NeuronGatedDeltaNet(nn.Module):
             for k in range(4):
                 conv_out = (
                     conv_out
-                    + w[:, k].unsqueeze(0).unsqueeze(-1)
-                    * conv_input[:, :, k : k + 1]
+                    + w[:, k].unsqueeze(0).unsqueeze(-1) * conv_input[:, :, k : k + 1]
                 )
             mixed_post_conv = F.silu(conv_out)
             new_conv_state = torch.cat([conv_state[:, :, 1:], mixed], dim=-1)
@@ -1211,20 +1245,26 @@ class NeuronGatedDeltaNet(nn.Module):
                 w = self._conv1d_weight().squeeze(1)
                 conv_out = torch.zeros_like(mixed)
                 for k in range(self.conv_kernel_size):
-                    conv_out = conv_out + w[:, k].unsqueeze(0).unsqueeze(-1) * conv_input[
-                        :, :, k : k + seq_len
-                    ]
+                    conv_out = (
+                        conv_out
+                        + w[:, k].unsqueeze(0).unsqueeze(-1)
+                        * conv_input[:, :, k : k + seq_len]
+                    )
                 mixed_post_conv = F.silu(conv_out)
                 if valid_mask_1d is not None:
                     state_len = self.conv_kernel_size - 1
-                    num_valid = valid_mask_1d.squeeze(-1).sum(dim=-1, keepdim=True).long()
+                    num_valid = (
+                        valid_mask_1d.squeeze(-1).sum(dim=-1, keepdim=True).long()
+                    )
                     idx_base = (state_len + num_valid - state_len).clamp(min=0)
                     offsets = torch.arange(state_len, device=mixed.device).unsqueeze(0)
                     gather_idx = idx_base + offsets
                     gather_idx = gather_idx.unsqueeze(1).expand(-1, self.conv_dim, -1)
                     new_conv_state = torch.gather(conv_input, 2, gather_idx)
                 else:
-                    new_conv_state = conv_input[:, :, -self.conv_kernel_size + 1 :].contiguous()
+                    new_conv_state = conv_input[
+                        :, :, -self.conv_kernel_size + 1 :
+                    ].contiguous()
             else:
                 mixed_post_conv = F.silu(
                     F.conv1d(
@@ -1466,10 +1506,15 @@ class NeuronGatedDeltaNet(nn.Module):
         z_gate = z.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
         output = output * F.silu(z_gate)
         output = output.reshape(batch_size, seq_len, self.value_dim)
-        output = self.out_proj(output)
+        output = self._output_project(output)
 
         if hybrid_cache_active:
-            return output, (new_rec_state, new_conv_state), new_rec_state, new_conv_state
+            return (
+                output,
+                (new_rec_state, new_conv_state),
+                new_rec_state,
+                new_conv_state,
+            )
 
         # Return dummy KV for KVCacheManager
         dummy_k = torch.zeros(
@@ -1507,9 +1552,7 @@ class Qwen36A3BInferenceConfig(InferenceConfig):
                 )
             layer_types: list = []
             for _ in range(num_layers // 4):
-                layer_types.extend(
-                    ["linear_attention"] * 3 + ["full_attention"]
-                )
+                layer_types.extend(["linear_attention"] * 3 + ["full_attention"])
             kwargs.setdefault("layer_types", layer_types)
 
         # DeltaNet
@@ -1870,7 +1913,9 @@ class NeuronQwen36A3BAttention(NeuronAttentionBase):
             V_full = v_cache
 
         attn_weights = torch.matmul(Q, K_full.transpose(-1, -2)) / math.sqrt(head_dim)
-        cache_positions = torch.arange(cache_len, device=position_ids.device).view(1, 1, 1, -1)
+        cache_positions = torch.arange(cache_len, device=position_ids.device).view(
+            1, 1, 1, -1
+        )
         causal_mask = cache_positions <= pos[:, None, :, None]
         attn_weights = attn_weights.masked_fill(~causal_mask, -65504.0)
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(Q.dtype)
@@ -2029,7 +2074,9 @@ class NeuronMoEBlock(nn.Module):
         # reduce_output=False); their gated sum is all-reduced once.
         with _defer_moe_allreduce():
             routed_local = self.moe(
-                hidden_states, padding_mask, is_speculative_decoding=is_spec,
+                hidden_states,
+                padding_mask,
+                is_speculative_decoding=is_spec,
             )[0]
         shared_local = self.shared_expert(hidden_states)
         gate = torch.sigmoid(self.shared_expert_gate(hidden_states))
@@ -2046,15 +2093,24 @@ class SharedExpertMLP(nn.Module):
     def __init__(self, hidden_size: int, intermediate_size: int):
         super().__init__()
         self.gate_proj = ColumnParallelLinear(
-            hidden_size, intermediate_size, bias=False, gather_output=False,
+            hidden_size,
+            intermediate_size,
+            bias=False,
+            gather_output=False,
         )
         self.up_proj = ColumnParallelLinear(
-            hidden_size, intermediate_size, bias=False, gather_output=False,
+            hidden_size,
+            intermediate_size,
+            bias=False,
+            gather_output=False,
         )
         # reduce_output=False: return the local partial so NeuronMoEBlock can
         # fuse it (gated) with the routed partial under a single all-reduce.
         self.down_proj = RowParallelLinear(
-            intermediate_size, hidden_size, bias=False, input_is_parallel=True,
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            input_is_parallel=True,
             reduce_output=False,
         )
 
@@ -2101,7 +2157,10 @@ class NeuronMTPHead(nn.Module):
         self.embed_norm = rms_cls(h, eps=eps)
         self.hidden_norm = rms_cls(h, eps=eps)
         self.eh_proj = ColumnParallelLinear(
-            2 * h, h, bias=False, gather_output=True,
+            2 * h,
+            h,
+            bias=False,
+            gather_output=True,
         )
 
         # NeuronQwen36A3BDecoderLayer reads config.layer_types[layer_idx] to select
@@ -2113,7 +2172,7 @@ class NeuronMTPHead(nn.Module):
 
         if len(layer_types) <= self.layer_idx:
             layer_types += [layer_type] * (self.layer_idx + 1 - len(layer_types))
-            
+
         layer_types[self.layer_idx] = layer_type
         layer_config.layer_types = layer_types
 
@@ -2123,7 +2182,10 @@ class NeuronMTPHead(nn.Module):
         # Sharded: the draft token is a sharded vocab-parallel argmax, so the
         # full-vocab logits are never gathered.
         self.mtp_lm_head = ColumnParallelLinear(
-            h, config.vocab_size, bias=False, gather_output=False,
+            h,
+            config.vocab_size,
+            bias=False,
+            gather_output=False,
         )
 
     def draft_step(
@@ -2214,7 +2276,9 @@ class NeuronQwen36A3BDecoderLayer(nn.Module):
         # the layer runs under cpu_mode (device tracing is unaffected).
         if not cpu_mode():
             hidden_states = ModuleMarkerStartWrapper()(hidden_states)
-        hidden_states = self.input_layernorm(hidden_states)
+        # The verify linear-attention kernel fuses the input RMSNorm; norm the other paths here.
+        if not (verify_mode and self.layer_type == "linear_attention"):
+            hidden_states = self.input_layernorm(hidden_states)
 
         if verify_mode and self.layer_type == "linear_attention":
             # Verify path: run the 2-token block as an exact single-step
@@ -2223,7 +2287,7 @@ class NeuronQwen36A3BDecoderLayer(nn.Module):
             # for the in-graph accept/reject state commit.
             seq_ids = kwargs.get("seq_ids", None)
             attn_out, S_stack, conv_cand = self.linear_attn.verify_block(
-                hidden_states, seq_ids
+                hidden_states, seq_ids, self.input_layernorm
             )
             hidden_states = residual + attn_out
             # Dummy KV so the verify target's KVCacheManager keeps a uniform
@@ -2344,19 +2408,35 @@ class HybridDeltaNetCacheManager(KVCacheManager):
         for layer_idx, layer_type in enumerate(self.layer_types):
             if layer_type == "linear_attention":
                 params.append(
-                    nn.Parameter(torch.zeros(recurrent_shape, dtype=dtype), requires_grad=False)
+                    nn.Parameter(
+                        torch.zeros(recurrent_shape, dtype=dtype), requires_grad=False
+                    )
                 )
                 params.append(
-                    nn.Parameter(torch.zeros(conv_shape, dtype=dtype), requires_grad=False)
+                    nn.Parameter(
+                        torch.zeros(conv_shape, dtype=dtype), requires_grad=False
+                    )
                 )
             else:
-                k_shape = self.k_shapes[layer_idx] if hasattr(self, "k_shapes") else self.k_shape
-                v_shape = self.v_shapes[layer_idx] if hasattr(self, "v_shapes") else self.v_shape
-                params.append(
-                    nn.Parameter(torch.zeros(k_shape, dtype=cache_dtype), requires_grad=False)
+                k_shape = (
+                    self.k_shapes[layer_idx]
+                    if hasattr(self, "k_shapes")
+                    else self.k_shape
+                )
+                v_shape = (
+                    self.v_shapes[layer_idx]
+                    if hasattr(self, "v_shapes")
+                    else self.v_shape
                 )
                 params.append(
-                    nn.Parameter(torch.zeros(v_shape, dtype=cache_dtype), requires_grad=False)
+                    nn.Parameter(
+                        torch.zeros(k_shape, dtype=cache_dtype), requires_grad=False
+                    )
+                )
+                params.append(
+                    nn.Parameter(
+                        torch.zeros(v_shape, dtype=cache_dtype), requires_grad=False
+                    )
                 )
 
         self.past_key_values = nn.ParameterList(params)
@@ -2367,11 +2447,15 @@ class HybridDeltaNetCacheManager(KVCacheManager):
         unsupported = []
         if nc.is_block_kv_layout:
             unsupported.append("block KV layout")
-        if getattr(nc, "kv_quant_config", None) is not None or getattr(nc, "kv_cache_quant", False):
+        if getattr(nc, "kv_quant_config", None) is not None or getattr(
+            nc, "kv_cache_quant", False
+        ):
             unsupported.append("KV cache quantization")
         if nc.enable_fused_speculation or nc.speculation_length > 0 or nc.is_medusa:
             unsupported.append("speculative decoding")
-        if getattr(nc, "enable_eagle_speculation", False) or getattr(nc, "is_eagle_draft", False):
+        if getattr(nc, "enable_eagle_speculation", False) or getattr(
+            nc, "is_eagle_draft", False
+        ):
             unsupported.append("EAGLE speculation")
         if nc.flash_decoding_enabled:
             unsupported.append("flash decoding")
@@ -2408,7 +2492,9 @@ class HybridDeltaNetCacheManager(KVCacheManager):
         recurrent_state, conv_state = self._fetch_cache(idx, kvcache_buffer)
         if seq_ids is not None:
             cache_idx = self.get_cache_update_index_for_seq_ids(seq_ids)
-            recurrent_state = torch.index_select(recurrent_state, dim=0, index=cache_idx)
+            recurrent_state = torch.index_select(
+                recurrent_state, dim=0, index=cache_idx
+            )
             conv_state = torch.index_select(conv_state, dim=0, index=cache_idx)
         elif self.kv_cache_padding_size > 0:
             recurrent_state = recurrent_state[: -self.kv_cache_padding_size]
@@ -2428,7 +2514,11 @@ class HybridDeltaNetCacheManager(KVCacheManager):
         for idx in range(len(self.past_key_values) // 2):
             if self._is_deltanet_layer(idx):
                 past_key_values.append(
-                    list(self.get_deltanet_state_by_layer_id(idx, kvcache_buffer, seq_ids))
+                    list(
+                        self.get_deltanet_state_by_layer_id(
+                            idx, kvcache_buffer, seq_ids
+                        )
+                    )
                 )
             else:
                 past_key_values.append(
@@ -2727,9 +2817,7 @@ class NeuronQwen36A3BModel(NeuronBaseModel):
             and attention_mask is not None
             and attention_mask.ndim == 2
         ):
-            deltanet_padding_mask = attention_mask.unsqueeze(-1).to(
-                inputs_embeds.dtype
-            )
+            deltanet_padding_mask = attention_mask.unsqueeze(-1).to(inputs_embeds.dtype)
         else:
             deltanet_padding_mask = (
                 (input_ids != self.padding_idx).unsqueeze(-1).to(inputs_embeds.dtype)
@@ -2775,9 +2863,8 @@ class NeuronQwen36A3BModel(NeuronBaseModel):
         hidden_states = inputs_embeds
 
         # Get KV cache for TKG and for model-local chunked CTE.
-        use_qwen_chunked_prefill = (
-            is_for_context_encoding
-            and getattr(self.config, "use_qwen_hybrid_chunked_prefill", False)
+        use_qwen_chunked_prefill = is_for_context_encoding and getattr(
+            self.config, "use_qwen_hybrid_chunked_prefill", False
         )
         cache_size = (
             self.config.neuron_config.seq_len
@@ -2977,8 +3064,7 @@ class NeuronQwen36A3BModel(NeuronBaseModel):
                 if getattr(self.config, "use_qwen_hybrid_chunked_prefill", False):
                     if attention_mask is not None and attention_mask.ndim == 2:
                         index = (
-                            attention_mask.to(torch.long).sum(dim=1, keepdim=True)
-                            - 1
+                            attention_mask.to(torch.long).sum(dim=1, keepdim=True) - 1
                         ).clamp(min=0)
                     else:
                         index = (
@@ -3027,9 +3113,8 @@ class NeuronQwen36A3BModel(NeuronBaseModel):
         outputs += updated_kv_cache
 
         # Append DeltaNet state tensors for input_output_aliases.
-        if (
-            not getattr(self.config, "use_hybrid_cache_manager", False)
-            and hasattr(self, "_deltanet_updated_states")
+        if not getattr(self.config, "use_hybrid_cache_manager", False) and hasattr(
+            self, "_deltanet_updated_states"
         ):
             outputs += self._deltanet_updated_states
 
@@ -3054,6 +3139,7 @@ def _config_for_mtp_draft(config: Qwen36A3BInferenceConfig):
     draft_config.num_hidden_layers = 1
     draft_config.layer_types = ["full_attention"]
     return draft_config
+
 
 # ============================================================
 # State Dict Converter
@@ -3096,13 +3182,19 @@ def reorder_deltanet_qkv_for_tp(
     blocks = []
     for rank in range(tp_degree):
         blocks.append(
-            q_weight[rank * local_k_heads : (rank + 1) * local_k_heads].reshape(-1, qkv_weight.shape[1])
+            q_weight[rank * local_k_heads : (rank + 1) * local_k_heads].reshape(
+                -1, qkv_weight.shape[1]
+            )
         )
         blocks.append(
-            k_weight[rank * local_k_heads : (rank + 1) * local_k_heads].reshape(-1, qkv_weight.shape[1])
+            k_weight[rank * local_k_heads : (rank + 1) * local_k_heads].reshape(
+                -1, qkv_weight.shape[1]
+            )
         )
         blocks.append(
-            v_weight[rank * local_v_heads : (rank + 1) * local_v_heads].reshape(-1, qkv_weight.shape[1])
+            v_weight[rank * local_v_heads : (rank + 1) * local_v_heads].reshape(
+                -1, qkv_weight.shape[1]
+            )
         )
     return torch.cat(blocks, dim=0).contiguous()
 
@@ -3131,6 +3223,33 @@ def reorder_deltanet_qkv_channels_for_tp(
     return torch.cat(blocks, dim=0).contiguous()
 
 
+def build_deltanet_in_proj_fused(
+    qkv: torch.Tensor,
+    z: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    tp_degree: int,
+) -> torch.Tensor:
+    """Fuse the four DeltaNet input projections into one [hidden, I] weight.
+
+    ``qkv`` is already per-rank-reordered ([rank0 Q|K|V | rank1 Q|K|V | ...]);
+    z/a/b are plain output-sharded. Interleave them so each rank's contiguous
+    slice of the fused output axis is [qkv_r | z_r | a_r | b_r] (the layout the
+    TKG kernel slices), then transpose to contraction-first [hidden, I] so the
+    kernel needs no runtime cat/transpose.
+    """
+    cd = qkv.shape[0] // tp_degree
+    vd = z.shape[0] // tp_degree
+    nv = a.shape[0] // tp_degree
+    blocks = []
+    for r in range(tp_degree):
+        blocks.append(qkv[r * cd : (r + 1) * cd])
+        blocks.append(z[r * vd : (r + 1) * vd])
+        blocks.append(a[r * nv : (r + 1) * nv])
+        blocks.append(b[r * nv : (r + 1) * nv])
+    return torch.cat(blocks, dim=0).t().contiguous()
+
+
 def _convert_full_attention_block(sd, prefix, config):
     """GQA per-layer conversions on `{prefix}.self_attn.*`, in place.
 
@@ -3152,9 +3271,11 @@ def _convert_full_attention_block(sd, prefix, config):
     if q_proj_key in sd:
         num_heads, head_dim = config.num_attention_heads, config.head_dim
         w = sd.pop(q_proj_key).reshape(num_heads, head_dim * 2, config.hidden_size)
-        sd[q_proj_key] = w[:, :head_dim, :].reshape(num_heads * head_dim, config.hidden_size)
-        sd[f"{prefix}.self_attn.output_gate_proj.weight"] = (
-            w[:, head_dim:, :].reshape(num_heads * head_dim, config.hidden_size)
+        sd[q_proj_key] = w[:, :head_dim, :].reshape(
+            num_heads * head_dim, config.hidden_size
+        )
+        sd[f"{prefix}.self_attn.output_gate_proj.weight"] = w[:, head_dim:, :].reshape(
+            num_heads * head_dim, config.hidden_size
         )
 
     if config.neuron_config.fused_qkv:
@@ -3174,7 +3295,9 @@ def _convert_moe_block(sd, prefix, config):
     """
     gate_key = f"{prefix}.mlp.gate.weight"
     if gate_key in sd:
-        sd[f"{prefix}.mlp.moe.router.linear_router.weight"] = sd.pop(gate_key).detach().clone()
+        sd[f"{prefix}.mlp.moe.router.linear_router.weight"] = (
+            sd.pop(gate_key).detach().clone()
+        )
 
     for hf_suffix, nxdi_suffix in (
         ("experts.gate_up_proj", "moe.expert_mlps.mlp_op.gate_up_proj.weight"),
@@ -3266,10 +3389,25 @@ def convert_qwen36_a3b_hf_to_neuron_state_dict(neuron_state_dict, config):
                 config.linear_key_head_dim,
                 config.linear_value_head_dim,
             )
+            # Fuse the four input projections into one contraction-first
+            # [hidden, I] weight (no runtime cat/transpose in the TKG kernel).
             qkv_key = f"layers.{l}.linear_attn.in_proj_qkv.weight"
-            if qkv_key in neuron_state_dict and tp > 1:
-                neuron_state_dict[qkv_key] = reorder_deltanet_qkv_for_tp(
-                    neuron_state_dict[qkv_key], *reorder_args,
+            if qkv_key in neuron_state_dict:
+                qkv = neuron_state_dict.pop(qkv_key)
+                if tp > 1:
+                    qkv = reorder_deltanet_qkv_for_tp(qkv, *reorder_args)
+                z = neuron_state_dict.pop(f"layers.{l}.linear_attn.in_proj_z.weight")
+                a = neuron_state_dict.pop(f"layers.{l}.linear_attn.in_proj_a.weight")
+                b = neuron_state_dict.pop(f"layers.{l}.linear_attn.in_proj_b.weight")
+                neuron_state_dict[f"layers.{l}.linear_attn.in_proj_fused.weight"] = (
+                    build_deltanet_in_proj_fused(qkv, z, a, b, tp)
+                )
+
+            # Store o_proj transposed ([value_dim, hidden]) for the kernel / matmul.
+            out_proj_key = f"layers.{l}.linear_attn.out_proj.weight"
+            if out_proj_key in neuron_state_dict:
+                neuron_state_dict[out_proj_key] = (
+                    neuron_state_dict[out_proj_key].t().contiguous()
                 )
 
             conv_key = f"layers.{l}.linear_attn.conv1d.weight"
@@ -3278,13 +3416,16 @@ def convert_qwen36_a3b_hf_to_neuron_state_dict(neuron_state_dict, config):
                 conv_weight = neuron_state_dict.pop(conv_key)
                 if tp > 1:
                     conv_weight = reorder_deltanet_qkv_channels_for_tp(
-                        conv_weight, *reorder_args,
+                        conv_weight,
+                        *reorder_args,
                     )
                 neuron_state_dict[conv_weight_key] = conv_weight.squeeze(1).contiguous()
 
             for vector_name in ("A_log", "dt_bias"):
                 vector_key = f"layers.{l}.linear_attn.{vector_name}"
-                vector_weight_key = f"layers.{l}.linear_attn.{vector_name}_weight.weight"
+                vector_weight_key = (
+                    f"layers.{l}.linear_attn.{vector_name}_weight.weight"
+                )
                 if vector_key in neuron_state_dict:
                     neuron_state_dict[vector_weight_key] = (
                         neuron_state_dict.pop(vector_key).reshape(-1, 1).contiguous()
@@ -3321,7 +3462,7 @@ def convert_qwen36_a3b_hf_to_neuron_state_dict(neuron_state_dict, config):
 
         layer_pfx = "mtp.layers.0."
         for k in [k for k in neuron_state_dict if k.startswith(layer_pfx)]:
-            neuron_state_dict[f"mtp_head.decoder_layer.{k[len(layer_pfx):]}"] = (
+            neuron_state_dict[f"mtp_head.decoder_layer.{k[len(layer_pfx) :]}"] = (
                 neuron_state_dict.pop(k).detach().clone()
             )
         for k in [k for k in neuron_state_dict if k.startswith("mtp.")]:
@@ -3341,7 +3482,9 @@ def convert_qwen36_a3b_hf_to_neuron_state_dict(neuron_state_dict, config):
                 neuron_state_dict[nk] = neuron_state_dict[nk].float() + 1.0
 
         # The draft layer is a standard full-attention + MoE layer.
-        _convert_full_attention_block(neuron_state_dict, "mtp_head.decoder_layer", config)
+        _convert_full_attention_block(
+            neuron_state_dict, "mtp_head.decoder_layer", config
+        )
         _convert_moe_block(neuron_state_dict, "mtp_head.decoder_layer", config)
 
         # Tie the draft LM head to the main model's (no mtp.lm_head in checkpoint).
@@ -3373,9 +3516,8 @@ class Qwen36A3BDecoderModelInstance(DecoderModelInstance):
 
         state_start_idx = num_output_from_trace + num_kv
 
-        if (
-            not getattr(module.config, "use_hybrid_cache_manager", False)
-            and hasattr(module, "_deltanet_state_params")
+        if not getattr(module.config, "use_hybrid_cache_manager", False) and hasattr(
+            module, "_deltanet_state_params"
         ):
             seed_params = list(module._deltanet_state_params)
             for i, param in enumerate(seed_params):
@@ -3655,7 +3797,9 @@ class Qwen36MTPDraft(NeuronBaseModel):
             past_key_value = None
         else:
             past_key_values = self.kv_mgr.get_cache(
-                seq_ids=seq_ids, seq_len=self.n_positions, is_for_context_encoding=False,
+                seq_ids=seq_ids,
+                seq_len=self.n_positions,
+                is_for_context_encoding=False,
             )
             past_key_value = past_key_values[0] if past_key_values is not None else None
 
@@ -3709,7 +3853,9 @@ class Qwen36MTPDraft(NeuronBaseModel):
         )
 
         sampled = _greedy_argmax(  # [B, q]
-            self.mtp_head.mtp_lm_head, draft_logits, self.rank_util,
+            self.mtp_head.mtp_lm_head,
+            draft_logits,
+            self.rank_util,
             disable_argmax_kernel=self.neuron_config.disable_argmax_kernel,
         )
         return [sampled, *updated_kv, hidden]
@@ -3738,16 +3884,27 @@ class Qwen36SpecTarget(NeuronQwen36A3BModel):
         self._captured_prenorm = args[0]
 
     def forward(
-        self, input_ids, attention_mask, position_ids, seq_ids, sampling_params,
-        *args, **kwargs,
+        self,
+        input_ids,
+        attention_mask,
+        position_ids,
+        seq_ids,
+        sampling_params,
+        *args,
+        **kwargs,
     ):
         if input_ids.shape[1] == self.neuron_config.speculation_length:
             return self._verify_forward(
                 input_ids, attention_mask, position_ids, seq_ids, sampling_params
             )
         return super().forward(
-            input_ids, attention_mask, position_ids, seq_ids, sampling_params,
-            *args, **kwargs,
+            input_ids,
+            attention_mask,
+            position_ids,
+            seq_ids,
+            sampling_params,
+            *args,
+            **kwargs,
         )
 
     def _verify_forward(
@@ -3761,14 +3918,16 @@ class Qwen36SpecTarget(NeuronQwen36A3BModel):
         hidden_states = inputs_embeds
         cos_cache, sin_cache = self.mrope_emb(inputs_embeds, position_ids)
         past_key_values = self.kv_mgr.get_cache(
-            seq_ids=seq_ids, seq_len=self.n_positions, is_for_context_encoding=False,
+            seq_ids=seq_ids,
+            seq_len=self.n_positions,
+            is_for_context_encoding=False,
         )
 
         # Prior over the committed cache (shared by both block tokens) + intra-
         # block causal active mask. The in-block tokens' K/V is not cached yet.
-        cache_positions = torch.arange(
-            self.n_positions, device=input_ids.device
-        ).view(1, 1, 1, -1)
+        cache_positions = torch.arange(self.n_positions, device=input_ids.device).view(
+            1, 1, 1, -1
+        )
         committed_len = position_ids[:, 0:1].view(batch_size, 1, 1, 1)
         prior_mask = (cache_positions < committed_len).expand(
             batch_size, 1, seq_len, self.n_positions
@@ -3812,7 +3971,9 @@ class Qwen36SpecTarget(NeuronQwen36A3BModel):
         verify_trunk_hidden = hidden_states  # pre-final-norm, both positions
         logits = self.lm_head(self.norm(hidden_states)).float()
         tokens = _greedy_argmax(  # [B, spec_len]
-            self.lm_head, logits, self.rank_util,
+            self.lm_head,
+            logits,
+            self.rank_util,
             disable_argmax_kernel=self.neuron_config.disable_argmax_kernel,
         )
 
@@ -3846,8 +4007,15 @@ class Qwen36FusedSpecModel(NeuronFusedSpecModel):
         return out
 
     def _eagle_token_gen_forward(
-        self, input_ids, attention_mask, position_ids, seq_ids, sampling_params,
-        slot_mapping=None, active_block_table=None, num_queries=None,
+        self,
+        input_ids,
+        attention_mask,
+        position_ids,
+        seq_ids,
+        sampling_params,
+        slot_mapping=None,
+        active_block_table=None,
+        num_queries=None,
         computed_context_lens=None,
     ):
         spec_len = self.neuron_config.speculation_length
@@ -3864,7 +4032,9 @@ class Qwen36FusedSpecModel(NeuronFusedSpecModel):
             dtype=draft_attention_mask.dtype,
             device=draft_attention_mask.device,
         )
-        draft_attention_mask = torch.scatter(draft_attention_mask, 1, scatter_index, zeros)
+        draft_attention_mask = torch.scatter(
+            draft_attention_mask, 1, scatter_index, zeros
+        )
         orig_hidden = hidden_state
 
         # 1. Draft spec_len-1 candidate tokens.
@@ -3872,10 +4042,16 @@ class Qwen36FusedSpecModel(NeuronFusedSpecModel):
             draft_position_id = draft_position_ids[:, i : i + 1] + i
             draft_input_ids = candidate_input_ids[:, -1:]
             target_position_id = draft_position_ids[:, i : i + 1] + i + 2
-            target_position_ids = torch.cat([target_position_ids, target_position_id], dim=1)
+            target_position_ids = torch.cat(
+                [target_position_ids, target_position_id], dim=1
+            )
             model_output = self.draft_model(
-                draft_input_ids, draft_attention_mask, draft_position_id,
-                seq_ids, sampling_params, prev_hidden=hidden_state,
+                draft_input_ids,
+                draft_attention_mask,
+                draft_position_id,
+                seq_ids,
+                sampling_params,
+                prev_hidden=hidden_state,
             )
             hidden_state = model_output[-1]
             ones = torch.ones(
@@ -3883,32 +4059,47 @@ class Qwen36FusedSpecModel(NeuronFusedSpecModel):
                 dtype=draft_attention_mask.dtype,
                 device=draft_attention_mask.device,
             )
-            draft_attention_mask = torch.scatter(draft_attention_mask, 1, draft_position_id, ones)
+            draft_attention_mask = torch.scatter(
+                draft_attention_mask, 1, draft_position_id, ones
+            )
             candidate_input_ids = torch.cat(
                 (candidate_input_ids, model_output[0].view(bs, -1)), dim=-1
             )
 
         # 2. Verify the spec block with the target (DeltaNet read-only seed).
         outputs = self.target_model(
-            candidate_input_ids, attention_mask, target_position_ids, seq_ids, sampling_params
+            candidate_input_ids,
+            attention_mask,
+            target_position_ids,
+            seq_ids,
+            sampling_params,
         )
         target_tokens = outputs[0]
         target_cache = list(outputs[1:-1])
         hidden_state = outputs[-1]
         candidates = self.target_model._verify_candidates
 
-        prev_hidden = torch.cat([orig_hidden, hidden_state[:, : spec_len - 1, :]], dim=1)
+        prev_hidden = torch.cat(
+            [orig_hidden, hidden_state[:, : spec_len - 1, :]], dim=1
+        )
 
         # 3. Final draft run to repopulate the draft KV with the verified block.
         model_output = self.draft_model(
-            candidate_input_ids, attention_mask, target_position_ids - 1,
-            seq_ids, sampling_params, prev_hidden=prev_hidden,
+            candidate_input_ids,
+            attention_mask,
+            target_position_ids - 1,
+            seq_ids,
+            sampling_params,
+            prev_hidden=prev_hidden,
         )
         flat_draft_cache = list(model_output[1:-1])
 
         # Greedy accept count - 1 (0 reject -> S1, 1 accept -> S2).
         index = (
-            ((~(candidate_input_ids[:, 1:] == target_tokens[:, :-1])).cumsum(dim=-1) < 1)
+            (
+                (~(candidate_input_ids[:, 1:] == target_tokens[:, :-1])).cumsum(dim=-1)
+                < 1
+            )
             .sum(dim=-1, keepdim=True, dtype=torch.int32)
             .view(self.batch_size, -1)
         )
@@ -3955,13 +4146,19 @@ class Qwen36FusedSpecModel(NeuronFusedSpecModel):
         draft_position_ids = copy.deepcopy(position_ids)
         scatter_index = torch.sum(attention_mask, dim=1, keepdim=True) - 1
         zeros = torch.zeros(
-            scatter_index.shape, dtype=attention_mask.dtype, device=attention_mask.device
+            scatter_index.shape,
+            dtype=attention_mask.dtype,
+            device=attention_mask.device,
         )
         draft_position_ids = torch.scatter(draft_position_ids, 1, scatter_index, zeros)
 
         draft_outputs = self.draft_model(
-            draft_input_ids, attention_mask, draft_position_ids,
-            seq_ids, sampling_params, full_hidden,
+            draft_input_ids,
+            attention_mask,
+            draft_position_ids,
+            seq_ids,
+            sampling_params,
+            full_hidden,
         )
         draft_cache = list(draft_outputs[1:-1])
 
@@ -3994,7 +4191,9 @@ class Qwen36FusedSpecModelInstance(DecoderModelInstance):
 
         num_output_from_trace = 1 if not self.neuron_config.output_logits else 2
         if self.neuron_config.tensor_capture_config:
-            num_output_from_trace += self.neuron_config.tensor_capture_config.get_offset()
+            num_output_from_trace += (
+                self.neuron_config.tensor_capture_config.get_offset()
+            )
         num_output_from_trace += 1  # fused-spec acceptance output
 
         nd = len(module.draft_model.kv_mgr.past_key_values)
@@ -4005,7 +4204,9 @@ class Qwen36FusedSpecModelInstance(DecoderModelInstance):
         for i, param in enumerate(state_params):
             aliases[param] = base + i
         if self.neuron_config.enable_eagle_speculation:
-            aliases[module.hidden_state_rolling_buffer.hidden_states] = base + len(state_params)
+            aliases[module.hidden_state_rolling_buffer.hidden_states] = base + len(
+                state_params
+            )
 
         return module, aliases
 
@@ -4156,9 +4357,19 @@ class NeuronQwen36A3BForCausalLM(NeuronBaseForCausalLM):
         if self.neuron_config.enable_fused_speculation:
             # The base unpacks medusa_args/llava_args/tf_args (*args); pass [] not None.
             return super()._get_model_outputs(
-                input_ids, attention_mask, position_ids, seq_ids, sampling_params,
-                prev_hidden, adapter_ids, medusa_args or [], llava_args or [],
-                slot_mapping, block_table, full_context_lens, computed_context_lens,
+                input_ids,
+                attention_mask,
+                position_ids,
+                seq_ids,
+                sampling_params,
+                prev_hidden,
+                adapter_ids,
+                medusa_args or [],
+                llava_args or [],
+                slot_mapping,
+                block_table,
+                full_context_lens,
+                computed_context_lens,
                 tf_args or [],
             )
 
@@ -4387,7 +4598,9 @@ class NeuronQwen36MTPDraftForCausalLM(NeuronQwen36A3BForCausalLM):
 
     @staticmethod
     def convert_hf_to_neuron_state_dict(state_dict, config):
-        sd = NeuronQwen36A3BForCausalLM.convert_hf_to_neuron_state_dict(state_dict, config)
+        sd = NeuronQwen36A3BForCausalLM.convert_hf_to_neuron_state_dict(
+            state_dict, config
+        )
         # Keep only the draft's params: embedding, MTP head (incl. its layer's own
         # rank_util), and the model-level rank_util. Drop the backbone layers/norm/
         # lm_head (the target owns those).

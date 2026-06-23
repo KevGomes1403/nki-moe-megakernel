@@ -25,11 +25,15 @@ if str(_HF_REF) not in sys.path:
     sys.path.insert(0, str(_HF_REF))
 
 from block_testing_utils import test_block_correctness
-from neuronx_distributed_inference.models.config import MoENeuronConfig, OnDeviceSamplingConfig
+from neuronx_distributed_inference.models.config import (
+    MoENeuronConfig,
+    OnDeviceSamplingConfig,
+)
 
 from models.qwen3_6_moe.modeling_qwen36_a3b import (
     NeuronGatedDeltaNet,
     Qwen36A3BInferenceConfig,
+    build_deltanet_in_proj_fused,
     reorder_deltanet_qkv_channels_for_tp,
     reorder_deltanet_qkv_for_tp,
 )
@@ -42,7 +46,7 @@ from configuration_qwen3_5_moe import Qwen3_5MoeConfig
 BATCH = 1
 SEQ_LEN = 128
 HIDDEN = 256
-HEAD_DIM = 64           # GQA head_dim (unused by this block, but config requires)
+HEAD_DIM = 64  # GQA head_dim (unused by this block, but config requires)
 NUM_V_HEADS = 8
 NUM_K_HEADS = 4
 LINEAR_KV_HEAD_DIM = 128  # matches the kernel's P_MAX/head_dim contract
@@ -114,13 +118,10 @@ def _build_hf_reference_config() -> Qwen3_5MoeConfig:
     )
 
 
-# Same names on both sides except for the conv/A_log/dt_bias rewraps and
-# the TP-shuffled QKV projection -- handled in sync_fn.
+# Same names on both sides except for the conv/A_log/dt_bias rewraps and the
+# transposed out_proj -- handled in sync_fn. The four in_proj projections are
+# fused into in_proj_fused.weight (built separately, not a 1:1 key copy).
 WEIGHT_MAPPING = {
-    "in_proj_qkv.weight": "in_proj_qkv.weight",
-    "in_proj_z.weight": "in_proj_z.weight",
-    "in_proj_a.weight": "in_proj_a.weight",
-    "in_proj_b.weight": "in_proj_b.weight",
     "conv1d.weight": "conv1d_weight.weight",
     "A_log": "A_log_weight.weight",
     "dt_bias": "dt_bias_weight.weight",
@@ -160,18 +161,44 @@ def sync_deltanet_weights(reference_block, checkpoint_path, weight_mapping, verb
                 t = reorder_deltanet_qkv_channels_for_tp(t, *reorder_args)
         elif ref_key in ("A_log", "dt_bias"):
             t = t.reshape(-1, 1).contiguous()
-        elif ref_key == "in_proj_qkv.weight" and TP_DEGREE > 1:
-            t = reorder_deltanet_qkv_for_tp(t, *reorder_args)
+        elif ref_key == "out_proj.weight":
+            # NxDI stores o_proj transposed: (hidden, value_dim) -> (value_dim, hidden).
+            t = t.t().contiguous()
 
         if t.shape != neuron_sd[neuron_key].shape:
             if verbose:
-                print(f"  shape mismatch {ref_key} {t.shape} vs {neuron_key} {neuron_sd[neuron_key].shape}")
+                print(
+                    f"  shape mismatch {ref_key} {t.shape} vs {neuron_key} {neuron_sd[neuron_key].shape}"
+                )
             continue
 
         neuron_sd[neuron_key] = t
         count += 1
         if verbose:
             print(f"  synced {ref_key} -> {neuron_key} {tuple(t.shape)}")
+
+    # Fuse the four reference input projections into in_proj_fused.weight
+    # ([hidden, I], per-rank column order [qkv_r | z_r | a_r | b_r]).
+    fused_key = "block.in_proj_fused.weight"
+    if fused_key in neuron_sd:
+        dt = neuron_sd[fused_key].dtype
+        qkv = ref_sd["in_proj_qkv.weight"].to(dt).contiguous()
+        if TP_DEGREE > 1:
+            qkv = reorder_deltanet_qkv_for_tp(qkv, *reorder_args)
+        z = ref_sd["in_proj_z.weight"].to(dt).contiguous()
+        a = ref_sd["in_proj_a.weight"].to(dt).contiguous()
+        b = ref_sd["in_proj_b.weight"].to(dt).contiguous()
+        fused = build_deltanet_in_proj_fused(qkv, z, a, b, TP_DEGREE)
+        if fused.shape == neuron_sd[fused_key].shape:
+            neuron_sd[fused_key] = fused
+            count += 1
+            if verbose:
+                print(f"  synced in_proj_* -> {fused_key} {tuple(fused.shape)}")
+        elif verbose:
+            print(
+                f"  shape mismatch in_proj_fused {fused.shape} "
+                f"vs {neuron_sd[fused_key].shape}"
+            )
 
     torch.save(neuron_sd, checkpoint_path)
     return count

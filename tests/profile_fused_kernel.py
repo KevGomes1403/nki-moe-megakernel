@@ -19,10 +19,11 @@ By default this exercises the gated per-head RMSNorm path (z/gamma passed). Pass
 "raw" as the 3rd arg to profile the bare recurrence (z/gamma None) for an A/B baseline.
 
 Usage:
-    python -m models.qwen3_6_moe.tests.profile_fused_kernel <decode|verify> <outdir> [raw]
+    python -m models.qwen3_6_moe.tests.profile_fused_kernel <decode|verify> <outdir> [raw] [bf16]
       decode -> deltanet_fused_tkg_fwd        (T=1 commit)
       verify -> deltanet_fused_tkg_fwd_state  (T=2 verify)
       raw    -> skip z/gamma (no gated RMSNorm) for an A/B baseline
+      bf16   -> bf16 inputs (default f32) for an fp32-vs-bf16 perf A/B
 """
 
 import os
@@ -70,23 +71,26 @@ VALUE_DIM = HV * D  # 1024
 
 def main():
     mode = sys.argv[1]  # decode | verify
-    raw = len(sys.argv) > 3 and sys.argv[3] == "raw"
+    flags = sys.argv[3:]
+    raw = "raw" in flags
+    dtype = torch.bfloat16 if "bf16" in flags else torch.float32
     T = 1 if mode == "decode" else 2
 
     torch.manual_seed(0)
-    # All f32; qkv is token-major [T, conv_dim], a/b token-major [T, Hv].
-    qkv = torch.randn(T, CONV_DIM).float()
-    conv_state = torch.randn(CONV_DIM, STATE_W).float()
-    conv_weight = torch.randn(CONV_DIM, K).float()
-    a = torch.randn(T, HV).float()
-    b = torch.randn(T, HV).float()
-    A_log = torch.randn(HV).float()
-    dt_bias = torch.randn(HV).float()
-    init_state = torch.randn(HV, D, D).float()
+    # qkv is token-major [T, conv_dim], a/b token-major [T, Hv]. dtype = f32 (default)
+    # or bf16 -- matching the model's activation dtype for an fp32-vs-bf16 perf A/B.
+    qkv = torch.randn(T, CONV_DIM).to(dtype)
+    conv_state = torch.randn(CONV_DIM, STATE_W).to(dtype)
+    conv_weight = torch.randn(CONV_DIM, K).to(dtype)
+    a = torch.randn(T, HV).to(dtype)
+    b = torch.randn(T, HV).to(dtype)
+    A_log = torch.randn(HV).to(dtype)
+    dt_bias = torch.randn(HV).to(dtype)
+    init_state = torch.randn(HV, D, D).to(dtype)
     # Gated per-head RMSNorm inputs (the "with rmsnorm" path): z token-major
     # [T, Hv*128], gamma per-head [128]. Skipped under `raw` for an A/B baseline.
-    z = torch.randn(T, VALUE_DIM).float()
-    gamma = torch.randn(D).float()
+    z = torch.randn(T, VALUE_DIM).to(dtype)
+    gamma = torch.randn(D).to(dtype)
 
     dev = xm.xla_device()
     host = (qkv, conv_state, conv_weight, a, b, A_log, dt_bias, init_state, z, gamma)
@@ -139,7 +143,8 @@ def main():
         xm.mark_step()
     _ = [o.cpu() for o in outs]
     path = "raw" if raw else "rmsnorm"
-    print(f"[profile_fused] emitted NEFF for {mode} T={T} ({path}) -> {_OUTDIR}")
+    dt = "bf16" if dtype is torch.bfloat16 else "f32"
+    print(f"[profile_fused] emitted NEFF for {mode} T={T} ({path}, {dt}) -> {_OUTDIR}")
 
 
 if __name__ == "__main__":
