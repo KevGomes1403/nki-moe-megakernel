@@ -64,25 +64,18 @@ except ImportError:
     from torch_neuronx.xla_impl.ops import nki_jit  # NKI 0.2.x (SDK 2.28)
 from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeRMSNorm
 
-from .nki_kernels.nki_deltanet import deltanet_recurrent_fwd as _deltanet_nki_kernel
-from .nki_kernels.nki_deltanet import (
+from .nki_kernels import (
+    deltanet_recurrent_fwd as _deltanet_nki_kernel,
     deltanet_recurrent_fwd_state as _deltanet_nki_kernel_state,
-)
-from .nki_kernels.nki_deltanet_chunked import (
     deltanet_chunk_step as _deltanet_nki_chunk_step,
-)
-from .nki_kernels.nki_deltanet_fused import (
     deltanet_fused_chunked_fwd as _deltanet_fused_kernel,
-)
-from .nki_kernels.nki_deltanet_fused import (
     _make_lower_mask,
     _make_lower_mask_diag,
     _make_identity,
-)
-from .nki_kernels.nki_deltanet_fused_tkg import (
     deltanet_fused_tkg_fwd as deltanet_fused_kernel,
     deltanet_fused_tkg_fwd_state as deltanet_fused_kernel_state,
     deltanet_attention_layer_state,
+    gqa_fused_tkg_fwd,
 )
 
 from neuronx_distributed_inference.models.config import (
@@ -204,6 +197,39 @@ except Exception:
     pass
 
 
+class TransposedColumnParallelLinear(ColumnParallelLinear):
+    """ColumnParallelLinear whose weight is stored [in, out] instead of [out, in].
+
+    The matmul consumes the weight directly (``x @ W``), so the contraction dim is
+    already on the partition axis and no runtime weight transpose is emitted.
+    """
+
+    def set_weight_and_bias_config(self) -> None:
+        self.weight_shape = (self.input_size, self.output_size_per_partition)
+        self.weight_partition_dim = 1
+        if self.add_bias:
+            bias_size = (
+                self.output_size
+                if self.gather_output
+                else self.output_size_per_partition
+            )
+            self.bias_shape = (bias_size,)
+            self.bias_partition_dim = 0
+        else:
+            self.bias_shape = None
+
+    def forward(self, input, slice_indices=None):
+        input_parallel = self._cpl_maybe_input_copy_to_tp_region(input)
+        weight = (
+            self.weight[:, slice_indices] if slice_indices is not None else self.weight
+        )
+        output_parallel = torch.matmul(input_parallel, weight)
+        output = self._cpl_maybe_gather_output(output_parallel)
+        if self.skip_bias_add:
+            return output, self.bias
+        return (output + self.bias) if self.bias is not None else output
+
+
 # ============================================================
 # Newton-Raphson Refined RMSNorm
 # ============================================================
@@ -304,6 +330,8 @@ class NeuronGatedDeltaNet(nn.Module):
 
         # KV cache dummy shape info
         self.head_dim = tc.head_dim  # 256
+        # Dummy KV layout must follow the global cache layout (BHDS when transposed).
+        self.k_cache_transposed = tc.neuron_config.k_cache_transposed
         tp_degree = tc.neuron_config.tp_degree
         raw_kv_heads = tc.num_key_value_heads
         if raw_kv_heads < tp_degree:
@@ -387,6 +415,30 @@ class NeuronGatedDeltaNet(nn.Module):
             ),
             requires_grad=False,
         )
+
+    def _dummy_kv(self, batch_size, seq_len, dtype, device):
+        """Zero KV placeholders for the KVCacheManager (DeltaNet carries state in
+        buffers, not KV). K follows the global cache layout: BHDS when transposed."""
+        v = torch.zeros(
+            batch_size,
+            self.kv_heads_per_rank,
+            seq_len,
+            self.head_dim,
+            dtype=dtype,
+            device=device,
+        )
+        if self.k_cache_transposed:
+            k = torch.zeros(
+                batch_size,
+                self.kv_heads_per_rank,
+                self.head_dim,
+                seq_len,
+                dtype=dtype,
+                device=device,
+            )
+        else:
+            k = torch.zeros_like(v)
+        return k, v
 
     def _conv1d_weight(self):
         return self.conv1d_weight.weight.unsqueeze(1)
@@ -578,15 +630,9 @@ class NeuronGatedDeltaNet(nn.Module):
                 new_conv_state,
             )
         # Dummy KV for the KVCacheManager (DeltaNet carries state in the buffers, not KV).
-        dummy_k = torch.zeros(
-            batch_size,
-            self.kv_heads_per_rank,
-            seq_len,
-            self.head_dim,
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
+        dummy_k, dummy_v = self._dummy_kv(
+            batch_size, seq_len, hidden_states.dtype, hidden_states.device
         )
-        dummy_v = torch.zeros_like(dummy_k)
         return output, (dummy_k, dummy_v), new_rec_state, new_conv_state
 
     def verify_block_candidates(self, query, key, value, g, beta, initial_state):
@@ -1517,15 +1563,9 @@ class NeuronGatedDeltaNet(nn.Module):
             )
 
         # Return dummy KV for KVCacheManager
-        dummy_k = torch.zeros(
-            batch_size,
-            self.kv_heads_per_rank,
-            seq_len,
-            self.head_dim,
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
+        dummy_k, dummy_v = self._dummy_kv(
+            batch_size, seq_len, hidden_states.dtype, hidden_states.device
         )
-        dummy_v = torch.zeros_like(dummy_k)
 
         return output, (dummy_k, dummy_v), new_rec_state, new_conv_state
 
@@ -1779,6 +1819,44 @@ class NeuronQwen36A3BAttention(NeuronAttentionBase):
             gather_output=False,
         )
 
+        # Fused GQA TKG kernel weights (decode/verify only). Contraction-first /
+        # head-major, per-rank, mirroring the DeltaNet in_proj_fused / out_proj
+        # layout; built in _convert_full_attention_block. Prefill keeps the
+        # standard q/k/v/output_gate/o_proj modules above.
+        self.use_tkg_attention_kernel = getattr(
+            config, "use_tkg_attention_kernel", False
+        )
+        if self.use_tkg_attention_kernel:
+            replicated_kv = max(
+                config.num_key_value_heads, config.neuron_config.tp_degree
+            )
+            global_qkv_dim = (
+                config.num_attention_heads + 2 * replicated_kv
+            ) * config.head_dim
+            global_gate_dim = config.num_attention_heads * config.head_dim
+            global_value_dim = config.num_attention_heads * config.head_dim
+            # [hidden, I] head-major [q..|k|v]; RowParallelLinear shards I (dim 1).
+            self.gqa_qkv_w = RowParallelLinear(
+                global_qkv_dim,
+                config.hidden_size,
+                bias=False,
+                input_is_parallel=True,
+            )
+            # [hidden, G] head-major output-gate weight; shards G.
+            self.gqa_gate_w = RowParallelLinear(
+                global_gate_dim,
+                config.hidden_size,
+                bias=False,
+                input_is_parallel=True,
+            )
+            # o_proj stored transposed [value_dim, hidden] (shards value_dim).
+            self.gqa_o_proj_w = ColumnParallelLinear(
+                config.hidden_size,
+                global_value_dim,
+                bias=False,
+                gather_output=False,
+            )
+
     def apply_rotary_embedding(
         self, Q, K, V, position_ids, cos_cache, sin_cache, use_polar_compatible_rope
     ):
@@ -1944,6 +2022,26 @@ class NeuronQwen36A3BAttention(NeuronAttentionBase):
         """
         bsz, q_len, _ = hidden_states.shape
 
+        # Decode/verify (cache present, not chunked prefill) through the fused GQA TKG kernel.
+        is_kernel_tkg = (
+            self.use_tkg_attention_kernel
+            and past_key_value is not None
+            and not (
+                q_len > 1
+                and getattr(self.config, "use_qwen_hybrid_chunked_prefill", False)
+            )
+        )
+        if is_kernel_tkg:
+            return self._forward_tkg_kernel(
+                hidden_states,
+                attention_mask,
+                active_mask,
+                position_ids,
+                past_key_value,
+                cos_cache,
+                sin_cache,
+            )
+
         # Use standard 2D position_ids for prep_qkv_tensors.
         rope_pos_ids = position_ids
 
@@ -2003,8 +2101,79 @@ class NeuronQwen36A3BAttention(NeuronAttentionBase):
         # (prevents mixed-precision dynamic-update-slice in neuronx-cc)
         K = K.to(self.torch_dtype)
         V = V.to(self.torch_dtype)
+        # Transposed K cache expects BHDS (the scatter dim is head_dim-major).
+        if self.k_cache_transposed:
+            K = K.permute(0, 1, 3, 2)
         past_key_value = (K, V)
         return attn_output, past_key_value, cos_cache, sin_cache
+
+    def _build_kernel_mask(self, attention_mask, active_mask, bsz, T, L, device):
+        """Build the fused kernel mask [L, B, q_heads, T] uint8 (1=keep), s_prior-major.
+
+        Prior window = first L-T cache slots (gated by the NxDI prior mask); the active tokens
+        occupy the last T slots (gated by intra-block causality, or all-keep for T=1 decode).
+        """
+        am = attention_mask
+        if am.dim() == 2:  # [B, L]
+            am = am[:, None, :].expand(bsz, T, L)
+        else:  # [B, 1, *, L]
+            am = am[:, 0]
+            if am.shape[1] == 1:
+                am = am.expand(bsz, T, L)
+        prior = am.to(torch.bool)[:, :, : L - T]  # [B, T(query), L-T]
+        if active_mask is not None:
+            active = active_mask[:, 0].to(torch.bool)  # [B, T(query), T(active key)]
+        else:
+            active = torch.ones(bsz, T, T, dtype=torch.bool, device=device)
+        full = torch.cat([prior, active], dim=2)  # [B, T(query), L]
+        mask = full.permute(2, 0, 1)[:, :, None, :].expand(L, bsz, self.num_heads, T)
+        return mask.to(torch.uint8).contiguous()
+
+    def _forward_tkg_kernel(
+        self,
+        hidden_states,
+        attention_mask,
+        active_mask,
+        position_ids,
+        past_key_value,
+        cos_cache,
+        sin_cache,
+    ):
+        """Fused GQA decode/verify: input-normed hidden in, all-reduced [B,S,H] out.
+
+        ``hidden_states`` is already input-RMSNorm'd (the decoder applies input_layernorm).
+        Returns ``(output, (active_k, active_v), cos_cache, sin_cache)`` -- the same tuple shape
+        the standard forward returns, so NxDI scatters active_k/active_v exactly as today.
+        """
+        bsz, T, _ = hidden_states.shape
+        k_cache, v_cache = past_key_value  # [B,1,D,L] BHDS, [B,1,L,D] BHSD
+        L = k_cache.shape[-1]
+        if cos_cache is None or sin_cache is None:
+            cos_cache, sin_cache = self.mrope_emb(hidden_states, position_ids)
+        mask = self._build_kernel_mask(
+            attention_mask, active_mask, bsz, T, L, hidden_states.device
+        )
+        o_out, active_k, active_v = gqa_fused_tkg_fwd[2](
+            hidden_states,
+            self.gqa_qkv_w.weight,
+            self.gqa_gate_w.weight,
+            self.q_layernorm.weight,
+            self.k_layernorm.weight,
+            cos_cache[0],
+            sin_cache[0],
+            k_cache,
+            v_cache,
+            mask,
+            self.gqa_o_proj_w.weight,
+            self.rms_norm_eps,
+        )
+        # o_out is the per-rank o_proj partial; all-reduce across tensor-parallel ranks.
+        output = o_out.unsqueeze(0).to(hidden_states.dtype)
+        output = mappings.reduce_from_tensor_model_parallel_region(
+            output,
+            process_group=parallel_state.get_tensor_model_parallel_group(),
+        )
+        return output, (active_k, active_v), cos_cache, sin_cache
 
 
 # ============================================================
@@ -2181,7 +2350,7 @@ class NeuronMTPHead(nn.Module):
         self.final_norm = rms_cls(h, eps=eps)
         # Sharded: the draft token is a sharded vocab-parallel argmax, so the
         # full-vocab logits are never gathered.
-        self.mtp_lm_head = ColumnParallelLinear(
+        self.mtp_lm_head = TransposedColumnParallelLinear(
             h,
             config.vocab_size,
             bias=False,
@@ -2293,15 +2462,10 @@ class NeuronQwen36A3BDecoderLayer(nn.Module):
             # Dummy KV so the verify target's KVCacheManager keeps a uniform
             # per-layer KV list (DeltaNet layers carry no GQA cache).
             b, s, _ = attn_out.shape
-            dummy_k = torch.zeros(
-                b,
-                self.linear_attn.kv_heads_per_rank,
-                s,
-                self.linear_attn.head_dim,
-                dtype=attn_out.dtype,
-                device=attn_out.device,
+            dummy_k, dummy_v = self.linear_attn._dummy_kv(
+                b, s, attn_out.dtype, attn_out.device
             )
-            present_key_value = (dummy_k, torch.zeros_like(dummy_k))
+            present_key_value = (dummy_k, dummy_v)
             deltanet_states = (S_stack, conv_cand)
         elif self.layer_type == "linear_attention":
             # DeltaNet path
@@ -2722,7 +2886,7 @@ class NeuronQwen36A3BModel(NeuronBaseModel):
             ]
         )
         self.norm = get_rmsnorm_cls()(self.hidden_size, eps=config.rms_norm_eps)
-        self.lm_head = ColumnParallelLinear(
+        self.lm_head = TransposedColumnParallelLinear(
             config.hidden_size,
             config.vocab_size,
             gather_output=False if self.on_device_sampling else True,
@@ -3250,6 +3414,27 @@ def build_deltanet_in_proj_fused(
     return torch.cat(blocks, dim=0).t().contiguous()
 
 
+def build_gqa_qkv_fused(q, k, v, num_q_heads, num_kv_heads, head_dim, tp_degree):
+    """Fuse GQA q/k/v projections into one contraction-first [hidden, I] weight.
+
+    KV heads are first replicated to tp_degree (repeat_interleave, matching NxDI's
+    GroupQueryAttention preshard), then each rank's contiguous output slice is
+    head-major [q_4r..q_4r+3 | k_r | v_r] -- the layout the fused TKG kernel slices.
+    Returns [hidden, I] (RowParallelLinear shards I).
+    """
+    reps = tp_degree // num_kv_heads
+    k = k.reshape(num_kv_heads, head_dim, -1).repeat_interleave(reps, dim=0)
+    v = v.reshape(num_kv_heads, head_dim, -1).repeat_interleave(reps, dim=0)
+    q = q.reshape(num_q_heads, head_dim, -1)
+    qh = num_q_heads // tp_degree  # q heads per rank
+    blocks = []
+    for r in range(tp_degree):
+        blocks.append(q[r * qh : (r + 1) * qh].reshape(qh * head_dim, -1))
+        blocks.append(k[r].reshape(head_dim, -1))
+        blocks.append(v[r].reshape(head_dim, -1))
+    return torch.cat(blocks, dim=0).t().contiguous()
+
+
 def _convert_full_attention_block(sd, prefix, config):
     """GQA per-layer conversions on `{prefix}.self_attn.*`, in place.
 
@@ -3276,6 +3461,25 @@ def _convert_full_attention_block(sd, prefix, config):
         )
         sd[f"{prefix}.self_attn.output_gate_proj.weight"] = w[:, head_dim:, :].reshape(
             num_heads * head_dim, config.hidden_size
+        )
+
+    # Fused GQA TKG kernel weights (decode/verify): head-major contraction-first
+    # qkv + gate, and o_proj stored transposed. Built as copies; prefill keeps the
+    # standard q/k/v/output_gate/o_proj. Mirrors DeltaNet in_proj_fused / out_proj.
+    if getattr(config, "use_tkg_attention_kernel", False):
+        tp = config.neuron_config.tp_degree
+        num_heads, head_dim = config.num_attention_heads, config.head_dim
+        q_w = sd[f"{prefix}.self_attn.q_proj.weight"]
+        k_w = sd[f"{prefix}.self_attn.k_proj.weight"]
+        v_w = sd[f"{prefix}.self_attn.v_proj.weight"]
+        sd[f"{prefix}.self_attn.gqa_qkv_w.weight"] = build_gqa_qkv_fused(
+            q_w, k_w, v_w, num_heads, config.num_key_value_heads, head_dim, tp
+        )
+        sd[f"{prefix}.self_attn.gqa_gate_w.weight"] = (
+            sd[f"{prefix}.self_attn.output_gate_proj.weight"].t().contiguous()
+        )
+        sd[f"{prefix}.self_attn.gqa_o_proj_w.weight"] = (
+            sd[f"{prefix}.self_attn.o_proj.weight"].t().contiguous()
         )
 
     if config.neuron_config.fused_qkv:
@@ -3446,6 +3650,13 @@ def convert_qwen36_a3b_hf_to_neuron_state_dict(neuron_state_dict, config):
     # decoder layer under `mtp.layers.0.*`; it ships neither a draft embedding
     # nor a draft LM head, so both are tied to the main model. When MTP is
     # disabled, drop the keys so they don't trip load_state_dict.
+
+    # Store lm_head transposed ([hidden, vocab]) for TransposedColumnParallelLinear.
+    if "lm_head.weight" in neuron_state_dict:
+        neuron_state_dict["lm_head.weight"] = (
+            neuron_state_dict["lm_head.weight"].t().contiguous()
+        )
+
     if config.mtp_num_hidden_layers == 0:
         for k in [k for k in neuron_state_dict if k.startswith("mtp.")]:
             neuron_state_dict.pop(k)

@@ -1,10 +1,15 @@
 """Fused single-kernel DeltaNet chunked forward for CTE (context encoding).
 
+Status: faster than chunked_step.py but uses the split decay form
+exp(gc[i]) * exp(-gc[j]), which overflows fp32 for this checkpoint's gating
+magnitude and yields NaN logits. Gated OFF for this model — chunked_step.py is
+the default prefill path. See README "Implementation notes".
+
 SSD-style architecture: processes ALL chunks for one (batch, head) pair in
 a single NKI kernel call.  State (128x128) persists in SBUF across chunks —
 no HBM round-trips for inter-chunk state propagation.
 
-Key optimizations over nki_deltanet_chunked.py:
+Key optimizations over the per-chunk-step kernel (chunked_step.py):
   1. Single kernel call per (B,H) instead of B*H*num_chunks calls
   2. State in SBUF across all chunks (no HBM state read/write per chunk)
   3. In-kernel cumsum via tensor_tensor_scan (no PyTorch cumsum)
@@ -16,7 +21,7 @@ Key optimizations over nki_deltanet_chunked.py:
 NKI 0.3.0 (SDK 2.29). k_dim = v_dim = 128 = P_MAX exactly.
 Chunk size = 128 = P_MAX (one tile per chunk).
 
-Mathematical framework (same as nki_deltanet_chunked.py):
+Mathematical framework (same as chunked_step.py):
   Per-chunk Neumann-series power-doubling for intra-chunk correction:
     A = -QK_decay * lower_mask
     N = (I+A)(I+A^2)(I+A^4)...(I+A^64)  [6 rounds]

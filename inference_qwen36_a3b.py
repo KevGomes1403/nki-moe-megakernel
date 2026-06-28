@@ -78,7 +78,9 @@ DEFAULT_PROMPTS = [
 ]
 
 
-def _make_neuron_config(tp_degree, seq_len, blockwise_block_size, spec_decode):
+def _make_neuron_config(
+    tp_degree, seq_len, blockwise_block_size, spec_decode, tkg_attention_kernel=False
+):
     """MoENeuronConfig shared by the target and draft; adds the EAGLE fused-spec
     flags (speculation_length=2 == k=1) when speculating."""
     spec_kwargs = (
@@ -98,6 +100,8 @@ def _make_neuron_config(tp_degree, seq_len, blockwise_block_size, spec_decode):
         flash_decoding_enabled=False,
         logical_nc_config=2,
         save_sharded_checkpoint=True,
+        # GQA TKG kernel reads the K cache as BHDS (its k_prior layout).
+        k_cache_transposed=tkg_attention_kernel,
         # A3B_SKIP_SHARD=1: trace graphs only; reuse an existing weights/ dir
         # (e.g. symlinked from another build with identical sharding).
         skip_sharding=os.environ.get("A3B_SKIP_SHARD") == "1",
@@ -146,7 +150,11 @@ def build_inference_config(
         draft_dict["mtp_num_hidden_layers"] = 1
         draft_config = Qwen36A3BInferenceConfig(
             neuron_config=_make_neuron_config(
-                tp_degree, seq_len, blockwise_block_size, spec_decode=True
+                tp_degree,
+                seq_len,
+                blockwise_block_size,
+                spec_decode=True,
+                tkg_attention_kernel=tkg_attention_kernel,
             ),
             **draft_dict,
         )
@@ -161,7 +169,11 @@ def build_inference_config(
     config_dict["mtp_num_hidden_layers"] = 0
     return Qwen36A3BInferenceConfig(
         neuron_config=_make_neuron_config(
-            tp_degree, seq_len, blockwise_block_size, spec_decode=spec_decode
+            tp_degree,
+            seq_len,
+            blockwise_block_size,
+            spec_decode=spec_decode,
+            tkg_attention_kernel=tkg_attention_kernel,
         ),
         fused_spec_config=fused_spec_config,
         **config_dict,
@@ -174,7 +186,9 @@ def _presharded_weights_complete(compiled_path: str, tp_degree: int) -> bool:
     tp2/tp3."""
     weights_dir = os.path.join(compiled_path, "weights")
     return all(
-        os.path.exists(os.path.join(weights_dir, f"tp{rank}_sharded_checkpoint.safetensors"))
+        os.path.exists(
+            os.path.join(weights_dir, f"tp{rank}_sharded_checkpoint.safetensors")
+        )
         for rank in range(tp_degree)
     )
 
@@ -192,7 +206,9 @@ def maybe_compile(model_path: str, compiled_path: str, inf_config) -> None:
     neff_path = os.path.join(compiled_path, "model.pt")
 
     if not os.path.exists(neff_path):
-        print(f"Compiling Qwen3.6-A3B to {compiled_path} (this can take 10-20 minutes)...")
+        print(
+            f"Compiling Qwen3.6-A3B to {compiled_path} (this can take 10-20 minutes)..."
+        )
         t0 = time.time()
         model = NeuronQwen36A3BForCausalLM(model_path, inf_config)
         model.compile(compiled_path)
@@ -207,7 +223,9 @@ def maybe_compile(model_path: str, compiled_path: str, inf_config) -> None:
         and not neuron_config.skip_sharding
         and not _presharded_weights_complete(compiled_path, neuron_config.tp_degree)
     ):
-        print(f"Presharded weights incomplete; re-sharding into {compiled_path}/weights/ ...")
+        print(
+            f"Presharded weights incomplete; re-sharding into {compiled_path}/weights/ ..."
+        )
         t0 = time.time()
         model = NeuronQwen36A3BForCausalLM(model_path, inf_config)
         model.shard_weights(compiled_path)
@@ -223,7 +241,9 @@ def load_model(compiled_path: str) -> NeuronQwen36A3BForCausalLM:
     return model
 
 
-def resolve_max_new_tokens(model, prompt_len: int, requested: Optional[int] = None) -> int:
+def resolve_max_new_tokens(
+    model, prompt_len: int, requested: Optional[int] = None
+) -> int:
     """New-token budget that fills the sequence window: seq_len - prompt_len.
 
     With no explicit --max-new-tokens, generate until the sequence is full; a
@@ -253,7 +273,9 @@ def generate(
     adapter.generation_config.transformers_version = transformers.__version__
 
     inputs = tokenizer(prompt, padding=True, return_tensors="pt")
-    new_tokens = resolve_max_new_tokens(model, inputs.input_ids.shape[1], max_new_tokens)
+    new_tokens = resolve_max_new_tokens(
+        model, inputs.input_ids.shape[1], max_new_tokens
+    )
 
     # Fused speculation runs through HF assisted decoding; prompt_lookup_num_tokens
     # selects that generation mode (NxDI then dispatches to _fused_assisted_decoding).
@@ -386,7 +408,9 @@ def benchmark_device(
         fused = latency_collectors.get("fused_speculation_model")
         if fused is not None and len(fused.latency_list):
             rounds_per_run = len(fused.latency_list) / bench.num_runs
-            report["e2e_model"]["tokens_per_round"] = round(new_tokens / rounds_per_run, 3)
+            report["e2e_model"]["tokens_per_round"] = round(
+                new_tokens / rounds_per_run, 3
+            )
 
     model.reset()
     return report
@@ -449,7 +473,9 @@ def main():
     # Header label only; the real per-prompt budget is seq_len - prompt_len when
     # --max-new-tokens is unset.
     mnt_desc = (
-        "seq_len - prompt_len" if args.max_new_tokens is None else str(args.max_new_tokens)
+        "seq_len - prompt_len"
+        if args.max_new_tokens is None
+        else str(args.max_new_tokens)
     )
 
     compiled_path = args.compiled_path or (
@@ -459,7 +485,9 @@ def main():
     )
 
     inf_config = build_inference_config(
-        args.model_path, args.tp_degree, args.seq_len,
+        args.model_path,
+        args.tp_degree,
+        args.seq_len,
         spec_decode=args.mtp_spec_decode,
         tkg_attention_kernel=args.tkg_attention_kernel,
     )
@@ -493,7 +521,7 @@ def main():
     print("=" * 70)
     for prompt in args.prompts:
         token_ids, _ = generate(model, tokenizer, prompt, args.max_new_tokens)
-        new_ids = token_ids[len(tokenizer(prompt).input_ids):]
+        new_ids = token_ids[len(tokenizer(prompt).input_ids) :]
         response = tokenizer.decode(new_ids, skip_special_tokens=True)
         print(f"\n{prompt}")
         print(response)
@@ -511,7 +539,11 @@ def main():
     )
     print("=" * 70)
     report = benchmark_device(
-        model, tokenizer, bench_prompt, args.max_new_tokens, num_runs=args.num_runs,
+        model,
+        tokenizer,
+        bench_prompt,
+        args.max_new_tokens,
+        num_runs=args.num_runs,
     )
     for key, sub in report.items():
         if sub is None:

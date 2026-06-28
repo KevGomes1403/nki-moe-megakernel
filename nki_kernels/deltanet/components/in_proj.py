@@ -8,7 +8,7 @@ the in_proj_qkv|z|a|b weights on the output axis (I = conv_dim + value_dim + 2*n
 caller slices the BSD output back into qkv/z/a/b at offsets conv_dim, +value_dim, +num_v_heads.
 proj_w is [H, I] -- the transpose of the nn.Linear [I, H] weights (qkv_tkg wants contraction H first).
 Per rank (TP=4): hidden=2048, I=3088, T<=2. The SBUF-resident fusion into conv+recurrence lives in
-nki_deltanet_fused_tkg.deltanet_in_proj_fused_tkg_fwd.
+deltanet/decode/fused_layer.py (deltanet_in_proj_fused_tkg_fwd).
 """
 
 import nki

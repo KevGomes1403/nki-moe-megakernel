@@ -20,7 +20,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from models.qwen3_6_moe.nki_kernels.nki_deltanet_fused import (  # noqa: E402
+from models.qwen3_6_moe.nki_kernels.deltanet.prefill.chunked_fused import (  # noqa: E402
     deltanet_fused_chunked_fwd,
     _make_lower_mask,
     _make_identity,

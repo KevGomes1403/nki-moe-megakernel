@@ -56,15 +56,15 @@ Outputs are FULL-shape in shared_hbm; each core writes its disjoint head/column/
 import nki
 import nki.language as nl
 
-from models.qwen3_6_moe.nki_kernels.nki_deltanet_conv_tkg import (
+from ..components.conv import (
     P_MAX,
     conv_qkv_sbuf,
     kernel_assert,
     qkv_to_channel_partition,
 )
-from models.qwen3_6_moe.nki_kernels.nki_deltanet_in_proj import in_proj_compose
-from models.qwen3_6_moe.nki_kernels.nki_deltanet_out_proj import out_proj_compose
-from models.qwen3_6_moe.nki_kernels.nki_deltanet_tkg import gated_delta_rule_tkg
+from ..components.in_proj import in_proj_compose
+from ..components.out_proj import out_proj_compose
+from ..components.recurrence import gated_delta_rule_tkg
 
 
 def fused_compose(

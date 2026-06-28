@@ -69,7 +69,7 @@ import nki
 import nki.isa as nisa
 import nki.language as nl
 
-from models.qwen3_6_moe.nki_kernels.nki_deltanet_norm_gate import norm_gate_row
+from .norm_gate import norm_gate_row
 
 # Partition dimension max (NeuronCore SBUF tile width) = d.
 P_MAX = 128

@@ -122,10 +122,10 @@ warm-up, greedy):
 
 ## Implementation notes
 
-DeltaNet prefill kernel. The default prefill path uses the chunked NKI kernel
-(`nki_kernels/nki_deltanet_chunked.py`), which forms the within-chunk decay as
-`exp(gc[i] - gc[j])` and is numerically stable. The fused kernel
-(`nki_kernels/nki_deltanet_fused.py`) uses the split form `exp(gc[i]) * exp(-gc[j])`,
+DeltaNet prefill kernel. The default prefill path uses the chunked-step NKI kernel
+(`nki_kernels/deltanet/prefill/chunked_step.py`), which forms the within-chunk decay
+as `exp(gc[i] - gc[j])` and is numerically stable. The fused kernel
+(`nki_kernels/deltanet/prefill/chunked_fused.py`) uses the split form `exp(gc[i]) * exp(-gc[j])`,
 which overflows float32 for this checkpoint's gating magnitude and produces NaN
 logits. Do not select the fused path for this model. Token generation (decode) uses a
 single-step recurrence that is stable by construction.
@@ -151,8 +151,9 @@ They are treated as validated code and are not edited.
 - `modeling_qwen36_a3b.py`: configuration, DeltaNet, GQA, MoE block, MTP head, hybrid
   cache manager, decoder layer, model, causal LM wrapper, fused-speculation classes,
   and the weight converter.
-- `nki_kernels/`: DeltaNet NKI kernels (`nki_deltanet.py` recurrent,
-  `nki_deltanet_chunked.py` per-chunk and stable, `nki_deltanet_fused.py` fused).
+- `nki_kernels/`: DeltaNet NKI kernels organized by stage and regime under
+  `deltanet/` (`components/`, `decode/`, `prefill/`); see `nki_kernels/README.md`
+  for the full map. Consumers import entrypoints from the `nki_kernels` package root.
 - `inference_qwen36_a3b.py`: end-to-end driver (compile, load, generate, benchmark).
 - `tests/`: CPU weight-conversion tests, hardware block tests for the MoE and DeltaNet
   blocks, the MTP state-rule oracle (`test_mtp_state_rule.py`), and kernel/decay

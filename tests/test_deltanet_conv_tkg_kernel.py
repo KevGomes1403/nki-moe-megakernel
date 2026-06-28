@@ -31,7 +31,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from models.qwen3_6_moe.nki_kernels.nki_deltanet_conv_tkg import (  # noqa: E402
+from models.qwen3_6_moe.nki_kernels.deltanet.components.conv import (  # noqa: E402
     deltanet_conv_tkg_fwd,
     deltanet_conv_tkg_fwd_cand,
     deltanet_conv_tkg_fwd_sbuf,

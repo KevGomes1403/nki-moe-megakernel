@@ -4,7 +4,7 @@ Compares NxDI's compiled gated DeltaNet kernel against the HF reference
 (Qwen3_5MoeGatedDeltaNet) on trn3 with TP=4, LNC=2.
 
 The NKI DeltaNet kernels work in 128-token chunks (P_MAX=128 in
-nki_deltanet_fused.py), so we use seq_len=128 -- exactly one chunk -- to
+deltanet/prefill/chunked_fused.py), so we use seq_len=128 -- exactly one chunk -- to
 exercise the fused-prefill path without padding artifacts.
 """
 

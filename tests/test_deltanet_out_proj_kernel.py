@@ -36,7 +36,7 @@ import nki  # noqa: E402
 import nki.isa as nisa  # noqa: E402
 import nki.language as nl  # noqa: E402
 
-from models.qwen3_6_moe.nki_kernels.nki_deltanet_out_proj import (  # noqa: E402
+from models.qwen3_6_moe.nki_kernels.deltanet.components.out_proj import (  # noqa: E402
     out_proj_compose,
 )
 

@@ -4,7 +4,7 @@ Status: **PROPOSED — not yet implemented.**
 Scope: the last fusion seam of the DeltaNet attention layer — everything in `attn_output()`
 (`modeling_qwen36_a3b.py:466-480`) *after* the gated per-head RMSNorm, i.e. **`out_proj` + the
 RowParallelLinear TP all-reduce**. Folding this into the existing fused conv→recurrence→gated-norm
-kernel (`nki_deltanet_fused_tkg.py`) makes the whole DeltaNet attention block one SBUF-resident NKI
+kernel (`deltanet/decode/fused_layer.py`) makes the whole DeltaNet attention block one SBUF-resident NKI
 launch that returns the *final* hidden-shaped output (post-projection, post-reduce). After this, the
 only host op left in the attention layer is the residual add.
 
@@ -14,7 +14,7 @@ already sketched in the megakernel scoping doc (`megakernel_scoping.html:306,314
 … add TP all-reduce" + "TP=4 all-reduce … `nki.collectives.all_reduce` … proven in `transformer_tkg`").
 
 Prerequisite: the gated norm must switch to **Layout B** (head_dim on the partition axis) — see
-`deltanet_gated_rmsnorm_spec.md` §3, which explicitly defers Layout B to "once `out_proj` is also
+`norm_gate.md` §3, which explicitly defers Layout B to "once `out_proj` is also
 in-kernel." That time is now.
 
 ---
@@ -34,14 +34,14 @@ output = self.out_proj(gated)          # RowParallelLinear: matmul + cross-rank 
 1. **Matmul** `o_partial[t, h] = Σ_v gated[t, v] · W[v, h]`, contracting over the rank's local
    `value_dim` channels. `W` (per rank) is the input-sharded `[hidden_size, value_dim]` nn.Linear
    weight; the kernel wants its **transpose** `[value_dim, hidden_size]` (same convention as the
-   in_proj `proj_w`, see `nki_deltanet_in_proj.py:8`).
+   in_proj `proj_w`, see `deltanet/components/in_proj.py:8`).
 2. **TP all-reduce** (sum) of `o_partial` across the `tp_degree` ranks — because each rank holds only
    `1/tp_degree` of the global value heads. This is the only collective in the DeltaNet layer.
 
 Output is the final attention-block output `o_out [T, hidden_size]` (full hidden, fully reduced).
 
 ### Concrete dims (A3B, TP=4, LNC=2)
-Ground-truth from `config.json` `text_config` (per `deltanet_gated_rmsnorm_spec.md` §2; the modeling-file
+Ground-truth from `config.json` `text_config` (per `norm_gate.md` §2; the modeling-file
 comment numbers `1536`/`48-head` are stale): `hidden_size H = 2048`, `linear_num_value_heads = 32`,
 `linear_value_head_dim d = 128`.
 
@@ -62,7 +62,7 @@ Constraints check (all pass): `d = 128 ≤ P_MAX` ✓; `B·S = T ≤ 128` ✓; `
 
 The recurrence + gated norm are **value-head sharded** across the 2 LNC cores: core `c` owns heads
 `[c·Hv_core, (c+1)·Hv_core)` and emits the gated output for *only its 4 heads*
-(`nki_deltanet_tkg.py:299` `vh_off`, `col_off`). The `out_proj` matmul **contracts over all value
+(`deltanet/components/recurrence.py:299` `vh_off`, `col_off`). The `out_proj` matmul **contracts over all value
 heads**. So the o_proj cannot read straight off the per-core norm output — the contraction needs heads
 the core doesn't own. Two ways to bridge:
 
@@ -114,7 +114,7 @@ With `OUT_IN_SB=True, TRANSPOSE_OUT=False` it returns `out_sb [min(T,P_MAX), H_s
 `group_size=1`, so it issues `Hv=8` accumulating `nc_matmul`s of 128-deep contraction (`:727-731`).
 
 **Validate this composes as a sub-call.** `output_projection_tkg` is `@nki.jit`; `in_proj_compose`
-already nests `@nki.jit qkv_tkg` inside the fused kernel and works (`nki_deltanet_in_proj.py:23`), so the
+already nests `@nki.jit qkv_tkg` inside the fused kernel and works (`deltanet/components/in_proj.py:23`), so the
 pattern is proven — but `transformer_tkg.py:91` warns about "double-jit stack overflow." If nesting
 fails, call the inner `_output_projection_tkg_impl` / shuffle helpers directly, or strip the decorator at
 the call site. Resolve at implementation time (§9).
@@ -125,7 +125,7 @@ the call site. Resolve at implementation time (§9).
 
 `output_projection_tkg` wants `attention` as `[D, B, N, S]` — **head_dim on the partition axis**. The
 current gated norm emits **Layout A** (`head_dim on the free axis`, `[T, W]` head-major,
-`nki_deltanet_norm_gate.py:27-60`). `deltanet_gated_rmsnorm_spec.md` §3 anticipated this exact moment:
+`deltanet/components/norm_gate.py:27-60`). `norm_gate.md` §3 anticipated this exact moment:
 
 > "Layout B pays off only once `out_proj` is also in-kernel … head_dim-on-partition feeds the matmul
 > transpose-free. Until then it is pure added transpose cost."
@@ -134,13 +134,13 @@ So add a **Layout B variant** of `norm_gate_row` that produces `[d=128, Hv_core�
 partition, `(head, t)` on free):
 - sum-of-squares = **partition-axis reduce via a ones-`nc_matmul`** (`stationary=ones[128,1]`,
   `moving=x²[128, Hv_core·T]` → `[1, Hv_core·T]` PSUM) — the technique the recurrence already has
-  (`nki_deltanet_tkg.py` `partition_broadcast_psum`/`ones_row`/`red_p`) and `rmsnorm_tkg.py:267` uses.
+  (`deltanet/components/recurrence.py` `partition_broadcast_psum`/`ones_row`/`red_p`) and `rmsnorm_tkg.py:267` uses.
 - `rsqrt(mean+eps)` broadcast back over the 128 partitions; `gamma [128,1]` per-partition multiply;
   `silu(z)` gate (z also transposed to head_dim-on-partition).
 - Output `[d, Hv_core·T]` → reshape to `[d, B, Hv_core, T]` = the o_proj `attention` slice for this
   core's heads, **transpose-free** into the gather+matmul.
 
-This replaces the Layout-A write at the recurrence output seam (`nki_deltanet_tkg.py:491-507`) **only on
+This replaces the Layout-A write at the recurrence output seam (`deltanet/components/recurrence.py:491-507`) **only on
 the o_proj-fused path**; keep Layout A for the standalone gated-norm and the non-o_proj fused entrypoints
 (they still emit `attn_out [T, W]` head-major). Gate it behind the same plumbing flag that turns o_proj on.
 
@@ -185,7 +185,7 @@ Add a thin composable + new entrypoints (mirroring the in_proj precedent: helper
 composition in the fused file).
 
 ```python
-# nki_deltanet_out_proj.py — thin reuse wrapper (+ standalone test harness)
+# deltanet/components/out_proj.py — thin reuse wrapper (+ standalone test harness)
 def out_proj_compose(attn_full_sb, out_w, replica_groups, sbm):
     """attn_full_sb [d,B,Hv,T] SBUF (all heads, head_dim on partition), out_w [value_dim,H] HBM
     -> reduced o_out shard [T, H_shard] SBUF. Calls output_projection_tkg(OUT_IN_SB) then nccl.all_reduce."""
@@ -195,7 +195,7 @@ def deltanet_out_proj_fwd(attn_full, out_w, replica_groups):
     """Standalone HBM harness for unit testing: attn_full [d,B,Hv,T] -> o_out [T,H]. Launch [2]."""
 ```
 
-Then extend the fused composes/entrypoints in `nki_deltanet_fused_tkg.py`. The full attention megakernel
+Then extend the fused composes/entrypoints in `deltanet/decode/fused_layer.py`. The full attention megakernel
 (in_proj → conv → recurrence → gated-norm(Layout B) → gather → o_proj → all-reduce):
 
 ```python
@@ -220,7 +220,7 @@ non-o_proj entrypoints (`deltanet_in_proj_fused_tkg_fwd`, …) for incremental b
 ## 8. Model integration (`modeling_qwen36_a3b.py`)
 
 1. **Weight:** pass `self.out_proj.weight.t()` (`[value_dim, H]`) into the kernel, same transpose
-   convention as `proj_w` (`nki_deltanet_in_proj.py:8`). Consider pre-transposing in
+   convention as `proj_w` (`deltanet/components/in_proj.py:8`). Consider pre-transposing in
    `convert_qwen36_a3b_hf_to_neuron_state_dict()` to avoid a per-call `.t()`.
 2. **Replica group:** build `replica_groups: List[List[int]]` from
    `parallel_state.get_tensor_model_parallel_group()` (the TP ranks), passed to the kernel as a

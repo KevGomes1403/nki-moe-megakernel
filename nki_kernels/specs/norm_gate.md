@@ -1,6 +1,6 @@
 # DeltaNet Gated Per-Head RMSNorm — TKG Kernel Spec & Implementation Plan
 
-Status: **IMPLEMENTED & on-device validated** (kernel `nki_deltanet_norm_gate.py`, integrated into the
+Status: **IMPLEMENTED & on-device validated** (kernel `deltanet/components/norm_gate.py`, integrated into the
 fused TKG kernel behind optional `z`/`gamma`/`eps`; test `tests/test_deltanet_fused_tkg_kernel.py` PASSes
 vs HF `Qwen3_5MoeRMSNormGated` at atol=1e-5/rtol=1e-2). No precedent in nkilib — custom.
 Scope: the back-half of the DeltaNet layer between the fused conv+recurrence kernel and `out_proj`.
@@ -8,7 +8,7 @@ This is the `attn_output()` pre-projection step in `modeling_qwen36_a3b.py:466-4
 
 > **API reality (as-built, supersedes the "NKI 0.3.0" notes below):** the installed SDK is **NKI 0.4.0**,
 > where **`nisa.rsqrt` does not exist**. The kernel uses `nisa.activation(op=nl.rsqrt, data=, scale=1/d,
-> bias=eps)` — the same form the existing recurrence kernel uses (`nki_deltanet_tkg.py:186`), which also
+> bias=eps)` — the same form the existing recurrence kernel uses (`deltanet/components/recurrence.py:186`), which also
 > folds mean-scale+eps into one Scalar-engine instruction (the optimization §7 wanted). `activation_reduce`
 > can't do the per-head reduce (it collapses the whole free dim), so square+`tensor_reduce(axis=(2,))` is
 > used. `nl.silu` is available. Treat the "use `nisa.rsqrt`" lines in §5/§7/§8 as obsolete.
@@ -91,8 +91,8 @@ Key consequences — and the headline simplification vs nkilib's `rmsnorm_tkg`:
 ## 3. Layout analysis — where `head_dim` goes
 
 The recurrence emits each token's output as a `[1, W]` row, **head-major on the free axis**
-(`nki_deltanet_tkg.py:422-431`: `O_row[0, h*d+j]`). The standalone input `attn_raw` is the full-shape
-`[T, W]` head-major HBM tensor (`nki_deltanet_fused_tkg.py:97`). Two viable layouts:
+(`deltanet/components/recurrence.py:422-431`: `O_row[0, h*d+j]`). The standalone input `attn_raw` is the full-shape
+`[T, W]` head-major HBM tensor (`deltanet/decode/fused_layer.py:97`). Two viable layouts:
 
 ### Layout A — `head_dim` on the FREE axis: `[P = T·Hv, F = d=128]`  ← recommended for v1 / standalone
 The head-major `[T, W]` tensor is **contiguous**: linear index `t*W + h*d + j = (t*Hv + h)*d + j`. So
@@ -104,7 +104,7 @@ reshape on load. Then:
 
 This mirrors nkilib's `rmsnorm_tkg_th` (T-on-partition, H-on-free, free-axis reduce). It also drops in at
 the recurrence's per-token output seam with **zero transpose**: each token's `O_row [1, W]`
-(`nki_deltanet_tkg.py:422-426`) is already `[1, Hv, d]` head-major, so the per-head reduce is a free-axis
+(`deltanet/components/recurrence.py:422-426`) is already `[1, Hv, d]` head-major, so the per-head reduce is a free-axis
 reduce over `d` on a 1-partition tile (T=1) — see §5. **Recommended for the fused integration as long as
 `out_proj` is external** (see the boundary note below).
 
@@ -112,7 +112,7 @@ reduce over `d` on a 1-partition tile (T=1) — see §5. **Recommended for the f
 Transpose the recurrence's output so the 128 head-dim lands on partitions, then:
 - sum-of-squares = **partition-axis reduce via a ones-`nc_matmul`** (`stationary=ones[128,1]`,
   `moving=x²[128, T·Hv]` → `[1, T·Hv]` in PSUM) — the technique nkilib uses for its H0 reduce
-  (`rmsnorm_tkg.py:267`) and that the recurrence already has (`nki_deltanet_tkg.py:90
+  (`rmsnorm_tkg.py:267`) and that the recurrence already has (`deltanet/components/recurrence.py:90
   partition_broadcast_psum`, `red_p`, `ones_row`).
 - `rsqrt`, broadcast back over 128 partitions, gamma `[128,1]` per-partition multiply, silu-gate.
 - Output `[128, T·Hv]` has `head_dim` on partition → feeds `output_projection_tkg` with no further transpose.
@@ -161,9 +161,9 @@ def deltanet_gated_rmsnorm(attn_raw, gamma, z, eps):
 
 Plumbing into the fused kernel (the integration surface, all in `nki_kernels/`):
 - Thread `z`, `gamma`, `eps` through `deltanet_fused_tkg_fwd` / `..._fwd_state` → `fused_compose` →
-  `gated_delta_rule_tkg`. Today none of these carry `z`/`gamma` (`nki_deltanet_fused_tkg.py:57,83,108`).
+  `gated_delta_rule_tkg`. Today none of these carry `z`/`gamma` (`deltanet/decode/fused_layer.py:57,83,108`).
 - In `gated_delta_rule_tkg`, slice `z` by the same `col_off` the output write uses
-  (`nki_deltanet_tkg.py:428-431`); `gamma` is replicated (load once per core). Call `norm_gate_row` on
+  (`deltanet/components/recurrence.py:428-431`); `gamma` is replicated (load once per core). Call `norm_gate_row` on
   `O_row` right before the DMA at line 430, and write the **gated** row instead of the raw row.
 - Model side (`modeling_qwen36_a3b.py`): `fused_attn_nki` passes `z`/`gamma`/`eps` into the kernel;
   `attn_output()` (lines 466-480) collapses to just `out_proj(...)`. Keep the torch norm/gate behind the
@@ -195,7 +195,7 @@ Per token (`o_row [1, W_core]` viewed as `[1, Hv_core, d]`):
 ### Step 2 — compose into the recurrence (the integration)
 1. Plumb `z`/`gamma`/`eps` through the entrypoints → `fused_compose` → `gated_delta_rule_tkg` (§4).
 2. Load `gamma` once per core; per token, slice `z_row = z[t, col_off:col_off+W_core]` into SBUF.
-3. At `nki_deltanet_tkg.py:424-433`, replace the raw `O_row` write with
+3. At `deltanet/components/recurrence.py:424-433`, replace the raw `O_row` write with
    `gated = norm_gate_row(O_row, z_row, gamma_sb, eps, d)` then DMA `gated` to the same `attn_out` columns.
    **No transpose, no extra HBM round-trip** — the kernel now emits the gated-normed output directly.
 4. Validate the fused kernel output against torch `attn_output(attn_raw, z)` (norm+gate only), then against
