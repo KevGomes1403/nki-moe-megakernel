@@ -76,6 +76,7 @@ from .nki_kernels import (
     deltanet_fused_tkg_fwd_state as deltanet_fused_kernel_state,
     deltanet_attention_layer_state,
     gqa_fused_tkg_fwd,
+    moe_layer_fwd,
 )
 
 from neuronx_distributed_inference.models.config import (
@@ -1605,6 +1606,7 @@ class Qwen36A3BInferenceConfig(InferenceConfig):
         kwargs.setdefault("use_qwen_hybrid_chunked_prefill", False)
         kwargs.setdefault("use_qwen_hybrid_chunked_prefill_nki", False)
         kwargs.setdefault("use_tkg_attention_kernel", False)
+        kwargs.setdefault("use_moe_layer_kernel", False)
 
         # MoE
         kwargs.setdefault("num_experts", 256)
@@ -2215,24 +2217,43 @@ class NeuronMoEBlock(nn.Module):
     def __init__(self, config: "Qwen36A3BInferenceConfig"):
         super().__init__()
         self.config = config
+        self.use_moe_layer_kernel = getattr(config, "use_moe_layer_kernel", False)
         self.moe = initialize_moe_module(config=config)
 
         # Always-on shared expert, owned here so we can apply the sigmoid gate.
         si = config.shared_expert_intermediate_size
         h = config.hidden_size
-        self.shared_expert = SharedExpertMLP(h, si)
+        self.shared_expert = SharedExpertMLP(
+            h, si, transposed=self.use_moe_layer_kernel
+        )
         # Scalar gate per token. Output is 1, so a parallel linear can't
         # shard along the output dim -- replicate across ranks instead.
         self.shared_expert_gate = nn.Linear(h, 1, bias=False)
+
+        # Fused MoE TKG kernel (verify path) reads router/sigma contraction-first. Router lives inside
+        # NxDI's self.moe (can't restow), so keep small rank-replicated transposed copies; the shared
+        # expert is stowed transposed in-place (SharedExpertMLP above), so it needs no copy.
+        if self.use_moe_layer_kernel:
+            self.moe_router_w_t = nn.Parameter(
+                torch.empty(h, config.num_experts), requires_grad=False
+            )  # [H, E]
+            self.moe_sigma_gate_t = nn.Parameter(
+                torch.empty(h, 1), requires_grad=False
+            )  # [H, 1]
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,
+        gamma: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # Debug knob: zero the MoE FFN contribution.
         if os.environ.get("A3B_BYPASS_MOE") == "1":
             return torch.zeros_like(hidden_states)
+
+        # Fused MoE TKG kernel path (verify): raw hidden + gamma, norm + routed + shared + gate in-kernel.
+        if gamma is not None:
+            return self._forward_moe_kernel(hidden_states, gamma)
 
         is_spec = (
             self.config.neuron_config.enable_fused_speculation
@@ -2255,35 +2276,85 @@ class NeuronMoEBlock(nn.Module):
             process_group=parallel_state.get_tensor_model_parallel_group(),
         )
 
+    def _forward_moe_kernel(self, hidden_states, gamma):
+        """Fused MoE layer (verify, T>1): one LNC2 launch -> per-rank partial -> single TP all-reduce.
+
+        Weights are read in kernel-native contraction-first layout with no runtime transpose: experts
+        straight from self.moe (gate_up a free [E,H,2,I] reshape), shared stowed transposed, router/sigma
+        from the rank-replicated transposed copies. ``gamma`` [1,H] is post_attention_layernorm.weight.
+        """
+        _, _, hidden = hidden_states.shape
+        tp = self.config.neuron_config.tp_degree
+        i_rank = self.config.moe_intermediate_size // tp  # per-rank routed intermediate
+        gate_up_w = self.moe.expert_mlps.mlp_op.gate_up_proj.weight  # [E, H, 2*I]
+        down_w = self.moe.expert_mlps.mlp_op.down_proj.weight  # [E, I, H]
+        partial = moe_layer_fwd[2](
+            hidden_states,
+            gamma,
+            self.moe_router_w_t,  # [H, E]
+            gate_up_w.reshape(
+                self.config.num_experts, hidden, 2, i_rank
+            ),  # [E, H, 2, I]
+            down_w,  # [E, I, H]
+            self.moe_sigma_gate_t,  # [H, 1]
+            self.shared_expert.gate_proj.weight,  # [H, I_s]
+            self.shared_expert.up_proj.weight,  # [H, I_s]
+            self.shared_expert.down_proj.weight,  # [I_s, H]
+            self.config.rms_norm_eps,
+            self.config.num_experts_per_tok,
+        )
+        return mappings.reduce_from_tensor_model_parallel_region(
+            partial,
+            process_group=parallel_state.get_tensor_model_parallel_group(),
+        )
+
 
 class SharedExpertMLP(nn.Module):
-    """Always-on shared expert: SwiGLU FFN sized by `shared_expert_intermediate_size`."""
+    """Always-on shared expert: SwiGLU FFN sized by `shared_expert_intermediate_size`.
 
-    def __init__(self, hidden_size: int, intermediate_size: int):
+    ``transposed`` stores weights contraction-first (gate/up ``[H, I_s]``, down ``[I_s, H]``) so the
+    fused MoE TKG kernel reads them with no runtime transpose; the PyTorch forward stays transpose-free
+    via direct matmuls (mirrors the DeltaNet in_proj_fused/out_proj layout). Both paths return the
+    local partial (no reduce) so NeuronMoEBlock fuses it with the routed partial under one all-reduce.
+    """
+
+    def __init__(
+        self, hidden_size: int, intermediate_size: int, transposed: bool = False
+    ):
         super().__init__()
-        self.gate_proj = ColumnParallelLinear(
-            hidden_size,
-            intermediate_size,
-            bias=False,
-            gather_output=False,
-        )
-        self.up_proj = ColumnParallelLinear(
-            hidden_size,
-            intermediate_size,
-            bias=False,
-            gather_output=False,
-        )
-        # reduce_output=False: return the local partial so NeuronMoEBlock can
-        # fuse it (gated) with the routed partial under a single all-reduce.
-        self.down_proj = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
-            input_is_parallel=True,
-            reduce_output=False,
-        )
+        self.transposed = transposed
+        if transposed:
+            # gate/up: [H, I_s] (shard I_s on dim 1); down: [I_s, H] (shard I_s on dim 0), matmul'd raw.
+            self.gate_proj = TransposedColumnParallelLinear(
+                hidden_size, intermediate_size, bias=False, gather_output=False
+            )
+            self.up_proj = TransposedColumnParallelLinear(
+                hidden_size, intermediate_size, bias=False, gather_output=False
+            )
+            self.down_proj = ColumnParallelLinear(
+                hidden_size, intermediate_size, bias=False, gather_output=False
+            )
+        else:
+            self.gate_proj = ColumnParallelLinear(
+                hidden_size, intermediate_size, bias=False, gather_output=False
+            )
+            self.up_proj = ColumnParallelLinear(
+                hidden_size, intermediate_size, bias=False, gather_output=False
+            )
+            self.down_proj = RowParallelLinear(
+                intermediate_size,
+                hidden_size,
+                bias=False,
+                input_is_parallel=True,
+                reduce_output=False,
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.transposed:
+            act = F.silu(self.gate_proj(x)) * self.up_proj(x)  # [., I_s] per-rank
+            return torch.matmul(
+                act, self.down_proj.weight
+            )  # [., I_s] @ [I_s, H] -> [., H] partial
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
@@ -2499,8 +2570,16 @@ class NeuronQwen36A3BDecoderLayer(nn.Module):
 
         # Dense MLP FFN
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        if verify_mode and self.mlp.use_moe_layer_kernel:
+            # Fused MoE kernel applies post_attention_layernorm in-kernel (norm-once, SBUF-resident);
+            # pass raw hidden + gamma so residual stays the pre-norm hidden.
+            hidden_states = self.mlp(
+                hidden_states,
+                gamma=self.post_attention_layernorm.weight.reshape(1, self.hidden_size),
+            )
+        else:
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
         if not cpu_mode():
@@ -3510,6 +3589,26 @@ def _convert_moe_block(sd, prefix, config):
         src = f"{prefix}.mlp.{hf_suffix}"
         if src in sd:
             sd[f"{prefix}.mlp.{nxdi_suffix}"] = sd.pop(src).transpose(1, 2).contiguous()
+
+    # Fused MoE layer kernel (verify path): stow the shared expert contraction-first IN PLACE (gate/up
+    # [I_s,H]->[H,I_s], down [H,I_s]->[I_s,H]) so the kernel reads it with no runtime transpose; the
+    # PyTorch SharedExpertMLP(transposed=True) forward consumes the same layout. Router/sigma stay in
+    # their standard layout for the decode/prefill path and get small rank-replicated transposed copies
+    # (NxDI owns the router, so it can't be restowed in place). Experts already match (no change).
+    if getattr(config, "use_moe_layer_kernel", False):
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            skey = f"{prefix}.mlp.shared_expert.{name}.weight"
+            if skey in sd:
+                sd[skey] = sd[skey].t().contiguous()
+        # .clone(): the copies must NOT share storage with the originals we keep for the PyTorch path
+        # (a [1,H].t() -> [H,1] is trivially "contiguous" so .contiguous() alone won't copy; safetensors
+        # rejects shared storage).
+        rkey = f"{prefix}.mlp.moe.router.linear_router.weight"
+        if rkey in sd:
+            sd[f"{prefix}.mlp.moe_router_w_t"] = sd[rkey].t().contiguous().clone()
+        sgkey = f"{prefix}.mlp.shared_expert_gate.weight"
+        if sgkey in sd:
+            sd[f"{prefix}.mlp.moe_sigma_gate_t"] = sd[sgkey].t().contiguous().clone()
 
 
 def convert_qwen36_a3b_hf_to_neuron_state_dict(neuron_state_dict, config):

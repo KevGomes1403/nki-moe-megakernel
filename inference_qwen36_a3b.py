@@ -116,6 +116,7 @@ def build_inference_config(
     seq_len: int,
     spec_decode: bool = False,
     tkg_attention_kernel: bool = False,
+    moe_layer_kernel: bool = False,
 ) -> Qwen36A3BInferenceConfig:
     """Build the NxDI config from the HF config.json on disk.
 
@@ -137,6 +138,8 @@ def build_inference_config(
     # Route the DeltaNet verify/decode recurrence through the TKG NKI kernel.
     # Carried by both the target and (harmlessly) the draft config below.
     config_dict["use_tkg_attention_kernel"] = tkg_attention_kernel
+    # Route the verify-pass MoE FFN through the fused MoE layer NKI kernel (T>1 only).
+    config_dict["use_moe_layer_kernel"] = moe_layer_kernel
 
     # block_size must exceed (seq_len * num_experts_per_tok) so prefill takes
     # forward_all_experts instead of forward_blockwise (the NKI blockwise
@@ -468,6 +471,13 @@ def main():
         help="Use the DeltaNet TKG NKI kernel for the verify/decode recurrence "
         "(default: PyTorch). Pair with --mtp-spec-decode to exercise verify.",
     )
+    parser.add_argument(
+        "--use-moe-layer-kernel",
+        action="store_true",
+        default=os.environ.get("A3B_MOE_LAYER_KERNEL") == "1",
+        help="Use the fused MoE layer NKI kernel for the verify-pass FFN (T>1). "
+        "Pair with --mtp-spec-decode. Changes the checkpoint layout -> recompile + reshard.",
+    )
     args = parser.parse_args()
 
     # Header label only; the real per-prompt budget is seq_len - prompt_len when
@@ -490,6 +500,7 @@ def main():
         args.seq_len,
         spec_decode=args.mtp_spec_decode,
         tkg_attention_kernel=args.tkg_attention_kernel,
+        moe_layer_kernel=args.use_moe_layer_kernel,
     )
     if args.tkg_attention_kernel:
         # Hard-fail if the flag didn't reach the configs, so we never silently
@@ -504,6 +515,19 @@ def main():
                 False,
             ), "use_tkg_attention_kernel did not propagate to the draft (MTP) config"
         print("[assert] TKG attention kernel ENABLED on target + draft configs")
+    if args.use_moe_layer_kernel:
+        # Hard-fail if the flag didn't reach the configs, so we never silently benchmark the
+        # PyTorch MoE fallback while believing we tested the fused kernel.
+        assert getattr(inf_config, "use_moe_layer_kernel", False), (
+            "use_moe_layer_kernel did not propagate to the target config"
+        )
+        if inf_config.fused_spec_config is not None:
+            assert getattr(
+                inf_config.fused_spec_config.draft_config,
+                "use_moe_layer_kernel",
+                False,
+            ), "use_moe_layer_kernel did not propagate to the draft (MTP) config"
+        print("[assert] Fused MoE layer kernel ENABLED on target + draft configs")
     maybe_compile(args.model_path, compiled_path, inf_config)
     model = load_model(compiled_path)
 

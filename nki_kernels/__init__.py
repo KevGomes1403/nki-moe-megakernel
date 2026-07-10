@@ -42,6 +42,9 @@ from .deltanet.prefill.chunked_fused import (
 # GQA (full-attention) decode/verify TKG megakernel.
 from .gqa import gqa_fused_tkg_fwd
 
+# MoE (post-attention FFN) fused-layer verify kernel.
+from .moe import moe_layer_fwd
+
 __all__ = [
     "deltanet_fused_tkg_fwd",
     "deltanet_fused_tkg_fwd_state",
@@ -54,4 +57,5 @@ __all__ = [
     "_make_lower_mask_diag",
     "_make_identity",
     "gqa_fused_tkg_fwd",
+    "moe_layer_fwd",
 ]
