@@ -4,19 +4,24 @@ Exercises ``gqa_fused_tkg_fwd`` (one LNC2 @nki.jit launch fusing qkv projection 
 partial RoPE -> attention -> sigmoid gate -> output projection, all intermediates in SBUF) against a
 PyTorch reference that mirrors the kernel's precision sequence stage-by-stage.
 
-The kernel receives ALREADY-RMSNorm'd hidden (the decoder applies input_layernorm), computes the gate
-from the same normed hidden, q/k-RMSNorms over head_dim, partial-RoPEs the first rope_dim, scales Q by
-1/sqrt(D), runs causal GQA attention over (prior-from-cache + active), applies sigmoid(gate) before the
-o_proj, and returns the per-rank o_proj PARTIAL [T, H] (TP all-reduce deferred). Active K/V are written
-into the caches in place.
+PRIMARY path (norm_in=True): the kernel receives RAW hidden and runs the pre-attention input RMSNorm
+IN-KERNEL (nkilib rmsnorm_tkg -> SBUF-resident [128,T,16] normed tile), feeding BOTH projections
+(qkv + gate) directly from SBUF with zero HBM round-trip; then q/k-RMSNorms over head_dim,
+partial-RoPEs the first rope_dim, scales Q by 1/sqrt(D), runs causal GQA attention over
+(prior-from-cache + active), applies sigmoid(gate) before the o_proj, and returns the per-rank o_proj
+PARTIAL [T, H]. The pre-normed regression path (norm_in=False, gamma_in=None) is the backward-compatible
+path the model still uses (hidden already normed in HBM).
 
-GATES:
-  * FP32 IO: torch.allclose(atol=1e-5, rtol=1e-2) -- the HARD gate (literal requirement).
-  * BF16 IO: report max_abs / max_rel / ULP / cosine; pass on allclose OR a magnitude-aware cosine
-    floor (the runtime is bf16, so cosine must be high; the hard numeric gate is fp32).
+GATES (cosine is BANNED repo-wide as a gate/metric):
+  * FP32 IO: torch.allclose(atol=1e-5, rtol=1e-2) -- the HARD gate. Also validates the spec-6.1 SBUF
+    column-order match between rmsnorm's output and qkv_tkg's H-shard slicing (a wrong permutation is
+    an O(1) mismatch, not 1e-6).
+  * BF16 IO: max_abs(kernel_bf16 - oracle_fp32) <= floor * BF16_HEADROOM, floor = the end-to-end
+    output-rounding step max_abs(oracle_fp32.to(bf16) - oracle_fp32). max_abs and max_rel reported for
+    every case and both dtypes.
 
-Cases (required): cores=1 {T=1, T=2} at L=128; cores=2 {T=1, T=2} at L=256 (exercises attention
-s_prior-sharding AND the no-sendrecv out_proj seam -- the riskiest path).
+Cases (required): cores in {1,2}, T in {1,2}, L in {128,256} -- incl. the c2/L256 s_prior-sharded case
+and the c2/L128 deployment case.
 
 Run (CORES 0,1):
     cd /home/ubuntu/trainium-model-translation && \
@@ -60,7 +65,13 @@ MROPE_SECTION = (11, 11, 10)
 
 ATOL = 1e-5
 RTOL = 1e-2
-COSINE_FLOOR = 0.999  # bf16 magnitude-aware (scale-invariant) gate
+# bf16 gate (cosine BANNED repo-wide): max_abs(kernel_bf16 - oracle_fp32) <= floor * BF16_HEADROOM,
+# floor = max_abs(oracle_fp32.to(bf16) - oracle_fp32) is the end-to-end output-rounding step. Headroom
+# covers the accumulated bf16 rounding of the full input-norm->qkv->qk-norm->rope->attention->o_proj
+# pipeline (many bf16-rounded matmuls/weights) on top of that single output-rounding floor. The
+# measured worst-case ratio (achieved / floor) across all cases/tensors is ~4.4x (active_k) and ~3.1x
+# for the o output; 8.0 leaves ~1.8x safety for seed variation while staying a meaningful gate.
+BF16_HEADROOM = 8.0
 
 
 # ---------------------------------------------------------------------------
@@ -91,9 +102,12 @@ def build_cos_sin(position_ids):
 def make_inputs(T, L, seed):
     """Random fp32 logical inputs (B=1). Weights are fan-in scaled so activations stay O(1).
 
-    Returns hidden [1,T,H] (pre-normed), qkv_w [H,I], gate_w [H,G], gamma_q/k [D], cos/sin [T,rope_dim],
-    prior_k/prior_v [L-T,D], o_proj_w [value_dim,H]. The active tokens sit at sequence positions
-    [L-T, L); the prior occupies the first L-T KV slots."""
+    Returns hidden [1,T,H] (RAW, pre-norm), qkv_w [H,I], gate_w [H,G], gamma_q/k [D], cos/sin
+    [T,rope_dim], prior_k/prior_v [L-T,D], o_proj_w [value_dim,H], gamma_in [H]. ``gamma_in`` is the
+    input_layernorm weight in STANDARD form (~1.0; the +1 checkpoint convention already applied) --
+    used only by the in-kernel-norm path. ``hidden`` is RAW: the norm path applies the input RMSNorm
+    (kernel and golden), the pre-normed regression path consumes it as-is. The active tokens sit at
+    sequence positions [L-T, L); the prior occupies the first L-T KV slots."""
     assert L % P_MAX == 0 and L > T
     torch.manual_seed(seed)
     hidden = torch.randn(1, T, HIDDEN)
@@ -102,11 +116,26 @@ def make_inputs(T, L, seed):
     gamma_q = torch.randn(HEAD_DIM)
     gamma_k = torch.randn(HEAD_DIM)
     o_proj_w = torch.randn(VALUE_DIM, HIDDEN) / math.sqrt(VALUE_DIM)
+    gamma_in = (
+        torch.randn(HIDDEN) * 0.02 + 1.0
+    )  # input_layernorm.weight, standard form (~1.0)
     position_ids = torch.arange(L - T, L)  # active token absolute positions
     cos, sin = build_cos_sin(position_ids)
     prior_k = torch.randn(L - T, HEAD_DIM)
     prior_v = torch.randn(L - T, HEAD_DIM)
-    return hidden, qkv_w, gate_w, gamma_q, gamma_k, cos, sin, prior_k, prior_v, o_proj_w
+    return (
+        hidden,
+        qkv_w,
+        gate_w,
+        gamma_q,
+        gamma_k,
+        cos,
+        sin,
+        prior_k,
+        prior_v,
+        o_proj_w,
+        gamma_in,
+    )
 
 
 def build_mask(T, L):
@@ -142,15 +171,40 @@ def _rope(x, cos, sin, dtype):
     return out
 
 
-def golden(inp, T, L, dtype):
+def golden(inp, T, L, dtype, norm_in):
     """Reference outputs mirroring the kernel stage-by-stage at the IO precision.
+
+    When ``norm_in`` the input RMSNorm over H is applied first (fp32 internal, mirroring the in-kernel
+    ``rmsnorm_tkg`` -> SBUF normed_sb feeding both projections); otherwise ``hidden`` is consumed as the
+    already-normed input (the pre-normed regression path). ``gamma_in`` is bf16-rounded in the bf16
+    oracle (via ``_rd``), matching the kernel's bf16 gamma input.
 
     Returns ``(o [T, H], active_k [1,1,D,T] BHDS, active_v [1,1,T,D] BHSD)`` -- the o_proj partial and
     the post-norm/RoPE active K / projected active V (the tensors NxDI scatters into the caches)."""
-    hidden, qkv_w, gate_w, gamma_q, gamma_k, cos, sin, prior_k, prior_v, o_proj_w = inp
+    (
+        hidden,
+        qkv_w,
+        gate_w,
+        gamma_q,
+        gamma_k,
+        cos,
+        sin,
+        prior_k,
+        prior_v,
+        o_proj_w,
+        gamma_in,
+    ) = inp
     D = HEAD_DIM
 
-    nh = _rd(hidden.reshape(T, HIDDEN), dtype)
+    h_io = _rd(hidden.reshape(T, HIDDEN), dtype)  # hidden as stored in HBM (bf16/fp32)
+    if norm_in:
+        # Pre-attention RMSNorm over full H (fp32 internal), gamma at IO dtype -> normed IO tile.
+        x32 = h_io.float()
+        g_in = _rd(gamma_in, dtype)
+        inv = (x32.square().mean(-1, keepdim=True) + EPS).rsqrt()
+        nh = _rd((x32 * inv) * g_in, dtype)
+    else:
+        nh = h_io
     qkv = _rd(nh @ _rd(qkv_w, dtype), dtype)  # [T, I]
     gate = _rd(nh @ _rd(gate_w, dtype), dtype)  # [T, G]
 
@@ -205,13 +259,29 @@ def golden(inp, T, L, dtype):
 # ---------------------------------------------------------------------------
 # Device runner
 # ---------------------------------------------------------------------------
-def run_kernel(inp, T, L, cores, dtype):
+def run_kernel(inp, T, L, cores, dtype, norm_in):
     """Build the cache buffers + mask, launch gqa_fused_tkg_fwd on `cores` cores.
+
+    When ``norm_in`` the input_layernorm weight is passed as ``gamma_in=`` [1,H] so the input RMSNorm
+    runs in-kernel (SBUF-resident, feeding both projections); otherwise gamma_in stays None (the
+    pre-normed regression path -- the model's current call).
 
     Returns ``(o_out [T,H], active_k [1,1,D,T], active_v [1,1,T,D])``."""
     import torch_xla.core.xla_model as xm
 
-    hidden, qkv_w, gate_w, gamma_q, gamma_k, cos, sin, prior_k, prior_v, o_proj_w = inp
+    (
+        hidden,
+        qkv_w,
+        gate_w,
+        gamma_q,
+        gamma_k,
+        cos,
+        sin,
+        prior_k,
+        prior_v,
+        o_proj_w,
+        gamma_in,
+    ) = inp
 
     k_cache = torch.zeros(1, 1, HEAD_DIM, L)
     v_cache = torch.zeros(1, 1, L, HEAD_DIM)
@@ -220,6 +290,9 @@ def run_kernel(inp, T, L, cores, dtype):
     mask = build_mask(T, L)
 
     dev = xm.xla_device()
+    gamma_in_dev = None
+    if norm_in:
+        gamma_in_dev = gamma_in.reshape(1, HIDDEN).to(dtype).contiguous().to(dev)
     o, active_k, active_v = gqa_fused_tkg_fwd[cores](
         hidden.to(dtype).contiguous().to(dev),
         qkv_w.to(dtype).contiguous().to(dev),
@@ -233,6 +306,7 @@ def run_kernel(inp, T, L, cores, dtype):
         mask.to(dev),
         o_proj_w.to(dtype).contiguous().to(dev),
         EPS,
+        gamma_in=gamma_in_dev,
     )
     return o.to(dtype).cpu(), active_k.to(dtype).cpu(), active_v.to(dtype).cpu()
 
@@ -240,126 +314,174 @@ def run_kernel(inp, T, L, cores, dtype):
 # ---------------------------------------------------------------------------
 # Metrics / checks
 # ---------------------------------------------------------------------------
-def _ulp_distance(ker, ref):
-    k = ker.to(torch.bfloat16).view(torch.int16).to(torch.int32)
-    r = ref.to(torch.bfloat16).view(torch.int16).to(torch.int32)
-    k = torch.where(k < 0, 0x8000 - k, k)
-    r = torch.where(r < 0, 0x8000 - r, r)
-    return (k - r).abs().max().item()
-
-
-def _cosine(ker, ref):
-    kd = ker.double().flatten()
-    rd = ref.double().flatten()
-    denom = (kd.norm() * rd.norm()).clamp_min(1e-30)
-    return (kd @ rd / denom).item()
-
-
 def _metrics(ker, ref):
+    """max_abs and max_rel (rel = |k-r| / max(|r|, 1e-4)) vs the reference."""
     kd = ker.double()
     rd = ref.double()
     abs_err = (kd - rd).abs()
     denom = rd.abs().clamp_min(1e-4)
-    return (
-        abs_err.max().item(),
-        (abs_err / denom).max().item(),
-        _ulp_distance(ker, ref),
-        _cosine(ker, ref),
-    )
+    return abs_err.max().item(), (abs_err / denom).max().item()
 
 
-def _check(name, ker, ref, dtype):
-    max_abs, max_rel, ulp, cos = _metrics(ker, ref)
-    allclose = torch.allclose(ker.double(), ref.double(), atol=ATOL, rtol=RTOL)
+def _bf16_floor(ref_fp32):
+    """End-to-end output-rounding floor: max_abs(oracle_fp32.to(bf16) - oracle_fp32)."""
+    r = ref_fp32.float()
+    return (r.to(torch.bfloat16).float() - r).abs().max().item()
+
+
+def _check(name, ker, ref_fp32, dtype):
+    """Gate one tensor against the fp32 oracle (used for o AND active K/V).
+
+    fp32 IO: HARD gate torch.allclose(atol=1e-5, rtol=1e-2).
+    bf16 IO: max_abs(kernel_bf16 - oracle_fp32) <= floor * BF16_HEADROOM (cosine BANNED). ref_fp32 is
+    the fp32 oracle for BOTH dtypes -- bf16 is gated against the ideal fp32 result, not a bf16 mirror.
+    Prints max_abs and max_rel for every case."""
+    max_abs, max_rel = _metrics(ker, ref_fp32)
     if dtype == torch.float32:
-        ok = allclose  # HARD gate
+        ok = torch.allclose(ker.double(), ref_fp32.double(), atol=ATOL, rtol=RTOL)
         gate = f"allclose(atol={ATOL} rtol={RTOL})"
+        extra = ""
     else:
-        ok = allclose or (cos >= COSINE_FLOOR)
-        gate = "allclose" if allclose else f"cosine>={COSINE_FLOOR}"
+        floor = _bf16_floor(ref_fp32)
+        limit = floor * BF16_HEADROOM
+        ratio = max_abs / max(floor, 1e-30)
+        ok = max_abs <= limit
+        gate = f"max_abs<=floor*{BF16_HEADROOM:g}"
+        extra = f"  floor={floor:.3e}  limit={limit:.3e}  ratio={ratio:.2f}x"
     status = "PASS" if ok else "FAIL"
     print(
-        f"[{name}] {status}  max_abs={max_abs:.3e}  max_rel={max_rel:.3e}  "
-        f"max_ulp={ulp}  cos={cos:.6f}  allclose={allclose}  gate={gate}"
+        f"[{name}] {status}  max_abs={max_abs:.3e}  max_rel={max_rel:.3e}  gate={gate}{extra}"
     )
-    assert ok, f"{name}: gate {gate} failed (max_abs={max_abs:.3e} cos={cos:.6f})"
+    assert ok, (
+        f"{name}: gate {gate} failed (max_abs={max_abs:.3e} max_rel={max_rel:.3e})"
+    )
 
 
-def _check_active(name, ker, ref, dtype):
-    """Active K/V check: fp32 hard gate (allclose atol=1e-5 rtol=1e-2); bf16 reports max_abs only."""
-    max_abs = (ker.double() - ref.double()).abs().max().item()
-    if dtype == torch.float32:
-        ok = torch.allclose(ker.double(), ref.double(), atol=ATOL, rtol=RTOL)
-        print(
-            f"[{name}] {'PASS' if ok else 'FAIL'}  max_abs={max_abs:.3e}  shape={tuple(ker.shape)}"
-        )
-        assert ok, f"{name}: active K/V mismatch (max_abs={max_abs:.3e})"
-    else:
-        print(f"[{name}] (bf16) max_abs={max_abs:.3e}  shape={tuple(ker.shape)}")
-
-
-def run_case(name, T, L, cores, seed, dtype):
+def run_case(name, T, L, cores, seed, dtype, norm_in=True):
+    """Run one case. norm_in=True exercises the in-kernel RMSNorm path (primary); False is the
+    pre-normed regression path. The bf16 gate compares against the fp32 oracle (same inputs)."""
     inp = make_inputs(T=T, L=L, seed=seed)
-    ker_o, ker_k, ker_v = run_kernel(inp, T, L, cores=cores, dtype=dtype)
-    ref_o, ref_k, ref_v = golden(inp, T, L, dtype)
+    ker_o, ker_k, ker_v = run_kernel(
+        inp, T, L, cores=cores, dtype=dtype, norm_in=norm_in
+    )
+    ref_o, ref_k, ref_v = golden(
+        inp, T, L, torch.float32, norm_in=norm_in
+    )  # fp32 oracle
     _check(name, ker_o, ref_o, dtype)
-    _check_active(f"{name}.active_k", ker_k, ref_k, dtype)
-    _check_active(f"{name}.active_v", ker_v, ref_v, dtype)
+    _check(f"{name}.active_k", ker_k, ref_k, dtype)
+    _check(f"{name}.active_v", ker_v, ref_v, dtype)
     return ker_o
 
 
 # ---------------------------------------------------------------------------
-# pytest entrypoints (fp32 hard gate)
+# pytest entrypoints -- in-kernel RMSNorm path (norm_in=True) is the PRIMARY focus.
+# fp32 = HARD gate allclose(atol=1e-5, rtol=1e-2); bf16 = max_abs <= floor * BF16_HEADROOM.
+# Matrix mirrors the pre-normed matrix: cores in {1,2}, T in {1,2}, L in {128,256}, incl. the
+# c2/L256 s_prior-sharded case and the c2/L128 deployment case.
 # ---------------------------------------------------------------------------
-def test_fp32_t1_cores1():
-    run_case("fp32_T1_L128_c1", T=1, L=128, cores=1, seed=1, dtype=torch.float32)
+def test_norm_fp32_t1_c1_l128():
+    run_case("norm_fp32_T1_L128_c1", T=1, L=128, cores=1, seed=1, dtype=torch.float32)
 
 
-def test_fp32_t2_cores1():
-    run_case("fp32_T2_L128_c1", T=2, L=128, cores=1, seed=2, dtype=torch.float32)
+def test_norm_fp32_t2_c1_l128():
+    run_case("norm_fp32_T2_L128_c1", T=2, L=128, cores=1, seed=2, dtype=torch.float32)
 
 
-def test_fp32_t1_cores2():
-    run_case("fp32_T1_L256_c2", T=1, L=256, cores=2, seed=3, dtype=torch.float32)
+def test_norm_fp32_t1_c2_l256():
+    run_case("norm_fp32_T1_L256_c2", T=1, L=256, cores=2, seed=3, dtype=torch.float32)
 
 
-def test_fp32_t2_cores2():
-    run_case("fp32_T2_L256_c2", T=2, L=256, cores=2, seed=4, dtype=torch.float32)
+def test_norm_fp32_t2_c2_l256():
+    run_case("norm_fp32_T2_L256_c2", T=2, L=256, cores=2, seed=4, dtype=torch.float32)
 
 
-# Deployment path: L=128 on a 2-core launch (seq_len=128 bucket). Attention runs unsharded
-# (s_prior < 256, batch=1), while qkv/o_proj stay H-sharded across the 2 cores.
-def test_fp32_t1_cores2_l128():
-    run_case("fp32_T1_L128_c2", T=1, L=128, cores=2, seed=5, dtype=torch.float32)
+def test_norm_fp32_t1_c2_l128():
+    run_case("norm_fp32_T1_L128_c2", T=1, L=128, cores=2, seed=5, dtype=torch.float32)
 
 
-def test_fp32_t2_cores2_l128():
-    run_case("fp32_T2_L128_c2", T=2, L=128, cores=2, seed=6, dtype=torch.float32)
+def test_norm_fp32_t2_c2_l128():
+    run_case("norm_fp32_T2_L128_c2", T=2, L=128, cores=2, seed=6, dtype=torch.float32)
 
 
-# pytest entrypoints (bf16 metrics, cosine floor)
-def test_bf16_t1_cores1():
-    run_case("bf16_T1_L128_c1", T=1, L=128, cores=1, seed=1, dtype=torch.bfloat16)
+def test_norm_bf16_t1_c1_l128():
+    run_case("norm_bf16_T1_L128_c1", T=1, L=128, cores=1, seed=1, dtype=torch.bfloat16)
 
 
-def test_bf16_t2_cores2():
-    run_case("bf16_T2_L256_c2", T=2, L=256, cores=2, seed=4, dtype=torch.bfloat16)
+def test_norm_bf16_t2_c2_l256():
+    run_case("norm_bf16_T2_L256_c2", T=2, L=256, cores=2, seed=4, dtype=torch.bfloat16)
+
+
+def test_norm_bf16_t1_c2_l128():
+    run_case("norm_bf16_T1_L128_c2", T=1, L=128, cores=2, seed=5, dtype=torch.bfloat16)
+
+
+# Backward-compat regression: gamma_in=None -> the pre-normed HBM path the model still uses.
+def test_prenorm_fp32_t1_c1_l128():
+    run_case(
+        "prenorm_fp32_T1_L128_c1",
+        T=1,
+        L=128,
+        cores=1,
+        seed=1,
+        dtype=torch.float32,
+        norm_in=False,
+    )
+
+
+def test_prenorm_fp32_t2_c2_l256():
+    run_case(
+        "prenorm_fp32_T2_L256_c2",
+        T=2,
+        L=256,
+        cores=2,
+        seed=4,
+        dtype=torch.float32,
+        norm_in=False,
+    )
 
 
 def main():
-    print("=== FP32 IO (hard gate: allclose atol=1e-5 rtol=1e-2) ===")
-    run_case("fp32_T1_L128_c1", T=1, L=128, cores=1, seed=1, dtype=torch.float32)
-    run_case("fp32_T2_L128_c1", T=2, L=128, cores=1, seed=2, dtype=torch.float32)
-    run_case("fp32_T1_L256_c2", T=1, L=256, cores=2, seed=3, dtype=torch.float32)
-    run_case("fp32_T2_L256_c2", T=2, L=256, cores=2, seed=4, dtype=torch.float32)
-    run_case("fp32_T1_L128_c2", T=1, L=128, cores=2, seed=5, dtype=torch.float32)
-    run_case("fp32_T2_L128_c2", T=2, L=128, cores=2, seed=6, dtype=torch.float32)
+    print(
+        "=== IN-KERNEL NORM PATH -- FP32 IO (HARD gate: allclose atol=1e-5 rtol=1e-2) ==="
+    )
+    run_case("norm_fp32_T1_L128_c1", T=1, L=128, cores=1, seed=1, dtype=torch.float32)
+    run_case("norm_fp32_T2_L128_c1", T=2, L=128, cores=1, seed=2, dtype=torch.float32)
+    run_case("norm_fp32_T1_L256_c2", T=1, L=256, cores=2, seed=3, dtype=torch.float32)
+    run_case("norm_fp32_T2_L256_c2", T=2, L=256, cores=2, seed=4, dtype=torch.float32)
+    run_case("norm_fp32_T1_L128_c2", T=1, L=128, cores=2, seed=5, dtype=torch.float32)
+    run_case("norm_fp32_T2_L128_c2", T=2, L=128, cores=2, seed=6, dtype=torch.float32)
 
-    print("\n=== BF16 IO (cosine floor gate; metrics reported) ===")
-    run_case("bf16_T1_L128_c1", T=1, L=128, cores=1, seed=1, dtype=torch.bfloat16)
-    run_case("bf16_T2_L128_c1", T=2, L=128, cores=1, seed=2, dtype=torch.bfloat16)
-    run_case("bf16_T1_L256_c2", T=1, L=256, cores=2, seed=3, dtype=torch.bfloat16)
-    run_case("bf16_T2_L256_c2", T=2, L=256, cores=2, seed=4, dtype=torch.bfloat16)
+    print(
+        f"\n=== IN-KERNEL NORM PATH -- BF16 IO (gate: max_abs <= floor * {BF16_HEADROOM:g}) ==="
+    )
+    run_case("norm_bf16_T1_L128_c1", T=1, L=128, cores=1, seed=1, dtype=torch.bfloat16)
+    run_case("norm_bf16_T2_L128_c1", T=2, L=128, cores=1, seed=2, dtype=torch.bfloat16)
+    run_case("norm_bf16_T1_L256_c2", T=1, L=256, cores=2, seed=3, dtype=torch.bfloat16)
+    run_case("norm_bf16_T2_L256_c2", T=2, L=256, cores=2, seed=4, dtype=torch.bfloat16)
+    run_case("norm_bf16_T1_L128_c2", T=1, L=128, cores=2, seed=5, dtype=torch.bfloat16)
+    run_case("norm_bf16_T2_L128_c2", T=2, L=128, cores=2, seed=6, dtype=torch.bfloat16)
+
+    print(
+        "\n=== REGRESSION -- pre-normed path (gamma_in=None; the model's current call) ==="
+    )
+    run_case(
+        "prenorm_fp32_T1_L128_c1",
+        T=1,
+        L=128,
+        cores=1,
+        seed=1,
+        dtype=torch.float32,
+        norm_in=False,
+    )
+    run_case(
+        "prenorm_fp32_T2_L256_c2",
+        T=2,
+        L=256,
+        cores=2,
+        seed=4,
+        dtype=torch.float32,
+        norm_in=False,
+    )
 
     print("\nALL CASES PASSED")
 

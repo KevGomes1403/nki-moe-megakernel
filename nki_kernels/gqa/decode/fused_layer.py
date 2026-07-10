@@ -41,6 +41,7 @@ from nkilib.core.utils.allocator import create_auto_alloc_manager
 from nkilib.core.utils.common_types import NormType, QKVOutputLayout, QuantizationType
 
 from ..components.attention import gqa_attention_d256
+from ..components.pre_attn_norm import pre_attn_rmsnorm_compose
 from ..components.qk_norm import qk_norm_compose
 from ..components.rope import rope_partial_compose
 
@@ -163,8 +164,14 @@ def gqa_fused_compose(
     o_proj_w,
     eps,
     kv_write_idx=None,
+    gamma_in=None,
 ):
     """Compose the full fused GQA token-generation layer.
+
+    ``hidden`` is PRE-NORMED when ``gamma_in`` is None; RAW when ``gamma_in`` is given (the input
+    RMSNorm is applied in-kernel and stays SBUF-resident, feeding both qkv_tkg calls with zero HBM
+    round-trip). ``gamma_in`` (input_layernorm.weight, [1, H], standard form) is the pre-attention
+    hidden-state RMSNorm -- distinct from the per-head qk-norms ``gamma_q``/``gamma_k``.
 
     Returns ``(o_out [T, H], active_k [B,1,D,T] BHDS, active_v [B,1,T,D] BHSD)`` -- the per-rank
     o_proj partial plus the post-norm/RoPE active K/V (the tensors NxDI's update_kv_by_layer_id
@@ -181,14 +188,24 @@ def gqa_fused_compose(
     kernel_assert(L % P_MAX == 0, "L (curr_sprior) must be a multiple of 128")
     io = hidden.dtype
 
-    # Stage 0 -- projections (NO norm: hidden is pre-RMSNorm'd). H-sharded; both cores end with full.
+    # Optional in-kernel pre-attention RMSNorm. When gamma_in is given, RMSNorm raw hidden once into
+    # an SBUF-resident [128, T, 16] tile (the exact qkv_tkg SBUF-input layout) and feed BOTH projection
+    # calls from it -- zero HBM round-trip. When gamma_in is None, hidden is already pre-normed in HBM.
+    if gamma_in != None:
+        normed_sb = nl.ndarray((P_MAX, T, HIDDEN // P_MAX), dtype=io, buffer=nl.sbuf)
+        pre_attn_rmsnorm_compose(hidden, gamma_in, eps, HIDDEN, normed_sb)
+        proj_input = normed_sb
+    else:
+        proj_input = hidden
+
+    # Stage 0 -- projections (NO norm: proj_input is RMSNorm'd hidden). H-sharded; both cores end with full.
     # Distinct-prefix managers so the two qkv_tkg calls don't emit duplicate buffer op names.
     qkv_sbm = create_auto_alloc_manager()
     qkv_sbm.set_name_prefix("gqa_qkv_")
     gate_sbm = create_auto_alloc_manager()
     gate_sbm.set_name_prefix("gqa_gate_")
     qkv_sb = qkv_tkg(
-        hidden=hidden,
+        hidden=proj_input,
         qkv_w=qkv_w,
         norm_w=None,
         norm_type=NormType.NO_NORM,
@@ -202,7 +219,7 @@ def gqa_fused_compose(
         sbm=qkv_sbm,
     )  # [T, I] head-major [q0|q1|q2|q3|k0|v0]
     gate_sb = qkv_tkg(
-        hidden=hidden,
+        hidden=proj_input,
         qkv_w=gate_w,
         norm_w=None,
         norm_type=NormType.NO_NORM,
@@ -332,11 +349,14 @@ def gqa_fused_tkg_fwd(
     o_proj_w,
     eps=1e-6,
     kv_write_idx=None,
+    gamma_in=None,
 ):
     """Fully fused GQA decode (T=1) and speculative verify (T>=2) in one LNC2 launch [2].
 
     Args:
-        hidden:   [B, S, H] PRE-NORMED hidden states (the input RMSNorm is already applied).
+        hidden:   [B, S, H] hidden states. PRE-NORMED when gamma_in is None (the input RMSNorm is
+                  already applied); RAW when gamma_in is given (the input RMSNorm runs in-kernel and
+                  stays SBUF-resident, feeding both projections with zero HBM round-trip).
         qkv_w:    [H, I] fused QKV weight, head-major cols [q0|q1|q2|q3|k0|v0] (transpose of nn.Linear).
         gate_w:   [H, G] output-gate weight, head-major cols [g0|g1|g2|g3] (transpose of nn.Linear).
         gamma_q:  [D] q-RMSNorm gamma (standard weight).   gamma_k: [D] k-RMSNorm gamma.
@@ -351,6 +371,10 @@ def gqa_fused_tkg_fwd(
                   write (returns 3 tensors, unchanged). When given = design B, the kernel scatters the
                   active K/V into the caches in place at [idx : idx+T] via nkilib indirect DMA and
                   ALSO returns the mutated cache handles (returns 5 tensors).
+        gamma_in: optional [1, H] input_layernorm.weight (standard form, no +1). None (default) =
+                  hidden is pre-normed in HBM (current behavior; the model's call is unaffected). When
+                  given, the pre-attention RMSNorm runs in-kernel and its output stays SBUF-resident,
+                  feeding both qkv_tkg calls directly. Distinct from the per-head qk-norms gamma_q/gamma_k.
 
     Returns:
         Design A (kv_write_idx is None): ``(o_out [T, H], active_k [B,1,D,T] BHDS,
@@ -373,4 +397,5 @@ def gqa_fused_tkg_fwd(
         o_proj_w,
         eps,
         kv_write_idx,
+        gamma_in,
     )
