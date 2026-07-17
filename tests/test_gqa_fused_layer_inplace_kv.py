@@ -84,7 +84,9 @@ def run_kernel_inplace(inp, T, L, cores, dtype, idx):
     """Launch with kv_write_idx=idx; return CPU (o, active_k, active_v, ret_k, ret_v, init_k, init_v)."""
     import torch_xla.core.xla_model as xm
 
-    hidden, qkv_w, gate_w, gamma_q, gamma_k, cos, sin, prior_k, prior_v, o_proj_w = inp
+    hidden, qkv_w, gate_w, gamma_q, gamma_k, cos, sin, prior_k, prior_v, o_proj_w, _ = (
+        inp
+    )
     k_cache = torch.zeros(1, 1, HEAD_DIM, L)
     v_cache = torch.zeros(1, 1, L, HEAD_DIM)
     k_cache[0, 0, :, 0 : L - T] = prior_k.transpose(
@@ -131,7 +133,9 @@ def run_kernel_none(inp, T, L, cores, dtype):
     """Launch with kv_write_idx omitted (default); return the raw kernel return tuple + CPU o_out."""
     import torch_xla.core.xla_model as xm
 
-    hidden, qkv_w, gate_w, gamma_q, gamma_k, cos, sin, prior_k, prior_v, o_proj_w = inp
+    hidden, qkv_w, gate_w, gamma_q, gamma_k, cos, sin, prior_k, prior_v, o_proj_w, _ = (
+        inp
+    )
     k_cache = torch.zeros(1, 1, HEAD_DIM, L)
     v_cache = torch.zeros(1, 1, L, HEAD_DIM)
     k_cache[0, 0, :, 0 : L - T] = prior_k.transpose(0, 1)
@@ -165,7 +169,7 @@ def run_case_inplace(name, T, L, cores, seed, dtype, idx):
     o, active_k, active_v, ret_k, ret_v, init_k, init_v = run_kernel_inplace(
         inp, T, L, cores, dtype, idx
     )
-    ref_o, ref_k, ref_v = golden(inp, T, L, dtype)
+    ref_o, ref_k, ref_v = golden(inp, T, L, dtype, norm_in=False)
 
     _gate(f"{name}.o_out", o, ref_o, dtype)  # the in-place write must not perturb o_out
 
@@ -196,7 +200,7 @@ def run_case_none(name, T, L, cores, seed, dtype):
     inp = make_inputs(T=T, L=L, seed=seed)
     out, o = run_kernel_none(inp, T, L, cores, dtype)
     assert len(out) == 3, f"{name}: default path must return 3 tensors, got {len(out)}"
-    ref_o, _, _ = golden(inp, T, L, dtype)
+    ref_o, _, _ = golden(inp, T, L, dtype, norm_in=False)
     _gate(f"{name}.o_out", o, ref_o, dtype)
 
 

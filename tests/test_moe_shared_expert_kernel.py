@@ -2,13 +2,13 @@
 
 Two things are proven:
 
-1. CORRECTNESS -- ``moe_shared_compose`` (post-attn RMSNorm -> nkilib mlp_tkg SwiGLU shared expert, all
+1. CORRECTNESS -- ``moe_shared_compose`` (post-attn RMSNorm -> raw-NKI SwiGLU shared expert, all
    intermediates SBUF-resident, zero HBM round-trip) vs an independent SwiGLU oracle
    ``down(silu(gate(x)) * up(x))`` at per-rank I_s=128 (per-rank partial, no reduce; norm in fp32).
    The megakernel-API SBUF tile ``shared_local [H0,T,H1]`` is read back token-shard-aware: each LNC core
-   DMAs ONLY its own shard slice into a shared HBM [H0,T,H1], the host un-permutes rmsnorm's layout back
-   to [T,H] (num_H_shards=1 for token-shard/single-core, =cores for the H-shard T=1 case). An HBM natural
-   readback ([T,H] assembled by mlp_tkg's transpose store) cross-checks the authoritative numerics.
+   DMAs ONLY its own shard slice into a shared HBM [H0,T,H1], the host un-permutes the tile's tp2013
+   H-permutation (n_s = LNC core count; tp102 at n_s=1) back to [T,H]. An HBM natural readback ([T,H]
+   assembled in-kernel) cross-checks the authoritative numerics -- it is layout-independent.
 
 2. ROUTED ALIGNMENT (the point of this task) -- ``shared_local`` now has the SAME per-LNC-core shard
    layout as ``routed_local`` (moe_tkg) byte-for-byte, so the future gated sum is a plain per-core add:
@@ -151,10 +151,14 @@ def oracle_routed_hf(hidden, gamma, router_w, gate_up_w, down_w, K):
 # ---------------------------------------------------------------------------
 # Layout helpers
 # ---------------------------------------------------------------------------
-def _unpermute(sbuf_out, T):
-    """Assembled layout-0 [H0,T,H1] -> natural [T,H] (H = h0*H1 + h1; tp102). The shared expert always
-    emits layout-0 (shard_on_h disabled), so no interleave un-permute is needed."""
-    return sbuf_out.permute(1, 0, 2).reshape(T, HIDDEN)
+def _unpermute(sbuf_out, T, n_s):
+    """Assembled tp2013 [H0,T,H1] -> natural [T,H]: free f = s*H2 + h2 <-> H = s*(H0*H2) + h0*H2 + h2.
+
+    ``n_s`` (= LNC core count) is the number of H-shards the kernel's SBUF tile carries. At n_s=1 this
+    degenerates exactly to tp102 (H = h0*H1 + f), so cores=1 decodes through the same code."""
+    H1 = HIDDEN // H0
+    H2 = H1 // n_s
+    return sbuf_out.reshape(H0, T, n_s, H2).permute(1, 2, 0, 3).reshape(T, HIDDEN)
 
 
 def _assemble_store(src_sb, out_hbm, T, H, intermediate):
@@ -245,7 +249,7 @@ def run_shared(inp, T, cores, dtype, mode):
         out = moe_shared_hbm_fwd[cores](*args, EPS)
         return out.to(torch.float32).cpu().reshape(T, HIDDEN)
     out = moe_shared_asm_fwd[cores](*args, EPS)
-    return _unpermute(out.to(torch.float32).cpu(), T)
+    return _unpermute(out.to(torch.float32).cpu(), T, n_s=cores)
 
 
 def run_combined(shared_inp, routed_w, T, cores, dtype):
@@ -267,7 +271,7 @@ def run_combined(shared_inp, routed_w, T, cores, dtype):
         _dev(down_w, dtype, dev),
     )
     out = moe_combined_asm_fwd[cores](*args, EPS, K_ROUTED)
-    return _unpermute(out.to(torch.float32).cpu(), T)
+    return _unpermute(out.to(torch.float32).cpu(), T, n_s=cores)
 
 
 # ---------------------------------------------------------------------------

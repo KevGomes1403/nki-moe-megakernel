@@ -37,7 +37,8 @@ LAYOUT (head_dim tiled on partition as D_TILES = ceil(d_head/128)):
                tp_k_prior=False). Its last s_active s_prior slots are overwritten by
                k_active inside the kernel.
   v_prior    : [B, 1, L, d_head]            HBM io_type.
-  v_active   : [B, 1, s_active, d_head]     HBM io_type.
+  v_active   : [B, 1, s_active, d_head]     HBM io_type, or (v_in_sb=True, bs == 1)
+               [s_active, d_head]           SBUF io_type -- read straight into v_sb.
   mask       : [L, B, H, s_active]          HBM uint8 (1=keep). s_prior-major (linear).
   out_sb     : [128, D_TILES, B*H*s_active] SBUF, written in place (out_in_sb=True).
 
@@ -72,13 +73,15 @@ def build_attention_tkg_config(
     curr_sprior,
     head_dim,
     full_sprior=None,
+    v_in_sb=False,
 ):
     """Build the AttnTKGConfig for the head_dim=256 GQA decode path.
 
     Pins the flags our config takes: flat KV (no block cache), no fp8, no FA
     s_prior tiling, no fused RoPE, no in-kernel mask gen; q/k pre-loaded in SBUF
-    and output kept in SBUF. Adaptive LNC2 sharding (s_prior or none) is decided
-    inside the kernel from the SPMD grid size.
+    and output kept in SBUF. ``v_in_sb`` additionally takes the active V from
+    SBUF. Adaptive LNC2 sharding (s_prior or none) is decided inside the kernel
+    from the SPMD grid size.
     """
     full_sprior = curr_sprior if full_sprior is None else full_sprior
     return AttnTKGConfig(
@@ -97,6 +100,7 @@ def build_attention_tkg_config(
         qk_in_sb=True,
         k_out_in_sb=False,
         out_in_sb=True,
+        v_in_sb=v_in_sb,
         enable_fa_s_prior_tiling=False,
     )
 
@@ -116,6 +120,7 @@ def gqa_attention_d256(
     head_dim,
     full_sprior=None,
     sbm=None,
+    v_in_sb=False,
 ):
     """Head_dim=256 GQA decode attention via the vendored AWS ``attention_tkg``.
 
@@ -125,7 +130,9 @@ def gqa_attention_d256(
 
     Args:
         q_sb, k_active_sb: head_dim-tiled SBUF query / active key (see layout).
-        k_prior, v_prior, v_active: HBM KV cache tensors (see layout).
+        k_prior, v_prior: HBM KV cache tensors (see layout).
+        v_active: HBM [B, 1, s_active, d_head], or SBUF [s_active, d_head] when
+            v_in_sb (bs == 1).
         mask: HBM uint8 attention mask [L, B, H, s_active] (1=keep).
         out_sb: SBUF output [128, D_TILES, B*H*s_active], written in place.
         bs, q_head, s_active, curr_sprior, head_dim: decode dims (GQA: q_head
@@ -133,6 +140,7 @@ def gqa_attention_d256(
         full_sprior: KV buffer capacity (defaults to curr_sprior).
         sbm: optional SbufManager (a megakernel may pass its own). Allocated here
             in auto-alloc mode when None.
+        v_in_sb: take the active V from SBUF instead of HBM.
 
     Returns:
         out_sb (the same SBUF tensor passed in).
@@ -158,6 +166,7 @@ def gqa_attention_d256(
         curr_sprior=curr_sprior,
         head_dim=head_dim,
         full_sprior=full_sprior,
+        v_in_sb=v_in_sb,
     )
 
     own_sbm = sbm is None

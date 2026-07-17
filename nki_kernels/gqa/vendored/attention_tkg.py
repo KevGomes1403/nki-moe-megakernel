@@ -3391,15 +3391,23 @@ def _compute_pv_matmul_and_store(
                         name=f"{sbm.get_name_prefix()}v_active_strided_load_remaining_b{i_b}_bt{btc.batch_tile_idx}",
                     )
             else:
-                v_active_view = (
-                    TensorView(v_active)
-                    .select(0, btc.global_batch_offset + i_b)
-                    .squeeze_dim(0)
-                )
+                # --- D256 PATCH (v_in_sb): take active V from the caller's SBUF tile
+                # instead of HBM. The copy stays a DMA because the destination shifts
+                # partitions 0..s_active-1 -> p_max-s_active..p_max-1. ---
+                if cfg.v_in_sb:
+                    v_active_src = v_active
+                else:
+                    v_active_src = (
+                        TensorView(v_active)
+                        .select(0, btc.global_batch_offset + i_b)
+                        .squeeze_dim(0)
+                        .get_view()
+                    )
+                # --- end D256 PATCH (v_in_sb) ---
                 # Load to the bottom right part of last chunk of v_sb: [s_active, d_head]
                 nisa.dma_copy(
                     v_sb[TC.p_max - cfg.s_active :, v_sb.shape[1] - cfg.d_head :],
-                    v_active_view.get_view(),
+                    v_active_src,
                     dge_mode=dge_mode.none,
                     name=f"v_active_load_sequential_b{i_b}_bt{btc.batch_tile_idx}",
                 )

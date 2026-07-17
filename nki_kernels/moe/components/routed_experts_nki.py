@@ -12,19 +12,21 @@ into tens of thousands of tiny packets, leaving the sync engine bound and the te
 
 The fix loads each selected expert's gate+up as ONE contiguous ``[H0, H1, 2I]`` slab (inner run ``2I``,
 512 B at bf16 -- half the descriptors), then slices ``gate = slab[:, :, 0:I]`` / ``up = slab[:, :, I:2I]``
-in SBUF (free). The slab load is split into two H1-halves so the gate/up matmul over the first half can
-start before the second half lands, and a 2-slot cross-expert prefetch ring issues expert k+1's weight
-DMAs while expert k computes. This path is always on -- there is no legacy/env-gated fallback.
+in SBUF (free). The slab load is split per H-shard ``s`` so the gate/up matmul over the first shard can
+start before the second lands, and a 2-slot cross-expert prefetch ring issues expert k+1's weight DMAs
+while expert k computes. This path is always on -- there is no legacy/env-gated fallback.
 
 Reproduces the ``moe_tkg`` selective contract exactly: top-K experts per token, SiLU activation,
 POST_SCALE by the (already L1-normalized) affinity with NO re-normalization, summed over the K experts.
 The stored ``[E,H,2,I]`` gate/up and ``[E,I,H]`` down weight layouts are unchanged.
 
-Layout: consumes the ``rmsnorm_tkg`` [H0,T,H1] tile (H = h0*H1 + j, "tp102") and emits ``routed_local``
-in the same convention (routed_local[h0, t, h1] = down output at H-column h0*H1 + h1), so both the SBUF
-megakernel readback and the natural [T,H] HBM store match what ``moe_tkg`` produced. Token-shard aware:
-each LNC core computes over the full H for its ``[T_offset:T_offset+T_per_shard]`` token slice (no
-H-sharding, no cross-core sendrecv) -- the caller supplies the shard geometry.
+Layout: consumes (and emits) the ``rmsnorm_tkg`` [H0,T,H1] tile in the "tp2013" H-permutation shared with
+the attention kernels' SBUF residual -- with ``n_s`` H-shards and ``H2 = H1 // n_s``, free index
+``f = s*H2 + h2`` maps to H-column ``s*(H0*H2) + h0*H2 + h2``. At ``n_s == 1`` this degenerates exactly to
+tp102 (H = h0*H1 + f). Only the AP index math into the (unmoved) HBM weights depends on it.
+
+Token-shard aware: each LNC core computes over the full H for its ``[T_offset:T_offset+T_per_shard]``
+token slice (no H-sharding of the work, no cross-core sendrecv) -- the caller supplies the geometry.
 
 Per-rank (TP=4) A3B routed dims: H=2048 (H0=128, H1=16), E=256, K=8, I=128 (single I tile).
 """
@@ -49,39 +51,32 @@ def expert_scalar_offset(expert_index, global_token_idx, k, K):
 
 
 def load_expert_weight_slab(
-    gate_up_flat, down_w, slab_slot, down_slot, expert_offset, H0, H1, two_I, I0, H
+    gate_up_flat, down_w, slab_slot, down_slot, expert_offset, H0, H2, n_s, two_I, I0, H
 ):
-    """Load one selected expert into a ring slot: fused gate+up slab (2 H1-halves) + down weight.
+    """Load one selected expert into a ring slot: fused gate+up slab (one DMA per H-shard) + down weight.
 
-    gate/up: ONE contiguous ``[H0, H1, 2I]`` slab per expert (inner run 2I, vs moe_tkg's I). Split into
-    two H1-halves (two DMAs) so the matmul over the first half can begin before the second half lands.
-    down: ``[I0, H]`` contiguous (inner run H, already efficient). All three are indirect DMAs (dynamic
-    expert via ``expert_offset``), so dge_mode is unknown (HW/SW DGE are unsafe for scalar_offset).
+    gate/up: ONE contiguous ``[H0, H1, 2I]`` slab per expert (inner run 2I, vs moe_tkg's I), issued as one
+    DMA per H-shard ``s`` so the matmul over shard 0 can begin before shard 1 lands. dim1 step (2I) equals
+    the inner extent, so each partition's H2 rows coalesce into a single ``H2 * 2I`` run.
+    down: ``[I0, H]`` contiguous (inner run H, already efficient) -- it reads the whole H row, so it makes
+    no assumption about the H permutation. All three are indirect DMAs (dynamic expert via
+    ``expert_offset``), so dge_mode is unknown (HW/SW DGE are unsafe for scalar_offset).
 
-    Slab convention: slab[h0, h1, c] = gate_up_flat[e][h0*H1 + h1, c] (c<I gate, c>=I up), matching the
-    normed tile's H = h0*H1 + j so each H1 matmul contracts H0 with aligned operands.
+    Slab convention: slab[h0, s*H2 + h2, c] = gate_up_flat[e][s*H0*H2 + h0*H2 + h2, c] (c<I gate, c>=I up),
+    matching the normed tile's tp2013 H-permutation so each free-index matmul contracts H0 with aligned
+    operands.
     """
-    half_h1 = H1 // 2
-    nisa.dma_copy(
-        dst=slab_slot[0:H0, 0:half_h1, 0:two_I],
-        src=gate_up_flat.ap(
-            pattern=[[H1 * two_I, H0], [two_I, half_h1], [1, two_I]],
-            offset=0,
-            scalar_offset=expert_offset,
-            indirect_dim=0,
-        ),
-        dge_mode=nisa.dge_mode.unknown,
-    )
-    nisa.dma_copy(
-        dst=slab_slot[0:H0, half_h1:H1, 0:two_I],
-        src=gate_up_flat.ap(
-            pattern=[[H1 * two_I, H0], [two_I, H1 - half_h1], [1, two_I]],
-            offset=half_h1 * two_I,
-            scalar_offset=expert_offset,
-            indirect_dim=0,
-        ),
-        dge_mode=nisa.dge_mode.unknown,
-    )
+    for s in range(n_s):
+        nisa.dma_copy(
+            dst=slab_slot[0:H0, s * H2 : (s + 1) * H2, 0:two_I],
+            src=gate_up_flat.ap(
+                pattern=[[H2 * two_I, H0], [two_I, H2], [1, two_I]],
+                offset=s * H0 * H2 * two_I,
+                scalar_offset=expert_offset,
+                indirect_dim=0,
+            ),
+            dge_mode=nisa.dge_mode.unknown,
+        )
     nisa.dma_copy(
         dst=down_slot[0:I0, 0:H],
         src=down_w.ap(
@@ -104,6 +99,7 @@ def accumulate_expert_output(
     global_token_idx,
     H0,
     H1,
+    H2,
     I,
     I0,
     two_I,
@@ -113,10 +109,11 @@ def accumulate_expert_output(
 ):
     """Compute one selected expert for one token and POST_SCALE-accumulate into output_temp.
 
-    gate_up: contract H0 over H1 slabs -> gate/up [I,1] fp32 PSUM; SiLU(gate)*up -> intermediate [I,1].
-    down: contract I0 -> [H0,1] per H1 slice via a strided stationary (columns h0*H1+h1) so
-    output_temp[h0, h1] lands at H-column h0*H1+h1. Scale by the L1-normalized affinity (POST_SCALE,
-    no re-normalization) and add to the token's running sum (fp32 accumulator).
+    gate_up: contract H0 over the H1 free indices -> gate/up [I,1] fp32 PSUM; SiLU(gate)*up -> [I,1].
+    down: contract I0 -> [H0,1] per free index f via a strided stationary picking the H-columns
+    {s*H0*H2 + h0*H2 + h2} (s, h2 = divmod(f, H2)), so output_temp[h0, f] lands at the tp2013 H-column of
+    (h0, f). Scale by the L1-normalized affinity (POST_SCALE, no re-normalization) and add to the token's
+    running sum (fp32 accumulator).
     """
     gate_psum = nl.ndarray((I, 1), dtype=nl.float32, buffer=nl.psum)
     up_psum = nl.ndarray((I, 1), dtype=nl.float32, buffer=nl.psum)
@@ -133,10 +130,11 @@ def accumulate_expert_output(
     nisa.tensor_tensor(dst=intermediate, data1=gate_sb, data2=up_sb, op=nl.multiply)
 
     down_psum = nl.ndarray((H0, H1), dtype=nl.float32, buffer=nl.psum)
-    for h1 in range(H1):  # H1 slices; strided stationary picks columns {h0*H1 + h1}
-        stationary = down_slot.ap(pattern=[[H, I0], [H1, H0]], offset=h1)
+    for f in range(H1):  # strided stationary picks the tp2013 H-columns of free index f
+        s, h2 = f // H2, f % H2
+        stationary = down_slot.ap(pattern=[[H, I0], [H2, H0]], offset=s * H0 * H2 + h2)
         nisa.nc_matmul(
-            dst=down_psum[0:H0, h1 : h1 + 1],
+            dst=down_psum[0:H0, f : f + 1],
             stationary=stationary,
             moving=intermediate[0:I0, 0:1],
         )
@@ -170,17 +168,19 @@ def routed_experts_selective(
     expert_affinities_eager,
     T_offset,
     T_per_shard,
+    n_s=1,
     output_in_sbuf=True,
 ):
     """Selective top-K routed experts on an SBUF-resident normed tile (fused-slab load + prefetch ring).
 
     Args:
-        normed_sb:                [H0=128, T, H1=H//128] SBUF post-attn-normed hidden (tp102 layout).
+        normed_sb:                [H0=128, T, H1=H//128] SBUF post-attn-normed hidden (tp2013 layout).
         expert_gate_up_w:         [E, H, 2, I] HBM fused gate/up expert weights (stored layout, unchanged).
         expert_down_w:            [E, I, H] HBM down expert weights (stored layout, unchanged).
         expert_index:             [T, K] uint32 SBUF top-K expert indices (from router_topk).
         expert_affinities_eager:  [T, K] fp32 SBUF L1-normalized top-K affinities in index order.
         T_offset / T_per_shard:   this core's token slice (token-shard geometry from the caller).
+        n_s:                      H-shards of the tp2013 permutation (== LNC core count; 1 -> tp102).
         output_in_sbuf:           True -> routed_local SBUF [H0,T,H1]; False -> HBM [T,H] natural.
 
     Returns:
@@ -199,6 +199,8 @@ def routed_experts_selective(
         I <= P_MAX, "routed_experts_nki supports I <= 128 (single intermediate tile)"
     )
     kernel_assert(expert_down_w.shape == (E, I, H), "expert_down_w must be [E, I, H]")
+    kernel_assert(H1 % n_s == 0, "tp2013 needs H1 divisible by the H-shard count n_s")
+    H2 = H1 // n_s
 
     # Flatten the stored [E,H,2,I] gate/up to [E,H,2I]: gate = cols 0:I, up = cols I:2I are contiguous.
     gate_up_flat = expert_gate_up_w.reshape((E, H, two_I))
@@ -245,7 +247,8 @@ def routed_experts_selective(
             down_slots[0],
             expert_scalar_offset(expert_index, global_token_idx, 0, K),
             H0,
-            H1,
+            H2,
+            n_s,
             two_I,
             I0,
             H,
@@ -263,7 +266,8 @@ def routed_experts_selective(
                     down_slots[nxt],
                     expert_scalar_offset(expert_index, global_token_idx, k + 1, K),
                     H0,
-                    H1,
+                    H2,
+                    n_s,
                     two_I,
                     I0,
                     H,
@@ -278,6 +282,7 @@ def routed_experts_selective(
                 global_token_idx,
                 H0,
                 H1,
+                H2,
                 I,
                 I0,
                 two_I,
@@ -286,22 +291,34 @@ def routed_experts_selective(
                 is_first=(k == 0),
             )
 
-    # Store: output_temp [H0, H1, T] -> routed_local [H0, T, H1] (H = h0*H1 + j). Each core writes its slice.
+    # Store: output_temp [H0, H1, T] -> routed_local [H0, T, H1] (free index f, tp2013). Each core writes
+    # its own token slice.
     routed_local = nl.ndarray((H0, T, H1), dtype=io_dtype, buffer=nl.sbuf)
-    for h1 in range(H1):
+    for f in range(H1):
         nisa.tensor_copy(
-            dst=routed_local[:, T_offset : T_offset + T_per_shard, h1],
-            src=output_temp[:, h1, :],
+            dst=routed_local[:, T_offset : T_offset + T_per_shard, f],
+            src=output_temp[:, f, :],
         )
     if output_in_sbuf:
         return routed_local
 
-    # HBM natural [T,H]: flat = global_token * H + (h0*H1 + h1); each core writes its token slice.
+    # HBM natural [T,H]: flat = t*H + (s*H0*H2 + h0*H2 + h2); each core writes its token slice, one DMA
+    # per H-shard (a single contiguous-per-partition DMA at n_s == 1).
     out_hbm = nl.ndarray((T, H), dtype=io_dtype, buffer=nl.shared_hbm)
-    nisa.dma_copy(
-        dst=out_hbm.ap(
-            pattern=[[H1, H0], [H, T_per_shard], [1, H1]], offset=T_offset * H
-        ),
-        src=routed_local[:, T_offset : T_offset + T_per_shard, :],
-    )
+    store_tile_to_hbm_th(out_hbm, routed_local, H0, H2, n_s, H, T_offset, T_per_shard)
     return out_hbm
+
+
+def store_tile_to_hbm_th(out_hbm, tile_sb, H0, H2, n_s, H, T_offset, T_per_shard):
+    """Store a tp2013 [H0,T,H1] SBUF tile into natural HBM [T,H], this core's token slice only.
+
+    dst flat for (h0, t', h2) of shard s = (T_offset + t')*H + s*H0*H2 + h0*H2 + h2.
+    """
+    for s in range(n_s):
+        nisa.dma_copy(
+            dst=out_hbm.ap(
+                pattern=[[H2, H0], [H, T_per_shard], [1, H2]],
+                offset=T_offset * H + s * H0 * H2,
+            ),
+            src=tile_sb[:, T_offset : T_offset + T_per_shard, s * H2 : (s + 1) * H2],
+        )

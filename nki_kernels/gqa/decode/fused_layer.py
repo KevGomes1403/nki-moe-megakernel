@@ -19,7 +19,7 @@ Dataflow (one launch [2]; both cores hold the full result after each cross-core 
            1/sqrt(D)), k_active, and gate -> [128, D_TILES, *] partition-major; v stays [T, D].
   Bridge B emit active K/V as outputs (BHDS k, BHSD v) for NxDI's scatter (design A, default).
   Stage 3  attention: gqa_attention_d256 (s_prior-sharded; out_in_sb leaves the full output on both
-           cores). Active K/V are passed in SBUF/HBM; the caches supply prior context only.
+           cores). Active K/V are passed in SBUF; the caches supply prior context only.
   Bridge B' optional in-place KV-cache scatter (design B) when kv_write_idx is given: write active K/V
            into k_cache/v_cache at [idx : idx+T] via nkilib indirect DMA; runs AFTER the attention read.
   Bridge C gate apply (out * sigmoid(gate)) + reorder into output_projection_tkg's [d,1,N,T] sub-head
@@ -277,20 +277,22 @@ def gqa_fused_compose(
             dst=active_k.ap(pattern=[[T, P_MAX], [1, T]], offset=(dt * P_MAX) * T),
             src=k_active_sb[0:P_MAX, dt, 0:T],
         )
+    v_active_sb = nl.ndarray((T, HEAD_DIM), dtype=io, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=v_active_sb, src=roped[0:T, V_HEAD, 0:HEAD_DIM])
     active_v = nl.ndarray((B, 1, T, HEAD_DIM), dtype=io, buffer=nl.shared_hbm)
     nisa.dma_copy(
         dst=active_v.ap(pattern=[[HEAD_DIM, T], [1, HEAD_DIM]], offset=0),
-        src=roped[0:T, V_HEAD, 0:HEAD_DIM],
+        src=v_active_sb,
     )
 
-    # Stage 3 -- attention. Active K/V passed in SBUF/HBM (caches hold prior only); full out on both.
+    # Stage 3 -- attention. Active K/V stay in SBUF (caches hold prior only); full out on both.
     out_sb = nl.ndarray((P_MAX, D_TILES, NUM_Q_HEADS * T), dtype=io, buffer=nl.sbuf)
     gqa_attention_d256(
         q_sb=q_sb,
         k_active_sb=k_active_sb,
         k_prior=k_cache,
         v_prior=v_cache,
-        v_active=active_v,
+        v_active=v_active_sb,
         mask=mask,
         out_sb=out_sb,
         bs=B,
@@ -298,6 +300,7 @@ def gqa_fused_compose(
         s_active=T,
         curr_sprior=L,
         head_dim=HEAD_DIM,
+        v_in_sb=True,
     )
 
     # Bridge B' -- optional design-B in-place KV-cache scatter (AFTER attention's prior read).

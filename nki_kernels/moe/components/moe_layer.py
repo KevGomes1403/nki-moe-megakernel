@@ -18,9 +18,12 @@ SINGLE ``reduce_from_tensor_model_parallel_region`` -- valid because the sigma-g
 AR(routed) + g*AR(shared) == AR(routed + g*shared). No cross-rank all-reduce here (megakernel/model
 boundary; a future megakernel could use ``nki.collectives.all_reduce`` on the SBUF tile).
 
-Per-rank (TP=4) A3B config: H=2048, E=256, K=8, routed I=128, shared I_s=128. The sigma-gate assumes the
-layout-0 (single_core_forced) [H0,T,H1] tile (H = h0*H1 + j) the routed+shared consumers force at cores=1
-and cores=2/T>1; cores=2/T=1 (decode) is out of scope (routed's own H-shard path is broken there).
+Every SBUF tile here -- ``normed_sb`` in and ``combined_local`` out -- is in the tp2013 H-permutation the
+attention kernels use for their residual (n_s = n_prgs H-shards, H2 = H1 // n_s, free index f = s*H2 + h2
+<-> H-column s*(H0*H2) + h0*H2 + h2), so a megakernel can share ONE SBUF residual. At one core it
+degenerates to tp102. The HBM contract ([B,S,H] in, [1,T,H] out) is layout-independent.
+
+Per-rank (TP=4) A3B config: H=2048, E=256, K=8, routed I=128, shared I_s=128.
 """
 
 import nki
@@ -30,7 +33,8 @@ import nki.language as nl
 from nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
 
 from .post_attn_norm import post_attn_rmsnorm_compose
-from .routed_experts import moe_h_shard_mode, routed_experts_compose
+from .routed_experts import NORM_SINGLE_CORE_FORCED, routed_experts_compose
+from .routed_experts_nki import store_tile_to_hbm_th
 from .shared_expert import moe_tkg_shard_decision, shared_expert_compose
 
 
@@ -45,12 +49,12 @@ def sigma_gate_compose(normed_sb, sigma_gate_w):
     """Sigmoid shared-expert gate: g = sigmoid(normed .h sigma_gate_w) -> [1, T] (rank-replicated).
 
     An H->1 projection contracting the full H, which lives split as the H0 partition x H1 free axes of
-    ``normed_sb`` (layout-0, H = h0*H1 + j). The weight loads the SAME way router_topk loads its tp102
-    weight -- reshape [H,1] -> [H0,H1] (row-major: [h0,j] = w[h0*H1+j]) -- so each H1 matmul contracts H0
-    with matching operands. Output is a [1, T] row (M=1) ready for the partition-broadcast in the gated sum.
+    ``normed_sb``. The [H,1] weight is loaded through the same tp2013 AP -- w_sb[h0, s*H2 + h2] =
+    w[s*H0*H2 + h0*H2 + h2] -- so each free-index matmul contracts H0 with matching operands. Output is a
+    [1, T] row (M=1) ready for the partition-broadcast in the gated sum.
 
     Args:
-        normed_sb:    [H0=128, T, H1=H//128] SBUF post-attn-normed hidden (layout-0).
+        normed_sb:    [H0=128, T, H1=H//128] SBUF post-attn-normed hidden (tp2013, n_s = n_prgs).
         sigma_gate_w: [H, 1] HBM gate weight, rank-replicated (load-transposed from stored [1, H]).
 
     Returns:
@@ -60,13 +64,21 @@ def sigma_gate_compose(normed_sb, sigma_gate_w):
     H = H0 * H1
     kernel_assert(tuple(sigma_gate_w.shape) == (H, 1), "sigma_gate_w must be [H, 1]")
 
+    _, n_s, _ = get_verified_program_sharding_info("moe_sigma_gate", (0, 1), 2)
+    kernel_assert(H1 % n_s == 0, "tp2013 needs H1 divisible by the H-shard count n_s")
+    H2 = H1 // n_s
+
     w_sb = nl.ndarray((H0, H1), dtype=normed_sb.dtype, buffer=nl.sbuf)
-    nisa.dma_copy(dst=w_sb, src=sigma_gate_w.reshape((H0, H1)))
+    for s in range(n_s):
+        nisa.dma_copy(
+            dst=w_sb[0:H0, s * H2 : (s + 1) * H2],
+            src=sigma_gate_w.ap(pattern=[[H2, H0], [1, H2]], offset=s * H0 * H2),
+        )
 
     logit_ps = nl.ndarray((1, T), dtype=nl.float32, buffer=nl.psum)
-    for j in range(H1):  # accumulate H0-contractions over H1 -> full-H logit [1, T]
+    for f in range(H1):  # accumulate H0-contractions over H1 -> full-H logit [1, T]
         nisa.nc_matmul(
-            dst=logit_ps, stationary=w_sb[:, j : j + 1], moving=normed_sb[:, :, j]
+            dst=logit_ps, stationary=w_sb[:, f : f + 1], moving=normed_sb[:, :, f]
         )
     logit_sb = nl.ndarray((1, T), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=logit_sb, src=logit_ps)
@@ -120,24 +132,20 @@ def gated_sum(routed_local, shared_local, g):
 
 
 def _store_combined_hbm(combined, moe_intermediate, output_bsh=False):
-    """Store combined [H0,T,H1] -> HBM [T,H] (or [1,T,H] if output_bsh; H = h0*H1 + j), one AP DMA.
+    """Store the tp2013 combined [H0,T,H1] tile -> HBM [T,H] natural (or [1,T,H] if output_bsh).
 
     ``output_bsh`` emits the [B=1,S=T,H] shape the model's residual stream expects (free -- same memory
     layout as [T,H]), so the caller needs no reshape. Token-shard aware: each core writes only its slice."""
     H0, T, H1 = combined.shape
     H = H0 * H1
-    shard_on_T, T_offset, T_per_shard = moe_tkg_shard_decision(T, H, moe_intermediate)
+    _, n_s, _ = get_verified_program_sharding_info("moe_store", (0, 1), 2)
+    H2 = H1 // n_s
+    _, T_offset, T_per_shard = moe_tkg_shard_decision(T, H, moe_intermediate)
     out_hbm = nl.ndarray(
         (1, T, H) if output_bsh else (T, H), dtype=combined.dtype, buffer=nl.shared_hbm
     )
     dst2d = out_hbm.reshape((T, H)) if output_bsh else out_hbm
-    # dst (h0,t',j) -> flat = (T_offset+t')*H + h0*H1 + j = t*H + (h0*H1+j); each core writes its slice.
-    nisa.dma_copy(
-        dst=dst2d.ap(
-            pattern=[[H1, H0], [H, T_per_shard], [1, H1]], offset=T_offset * H
-        ),
-        src=combined[:, T_offset : T_offset + T_per_shard, :],
-    )
+    store_tile_to_hbm_th(dst2d, combined, H0, H2, n_s, H, T_offset, T_per_shard)
     return out_hbm
 
 
@@ -176,15 +184,15 @@ def moe_layer_compose(
         combined_local: SBUF [H0,T,H1] (output_in_sbuf=True) or HBM [T,H] (False) -- the SINGLE per-rank
                         MoE partial for ONE downstream reduce_from_tensor_model_parallel_region.
     """
-    B, S, H = hidden.shape
-    T = B * S
     moe_intermediate = expert_gate_up_w.shape[3]
-    _, n_prgs, _ = get_verified_program_sharding_info("moe_layer", (0, 1), 2)
 
-    # NORM ONCE, in the layout both routed and shared consume (I == I_s -> same shard decision).
-    single_core_forced, _ = moe_h_shard_mode(T, H, moe_intermediate, n_prgs)
+    # NORM ONCE, in the tp2013 layout every consumer (router, routed, shared, sigma-gate) reads.
     normed_sb = post_attn_rmsnorm_compose(
-        hidden, gamma, eps, hidden_actual, single_core_forced=single_core_forced
+        hidden,
+        gamma,
+        eps,
+        hidden_actual,
+        single_core_forced=NORM_SINGLE_CORE_FORCED,
     )
 
     routed_local = routed_experts_compose(

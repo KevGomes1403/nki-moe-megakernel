@@ -5,57 +5,37 @@
 
 A plain SwiGLU FFN -- down(silu(gate(x)) * up(x)) -- on the SAME SBUF-resident ``normed_sb [H0,T,H1]``
 the routed path consumes (zero HBM round-trip). Returns the per-rank partial over H (down_proj without
-internal reduce); the sigma-gate, gated sum and combined TP all-reduce are the NEXT slice.
+internal reduce); the sigma-gate, gated sum and combined TP all-reduce live in ``moe_layer``.
 
-Reuses nkilib's mlp_tkg matmul machinery -- the exact ``process_gate_up_projection`` /
-``process_down_projection`` primitives the routed experts (moe_tkg) use, so NO matmul is written from
-scratch. The public ``mlp_tkg`` WRAPPER is not used: its store_output_in_sbuf + NO_NORM path is
-unexercised in nkilib and broken for SBUF input (an unbalanced ``pop_heap`` with no matching alloc, plus
-an unimported ``Logger`` on the sbm=None branch, and it forbids the auto-alloc SBM that SBUF input needs
-to avoid colliding with the compiler-allocated normed tile). moe_tkg sidesteps the wrapper the same way
-(selective_expert_impl drives the primitives directly with an auto-alloc SBM); we mirror that.
+Written in raw NKI, structurally ONE routed expert without the expert index / affinity scale, reusing the
+same AP idioms as ``routed_experts_nki``. nkilib's ``mlp_tkg`` primitives cannot be used: their gate/up
+loader hardcodes ``weight.reshape_dim(dim=0, shape=(H0, H1_shard))`` -- the tp102 H-permutation -- and
+tp2013 needs H viewed as (s, h0, h2) and then PERMUTED so h0 is the partition axis, which ``reshape_dim``
+cannot express and no flag toggles.
 
-Per-LNC-core layout matches moe_tkg's ``routed_local`` so the future gated sum is a plain per-core add.
-We mirror moe_tkg selective's TOKEN-shard decision (selective_expert_impl.py:117-142):
-  * token-shard (cores>1, T>1, not big-config): each core runs the H-unsharded primitives on its token
-    slice ``[T_offset:T_offset+T_per_shard]`` and writes ONLY that slice into the [H0,T,H1] output
-    (selective_expert_impl.py:383-386 idiom) -- byte-for-byte routed_local.
-  * single-core (cores==1): full [H0,T,H1] on the one core -- matches routed_local (num_shards=1).
-``shard_on_h_disabled`` is kept True in ALL cases: the H-shard path moe_tkg takes at cores>1/T==1 needs a
-genuinely per-core H-sharded norm input, but the token-sharded RMSNorm emits the SAME full tile on both
-cores at T==1, so that path double-counts the gate/up sendrecv -- moe_tkg's own routed path fails there
-identically. cores=2/T=1 therefore stays correct full-compute (both cores), which DIVERGES from
-routed_local's (broken) H-shard layout -- the remaining reconciliation for the combine slice, which must
-supply an H-sharded norm to fix routed AND shared together (see moe_layer.md).
+Layout (tp2013, shared with the attention kernels' SBUF residual): with ``n_s = n_prgs`` H-shards and
+``H2 = H1 // n_s``, free index ``f = s*H2 + h2`` maps to H-column ``s*(H0*H2) + h0*H2 + h2``; at one core
+this degenerates to tp102. gate/up are SEPARATE ``[H, I_s]`` tensors, so each partition's H2 rows coalesce
+into an ``H2 * I_s`` run (2 KB at bf16); down is the contiguous ``[I_s, H]`` row load, permutation-agnostic.
+
+Work split: TOKEN-sharded, identical to the routed path (``moe_token_shard``), so ``shared_local`` keeps
+the same per-core layout as ``routed_local`` and the gated sum is a plain per-core add. At cores>1 / T==1
+there is no token split, so both cores compute the full tile -- redundant but correct on every core.
 Weights are rank-replicated; ``shared_local`` stays the per-rank partial (cross-rank all-reduce deferred).
+
+Per-rank (TP=4) A3B dims: H=2048 (H0=128, H1=16), I_s=128 (shared_expert_intermediate_size 512 / TP=4).
 """
 
 import nki.isa as nisa
 import nki.language as nl
 
-from nkilib.core.mlp.mlp_parameters import MLPParameters
-from nkilib.core.mlp.mlp_tkg.mlp_tkg_constants import MLPTKGConstants
-from nkilib.core.mlp.mlp_tkg.mlp_tkg_down_projection import process_down_projection
-from nkilib.core.mlp.mlp_tkg.mlp_tkg_gate_up_projection import (
-    process_gate_up_projection,
-)
-from nkilib.core.mlp.mlp_tkg.mlp_tkg_utils import (
-    alloc_tensor_view,
-    convert_params_to_views,
-    transpose_store_sbuf_copy,
-)
-from nkilib.core.utils.allocator import SbufManager
-from nkilib.core.utils.common_types import ActFnType, NormType
-from nkilib.core.utils.kernel_helpers import (
-    div_ceil,
-    get_verified_program_sharding_info,
-)
-from nkilib.core.utils.logging import get_logger
+from nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
 
 from .post_attn_norm import post_attn_rmsnorm_compose
-from .routed_experts import moe_h_shard_mode
+from .routed_experts import NORM_SINGLE_CORE_FORCED, moe_token_shard
+from .routed_experts_nki import store_tile_to_hbm_th
 
-_MLP_SBUF_BUDGET = 200 * 1024
+P_MAX = 128
 
 
 def kernel_assert(condition, error_text):
@@ -66,85 +46,40 @@ def kernel_assert(condition, error_text):
 
 
 def moe_tkg_shard_decision(T, H, intermediate):
-    """Per-LNC-core TOKEN-shard geometry mirroring moe_tkg selective (selective_expert_impl.py:117-142).
-
-    Returns (shard_on_T, T_offset, T_per_shard). ``shard_on_T`` is True only when moe_tkg token-shards
-    (cores>1, T>1, not big-config); each core then owns tokens [T_offset:T_offset+T_per_shard] over full
-    H. Otherwise (cores==1, or cores>1/T==1) each core computes the full [H0,T,H1] tile -- shard_on_h stays
-    disabled everywhere (module docstring: the H-shard path needs an H-sharded norm the token-sharded
-    RMSNorm cannot supply at T==1).
-    """
+    """This core's (shard_on_T, T_offset, T_per_shard) for the MoE expert paths (routed == shared)."""
     _, n_prgs, shard_id = get_verified_program_sharding_info("moe_shared", (0, 1), 2)
-    single_core_forced, _ = moe_h_shard_mode(T, H, intermediate, n_prgs)
-    shard_on_T = (
-        single_core_forced and n_prgs > 1
-    )  # moe_tkg token-shards only when cores>1 and T>1
-    if shard_on_T:
-        T_first = T // n_prgs
-        T_per_shard = T_first if shard_id == 0 else T - T_first
-        T_offset = 0 if shard_id == 0 else T_first
-    else:
-        T_per_shard, T_offset = T, 0
-    return shard_on_T, T_offset, T_per_shard
+    return moe_token_shard(T, H, intermediate, n_prgs, shard_id)
 
 
-def _mlp_tkg_gate_up_down(params, sbm, dims, T_offset):
-    """mlp_tkg's SBUF-in NO_NORM core over ``dims.T`` tokens starting at ``T_offset``.
+def load_shared_weights(gate_w, up_w, down_w, H0, H1, H2, n_s, I_s, H, dtype):
+    """Load the shared expert's [H,I_s] gate/up (tp2013) and [I_s,H] down (contiguous) into SBUF.
 
-    Reuses the nkilib primitives directly (the public wrapper's SBUF+NO_NORM path pops an unallocated
-    heap frame). gate_up slices the full normed tile to ``[T_offset:T_offset+dims.T]``; with
-    shard_on_h_disabled each core computes the full H per-rank partial for its token slice. Returns the
-    down tile [H0, H1_shard(=H1), dims.T] SBUF.
+    gate/up slabs: slab[h0, s*H2 + h2, c] = w[s*H0*H2 + h0*H2 + h2, c]; dim1 step (I_s) equals the inner
+    extent, so each partition's H2 rows coalesce into one H2*I_s run. Static (non-indirect) DMAs.
     """
-    sbm.open_scope()
-    input_sb = (
-        params.hidden_tensor
-    )  # full SBUF normed tile [H0, T, H1]; gate_up slices T by T_offset
-
-    gate_up_sb = alloc_tensor_view(
-        sbm,
-        (dims.I0, div_ceil(dims.I, dims.I0), dims.T),
-        dtype=params.hidden_tensor.dtype,
-        buffer=nl.sbuf,
-        name="gate_up_sbuf",
-    )
-    sbm.open_scope()
-    gate_tile_info = process_gate_up_projection(
-        hidden=input_sb,
-        output=gate_up_sb,
-        params=params,
-        dims=dims,
-        sbm=sbm,
-        T_offset=T_offset,
-    )
-    sbm.close_scope()
-
-    down_sb = alloc_tensor_view(
-        sbm,
-        (dims.H0, dims.H1_shard, dims.T),
-        dtype=params.hidden_tensor.dtype,
-        buffer=nl.sbuf,
-        name="down_sbuf",
-    )
-    sbm.open_scope()
-    process_down_projection(
-        hidden=gate_up_sb,
-        output=down_sb,
-        params=params,
-        dims=dims,
-        gate_tile_info=gate_tile_info,
-        sbm=sbm,
-    )
-    sbm.close_scope()
-    return down_sb
+    gate_sb = nl.ndarray((H0, H1, I_s), dtype=dtype, buffer=nl.sbuf)
+    up_sb = nl.ndarray((H0, H1, I_s), dtype=dtype, buffer=nl.sbuf)
+    for s in range(n_s):
+        pattern = [[H2 * I_s, H0], [I_s, H2], [1, I_s]]
+        offset = s * H0 * H2 * I_s
+        nisa.dma_copy(
+            dst=gate_sb[0:H0, s * H2 : (s + 1) * H2, 0:I_s],
+            src=gate_w.ap(pattern=pattern, offset=offset),
+        )
+        nisa.dma_copy(
+            dst=up_sb[0:H0, s * H2 : (s + 1) * H2, 0:I_s],
+            src=up_w.ap(pattern=pattern, offset=offset),
+        )
+    down_sb = nl.ndarray((I_s, H), dtype=dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=down_sb[0:I_s, 0:H], src=down_w)
+    return gate_sb, up_sb, down_sb
 
 
 def shared_expert_compose(normed_sb, gate_w, up_w, down_w, output_in_sbuf=True):
-    """SwiGLU shared expert on an SBUF-resident normed tile via nkilib mlp_tkg (zero HBM round-trip).
+    """SwiGLU shared expert on an SBUF-resident normed tile (raw NKI, zero HBM round-trip).
 
     Args:
-        normed_sb:      [H0=128, T, H1=H//128] SBUF post-attn-normed hidden in the full layout-0
-                        (single_core_forced) tile -- shard_on_h is disabled, so each core reads full H.
+        normed_sb:      [H0=128, T, H1=H//128] SBUF post-attn-normed hidden (tp2013, n_s = n_prgs).
         gate_w:         [H, I_s] HBM gate weight (contraction-first; load-transposed from stored [I_s,H]).
         up_w:           [H, I_s] HBM up weight (contraction-first; load-transposed from stored [I_s,H]).
         down_w:         [I_s, H] HBM down weight (load-transposed from stored [H, I_s]).
@@ -153,11 +88,12 @@ def shared_expert_compose(normed_sb, gate_w, up_w, down_w, output_in_sbuf=True):
 
     Returns:
         shared_local: SBUF [H0,T,H1] (output_in_sbuf=True) or HBM [T,H] (False) -- per-rank partial with
-                      the SAME per-LNC-core shard layout as moe_tkg's routed_local.
+                      the SAME per-LNC-core token-shard layout as routed_local.
     """
     H0, T, H1 = normed_sb.shape
     H = H0 * H1
     I_s = up_w.shape[1]
+    dtype = normed_sb.dtype
     kernel_assert(
         tuple(gate_w.shape) == (H, I_s), "gate_w must be [H, I_s] matching normed_sb H"
     )
@@ -165,51 +101,61 @@ def shared_expert_compose(normed_sb, gate_w, up_w, down_w, output_in_sbuf=True):
         tuple(up_w.shape) == (H, I_s), "up_w must be [H, I_s] matching normed_sb H"
     )
     kernel_assert(tuple(down_w.shape) == (I_s, H), "down_w must be [I_s, H]")
-
-    shard_on_T, T_offset, T_per_shard = moe_tkg_shard_decision(T, H, I_s)
-
-    params = MLPParameters(
-        hidden_tensor=normed_sb,  # SBUF [H0,T,H1] -> input_in_sbuf auto-detected
-        gate_proj_weights_tensor=gate_w,  # [H, I_s]
-        up_proj_weights_tensor=up_w,  # [H, I_s]
-        down_proj_weights_tensor=down_w,  # [I_s, H] -> derives H, I_s
-        activation_fn=ActFnType.SiLU,
-        normalization_type=NormType.NO_NORM,
-        store_output_in_sbuf=output_in_sbuf,
-        shard_on_h_disabled=True,  # each core computes full H; token-sharded over T when shard_on_T
+    kernel_assert(
+        I_s <= P_MAX, "shared expert supports I_s <= 128 (single intermediate tile)"
     )
 
-    sbm = SbufManager(
-        0, _MLP_SBUF_BUDGET, get_logger("shared_expert"), use_auto_alloc=True
+    _, n_prgs, shard_id = get_verified_program_sharding_info("moe_shared", (0, 1), 2)
+    kernel_assert(
+        H1 % n_prgs == 0, "tp2013 needs H1 divisible by the H-shard count n_s"
     )
-    sbm.set_name_prefix("shared_mlp_")
+    n_s = n_prgs
+    H2 = H1 // n_s
+    _, T_offset, T_per_shard = moe_token_shard(T, H, I_s, n_prgs, shard_id)
 
-    convert_params_to_views(params)
-    dims = MLPTKGConstants.calculate_constants(params)
-    if shard_on_T:
-        dims.T = T_per_shard  # each core computes ONLY its token slice
+    gate_sb, up_sb, down_sb = load_shared_weights(
+        gate_w, up_w, down_w, H0, H1, H2, n_s, I_s, H, dtype
+    )
 
-    down_sb = _mlp_tkg_gate_up_down(
-        params, sbm, dims, T_offset
-    )  # [H0, H1_shard, dims.T]
+    # gate/up: contract H0 over the H1 free indices for this core's whole token slice at once.
+    gate_psum = nl.ndarray((I_s, T_per_shard), dtype=nl.float32, buffer=nl.psum)
+    up_psum = nl.ndarray((I_s, T_per_shard), dtype=nl.float32, buffer=nl.psum)
+    for f in range(H1):
+        moving = normed_sb[:, T_offset : T_offset + T_per_shard, f]
+        nisa.nc_matmul(dst=gate_psum, stationary=gate_sb[:, f, 0:I_s], moving=moving)
+        nisa.nc_matmul(dst=up_psum, stationary=up_sb[:, f, 0:I_s], moving=moving)
 
-    if not output_in_sbuf:
-        out_hbm = nl.ndarray((T, H), dtype=normed_sb.dtype, buffer=nl.shared_hbm)
-        transpose_store_sbuf_copy(
-            down_sb.base_tensor, out_hbm, dims, normed_sb.dtype, sbm, T_offset
-        )
-        sbm.close_scope()
-        return out_hbm
+    gate_act = nl.ndarray((I_s, T_per_shard), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.activation(dst=gate_act, data=gate_psum, op=nl.silu)
+    up_act = nl.ndarray((I_s, T_per_shard), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=up_act, src=up_psum)
+    intermediate = nl.ndarray((I_s, T_per_shard), dtype=dtype, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=intermediate, data1=gate_act, data2=up_act, op=nl.multiply)
 
-    # SBUF store mirrors selective_expert_impl.py:383-386 -- each core writes ONLY its own shard slice.
-    shared_local = nl.ndarray((H0, T, H1), dtype=normed_sb.dtype, buffer=nl.sbuf)
-    for h1_idx in range(dims.H1_shard):
+    # down: contract I_s -> [H0,1] per free index f, the strided stationary picking the tp2013 H-columns
+    # {s*H0*H2 + h0*H2 + h2} (s, h2 = divmod(f, H2)). Each core writes ONLY its own token slice.
+    shared_local = nl.ndarray((H0, T, H1), dtype=dtype, buffer=nl.sbuf)
+    for local_token_idx in range(T_per_shard):
+        down_psum = nl.ndarray((H0, H1), dtype=nl.float32, buffer=nl.psum)
+        for f in range(H1):
+            s, h2 = f // H2, f % H2
+            nisa.nc_matmul(
+                dst=down_psum[0:H0, f : f + 1],
+                stationary=down_sb.ap(
+                    pattern=[[H, I_s], [H2, H0]], offset=s * H0 * H2 + h2
+                ),
+                moving=intermediate[0:I_s, local_token_idx : local_token_idx + 1],
+            )
         nisa.tensor_copy(
-            dst=shared_local[:, T_offset : T_offset + dims.T, h1_idx],
-            src=down_sb.base_tensor[:, h1_idx, :],
+            dst=shared_local[:, T_offset + local_token_idx, :], src=down_psum
         )
-    sbm.close_scope()
-    return shared_local
+
+    if output_in_sbuf:
+        return shared_local
+
+    out_hbm = nl.ndarray((T, H), dtype=dtype, buffer=nl.shared_hbm)
+    store_tile_to_hbm_th(out_hbm, shared_local, H0, H2, n_s, H, T_offset, T_per_shard)
+    return out_hbm
 
 
 def moe_shared_compose(
@@ -224,10 +170,6 @@ def moe_shared_compose(
 ):
     """Full shared-expert chain: post-attn RMSNorm -> SwiGLU shared expert (all SBUF-resident).
 
-    Isolation convenience: norms into the full layout-0 [H0,T,H1] tile (single_core_forced) that the
-    shard_on_h-disabled shared expert consumes on every LNC core with zero HBM round-trip -- the token
-    slicing happens inside ``shared_expert_compose`` from the same full tile.
-
     Args:
         hidden:   [B, S, H] HBM raw post-attn residual (B=1), left untouched.
         gamma:    [1, H] HBM post_attention_layernorm.weight (standard form).
@@ -239,7 +181,11 @@ def moe_shared_compose(
         (shared_local, normed_sb): the shared partial and the SBUF normed tile (shared by the routed slice).
     """
     normed_sb = post_attn_rmsnorm_compose(
-        hidden, gamma, eps, hidden_actual, single_core_forced=True
+        hidden,
+        gamma,
+        eps,
+        hidden_actual,
+        single_core_forced=NORM_SINGLE_CORE_FORCED,
     )
     shared_local = shared_expert_compose(
         normed_sb, gate_w, up_w, down_w, output_in_sbuf=output_in_sbuf

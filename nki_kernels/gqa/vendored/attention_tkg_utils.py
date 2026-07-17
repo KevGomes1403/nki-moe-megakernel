@@ -13,10 +13,10 @@
 # limitations under the License.
 
 # ===========================================================================
-# VENDORED from nkilib core/attention/attention_tkg_utils.py -- UNMODIFIED AWS
-# code (NKI 0.4.0 / neuronx-cc 2.25.3371.0, installed 2026-06-12). The only
-# change is the relative import below, rewritten to resolve against the
-# installed nkilib package. No logic is changed.
+# VENDORED from nkilib core/attention/attention_tkg_utils.py -- AWS code (NKI
+# 0.4.0 / neuronx-cc 2.25.3371.0, installed 2026-06-12). The changes are the
+# relative import below, rewritten to resolve against the installed nkilib
+# package, and the `v_in_sb` config flag (D256 PATCH). No logic is changed.
 # ===========================================================================
 import math
 from dataclasses import dataclass
@@ -94,6 +94,12 @@ class AttnTKGConfig(nl.NKIObject):
 
     out_in_sb: bool = False
     """Output attention tensor should remain in SBUF instead of being stored to HBM."""
+
+    # --- D256 PATCH (v_in_sb) ---
+    v_in_sb: bool = False
+    """Active value tensor is pre-loaded in SBUF as [s_active, d_head] (bs == 1).
+    Flat KV only; the kernel copies it straight into v_sb instead of reading HBM."""
+    # --- end D256 PATCH (v_in_sb) ---
 
     enable_fa_s_prior_tiling: bool = True
     """Whether to enable Flash Attention (FA) with s_prior tiling.

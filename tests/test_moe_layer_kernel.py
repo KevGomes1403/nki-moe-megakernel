@@ -6,8 +6,9 @@ sum), zero HBM round-trip, returning the SINGLE per-rank partial ``routed_local 
 for one downstream ``reduce_from_tensor_model_parallel_region``.
 
 Readback (authoritative) = SBUF megakernel-API tile assembled token-shard-aware: each LNC core DMAs ONLY
-its shard slice into shared HBM [H0,T,H1], host un-permutes rmsnorm's layout-0 back to [T,H]. An HBM
-natural readback ([T,H] via one AP DMA in the kernel) cross-checks. A tiny sigma-gate readback checks g.
+its shard slice into shared HBM [H0,T,H1], host un-permutes the tile's tp2013 H-permutation (n_s = LNC
+core count; tp102 at n_s=1) back to [T,H]. An HBM natural readback ([T,H] via one AP DMA in the kernel)
+cross-checks -- it is layout-independent. A tiny sigma-gate readback checks g.
 
 Oracle = full NeuronMoEBlock-equivalent per-rank partial (fp32): normed=RMSNorm(hidden,gamma); routed
 top-8 (fp32 softmax over E -> L1-normalize) affinity-weighted expert sum; shared SwiGLU; combined =
@@ -169,9 +170,14 @@ def oracle_layer(inp, K):
 # ---------------------------------------------------------------------------
 # Layout helpers (SBUF readback)
 # ---------------------------------------------------------------------------
-def _unpermute(sbuf_out, T):
-    """Assembled layout-0 [H0,T,H1] -> natural [T,H] (H = h0*H1 + j; tp102)."""
-    return sbuf_out.permute(1, 0, 2).reshape(T, HIDDEN)
+def _unpermute(sbuf_out, T, n_s):
+    """Assembled tp2013 [H0,T,H1] -> natural [T,H]: free f = s*H2 + h2 <-> H = s*(H0*H2) + h0*H2 + h2.
+
+    ``n_s`` (= LNC core count) is the number of H-shards the kernel's SBUF tile carries. At n_s=1 this
+    degenerates exactly to tp102 (H = h0*H1 + f), so cores=1 decodes through the same code."""
+    H1 = HIDDEN // H0
+    H2 = H1 // n_s
+    return sbuf_out.reshape(H0, T, n_s, H2).permute(1, 2, 0, 3).reshape(T, HIDDEN)
 
 
 def _assemble_store(src_sb, out_hbm, T, H, intermediate):
@@ -301,7 +307,7 @@ def run_layer(inp, T, cores, dtype, mode, K):
         out = moe_layer_hbm_fwd[cores](*args, EPS, K)
         return out.to(torch.float32).cpu().reshape(T, HIDDEN)
     out = moe_layer_asm_fwd[cores](*args, EPS, K)
-    return _unpermute(out.to(torch.float32).cpu(), T)
+    return _unpermute(out.to(torch.float32).cpu(), T, n_s=cores)
 
 
 def run_sigma(inp, T, cores, dtype):

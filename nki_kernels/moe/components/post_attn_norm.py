@@ -9,14 +9,14 @@ input norm -- ``normed_sb`` is shared by ALL downstream composables (router, rou
 next slice's shared expert).
 
 100% of the math is nkilib ``rmsnorm_tkg`` -- identical to the GQA input RMSNorm
-(``pre_attn_rmsnorm_compose``); only the gamma differs (post_attention_layernorm.weight) AND the H
-sharding is exposed via ``single_core_forced`` so the emitted [H0,T,H1] permutation matches moe_tkg's
-consumer mode:
-  * num_H_shards = n_prgs (default): interleaved layout-1 -- matches moe_tkg when it shards on H (T==1).
-  * num_H_shards = 1 (single_core_forced): layout-0 (H = h0*H1 + j) -- matches moe_tkg when it shards
-    on tokens (T > 1). qkv_tkg always shards on H, so the GQA glue never needs this knob.
-The caller (``moe_routed_compose``) picks the mode from moe_tkg's shard decision; ``routed_experts_compose``
-sets the router ``x_sb_layout`` the same way so nothing reloads/transposes.
+(``pre_attn_rmsnorm_compose``); only the gamma differs (post_attention_layernorm.weight) AND the emitted
+[H0,T,H1] H-permutation is exposed via ``single_core_forced``, which keys ``rmsnorm_tkg``'s num_H_shards:
+  * num_H_shards = n_prgs (single_core_forced=False, what the MoE consumers use): "tp2013" -- free index
+    f = s*H2 + h2 <-> H-column s*(H0*H2) + h0*H2 + h2, H2 = H1 // n_prgs. This is the layout the attention
+    kernels emit, so a megakernel can share ONE SBUF residual. At n_prgs=1 it degenerates to tp102.
+  * num_H_shards = 1 (single_core_forced=True): "tp102" (H = h0*H1 + f) on every core.
+Note num_H_shards is keyed off the LNC count only -- it is independent of whether rmsnorm itself shards
+the BxS work (it does not below SHARDING_THRESHOLD, so at T<=2 both cores compute the full norm).
 """
 
 import nki.language as nl
@@ -51,8 +51,8 @@ def post_attn_rmsnorm_compose(
         eps:           RMSNorm epsilon (config.rms_norm_eps).
         hidden_actual: actual H used for the mean (defaults to H; set when input is padded).
         normed_sb:     optional [H0, T, H1] SBUF output; allocated if None.
-        single_core_forced: force num_H_shards=1 (layout-0) so the emitted layout matches a token-sharded
-                       moe_tkg consumer; False keeps the n_prgs-interleaved layout (H-sharded consumer).
+        single_core_forced: True forces num_H_shards=1 (tp102) on every core; False (what the MoE
+                       consumers pass) emits num_H_shards=n_prgs -- the tp2013 megakernel residual layout.
 
     Returns:
         normed_sb: [H0=128, T, H1=H//128] SBUF (same dtype as hidden), the MoE-layer input norm tile.
