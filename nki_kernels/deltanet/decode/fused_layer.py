@@ -432,9 +432,10 @@ def deltanet_in_proj_fused_tkg_fwd_state(
     return attn_out, candidate_states, conv_cand
 
 
-def out_proj_from_recurrence(attn_sb, out_w, T, W_core):
-    """Project this core's SBUF gated output [T, W_core] through out_proj_compose; returns o_out [T, hidden]."""
-    return out_proj_compose(attn_sb[0:T, 0:W_core], out_w)
+def out_proj_from_recurrence(attn_sb, out_w, T, W_core, out_in_sb=False):
+    """Project this core's SBUF gated output [T, W_core] through out_proj_compose; returns o_out [T, hidden]
+    (HBM) or the per-core SBUF [T, hidden/n] H-shard when out_in_sb=True (megakernel residual add)."""
+    return out_proj_compose(attn_sb[0:T, 0:W_core], out_w, out_in_sb=out_in_sb)
 
 
 def attention_layer_compose(
@@ -455,8 +456,13 @@ def attention_layer_compose(
     cand_is_3d,
     z_gamma,
     z_eps,
+    out_in_sb=False,
 ):
-    """Compose in_proj -> conv -> recurrence -> gated norm into SBUF, then project to o_out [T, hidden]."""
+    """Compose in_proj -> conv -> recurrence -> gated norm into SBUF, then project to o_out.
+
+    ``hidden`` may be HBM [B, S, H] or the megakernel's SBUF [128, T, 16] residual (qkv_tkg sniffs the
+    buffer). ``out_in_sb`` returns the per-core SBUF [T, hidden/n] o_proj partial instead of HBM [T, hidden].
+    """
     conv_dim = conv_weight.shape[0]
     value_dim = conv_dim - 2 * key_dim
     Hk_full = key_dim // P_MAX
@@ -513,7 +519,7 @@ def attention_layer_compose(
         z_off=z_off,
         attn_sb_out=attn_sb,
     )
-    return out_proj_from_recurrence(attn_sb, out_w, T, W_core)
+    return out_proj_from_recurrence(attn_sb, out_w, T, W_core, out_in_sb=out_in_sb)
 
 
 @nki.jit

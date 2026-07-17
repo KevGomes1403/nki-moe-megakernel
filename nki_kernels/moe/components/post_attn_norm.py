@@ -46,7 +46,8 @@ def post_attn_rmsnorm_compose(
     """RMSNorm raw post-attn hidden into an SBUF-resident [H0, T, H1] tile (zero HBM round-trip).
 
     Args:
-        hidden:        [B, T, H] HBM raw post-attn residual (B*S = T tokens), bf16/fp32; left untouched.
+        hidden:        raw post-attn residual, either [B, T, H] HBM or [H0=128, T, H1] SBUF (the
+                       megakernel residual); left untouched. rmsnorm_tkg consumes either directly.
         gamma:         [1, H] HBM post_attention_layernorm.weight (standard form; no +1 applied here).
         eps:           RMSNorm epsilon (config.rms_norm_eps).
         hidden_actual: actual H used for the mean (defaults to H; set when input is padded).
@@ -57,10 +58,15 @@ def post_attn_rmsnorm_compose(
     Returns:
         normed_sb: [H0=128, T, H1=H//128] SBUF (same dtype as hidden), the MoE-layer input norm tile.
     """
-    B, S, hdim = hidden.shape
-    T = B * S
-    kernel_assert(hdim % H0 == 0, "hidden H must be divisible by 128")
-    h1 = hdim // H0
+    if hidden.buffer == nl.sbuf:
+        h0_in, T, h1 = hidden.shape  # [H0, T, H1] megakernel residual
+        kernel_assert(h0_in == H0, "SBUF hidden partition dim must be 128")
+        hdim = h0_in * h1
+    else:
+        B, S, hdim = hidden.shape
+        T = B * S
+        kernel_assert(hdim % H0 == 0, "hidden H must be divisible by 128")
+        h1 = hdim // H0
     kernel_assert(tuple(gamma.shape) == (1, hdim), "gamma must be [1, H]")
 
     if hidden_actual is None:

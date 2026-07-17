@@ -165,6 +165,7 @@ def gqa_fused_compose(
     eps,
     kv_write_idx=None,
     gamma_in=None,
+    out_in_sb=False,
 ):
     """Compose the full fused GQA token-generation layer.
 
@@ -180,10 +181,15 @@ def gqa_fused_compose(
     mutated ``(k_cache, v_cache)`` handles so callers can observe / alias the write; the first three
     returns are unchanged so design A keeps working.
     """
-    B, S, H = hidden.shape
-    kernel_assert(B == 1, "fused GQA kernel supports batch size B == 1")
+    if hidden.buffer == nl.sbuf:
+        h0_in, T, h1 = hidden.shape  # [H0, T, H1] megakernel residual (B == 1)
+        kernel_assert(h0_in == P_MAX, "SBUF hidden partition dim must be 128")
+        B, H = 1, h0_in * h1
+    else:
+        B, S, H = hidden.shape
+        kernel_assert(B == 1, "fused GQA kernel supports batch size B == 1")
+        T = B * S
     kernel_assert(H == HIDDEN, "hidden dim must equal HIDDEN")
-    T = B * S
     L = k_cache.shape[3]  # full KV length (prior + active), multiple of 128
     kernel_assert(L % P_MAX == 0, "L (curr_sprior) must be a multiple of 128")
     io = hidden.dtype
@@ -324,13 +330,15 @@ def gqa_fused_compose(
             )
 
     # Stage 4 -- o_proj. H-sharded across cores; each core writes its disjoint hidden columns -> full.
+    # out_in_sb=True returns the per-core H-shard as an SBUF [T, H/n_prgs] tile for the megakernel
+    # residual add (P1 selects TRANSPOSE_OUT for the residual layout); default False keeps HBM [T, H].
     o_out = output_projection_tkg(
         attention=attn_full,
         weight=o_proj_w,
         bias=None,
         quantization_type=QuantizationType.NONE,
         TRANSPOSE_OUT=False,
-        OUT_IN_SB=False,
+        OUT_IN_SB=out_in_sb,
     )
     if kv_write_idx != None:
         return o_out, active_k, active_v, k_cache, v_cache

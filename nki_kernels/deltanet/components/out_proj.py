@@ -33,7 +33,7 @@ def kernel_assert(condition, error_text):
     )
 
 
-def out_proj_compose(attn_sb, out_w, sbm=None):
+def out_proj_compose(attn_sb, out_w, sbm=None, out_in_sb=False):
     """Per-rank DeltaNet output projection
 
     Args:
@@ -41,10 +41,12 @@ def out_proj_compose(attn_sb, out_w, sbm=None):
             element [t, h_local*d + j] = local value-head h_local, head_dim j).
         out_w:   [value_dim, hidden] HBM, transpose of the o_proj nn.Linear weight.
         sbm:     optional BufferManager passed through to output_projection_tkg.
+        out_in_sb: True -> return the per-core H-shard as an SBUF [T, hidden/n] tile for the
+            megakernel residual add; False (default) -> HBM [T, hidden].
 
     Returns:
-        o_out: [T, hidden] HBM -- per-rank o_proj PARTIAL. Each core writes its disjoint
-            hidden/n shard; the full [T, hidden] is complete on return.
+        o_out: per-rank o_proj PARTIAL -- HBM [T, hidden] (out_in_sb=False) or SBUF [T, hidden/n]
+            (out_in_sb=True). Each core writes its disjoint hidden/n shard.
 
     Steps: cross-LNC sendrecv gather of all heads -> transpose Layout A to [d, 1, Hv, T]
     (head_dim on partition) -> output_projection_tkg(OUT_IN_SB=False, TRANSPOSE_OUT=False, NONE).
@@ -101,6 +103,6 @@ def out_proj_compose(attn_sb, out_w, sbm=None):
         bias=None,
         quantization_type=QuantizationType.NONE,
         TRANSPOSE_OUT=False,
-        OUT_IN_SB=False,
+        OUT_IN_SB=out_in_sb,
         sbm=sbm,
     )
