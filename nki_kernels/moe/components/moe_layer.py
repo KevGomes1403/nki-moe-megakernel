@@ -164,6 +164,7 @@ def moe_layer_compose(
     hidden_actual=None,
     output_in_sbuf=True,
     output_bsh=False,
+    name_prefix="",
 ):
     """Fully fused MoE layer: norm ONCE -> routed + shared + sigma-gate -> gated sum (per-rank partial).
 
@@ -193,10 +194,17 @@ def moe_layer_compose(
         eps,
         hidden_actual,
         single_core_forced=NORM_SINGLE_CORE_FORCED,
+        name_prefix=name_prefix,
     )
 
     routed_local = routed_experts_compose(
-        normed_sb, router_w, expert_gate_up_w, expert_down_w, k=k, output_in_sbuf=True
+        normed_sb,
+        router_w,
+        expert_gate_up_w,
+        expert_down_w,
+        k=k,
+        output_in_sbuf=True,
+        name_prefix=name_prefix,
     )
     shared_local = shared_expert_compose(
         normed_sb, shared_gate_w, shared_up_w, shared_down_w, output_in_sbuf=True

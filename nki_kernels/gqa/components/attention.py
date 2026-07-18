@@ -60,7 +60,7 @@ except ImportError:  # pragma: no cover - nkilib is expected to be installed
 SBM_BUDGET_BYTES = 24 * 1024 * 1024
 
 
-def _kernel_assert(condition, msg):
+def kernel_assert(condition, msg):
     assert condition, (
         f"[INTERNAL_ERROR] [NCC_INKI016] Kernel validation exception: {msg}"
     )
@@ -121,6 +121,7 @@ def gqa_attention_d256(
     full_sprior=None,
     sbm=None,
     v_in_sb=False,
+    name_prefix="",
 ):
     """Head_dim=256 GQA decode attention via the vendored AWS ``attention_tkg``.
 
@@ -146,16 +147,16 @@ def gqa_attention_d256(
         out_sb (the same SBUF tensor passed in).
     """
     d_tiles = _d_tiles(head_dim)
-    _kernel_assert(head_dim % _D_HEAD_TILE == 0, "head_dim must be a multiple of 128")
-    _kernel_assert(
+    kernel_assert(head_dim % _D_HEAD_TILE == 0, "head_dim must be a multiple of 128")
+    kernel_assert(
         q_sb.shape[0] == _D_HEAD_TILE and q_sb.shape[1] == d_tiles,
         f"q_sb must be [128, {d_tiles}, B*H*s_active], got {q_sb.shape}",
     )
-    _kernel_assert(
+    kernel_assert(
         out_sb.shape[0] == _D_HEAD_TILE and out_sb.shape[1] == d_tiles,
         f"out_sb must be [128, {d_tiles}, B*H*s_active], got {out_sb.shape}",
     )
-    _kernel_assert(
+    kernel_assert(
         curr_sprior % _D_HEAD_TILE == 0, "curr_sprior (L) must be a multiple of 128"
     )
 
@@ -171,8 +172,9 @@ def gqa_attention_d256(
 
     own_sbm = sbm is None
     if own_sbm:
-        _kernel_assert(SbufManager is not None, "nkilib SbufManager unavailable")
+        kernel_assert(SbufManager is not None, "nkilib SbufManager unavailable")
         sbm = SbufManager(0, SBM_BUDGET_BYTES, use_auto_alloc=True)
+        sbm.set_name_prefix(name_prefix)
 
     # attention_tkg's first stack allocations (one_vec, position IDs) run before
     # its own per-tile open_scope, so a scope must be open when we own the sbm.

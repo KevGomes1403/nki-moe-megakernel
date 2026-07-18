@@ -3409,7 +3409,7 @@ def _compute_pv_matmul_and_store(
                     v_sb[TC.p_max - cfg.s_active :, v_sb.shape[1] - cfg.d_head :],
                     v_active_src,
                     dge_mode=dge_mode.none,
-                    name=f"v_active_load_sequential_b{i_b}_bt{btc.batch_tile_idx}",
+                    name=f"{sbm.get_name_prefix()}v_active_load_sequential_b{i_b}_bt{btc.batch_tile_idx}",
                 )
 
         # Perform V^T @ exp^T, which equals to (exp @ V)^T. Recall mm1 output is transposed - KQ^T

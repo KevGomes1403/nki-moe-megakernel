@@ -434,7 +434,7 @@ def deltanet_in_proj_fused_tkg_fwd_state(
 
 def out_proj_from_recurrence(attn_sb, out_w, T, W_core, out_in_sb=False):
     """Project this core's SBUF gated output [T, W_core] through out_proj_compose; returns o_out [T, hidden]
-    (HBM) or the per-core SBUF [T, hidden/n] H-shard when out_in_sb=True (megakernel residual add)."""
+    (HBM) or the per-core SBUF [H0, H1_shard*T] H-shard when out_in_sb=True (megakernel residual add)."""
     return out_proj_compose(attn_sb[0:T, 0:W_core], out_w, out_in_sb=out_in_sb)
 
 
@@ -457,11 +457,13 @@ def attention_layer_compose(
     z_gamma,
     z_eps,
     out_in_sb=False,
+    name_prefix="",
 ):
     """Compose in_proj -> conv -> recurrence -> gated norm into SBUF, then project to o_out.
 
     ``hidden`` may be HBM [B, S, H] or the megakernel's SBUF [128, T, 16] residual (qkv_tkg sniffs the
-    buffer). ``out_in_sb`` returns the per-core SBUF [T, hidden/n] o_proj partial instead of HBM [T, hidden].
+    buffer). ``out_in_sb`` returns the per-core SBUF [H0, H1_shard*T] o_proj partial (transposed_out)
+    instead of HBM [T, hidden].
     """
     conv_dim = conv_weight.shape[0]
     value_dim = conv_dim - 2 * key_dim
@@ -477,7 +479,9 @@ def attention_layer_compose(
     W_core = Hv_core * P_MAX
     W_full = Hv_full * P_MAX
 
-    proj_sb = in_proj_compose(hidden, proj_w, gamma, eps, output_in_sbuf=True)
+    proj_sb = in_proj_compose(
+        hidden, proj_w, gamma, eps, output_in_sbuf=True, name_prefix=name_prefix
+    )
     T = proj_sb.shape[0]
 
     attn_shape = nl.ndarray((T, W_full), dtype=nl.float32, buffer=nl.sbuf)

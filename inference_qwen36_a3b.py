@@ -117,6 +117,7 @@ def build_inference_config(
     spec_decode: bool = False,
     tkg_attention_kernel: bool = False,
     moe_layer_kernel: bool = False,
+    verify_megakernel: bool = False,
 ) -> Qwen36A3BInferenceConfig:
     """Build the NxDI config from the HF config.json on disk.
 
@@ -135,11 +136,15 @@ def build_inference_config(
             "rope_theta", 10_000_000
         )
     config_dict.setdefault("tie_word_embeddings", False)
+    if verify_megakernel:
+        tkg_attention_kernel = True
+        moe_layer_kernel = True
     # Route the DeltaNet verify/decode recurrence through the TKG NKI kernel.
     # Carried by both the target and (harmlessly) the draft config below.
     config_dict["use_tkg_attention_kernel"] = tkg_attention_kernel
     # Route the verify-pass MoE FFN through the fused MoE layer NKI kernel (T>1 only).
     config_dict["use_moe_layer_kernel"] = moe_layer_kernel
+    config_dict["use_verify_megakernel"] = verify_megakernel
 
     # block_size must exceed (seq_len * num_experts_per_tok) so prefill takes
     # forward_all_experts instead of forward_blockwise (the NKI blockwise
@@ -478,6 +483,13 @@ def main():
         help="Use the fused MoE layer NKI kernel for the verify-pass FFN (T>1). "
         "Pair with --mtp-spec-decode. Changes the checkpoint layout -> recompile + reshard.",
     )
+    parser.add_argument(
+        "--verify-megakernel",
+        action="store_true",
+        default=os.environ.get("A3B_VERIFY_MEGAKERNEL") == "1",
+        help="Run the whole verify pass through the single fused megakernel (implies the TKG "
+        "attention + MoE layer kernels). Pair with --mtp-spec-decode.",
+    )
     args = parser.parse_args()
 
     # Header label only; the real per-prompt budget is seq_len - prompt_len when
@@ -501,6 +513,7 @@ def main():
         spec_decode=args.mtp_spec_decode,
         tkg_attention_kernel=args.tkg_attention_kernel,
         moe_layer_kernel=args.use_moe_layer_kernel,
+        verify_megakernel=args.verify_megakernel,
     )
     if args.tkg_attention_kernel:
         # Hard-fail if the flag didn't reach the configs, so we never silently
@@ -528,6 +541,17 @@ def main():
                 False,
             ), "use_moe_layer_kernel did not propagate to the draft (MTP) config"
         print("[assert] Fused MoE layer kernel ENABLED on target + draft configs")
+    if args.verify_megakernel:
+        assert getattr(inf_config, "use_verify_megakernel", False), (
+            "use_verify_megakernel did not propagate to the target config"
+        )
+        if inf_config.fused_spec_config is not None:
+            assert getattr(
+                inf_config.fused_spec_config.draft_config,
+                "use_verify_megakernel",
+                False,
+            ), "use_verify_megakernel did not propagate to the draft (MTP) config"
+        print("[assert] Verify-trunk megakernel ENABLED on target + draft configs")
     maybe_compile(args.model_path, compiled_path, inf_config)
     model = load_model(compiled_path)
 

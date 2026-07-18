@@ -29,7 +29,7 @@ per-rank partial over H (down-proj contracts the I-shard); the cross-rank all-re
 
 import nki.language as nl
 
-from nkilib.core.router_topk.router_topk import router_topk
+from ..vendored.router_topk import router_topk
 from nkilib.core.utils.common_types import RouterActFnType
 from nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
 
@@ -90,6 +90,7 @@ def routed_experts_compose(
     expert_down_w,
     k=8,
     output_in_sbuf=True,
+    name_prefix="",
 ):
     """Router + selective experts on an SBUF-resident normed tile (zero HBM round-trip).
 
@@ -142,6 +143,7 @@ def routed_experts_compose(
         norm_topk_prob=True,  # L1-normalize the top-k affinities
         return_eager_affi=True,
         skip_store_router_logits=True,  # router_logits unused downstream
+        name_prefix=name_prefix,
     )
     # outs = [router_logits(None), expert_index[T,k], scattered_affinities[T,E], eager[T,k]] -- SBUF.
     # eager[t,k] == scattered[t, index[t,k]] (both the L1-normalized affinity of the k-th selected

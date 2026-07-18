@@ -166,6 +166,7 @@ def gqa_fused_compose(
     kv_write_idx=None,
     gamma_in=None,
     out_in_sb=False,
+    name_prefix="",
 ):
     """Compose the full fused GQA token-generation layer.
 
@@ -199,7 +200,9 @@ def gqa_fused_compose(
     # calls from it -- zero HBM round-trip. When gamma_in is None, hidden is already pre-normed in HBM.
     if gamma_in != None:
         normed_sb = nl.ndarray((P_MAX, T, HIDDEN // P_MAX), dtype=io, buffer=nl.sbuf)
-        pre_attn_rmsnorm_compose(hidden, gamma_in, eps, HIDDEN, normed_sb)
+        pre_attn_rmsnorm_compose(
+            hidden, gamma_in, eps, HIDDEN, normed_sb, name_prefix=name_prefix
+        )
         proj_input = normed_sb
     else:
         proj_input = hidden
@@ -207,9 +210,9 @@ def gqa_fused_compose(
     # Stage 0 -- projections (NO norm: proj_input is RMSNorm'd hidden). H-sharded; both cores end with full.
     # Distinct-prefix managers so the two qkv_tkg calls don't emit duplicate buffer op names.
     qkv_sbm = create_auto_alloc_manager()
-    qkv_sbm.set_name_prefix("gqa_qkv_")
+    qkv_sbm.set_name_prefix(name_prefix + "gqa_qkv_")
     gate_sbm = create_auto_alloc_manager()
-    gate_sbm.set_name_prefix("gqa_gate_")
+    gate_sbm.set_name_prefix(name_prefix + "gqa_gate_")
     qkv_sb = qkv_tkg(
         hidden=proj_input,
         qkv_w=qkv_w,
@@ -307,6 +310,7 @@ def gqa_fused_compose(
         curr_sprior=L,
         head_dim=HEAD_DIM,
         v_in_sb=True,
+        name_prefix=name_prefix,
     )
 
     # Bridge B' -- optional design-B in-place KV-cache scatter (AFTER attention's prior read).
@@ -330,14 +334,14 @@ def gqa_fused_compose(
             )
 
     # Stage 4 -- o_proj. H-sharded across cores; each core writes its disjoint hidden columns -> full.
-    # out_in_sb=True returns the per-core H-shard as an SBUF [T, H/n_prgs] tile for the megakernel
-    # residual add (P1 selects TRANSPOSE_OUT for the residual layout); default False keeps HBM [T, H].
+    # out_in_sb=True returns the per-core H-shard as an SBUF [H0, H1_shard*T] tile (transposed_out) for
+    # the megakernel residual add; default False keeps the HBM [T, H] contract.
     o_out = output_projection_tkg(
         attention=attn_full,
         weight=o_proj_w,
         bias=None,
         quantization_type=QuantizationType.NONE,
-        TRANSPOSE_OUT=False,
+        TRANSPOSE_OUT=out_in_sb,
         OUT_IN_SB=out_in_sb,
     )
     if kv_write_idx != None:

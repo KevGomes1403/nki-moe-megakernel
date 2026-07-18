@@ -41,15 +41,16 @@ def out_proj_compose(attn_sb, out_w, sbm=None, out_in_sb=False):
             element [t, h_local*d + j] = local value-head h_local, head_dim j).
         out_w:   [value_dim, hidden] HBM, transpose of the o_proj nn.Linear weight.
         sbm:     optional BufferManager passed through to output_projection_tkg.
-        out_in_sb: True -> return the per-core H-shard as an SBUF [T, hidden/n] tile for the
-            megakernel residual add; False (default) -> HBM [T, hidden].
+        out_in_sb: True -> return the per-core H-shard as an SBUF [H0, H1_shard*T] tile
+            (TRANSPOSE_OUT, the layout the megakernel residual add consumes); False (default)
+            -> HBM [T, hidden].
 
     Returns:
-        o_out: per-rank o_proj PARTIAL -- HBM [T, hidden] (out_in_sb=False) or SBUF [T, hidden/n]
-            (out_in_sb=True). Each core writes its disjoint hidden/n shard.
+        o_out: per-rank o_proj PARTIAL -- HBM [T, hidden] (out_in_sb=False) or SBUF
+            [H0, H1_shard*T] (out_in_sb=True). Each core writes its disjoint hidden/n shard.
 
     Steps: cross-LNC sendrecv gather of all heads -> transpose Layout A to [d, 1, Hv, T]
-    (head_dim on partition) -> output_projection_tkg(OUT_IN_SB=False, TRANSPOSE_OUT=False, NONE).
+    (head_dim on partition) -> output_projection_tkg(NONE quantization).
     """
     T, W_core = attn_sb.shape
     value_dim, hidden = out_w.shape
@@ -102,7 +103,7 @@ def out_proj_compose(attn_sb, out_w, sbm=None, out_in_sb=False):
         weight=out_w,
         bias=None,
         quantization_type=QuantizationType.NONE,
-        TRANSPOSE_OUT=False,
+        TRANSPOSE_OUT=out_in_sb,
         OUT_IN_SB=out_in_sb,
         sbm=sbm,
     )

@@ -22,24 +22,5 @@ persists (no HBM round-trip) and is shared by all consumers. Full pipeline:
 ``nki_kernels/specs/moe_layer.md``. Isolation tests: ``tests/test_moe_{routed,shared_expert,layer}_kernel.py``.
 """
 
-from .components.moe_layer import (
-    gated_sum,
-    moe_layer_compose,
-    moe_layer_fwd,
-    sigma_gate_compose,
-)
-from .components.post_attn_norm import post_attn_rmsnorm_compose
-from .components.routed_experts import moe_routed_compose, routed_experts_compose
-from .components.shared_expert import moe_shared_compose, shared_expert_compose
-
-__all__ = [
-    "post_attn_rmsnorm_compose",
-    "routed_experts_compose",
-    "moe_routed_compose",
-    "shared_expert_compose",
-    "moe_shared_compose",
-    "moe_layer_compose",
-    "moe_layer_fwd",
-    "sigma_gate_compose",
-    "gated_sum",
-]
+from .components import *  # noqa: F401,F403 -- components/__init__ owns the export list
+from .components import __all__ as __all__

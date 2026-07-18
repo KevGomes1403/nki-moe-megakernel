@@ -78,6 +78,14 @@ from .nki_kernels import (
     gqa_fused_tkg_fwd,
     moe_layer_fwd,
 )
+from .nki_kernels.megakernel import (
+    DN_FIELDS,
+    GQA_FIELDS,
+    MOE_FIELDS,
+    build_verify_megakernel,
+    flatten_megakernel_args,
+    split_megakernel_returns,
+)
 
 from neuronx_distributed_inference.models.config import (
     FusedSpecNeuronConfig,
@@ -1607,6 +1615,7 @@ class Qwen36A3BInferenceConfig(InferenceConfig):
         kwargs.setdefault("use_qwen_hybrid_chunked_prefill_nki", False)
         kwargs.setdefault("use_tkg_attention_kernel", False)
         kwargs.setdefault("use_moe_layer_kernel", False)
+        kwargs.setdefault("use_verify_megakernel", False)
 
         # MoE
         kwargs.setdefault("num_experts", 256)
@@ -4217,15 +4226,12 @@ class Qwen36SpecTarget(NeuronQwen36A3BModel):
             **kwargs,
         )
 
-    def _verify_forward(
-        self, input_ids, attention_mask, position_ids, seq_ids, sampling_params
-    ):
-        seq_ids = seq_ids.to(torch.int32)
+    def _verify_prologue(self, input_ids, position_ids, seq_ids):
+        """Shared entry work for both verify paths: embeds, rope, cache handles, masks."""
         batch_size, seq_len = input_ids.shape[:2]
         position_ids = position_ids.view(-1, seq_len).long()
 
         inputs_embeds = self.embed_tokens(input_ids)
-        hidden_states = inputs_embeds
         cos_cache, sin_cache = self.mrope_emb(inputs_embeds, position_ids)
         past_key_values = self.kv_mgr.get_cache(
             seq_ids=seq_ids,
@@ -4246,6 +4252,59 @@ class Qwen36SpecTarget(NeuronQwen36A3BModel):
         verify_active_mask = (
             block_idx.view(1, 1, seq_len, 1) >= block_idx.view(1, 1, 1, seq_len)
         ).expand(batch_size, 1, seq_len, seq_len)
+
+        return (
+            position_ids,
+            inputs_embeds,
+            cos_cache,
+            sin_cache,
+            past_key_values,
+            prior_mask,
+            verify_active_mask,
+        )
+
+    def _verify_epilogue(
+        self, hidden_states, next_decoder_cache, layer_candidates, position_ids, seq_ids
+    ):
+        """Shared exit work for both verify paths: cache commit, final norm, lm_head, argmax."""
+        updated_kv = self.kv_mgr.update_cache(
+            is_for_context_encoding=False,
+            seq_ids=seq_ids,
+            position_ids=position_ids,
+            new_key_values=next_decoder_cache,
+            seq_len=self.n_positions,
+        )
+
+        verify_trunk_hidden = hidden_states  # pre-final-norm, both positions
+        logits = self.lm_head(self.norm(hidden_states)).float()
+        tokens = _greedy_argmax(  # [B, spec_len]
+            self.lm_head,
+            logits,
+            self.rank_util,
+            disable_argmax_kernel=self.neuron_config.disable_argmax_kernel,
+        )
+
+        self._verify_candidates = layer_candidates
+        return [tokens, *updated_kv, verify_trunk_hidden]
+
+    def _verify_forward(
+        self, input_ids, attention_mask, position_ids, seq_ids, sampling_params
+    ):
+        if getattr(self.config, "use_verify_megakernel", False):
+            return self._verify_forward_megakernel(
+                input_ids, attention_mask, position_ids, seq_ids, sampling_params
+            )
+        seq_ids = seq_ids.to(torch.int32)
+        (
+            position_ids,
+            inputs_embeds,
+            cos_cache,
+            sin_cache,
+            past_key_values,
+            prior_mask,
+            verify_active_mask,
+        ) = self._verify_prologue(input_ids, position_ids, seq_ids)
+        hidden_states = inputs_embeds
 
         next_decoder_cache = ()
         layer_candidates = []
@@ -4270,25 +4329,132 @@ class Qwen36SpecTarget(NeuronQwen36A3BModel):
             if layer_outputs[5] is not None:  # (S_stack, conv_cand) for DeltaNet
                 layer_candidates.append(layer_outputs[5])
 
-        updated_kv = self.kv_mgr.update_cache(
-            is_for_context_encoding=False,
-            seq_ids=seq_ids,
-            position_ids=position_ids,
-            new_key_values=next_decoder_cache,
-            seq_len=self.n_positions,
+        return self._verify_epilogue(
+            hidden_states, next_decoder_cache, layer_candidates, position_ids, seq_ids
         )
 
-        verify_trunk_hidden = hidden_states  # pre-final-norm, both positions
-        logits = self.lm_head(self.norm(hidden_states)).float()
-        tokens = _greedy_argmax(  # [B, spec_len]
-            self.lm_head,
-            logits,
-            self.rank_util,
-            disable_argmax_kernel=self.neuron_config.disable_argmax_kernel,
-        )
+    def _verify_forward_megakernel(
+        self, input_ids, attention_mask, position_ids, seq_ids, sampling_params
+    ):
+        seq_ids = seq_ids.to(torch.int32)
+        batch_size, seq_len = input_ids.shape[:2]
+        (
+            position_ids,
+            inputs_embeds,
+            cos_cache,
+            sin_cache,
+            past_key_values,
+            prior_mask,
+            verify_active_mask,
+        ) = self._verify_prologue(input_ids, position_ids, seq_ids)
 
-        self._verify_candidates = layer_candidates
-        return [tokens, *updated_kv, verify_trunk_hidden]
+        H = self.config.hidden_size
+        eps = self.config.rms_norm_eps
+        E = self.config.num_experts
+        i_rank = (
+            self.config.moe_intermediate_size // self.config.neuron_config.tp_degree
+        )
+        layer_is_gqa = [l.layer_type != "linear_attention" for l in self.layers]
+
+        # Per-field weight lists, keyed by the megakernel's own field names so the flat
+        # positional order stays owned by flatten_megakernel_args.
+        dn = {f: [] for f in DN_FIELDS}
+        gqa = {f: [] for f in GQA_FIELDS}
+        moe = {f: [] for f in MOE_FIELDS}
+        key_dim = None
+        gqa_mask = None
+
+        for idx, layer in enumerate(self.layers):
+            mlp = layer.mlp
+            moe["gamma"].append(layer.post_attention_layernorm.weight.reshape(1, H))
+            moe["router_w"].append(mlp.moe_router_w_t)
+            moe["gate_up_w"].append(
+                mlp.moe.expert_mlps.mlp_op.gate_up_proj.weight.reshape(E, H, 2, i_rank)
+            )
+            moe["down_w"].append(mlp.moe.expert_mlps.mlp_op.down_proj.weight)
+            moe["sigma_gate_w"].append(mlp.moe_sigma_gate_t)
+            moe["shared_gate_w"].append(mlp.shared_expert.gate_proj.weight)
+            moe["shared_up_w"].append(mlp.shared_expert.up_proj.weight)
+            moe["shared_down_w"].append(mlp.shared_expert.down_proj.weight)
+
+            if layer_is_gqa[idx]:
+                sa = layer.self_attn
+                k_cache, v_cache = past_key_values[idx]
+                gqa["qkv_w"].append(sa.gqa_qkv_w.weight)
+                gqa["gate_w"].append(sa.gqa_gate_w.weight)
+                gqa["gamma_q"].append(sa.q_layernorm.weight)
+                gqa["gamma_k"].append(sa.k_layernorm.weight)
+                gqa["in_gamma"].append(layer.input_layernorm.weight.reshape(1, H))
+                gqa["o_proj_w"].append(sa.gqa_o_proj_w.weight)
+                gqa["k_cache"].append(k_cache)
+                gqa["v_cache"].append(v_cache)
+                if gqa_mask is None:
+                    gqa_mask = sa._build_kernel_mask(
+                        prior_mask,
+                        verify_active_mask,
+                        batch_size,
+                        seq_len,
+                        k_cache.shape[-1],
+                        input_ids.device,
+                    )
+            else:
+                la = layer.linear_attn
+                if key_dim is None:
+                    key_dim = la.key_dim
+                dn["proj_w"].append(la.in_proj_fused.weight)
+                dn["in_gamma"].append(layer.input_layernorm.weight.reshape(1, H))
+                dn["conv_state"].append(
+                    torch.index_select(la.conv_state_buffer, 0, seq_ids)[0]
+                )
+                dn["conv_weight"].append(la.conv1d_weight.weight)
+                dn["A_log"].append(la._A_log())
+                dn["dt_bias"].append(la._dt_bias())
+                dn["init_state"].append(
+                    torch.index_select(la.recurrent_state_buffer, 0, seq_ids)[0]
+                )
+                dn["out_w"].append(la.out_proj.weight)
+                dn["z_gamma"].append(la.norm.weight)
+
+        replica_groups = (list(range(self.config.neuron_config.tp_degree)),)
+        megakernel = build_verify_megakernel(layer_is_gqa)
+        flat = flatten_megakernel_args(
+            inputs_embeds,
+            dn,
+            gqa,
+            moe,
+            cos_cache[0],
+            sin_cache[0],
+            gqa_mask,
+            key_dim,
+            eps,
+            replica_groups,
+        )
+        n_gqa = sum(layer_is_gqa)
+        n_dn = len(layer_is_gqa) - n_gqa
+        output, gqa_active_kv, dn_cand = split_megakernel_returns(
+            megakernel[2](*flat), n_gqa, n_dn
+        )
+        hidden_states = output.to(inputs_embeds.dtype)
+
+        next_decoder_cache = ()
+        layer_candidates = []
+        gi, di = 0, 0
+        for idx, layer in enumerate(self.layers):
+            if layer_is_gqa[idx]:
+                next_decoder_cache += ((gqa_active_kv[gi][0], gqa_active_kv[gi][1]),)
+                gi += 1
+            else:
+                dummy_k, dummy_v = layer.linear_attn._dummy_kv(
+                    batch_size, seq_len, hidden_states.dtype, hidden_states.device
+                )
+                next_decoder_cache += ((dummy_k, dummy_v),)
+                s_stack, conv_cand = dn_cand[di]
+                layer_candidates.append((s_stack.unsqueeze(0), conv_cand.unsqueeze(0)))
+                di += 1
+
+        return self._verify_epilogue(
+            hidden_states, next_decoder_cache, layer_candidates, position_ids, seq_ids
+        )
 
 
 class Qwen36FusedSpecModel(NeuronFusedSpecModel):

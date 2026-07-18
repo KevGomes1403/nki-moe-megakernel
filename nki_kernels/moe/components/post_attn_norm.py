@@ -8,9 +8,8 @@ tile that the router and routed/shared experts consume with zero HBM round-trip.
 input norm -- ``normed_sb`` is shared by ALL downstream composables (router, routed experts, and the
 next slice's shared expert).
 
-100% of the math is nkilib ``rmsnorm_tkg`` -- identical to the GQA input RMSNorm
-(``pre_attn_rmsnorm_compose``); only the gamma differs (post_attention_layernorm.weight) AND the emitted
-[H0,T,H1] H-permutation is exposed via ``single_core_forced``, which keys ``rmsnorm_tkg``'s num_H_shards:
+``single_core_forced`` keys ``rmsnorm_tkg``'s num_H_shards, which selects the emitted [H0,T,H1]
+H-permutation:
   * num_H_shards = n_prgs (single_core_forced=False, what the MoE consumers use): "tp2013" -- free index
     f = s*H2 + h2 <-> H-column s*(H0*H2) + h0*H2 + h2, H2 = H1 // n_prgs. This is the layout the attention
     kernels emit, so a megakernel can share ONE SBUF residual. At n_prgs=1 it degenerates to tp102.
@@ -19,20 +18,10 @@ Note num_H_shards is keyed off the LNC count only -- it is independent of whethe
 the BxS work (it does not below SHARDING_THRESHOLD, so at T<=2 both cores compute the full norm).
 """
 
-import nki.language as nl
-
-from nkilib.core.subkernels.rmsnorm_tkg import rmsnorm_tkg
+from ...common import H0, rmsnorm_to_sbuf
 
 H = 2048
-H0 = 128  # partition dim (nl.tile_size.pmax)
 H1 = H // H0  # 16 free H-tiles
-
-
-def kernel_assert(condition, error_text):
-    """Assert with an NKI-formatted error message (identifies kernel-origin failures)."""
-    assert condition, (
-        f"[INTERNAL_ERROR] [NCC_INKI016] Kernel validation exception: {error_text}"
-    )
 
 
 def post_attn_rmsnorm_compose(
@@ -42,44 +31,19 @@ def post_attn_rmsnorm_compose(
     hidden_actual=None,
     normed_sb=None,
     single_core_forced=False,
+    name_prefix="",
 ):
     """RMSNorm raw post-attn hidden into an SBUF-resident [H0, T, H1] tile (zero HBM round-trip).
 
-    Args:
-        hidden:        raw post-attn residual, either [B, T, H] HBM or [H0=128, T, H1] SBUF (the
-                       megakernel residual); left untouched. rmsnorm_tkg consumes either directly.
-        gamma:         [1, H] HBM post_attention_layernorm.weight (standard form; no +1 applied here).
-        eps:           RMSNorm epsilon (config.rms_norm_eps).
-        hidden_actual: actual H used for the mean (defaults to H; set when input is padded).
-        normed_sb:     optional [H0, T, H1] SBUF output; allocated if None.
-        single_core_forced: True forces num_H_shards=1 (tp102) on every core; False (what the MoE
-                       consumers pass) emits num_H_shards=n_prgs -- the tp2013 megakernel residual layout.
-
-    Returns:
-        normed_sb: [H0=128, T, H1=H//128] SBUF (same dtype as hidden), the MoE-layer input norm tile.
+    ``gamma`` is the layer's post_attention_layernorm.weight; see ``rmsnorm_to_sbuf`` for the full
+    argument contract, and the module docstring for what ``single_core_forced`` does to the layout.
     """
-    if hidden.buffer == nl.sbuf:
-        h0_in, T, h1 = hidden.shape  # [H0, T, H1] megakernel residual
-        kernel_assert(h0_in == H0, "SBUF hidden partition dim must be 128")
-        hdim = h0_in * h1
-    else:
-        B, S, hdim = hidden.shape
-        T = B * S
-        kernel_assert(hdim % H0 == 0, "hidden H must be divisible by 128")
-        h1 = hdim // H0
-    kernel_assert(tuple(gamma.shape) == (1, hdim), "gamma must be [1, H]")
-
-    if hidden_actual is None:
-        hidden_actual = hdim
-    if normed_sb is None:
-        normed_sb = nl.ndarray((H0, T, h1), dtype=hidden.dtype, buffer=nl.sbuf)
-
-    rmsnorm_tkg(
-        input=hidden,
-        gamma=gamma,
-        output=normed_sb,
+    return rmsnorm_to_sbuf(
+        hidden,
+        gamma,
         eps=eps,
         hidden_actual=hidden_actual,
+        normed_sb=normed_sb,
         single_core_forced=single_core_forced,
+        name_prefix=name_prefix + "postnorm_",
     )
-    return normed_sb

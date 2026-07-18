@@ -12,16 +12,26 @@ deltanet/decode/fused_layer.py (deltanet_in_proj_fused_tkg_fwd).
 """
 
 import nki
+import nki.isa as nisa
 import nki.language as nl
 
 from nkilib.core.qkv.qkv_tkg import qkv_tkg
+from nkilib.core.utils.allocator import create_auto_alloc_manager
 from nkilib.core.utils.common_types import NormType, QKVOutputLayout, QuantizationType
 
 
-def in_proj_compose(hidden, proj_w, gamma, eps, output_in_sbuf):
-    """Fused input RMSNorm + 4-way projection via qkv_tkg; returns [B,S,I] HBM or [B*S,I] SBUF (caller slices qkv/z/a/b)."""
+def in_proj_compose(hidden, proj_w, gamma, eps, output_in_sbuf, name_prefix=""):
+    """Fused input RMSNorm + 4-way projection via qkv_tkg; returns [B,S,I] HBM or [B*S,I] SBUF (caller slices qkv/z/a/b).
+    """
+    if hidden.buffer == nl.sbuf:
+        norm_in = nl.ndarray(hidden.shape, dtype=hidden.dtype, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=norm_in, src=hidden)
+    else:
+        norm_in = hidden
+    sbm = create_auto_alloc_manager()
+    sbm.set_name_prefix(name_prefix + "in_proj_")
     return qkv_tkg(
-        hidden=hidden,
+        hidden=norm_in,
         qkv_w=proj_w,
         norm_w=gamma,
         norm_type=NormType.RMS_NORM,
@@ -33,6 +43,7 @@ def in_proj_compose(hidden, proj_w, gamma, eps, output_in_sbuf):
         num_kv_heads=None,
         fused_add=False,
         output_in_sbuf=output_in_sbuf,
+        sbm=sbm,
     )
 
 
