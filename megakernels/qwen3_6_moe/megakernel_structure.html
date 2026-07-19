@@ -1,0 +1,1519 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Qwen3.6-A3B Verify Megakernel — Structure Brief</title>
+<style>
+/* ============================================================
+   silicon & signal
+   teal  = accent + the provenance ownership ramp (ours → forked → upstream)
+   amber = reserved, semantically, for HBM traffic
+   ============================================================ */
+:root {
+  --paper:#F2F4F4; --surface:#FBFCFC; --surface-2:#E9EDED;
+  --ink:#0F1719; --ink-2:#33474B; --muted:#5A6B6E; --faint:#8B9B9E;
+  --rule:#D7DFDF; --rule-2:#C3CFCF;
+  --signal:#06696F; --signal-ink:#04565B; --signal-wash:#DDEBEC;
+  --cost:#8F5410; --cost-wash:#F5EADB;
+
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, "JetBrains Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper:#0C1113; --surface:#121A1C; --surface-2:#182225;
+    --ink:#DFE8E9; --ink-2:#B3C4C6; --muted:#8CA0A3; --faint:#63797C;
+    --rule:#223034; --rule-2:#2D3E42;
+    --signal:#4ECDD4; --signal-ink:#8AE2E7; --signal-wash:#0F2A2D;
+    --cost:#E2A054; --cost-wash:#241B12;
+  }
+}
+:root[data-theme="dark"] {
+  --paper:#0C1113; --surface:#121A1C; --surface-2:#182225;
+  --ink:#DFE8E9; --ink-2:#B3C4C6; --muted:#8CA0A3; --faint:#63797C;
+  --rule:#223034; --rule-2:#2D3E42;
+  --signal:#4ECDD4; --signal-ink:#8AE2E7; --signal-wash:#0F2A2D;
+  --cost:#E2A054; --cost-wash:#241B12;
+}
+:root[data-theme="light"] {
+  --paper:#F2F4F4; --surface:#FBFCFC; --surface-2:#E9EDED;
+  --ink:#0F1719; --ink-2:#33474B; --muted:#5A6B6E; --faint:#8B9B9E;
+  --rule:#D7DFDF; --rule-2:#C3CFCF;
+  --signal:#06696F; --signal-ink:#04565B; --signal-wash:#DDEBEC;
+  --cost:#8F5410; --cost-wash:#F5EADB;
+}
+
+* { box-sizing:border-box; }
+body { margin:0; background:var(--paper); color:var(--ink);
+       font:400 15.5px/1.65 var(--sans); -webkit-font-smoothing:antialiased; }
+
+/* ---------- shell ---------- */
+.shell { max-width:1240px; margin:0 auto; padding:0 26px 120px; }
+@media (min-width:1180px) {
+  .shell { display:grid; grid-template-columns:190px minmax(0,1fr); gap:54px; }
+}
+.main { min-width:0; }
+
+/* ---------- masthead ---------- */
+.masthead { padding:64px 0 0; }
+.eyebrow { font:600 11px/1 var(--mono); letter-spacing:.18em; text-transform:uppercase;
+           color:var(--signal); display:block; margin-bottom:18px; }
+h1 { font:500 clamp(28px,3.4vw,40px)/1.15 var(--mono); letter-spacing:-.02em;
+     margin:0 0 18px; text-wrap:balance; }
+.thesis { font-size:18px; line-height:1.6; color:var(--ink-2); max-width:58ch; margin:0 0 30px; }
+.thesis b { color:var(--ink); font-weight:600; }
+.filepath { font:400 12.5px/1.5 var(--mono); color:var(--muted);
+            border-left:2px solid var(--signal); padding-left:12px; margin:0 0 36px;
+            overflow-wrap:anywhere; }
+
+/* ---------- fact strip ---------- */
+.facts { display:grid; grid-template-columns:repeat(auto-fit,minmax(122px,1fr));
+         gap:1px; background:var(--rule); border:1px solid var(--rule);
+         border-radius:3px; overflow:hidden; margin:0; }
+.fact { background:var(--surface); padding:14px 16px; }
+.fact dt { font:500 10px/1 var(--mono); letter-spacing:.12em; text-transform:uppercase;
+           color:var(--faint); margin-bottom:8px; }
+.fact dd { margin:0; font:500 18px/1.15 var(--mono); color:var(--ink); font-variant-numeric:tabular-nums; }
+.fact dd em { font-style:normal; font-size:12px; color:var(--muted); }
+
+/* ---------- rail ---------- */
+.rail { display:none; }
+@media (min-width:1180px) {
+  .rail { display:block; position:sticky; top:0; padding:72px 0 40px;
+          max-height:100vh; overflow-y:auto; }
+}
+.rail-title { font:600 10px/1 var(--mono); letter-spacing:.16em; text-transform:uppercase;
+              color:var(--faint); margin-bottom:14px; }
+.rail a { display:block; padding:5px 0 5px 13px; border-left:1px solid var(--rule);
+          font:400 13px/1.4 var(--sans); color:var(--muted); text-decoration:none;
+          transition:color .12s, border-color .12s; }
+.rail a:hover, .rail a:focus-visible { color:var(--signal); border-left-color:var(--signal); }
+
+.toc-inline { display:block; border:1px solid var(--rule); border-radius:3px;
+              background:var(--surface); padding:16px 20px; margin:34px 0 0; }
+@media (min-width:1180px) { .toc-inline { display:none; } }
+.toc-inline ol { margin:0; padding-left:20px; columns:2; column-gap:26px; font-size:14px; }
+@media (max-width:560px) { .toc-inline ol { columns:1; } }
+.toc-inline a { color:var(--ink-2); text-decoration:none; }
+
+/* ---------- sections ---------- */
+section { padding-top:62px; scroll-margin-top:20px; }
+h2 { font:500 22px/1.25 var(--mono); letter-spacing:-.01em; margin:0 0 8px;
+     display:flex; align-items:baseline; gap:12px; text-wrap:balance; }
+h2::before { content:""; flex:0 0 22px; height:1px; background:var(--signal); transform:translateY(-6px); }
+.deck { color:var(--muted); font-size:15px; margin:0 0 24px; max-width:64ch; }
+@media (min-width:640px) { .deck { padding-left:34px; } }
+h3 { font:500 15px/1.4 var(--mono); margin:34px 0 10px; color:var(--ink); }
+h4 { font:600 10.5px/1 var(--mono); letter-spacing:.13em; text-transform:uppercase;
+     color:var(--muted); margin:24px 0 10px; }
+p { margin:0 0 14px; max-width:70ch; }
+a { color:var(--signal); text-underline-offset:2px; }
+
+/* ---------- code ---------- */
+code { font:400 .875em/1.5 var(--mono); color:var(--ink);
+       background:var(--surface-2); padding:1.5px 5px; border-radius:2px; }
+pre { background:var(--surface); border:1px solid var(--rule); border-radius:3px;
+      padding:16px 18px; overflow-x:auto; margin:16px 0;
+      font:400 12.5px/1.7 var(--mono); color:var(--ink-2); }
+pre code { background:none; padding:0; white-space:pre; color:inherit; font-size:inherit; }
+.kw { color:var(--signal); }
+.cm { color:var(--faint); }
+.hb { color:var(--cost); }
+pre b { color:var(--ink); font-weight:600; }
+
+/* ---------- provenance: an ownership ramp, not 3 arbitrary hues ---------- */
+.p { display:inline-flex; align-items:center; white-space:nowrap;
+     font:600 9.5px/1 var(--mono); letter-spacing:.09em; text-transform:uppercase;
+     padding:4px 7px; border-radius:2px; border:1px solid transparent; }
+.p-ours { background:var(--signal); color:var(--paper); border-color:var(--signal); }
+.p-fork { background:var(--signal-wash); color:var(--signal-ink); border-color:var(--signal); }
+.p-lib  { background:transparent; color:var(--muted); border-color:var(--rule-2); }
+.legend { display:flex; flex-wrap:wrap; gap:10px 22px; align-items:center; margin:16px 0 0; }
+.legend div { display:flex; align-items:center; gap:9px; font-size:13px; color:var(--muted); }
+
+/* ---------- tables ---------- */
+.tw { overflow-x:auto; margin:18px 0; border:1px solid var(--rule);
+      border-radius:3px; background:var(--surface); }
+table { border-collapse:collapse; width:100%; font-size:13.5px; min-width:580px; }
+caption { text-align:left; padding:13px 16px 2px; font:600 10px/1.4 var(--mono);
+          letter-spacing:.13em; text-transform:uppercase; color:var(--faint); }
+th { text-align:left; font:600 10px/1.3 var(--mono); letter-spacing:.1em; text-transform:uppercase;
+     color:var(--faint); padding:12px 16px; border-bottom:1px solid var(--rule-2); white-space:nowrap; }
+td { padding:10px 16px; border-bottom:1px solid var(--rule); vertical-align:top; color:var(--ink-2); }
+tbody tr:last-child td { border-bottom:none; }
+td code { font-size:12px; white-space:nowrap; }
+td.nm { color:var(--ink); font-family:var(--mono); font-size:12.5px; }
+td.num { font-variant-numeric:tabular-nums; font-family:var(--mono); font-size:12.5px; color:var(--ink); }
+td.num em { font-family:var(--sans); font-size:11.5px; font-style:normal; }
+.grp td { background:var(--surface-2); font:600 10px/1 var(--mono); letter-spacing:.13em;
+          text-transform:uppercase; color:var(--muted); padding:9px 16px; }
+
+/* ---------- panels ---------- */
+.panel { background:var(--surface); border:1px solid var(--rule); border-radius:3px;
+         padding:17px 20px; margin:18px 0; }
+.panel > :first-child { margin-top:0; } .panel > :last-child { margin-bottom:0; }
+.panel-key  { border-left:2px solid var(--signal); }
+.panel-cost { border-left:2px solid var(--cost); background:var(--cost-wash); }
+.panel h4 { margin-top:0; }
+.panel p { font-size:14px; }
+
+/* ---------- SBUF containment frame (recurring motif) ---------- */
+.sbuf-frame { position:relative; margin:24px 0; padding:30px 18px 26px;
+              border:1px solid var(--signal); border-radius:3px; }
+.frame-tag { position:absolute; top:-7px; left:16px; background:var(--paper); padding:0 8px;
+             font:600 9.5px/1 var(--mono); letter-spacing:.15em; text-transform:uppercase; color:var(--signal); }
+.frame-note { position:absolute; bottom:-7px; right:16px; background:var(--paper); padding:0 8px;
+              font:400 9.5px/1 var(--mono); letter-spacing:.08em; color:var(--faint); }
+.pierce { display:flex; align-items:center; gap:11px; margin:4px 0 14px;
+          font:500 10px/1 var(--mono); letter-spacing:.11em; text-transform:uppercase; color:var(--cost); }
+.pierce::after { content:""; height:0; flex:1; border-top:1px dashed var(--cost); opacity:.55; }
+.pierce.bot { margin:16px 0 4px; }
+
+/* ---------- residual spine ---------- */
+.spine { margin:0; padding:0; }
+.spine-row { display:grid; grid-template-columns:9px minmax(0,1fr); gap:0 20px; }
+.spine-line { position:relative; }
+.spine-line::before { content:""; position:absolute; left:3px; top:0; bottom:0;
+                      width:2px; background:var(--signal); opacity:.3; }
+.spine-node { position:relative; padding-bottom:14px; }
+.spine-node .dot { position:absolute; left:-24px; top:17px; width:9px; height:9px; border-radius:50%;
+                   background:var(--paper); border:2px solid var(--signal); }
+.block { background:var(--surface); border:1px solid var(--rule); border-radius:3px; padding:12px 15px; }
+.block .bt { font:500 13px/1.3 var(--mono); color:var(--ink); margin-bottom:5px;
+             display:flex; flex-wrap:wrap; align-items:center; gap:9px; }
+.block .bd { font-size:13px; color:var(--muted); line-height:1.55; }
+.block .bd code { font-size:11.5px; }
+.op { font:500 12px/1.4 var(--mono); color:var(--signal); padding:2px 0 14px; }
+.op .plus { color:var(--ink); }
+
+/* ---------- grids ---------- */
+.duo { display:grid; grid-template-columns:1fr; gap:16px; margin:18px 0; }
+@media (min-width:760px) { .duo { grid-template-columns:1fr 1fr; } }
+.trio { display:grid; grid-template-columns:1fr; gap:16px; margin:18px 0; }
+@media (min-width:920px) { .trio { grid-template-columns:repeat(3,1fr); } }
+
+/* ---------- signature card ---------- */
+.sig { background:var(--surface); border:1px solid var(--rule); border-radius:3px;
+       overflow:hidden; margin:18px 0; }
+.sig-head { padding:12px 17px; border-bottom:1px solid var(--rule); background:var(--surface-2);
+            display:flex; flex-wrap:wrap; gap:8px 12px; align-items:center; }
+.sig-head .fn { font:500 13.5px/1.3 var(--mono); color:var(--ink); }
+.sig-head .loc { font:400 11.5px/1.3 var(--mono); color:var(--faint); margin-left:auto; }
+.sig-body { display:grid; grid-template-columns:1fr; }
+@media (min-width:720px) { .sig-body { grid-template-columns:1fr 1fr; } }
+.sig-col { padding:15px 17px; }
+.sig-col + .sig-col { border-top:1px solid var(--rule); }
+@media (min-width:720px) { .sig-col + .sig-col { border-top:none; border-left:1px solid var(--rule); } }
+.sig-col h5 { margin:0 0 11px; font:600 9.5px/1 var(--mono); letter-spacing:.14em;
+              text-transform:uppercase; color:var(--faint); }
+.io { list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:8px; }
+.io li { font-size:12.8px; line-height:1.5; color:var(--muted); }
+.io .n { font:500 12.5px var(--mono); color:var(--ink); }
+.io .s { font:400 12.5px var(--mono); color:var(--signal); }
+.io .b { font:400 9.5px var(--mono); letter-spacing:.1em; text-transform:uppercase; color:var(--faint); }
+.io .b.hbm { color:var(--cost); }
+
+/* ---------- decision cards ---------- */
+.dec { border:1px solid var(--rule); border-radius:3px; background:var(--surface); padding:16px 18px; }
+.dec h3 { margin:0 0 8px; font-size:13.5px; }
+.dec .why { font-size:13.5px; color:var(--muted); line-height:1.58; margin:0 0 11px; }
+.dec .alt { font-size:12.5px; color:var(--ink-2); border-top:1px dashed var(--rule-2);
+            padding-top:9px; margin:0; }
+.dec .alt b { font:600 9.5px var(--mono); letter-spacing:.11em; text-transform:uppercase;
+              color:var(--faint); display:block; margin-bottom:4px; }
+
+ul.tight { margin:12px 0; padding-left:20px; max-width:70ch; }
+ul.tight li { margin-bottom:7px; font-size:14.5px; color:var(--ink-2); }
+ol.steps { margin:12px 0; padding-left:22px; max-width:70ch; }
+ol.steps li { margin-bottom:11px; font-size:14.5px; color:var(--ink-2); }
+hr { border:none; border-top:1px solid var(--rule); margin:60px 0 0; }
+.foot { margin-top:20px; font-size:13px; color:var(--faint); }
+:focus-visible { outline:2px solid var(--signal); outline-offset:2px; border-radius:2px; }
+@media (prefers-reduced-motion:reduce) { * { transition:none !important; animation:none !important; } }
+</style>
+</head>
+<body>
+<div class="shell">
+
+<div>
+  <nav class="rail" aria-label="Sections">
+    <div class="rail-title">Contents</div>
+    <a href="#config">Model configuration</a>
+    <a href="#notation">Notation</a>
+    <a href="#shape">The shape of it</a>
+    <a href="#spine">The residual spine</a>
+    <a href="#memory">Memory &amp; layout</a>
+    <a href="#inventory">Kernel inventory</a>
+    <a href="#deltanet">DeltaNet path</a>
+    <a href="#gqa">GQA path</a>
+    <a href="#moe">MoE path</a>
+    <a href="#collectives">Collectives</a>
+    <a href="#state">State &amp; cache writes</a>
+    <a href="#decisions">Design decisions</a>
+    <a href="#reading">Reading guide</a>
+  </nav>
+</div>
+
+<main class="main">
+
+<header class="masthead">
+  <span class="eyebrow">Structure brief · Qwen3.6-A3B</span>
+  <h1>The verify-trunk megakernel</h1>
+  <p class="thesis">
+    Forty decoder layers — thirty DeltaNet, ten GQA, MoE on every one — collapsed into
+    <b>one NKI launch</b>. The residual stream never leaves SBUF: only the entry load and
+    the final store touch HBM.
+  </p>
+  <p class="filepath">models/qwen3_6_moe/nki_kernels/megakernel/qwen36_verify_megakernel.py</p>
+
+  <dl class="facts">
+    <div class="fact"><dt>Layers</dt><dd>40 <em>30 Δ · 10 GQA</em></dd></div>
+    <div class="fact"><dt>Launches</dt><dd>1 <em>was 120</em></dd></div>
+    <div class="fact"><dt>Tokens</dt><dd>T = 2 <em>verify</em></dd></div>
+    <div class="fact"><dt>TP × LNC</dt><dd>4 × 2</dd></div>
+    <div class="fact"><dt>Residual</dt><dd>8 KB <em>SBUF</em></dd></div>
+    <div class="fact"><dt>Peak SBUF</dt><dd>22.6 <em>MiB/core</em></dd></div>
+  </dl>
+
+  <nav class="toc-inline" aria-label="Contents">
+    <ol>
+      <li><a href="#config">Model configuration</a></li>
+      <li><a href="#notation">Notation</a></li>
+      <li><a href="#shape">The shape of it</a></li>
+      <li><a href="#spine">The residual spine</a></li>
+      <li><a href="#memory">Memory &amp; layout</a></li>
+      <li><a href="#inventory">Kernel inventory</a></li>
+      <li><a href="#deltanet">DeltaNet path</a></li>
+      <li><a href="#gqa">GQA path</a></li>
+      <li><a href="#moe">MoE path</a></li>
+      <li><a href="#collectives">Collectives</a></li>
+      <li><a href="#state">State &amp; cache writes</a></li>
+      <li><a href="#decisions">Design decisions</a></li>
+      <li><a href="#reading">Reading guide</a></li>
+    </ol>
+  </nav>
+</header>
+
+<!-- ══════════════════════════ 0a · CONFIG ══════════════════════════ -->
+<section id="config">
+  <h2>Model configuration</h2>
+  <p class="deck">Qwen3.6-35B-A3B, deployed at <b>TP = 4</b>. Every shape in this document is a
+     <b>per-rank</b> shape unless stated otherwise — that is what the kernels actually see.</p>
+
+  <div class="tw">
+  <table>
+    <caption>From the checkpoint config · hidden_size is not sharded; everything head- or expert-wide is</caption>
+    <thead><tr><th>Parameter</th><th>Full model</th><th>Per rank (TP=4)</th><th>Symbol</th></tr></thead>
+    <tbody>
+      <tr class="grp"><td colspan="4">Trunk</td></tr>
+      <tr><td class="nm">hidden_size</td><td class="num">2048</td><td class="num">2048 <em style="color:var(--faint);font-style:normal">not sharded</em></td><td><code>H</code></td></tr>
+      <tr><td class="nm">num_hidden_layers</td><td class="num">40</td><td class="num">40</td><td>—</td></tr>
+      <tr><td class="nm">rms_norm_eps</td><td class="num">1e-6</td><td class="num">1e-6</td><td><code>eps</code></td></tr>
+      <tr><td class="nm">vocab_size</td><td class="num">248,320</td><td class="num">62,080</td><td>—</td></tr>
+
+      <tr class="grp"><td colspan="4">GQA layers — 10 of 40</td></tr>
+      <tr><td class="nm">num_attention_heads</td><td class="num">16</td><td class="num">4</td><td><code>NUM_Q_HEADS</code></td></tr>
+      <tr><td class="nm">num_key_value_heads</td><td class="num">2</td><td class="num">1 <em style="color:var(--cost);font-style:normal">replicated ×2</em></td><td><code>NUM_KV_HEADS</code></td></tr>
+      <tr><td class="nm">head_dim</td><td class="num">256</td><td class="num">256</td><td><code>D</code></td></tr>
+      <tr><td class="nm">partial_rotary_factor</td><td class="num">0.25</td><td class="num">→ 64 RoPE dims</td><td><code>rope_dim</code></td></tr>
+      <tr><td class="nm">full_attention_interval</td><td class="num">4</td><td class="num">layers 3, 7, 11 … 39</td><td>—</td></tr>
+
+      <tr class="grp"><td colspan="4">DeltaNet layers — 30 of 40</td></tr>
+      <tr><td class="nm">linear_num_key_heads</td><td class="num">16</td><td class="num">4</td><td><code>Hk</code></td></tr>
+      <tr><td class="nm">linear_num_value_heads</td><td class="num">32</td><td class="num">8</td><td><code>Hv</code></td></tr>
+      <tr><td class="nm">linear_key_head_dim</td><td class="num">128</td><td class="num">128</td><td><code>d</code></td></tr>
+      <tr><td class="nm">linear_value_head_dim</td><td class="num">128</td><td class="num">128</td><td><code>d</code></td></tr>
+      <tr><td class="nm">linear_conv_kernel_dim</td><td class="num">4</td><td class="num">4</td><td><code>K_conv</code></td></tr>
+
+      <tr class="grp"><td colspan="4">MoE — all 40 layers</td></tr>
+      <tr><td class="nm">num_experts</td><td class="num">256</td><td class="num">256 <em style="color:var(--faint);font-style:normal">replicated</em></td><td><code>E</code></td></tr>
+      <tr><td class="nm">num_experts_per_tok</td><td class="num">8</td><td class="num">8</td><td><code>K</code></td></tr>
+      <tr><td class="nm">moe_intermediate_size</td><td class="num">512</td><td class="num">128</td><td><code>I</code></td></tr>
+      <tr><td class="nm">shared_expert_intermediate_size</td><td class="num">512</td><td class="num">128</td><td><code>I_s</code></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>Derived shapes the kernels actually use</h3>
+  <p>None of these appear in the config file — they fall out of it, and they are the numbers you will
+  see hardcoded as module constants.</p>
+
+<pre><code><span class="cm"># DeltaNet, per rank</span>
+key_dim    = Hk · d        =  4 · 128 =  <b>512</b>
+value_dim  = Hv · d        =  8 · 128 = <b>1024</b>
+conv_dim   = 2·key_dim + value_dim    = <b>2048</b>   <span class="cm"># q, k, and v are all convolved</span>
+I          = conv_dim + value_dim + 2·Hv = <b>3088</b>   <span class="cm"># fused in_proj width (+ a, b gate scalars)</span>
+rep        = Hv / Hk       = <b>2</b>                    <span class="cm"># GQA expansion inside DeltaNet</span>
+state_w    = K_conv − 1    = <b>3</b>                    <span class="cm"># conv sliding-window depth</span>
+
+<span class="cm"># GQA, per rank</span>
+N          = 4 Q + 1 K + 1 V heads    = <b>6</b>          <span class="cm"># the fused qkv head axis</span>
+I_DIM      = N · D         =  6 · 256 = <b>1536</b>       <span class="cm"># fused qkv width</span>
+GATE_DIM   = 4 · D                    = <b>1024</b>
+VALUE_DIM  = 4 · D                    = <b>1024</b>       <span class="cm"># o_proj contraction</span>
+D_TILES    = D / 128                  = <b>2</b>          <span class="cm"># the head_dim=256 tiling factor</span>
+N_SUB      = 4 · D_TILES              = <b>8</b>          <span class="cm"># o_proj sub-heads of 128</span>
+rope_dim   = 0.25 · D                 = <b>64</b>
+
+<span class="cm"># Hardware / layout</span>
+H0 = nl.tile_size.pmax    = <b>128</b>       <span class="cm"># SBUF partitions — a hardware constant</span>
+H1 = H / H0               =  <b>16</b>       <span class="cm"># free-axis width of the residual</span>
+H2 = H1 / n_prgs          =   <b>8</b>       <span class="cm"># per-LNC-core free width (tp2013)</span>
+T  = B · S                =   <b>2</b>       <span class="cm"># verify pass: 1 committed + 1 speculative</span>
+</code></pre>
+
+  <div class="panel panel-cost">
+    <h4>The KV-head subtlety</h4>
+    <p>The model has <b>2</b> KV heads but is deployed at TP=4, so KV heads are <b>replicated</b>, not
+    split — each rank gets 1. The true model-wide GQA ratio is 16:2 = 8:1, but the ratio a kernel sees
+    is <b>4:1</b>. Read <code>NUM_Q_HEADS=4, NUM_KV_HEADS=1</code> in <code>fused_layer.py</code> with
+    that in mind.</p>
+  </div>
+
+  <h3>The layer pattern</h3>
+  <p><code>full_attention_interval = 4</code> puts a GQA layer at every index ≡ 3 (mod 4). The
+  megakernel receives this as the <code>layer_is_gqa</code> boolean list, which is also the cache key
+  for the generated flat signature:</p>
+<pre><code>idx  0   1   2   3   4   5   6   7  …  36  37  38  39
+     Δ   Δ   Δ  <b>GQA</b>  Δ   Δ   Δ  <b>GQA</b> …   Δ   Δ   Δ  <b>GQA</b>
+
+30 × DeltaNet   ·   10 × GQA   ·   40 × MoE FFN
+</code></pre>
+</section>
+
+<!-- ══════════════════════════ 0b · NOTATION ══════════════════════════ -->
+<section id="notation">
+  <h2>Notation</h2>
+  <p class="deck">Every symbol used in the shape contracts below. Worth one read now — the kernels use
+     these bare, with no comment explaining them.</p>
+
+  <div class="tw">
+  <table>
+    <caption>Symbol glossary · value column is per rank at TP=4, LNC=2, verify pass</caption>
+    <thead><tr><th>Symbol</th><th>Axis / meaning</th><th>Value</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr class="grp"><td colspan="4">Token &amp; hidden axes</td></tr>
+      <tr><td class="nm">B</td><td>batch</td><td class="num">1</td><td>asserted <code>== 1</code> in both attention paths</td></tr>
+      <tr><td class="nm">S</td><td>sequence length this step</td><td class="num">2</td><td>the speculative block</td></tr>
+      <tr><td class="nm">T</td><td><b>tokens in flight</b> = B·S</td><td class="num">2</td><td>the axis every candidate state is indexed by</td></tr>
+      <tr><td class="nm">H</td><td>hidden size</td><td class="num">2048</td><td>not sharded by TP</td></tr>
+      <tr><td class="nm">H0</td><td><b>SBUF partitions</b></td><td class="num">128</td><td>hardware constant, <code>nl.tile_size.pmax</code></td></tr>
+      <tr><td class="nm">H1</td><td><b>free-axis width</b> = H/H0</td><td class="num">16</td><td>the residual is <code>[H0, T, H1]</code></td></tr>
+      <tr><td class="nm">H2</td><td>per-core free width = H1/n_prgs</td><td class="num">8</td><td>the tp2013 inner block</td></tr>
+      <tr><td class="nm">H1_shard</td><td>o_proj output H-shard</td><td class="num">8</td><td>same as H2; the name differs by call site</td></tr>
+      <tr><td class="nm">L</td><td>KV cache length</td><td>n_positions</td><td><code>% 128 == 0</code>; <code>% 256</code> when s_prior-sharded</td></tr>
+
+      <tr class="grp"><td colspan="4">Parallelism</td></tr>
+      <tr><td class="nm">TP</td><td>tensor-parallel ranks</td><td class="num">4</td><td>separate devices; joined by <code>nccl.all_reduce</code></td></tr>
+      <tr><td class="nm">n_prgs / n_s</td><td><b>LNC cores</b> per rank</td><td class="num">2</td><td>joined by <code>nisa.sendrecv</code>; SBUF is private per core</td></tr>
+      <tr><td class="nm">prg_id</td><td>this core's index</td><td>0 or 1</td><td>folds to a trace-time constant</td></tr>
+      <tr><td class="nm">rg</td><td>nccl replica group</td><td><code>([0,1,2,3],)</code></td><td>a traced constant, not <code>torch.distributed</code></td></tr>
+      <tr><td class="nm">T_offset, T_len</td><td>this core's token slice</td><td>(0,1) or (1,1)</td><td>MoE only; outside it the tile is garbage</td></tr>
+
+      <tr class="grp"><td colspan="4">DeltaNet</td></tr>
+      <tr><td class="nm">Hk / Hv</td><td>key / value heads</td><td class="num">4 / 8</td><td>per rank; further split across LNC → 2 / 4 per core</td></tr>
+      <tr><td class="nm">d</td><td>head dim (= P_MAX)</td><td class="num">128</td><td>conveniently equal to the partition count</td></tr>
+      <tr><td class="nm">rep</td><td>GQA expansion Hv/Hk</td><td class="num">2</td><td>done as a stride-0 access pattern, not a copy</td></tr>
+      <tr><td class="nm">conv_dim</td><td>convolved channels</td><td class="num">2048</td><td>q, k and v all pass through the conv</td></tr>
+      <tr><td class="nm">state_w</td><td>conv window depth</td><td class="num">3</td><td><code>K_conv − 1</code></td></tr>
+      <tr><td class="nm">I</td><td>fused in_proj width</td><td class="num">3088</td><td><code>conv_dim + value_dim + 2·Hv</code></td></tr>
+      <tr><td class="nm">W</td><td>packed state width</td><td class="num">512</td><td>per core: <code>Hv_core · d</code> = 4·128</td></tr>
+
+      <tr class="grp"><td colspan="4">GQA</td></tr>
+      <tr><td class="nm">D</td><td>head_dim</td><td class="num">256</td><td>2× the nkilib limit — the whole reason for the fork</td></tr>
+      <tr><td class="nm">D_TILES</td><td>head_dim partition tiles</td><td class="num">2</td><td><code>ceil(D/128)</code></td></tr>
+      <tr><td class="nm">N</td><td>heads on the fused qkv axis</td><td class="num">6</td><td>ordered <code>[q0|q1|q2|q3|k0|v0]</code></td></tr>
+      <tr><td class="nm">N_SUB</td><td>o_proj sub-heads</td><td class="num">8</td><td>q-head major, d-tile minor: <code>n = h·2 + dt</code></td></tr>
+      <tr><td class="nm">s_active / s_prior</td><td>new vs. cached positions</td><td>T / L</td><td>active tokens occupy the <em>last</em> s_active slots</td></tr>
+
+      <tr class="grp"><td colspan="4">MoE</td></tr>
+      <tr><td class="nm">E</td><td>experts</td><td class="num">256</td><td>replicated across ranks; weights sharded on I</td></tr>
+      <tr><td class="nm">K</td><td>experts per token</td><td class="num">8</td><td>router top-k; <code>k ≤ 8</code> asserted</td></tr>
+      <tr><td class="nm">I</td><td>routed expert intermediate</td><td class="num">128</td><td>512 / TP — note this <code>I</code> ≠ DeltaNet's <code>I</code></td></tr>
+      <tr><td class="nm">I_s</td><td>shared expert intermediate</td><td class="num">128</td><td>512 / TP</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="panel panel-cost">
+    <h4>Two collisions to watch for</h4>
+    <p><code>I</code> means the fused in_proj width (3088) in DeltaNet and the expert intermediate
+    size (128) in MoE. <code>K</code> means the conv kernel width (4) in DeltaNet and the router top-k
+    (8) in MoE. Both are reused in the source with no disambiguation — context is the only guide.</p>
+  </div>
+
+  <h3>Buffer vocabulary</h3>
+  <div class="tw">
+  <table>
+    <thead><tr><th>Term</th><th>What it is</th><th>Scope</th></tr></thead>
+    <tbody>
+      <tr><td class="nm">SBUF</td><td>on-chip scratchpad, ~30 MiB usable</td><td><b>private per LNC core</b> — not shared</td></tr>
+      <tr><td class="nm">PSUM</td><td>matmul accumulator banks</td><td>per core; nccl cannot touch it</td></tr>
+      <tr><td class="nm">HBM</td><td>device DRAM</td><td>shared; every access is expensive</td></tr>
+      <tr><td class="nm"><code>nl.shared_hbm</code></td><td>HBM the kernel allocates and returns</td><td>how state/KV leave the kernel</td></tr>
+      <tr><td class="nm">partition axis</td><td>first axis of an SBUF tile, ≤128</td><td>compute engines are partition-aligned</td></tr>
+      <tr><td class="nm">free axis</td><td>remaining axes, ≤512 for a reduce</td><td>reshapes here are free; across partitions they are not</td></tr>
+      <tr><td class="nm">AP</td><td>access pattern — strided DMA descriptor</td><td><code>[[stride, extent], …]</code></td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<!-- ══════════════════════════ 1 · SHAPE ══════════════════════════ -->
+<section id="shape">
+  <h2>The shape of it</h2>
+  <p class="deck">Three composables, called in a Python <code>for</code> loop that unrolls at trace time.
+     Everything else is plumbing around them.</p>
+
+  <div class="trio">
+    <div class="dec">
+      <h3>attention_layer_compose</h3>
+      <p class="why">DeltaNet (linear attention). Input norm → fused in_proj → causal conv →
+      gated delta-rule recurrence → gated RMSNorm → o_proj. Runs on 30 layers.</p>
+      <p class="alt"><b>Shards on</b> value heads, per LNC core</p>
+    </div>
+    <div class="dec">
+      <h3>gqa_fused_compose</h3>
+      <p class="why">Grouped-query attention with <code>head_dim=256</code>. Input norm → qkv+gate
+      projections → qk-norm → partial RoPE → attention → sigmoid gate → o_proj. Runs on 10 layers.</p>
+      <p class="alt"><b>Shards on</b> s_prior, then H for o_proj</p>
+    </div>
+    <div class="dec">
+      <h3>moe_layer_compose</h3>
+      <p class="why">The whole MoE FFN. Norm once → router top-8 → routed experts + shared expert →
+      σ-gate → gated sum. Runs on all 40 layers.</p>
+      <p class="alt"><b>Shards on</b> tokens, per LNC core</p>
+    </div>
+  </div>
+
+  <h3>Provenance, at a glance</h3>
+  <p>Colour encodes ownership, not category — the more filled the chip, the more of the code is ours.</p>
+  <div class="legend">
+    <div><span class="p p-ours">Ours</span> hand-authored in this repo</div>
+    <div><span class="p p-fork">Forked</span> vendored from AWS, then patched</div>
+    <div><span class="p p-lib">nkilib</span> called from the installed site-package, untouched</div>
+  </div>
+
+  <div class="panel panel-key">
+    <h4>The one-line summary</h4>
+    <p>All of the <em>math that is specific to Qwen3.6</em> — the DeltaNet recurrence, the MoE expert
+    loop, qk-norm, partial RoPE — is hand-written NKI in this repo. Only three things come from
+    outside: the two bookend GEMM kernels (<code>qkv_tkg</code>, <code>output_projection_tkg</code>) and
+    <code>rmsnorm_tkg</code>, all called directly from nkilib; plus two forks —
+    <code>attention_tkg</code> (patched to lift the <code>head_dim ≤ 128</code> cap) and
+    <code>router_topk</code> (patched to accept a per-layer name prefix).</p>
+  </div>
+</section>
+
+<!-- ══════════════════════════ 2 · SPINE ══════════════════════════ -->
+<section id="spine">
+  <h2>The residual spine</h2>
+  <p class="deck">One SBUF tile lives for the entire kernel. Every layer reads it, and adds two
+     reduced partials back into it. Nothing else persists.</p>
+
+<pre><code><span class="cm"># qwen36_verify_megakernel.py:177 — the whole kernel, abridged</span>
+residual = ndarray[H0=128, T*H1] sbuf              <span class="cm"># 8 KB, tp2013, identical on both cores</span>
+<span class="hb">_load_residual_to_sbuf</span>(residual, X)                  <span class="hb"># ← the only HBM read of hidden state</span>
+
+<span class="kw">for</span> i <span class="kw">in</span> range(40):
+    x_sb = residual.reshape((H0, T, H1))           <span class="cm"># free reshape, no copy</span>
+
+    <span class="kw">if</span> layer_is_gqa[i]:
+        attn_partial, active_k, active_v = <b>gqa_fused_compose</b>(x_sb, ..., out_in_sb=<b>True</b>)
+    <span class="kw">else</span>:
+        attn_partial = <b>attention_layer_compose</b>(x_sb, ..., write_candidates=<b>True</b>, out_in_sb=<b>True</b>)
+
+    residual += <span class="kw">_all_reduce_gather_h</span>(attn_partial)     <span class="cm"># TP all-reduce + LNC gather on H</span>
+
+    moe_partial = <b>moe_layer_compose</b>(residual, ..., output_in_sbuf=<b>True</b>)
+    residual += <span class="kw">_all_reduce_gather_tokens</span>(moe_partial) <span class="cm"># TP all-reduce + LNC gather on T</span>
+
+<span class="hb">_store_residual_to_hbm</span>(output, residual)              <span class="hb"># ← the only HBM write of hidden state</span>
+<span class="kw">return</span> (output, *gqa_active_kv, *dn_candidates)      <span class="cm"># every mutated handle, or DCE eats it</span>
+</code></pre>
+
+  <div class="sbuf-frame">
+    <span class="frame-tag">SBUF resident</span>
+    <span class="frame-note">×40 layers</span>
+
+    <div class="pierce">HBM → SBUF · entry load</div>
+
+    <div class="spine">
+      <div class="spine-row">
+        <div class="spine-line"></div>
+        <div>
+          <div class="spine-node">
+            <span class="dot"></span>
+            <div class="block">
+              <div class="bt">residual <span class="p p-ours">Ours</span></div>
+              <div class="bd"><code>[H0=128, T*H1]</code> · tp2013 shard-interleaved · replicated on both LNC cores</div>
+            </div>
+          </div>
+
+          <div class="op">├─ attention → <code>attn_partial [H0, H1_shard*T]</code> <span class="plus">per-rank, per-core partial</span></div>
+          <div class="op">│&nbsp;&nbsp; all_reduce(TP=4) → sendrecv(LNC) → <span class="plus">gather on H</span></div>
+
+          <div class="spine-node">
+            <span class="dot"></span>
+            <div class="block">
+              <div class="bt">residual += attn_out</div>
+              <div class="bd">Full <code>[H0, T*H1]</code> again. In place, <code>nisa.tensor_tensor(op=nl.add)</code>.</div>
+            </div>
+          </div>
+
+          <div class="op">├─ MoE FFN → <code>moe_partial [H0, T, H1]</code> <span class="plus">valid only on this core's token slice</span></div>
+          <div class="op">│&nbsp;&nbsp; slice T-block → all_reduce(TP=4) → sendrecv(LNC) → <span class="plus">gather on T</span></div>
+
+          <div class="spine-node">
+            <span class="dot"></span>
+            <div class="block">
+              <div class="bt">residual += moe_out</div>
+              <div class="bd">Ready for layer <em>i</em>+1. Side outputs (KV, states) already parked in HBM.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="pierce bot">SBUF → HBM · final store</div>
+  </div>
+
+  <div class="panel panel-cost">
+    <h4>What still touches HBM inside the loop</h4>
+    <p>The residual doesn't, but three things do, by design: <b>weights</b> stream in per layer
+    (~22.6 MiB per core per layer — two layers will not fit, so there is no cross-layer weight ring);
+    <b>DeltaNet candidate states</b> are written out per layer; and <b>GQA active K/V</b> are written
+    out per layer. The last two are outputs the host needs for the accept/reject commit.</p>
+  </div>
+</section>
+
+<!-- ══════════════════════════ 3 · MEMORY ══════════════════════════ -->
+<section id="memory">
+  <h2>Memory &amp; layout</h2>
+  <p class="deck">One layout convention, <code>tp2013</code>, is what lets attention and MoE share a
+     single residual tile with no repacking. It is worth ten minutes before reading any kernel.</p>
+
+  <h3>The index map</h3>
+  <p>With <code>H=2048</code>, <code>H0=128</code> partitions, <code>H1=16</code> free,
+  <code>n_s = n_prgs = 2</code> LNC cores, <code>H2 = H1/n_s = 8</code>:</p>
+
+<pre><code><span class="cm"># SBUF free index f, partition index h0  →  logical hidden column h</span>
+s, h2 = divmod(f, H2)
+h     = s*(H0*H2) + h0*H2 + h2          <span class="cm"># tp2013</span>
+
+<span class="cm"># at n_s == 1 this degenerates EXACTLY to tp102:</span>
+h     = h0*H1 + f
+</code></pre>
+
+  <p>The property that matters: <b>an H-contraction shard is a contiguous free-slice.</b> That is
+  what makes the attention H-gather and the MoE token-gather both cheap on the same tile.</p>
+
+  <div class="panel panel-cost">
+    <h4>Trap</h4>
+    <p>tp2013 is derived from <code>n_prgs</code> and is <em>LNC-coupled</em> — never hardcode it.
+    Separately, <code>rmsnorm_tkg</code> picks its H-layout from <code>lnc</code>, not from the
+    token-shard decision, which is why <code>NORM_SINGLE_CORE_FORCED = False</code> in the MoE path.
+    At <code>T=1</code> with 2 cores the two conventions used to disagree silently; that is now an assert.</p>
+  </div>
+
+  <h3>Where each tensor lives</h3>
+  <div class="tw">
+  <table>
+    <caption>Buffer residency across one layer</caption>
+    <thead><tr><th>Tensor</th><th>Buffer</th><th>Shape</th><th>Lifetime</th></tr></thead>
+    <tbody>
+      <tr><td class="nm">residual</td><td>SBUF</td><td><code>[128, T*16]</code></td><td>whole kernel</td></tr>
+      <tr><td class="nm">all weights</td><td>HBM → SBUF</td><td>—</td><td>streamed per layer</td></tr>
+      <tr><td class="nm">attn_partial</td><td>SBUF</td><td><code>[128, H1_shard*T]</code></td><td>one layer</td></tr>
+      <tr><td class="nm">moe_partial</td><td>SBUF</td><td><code>[128, T, 16]</code></td><td>one layer</td></tr>
+      <tr><td class="nm">cand_state</td><td><code>shared_hbm</code></td><td><code>[T, Hv, 128, 128]</code> fp32</td><td>kernel output</td></tr>
+      <tr><td class="nm">conv_cand</td><td><code>shared_hbm</code></td><td><code>[T, conv_dim, K-1]</code></td><td>kernel output</td></tr>
+      <tr><td class="nm">active_k</td><td><code>shared_hbm</code></td><td><code>[1, 1, 256, T]</code> BHDS</td><td>kernel output</td></tr>
+      <tr><td class="nm">active_v</td><td><code>shared_hbm</code></td><td><code>[1, 1, T, 256]</code> BHSD</td><td>kernel output</td></tr>
+      <tr><td class="nm">k_cache / v_cache</td><td>HBM</td><td><code>[1,1,256,L]</code> / <code>[1,1,L,256]</code></td><td>read-only here</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>SBUF budget — why there is no cross-layer weight ring</h3>
+  <div class="tw">
+  <table>
+    <caption>Worst-case layer (DeltaNet + MoE), trn3 ≈ 30 MiB usable per core</caption>
+    <thead><tr><th>Item</th><th>Per rank</th><th>Per core</th></tr></thead>
+    <tbody>
+      <tr><td>Attention weights (H-sharded)</td><td>16.1 MiB</td><td>8.05 MiB</td></tr>
+      <tr><td>Routed experts (16 gathered)</td><td>24 MiB</td><td>12 MiB</td></tr>
+      <tr><td>Shared expert</td><td>1.5 MiB</td><td>1.5 MiB</td></tr>
+      <tr><td>Router + σ-gate (replicated)</td><td>1.0 MiB</td><td>1.0 MiB</td></tr>
+      <tr><td><b>One layer resident</b></td><td><b>42.6 MiB</b></td><td><b>≈ 22.6 MiB (75%)</b></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Two layers would need ~45 MiB per core. So weights stream per layer, and only
+  <em>intra</em>-layer overlap is available — which is exactly what the expert prefetch ring does.</p>
+</section>
+
+<!-- ══════════════════════════ 4 · INVENTORY ══════════════════════════ -->
+<section id="inventory">
+  <h2>Kernel inventory</h2>
+  <p class="deck">Every kernel and subkernel on the megakernel path, with its provenance and its
+     in/out contract. Paths are relative to <code>models/qwen3_6_moe/nki_kernels/</code>.</p>
+
+  <div class="tw">
+  <table>
+    <caption>Complete call-graph inventory</caption>
+    <thead>
+      <tr><th>Entry point</th><th>Where</th><th>Origin</th><th>In</th><th>Out</th></tr>
+    </thead>
+    <tbody>
+      <tr class="grp"><td colspan="5">Megakernel shell</td></tr>
+      <tr>
+        <td class="nm">qwen36_verify_megakernel</td>
+        <td><code>megakernel/…_megakernel.py</code></td>
+        <td><span class="p p-ours">Ours</span></td>
+        <td><code>X [B,S,H]</code> HBM + all weights, caches, <code>cos/sin/mask</code></td>
+        <td><code>(hidden [B,S,H], *active_k/v ×10, *cand ×30)</code></td>
+      </tr>
+      <tr>
+        <td class="nm">build_verify_megakernel</td>
+        <td><code>megakernel/…_megakernel.py</code></td>
+        <td><span class="p p-ours">Ours</span></td>
+        <td><code>layer_is_gqa: list[bool]</code></td>
+        <td>jitted flat-signature wrapper (cached)</td>
+      </tr>
+      <tr>
+        <td class="nm">_load / _store_residual</td>
+        <td><code>megakernel/…_megakernel.py</code></td>
+        <td><span class="p p-ours">Ours</span></td>
+        <td><code>[B,S,H]</code> HBM ⇄ <code>[H0, T*H1]</code> SBUF</td>
+        <td>tp2013 shard-interleaved copy</td>
+      </tr>
+      <tr>
+        <td class="nm">_all_reduce_gather_h</td>
+        <td><code>megakernel/…_megakernel.py</code></td>
+        <td><span class="p p-ours">Ours</span></td>
+        <td><code>[H0, H1_shard*T]</code> SBUF</td>
+        <td><code>[H0, T*H1]</code> SBUF, full H</td>
+      </tr>
+      <tr>
+        <td class="nm">_all_reduce_gather_tokens</td>
+        <td><code>megakernel/…_megakernel.py</code></td>
+        <td><span class="p p-ours">Ours</span></td>
+        <td><code>[H0, T, H1]</code> SBUF + <code>(T_offset, T_len)</code></td>
+        <td><code>[H0, T*H1]</code> SBUF, all tokens</td>
+      </tr>
+      <tr>
+        <td class="nm">TensorView · get_verified_program_sharding_info</td>
+        <td><code>nkilib.core.utils</code></td>
+        <td><span class="p p-lib">nkilib</span></td>
+        <td>—</td><td>layout views / <code>(n_prgs, prg_id)</code></td>
+      </tr>
+
+      <tr class="grp"><td colspan="5">DeltaNet path — 30 layers</td></tr>
+      <tr>
+        <td class="nm">attention_layer_compose</td>
+        <td><code>deltanet/decode/fused_layer.py</code></td>
+        <td><span class="p p-ours">Ours</span></td>
+        <td><code>[H0,T,H1]</code> SBUF + 9 weights + 2 out-params</td>
+        <td><code>[H0, H1_shard*T]</code> SBUF</td>
+      </tr>
+      <tr>
+        <td class="nm">in_proj_compose</td>
+        <td><code>deltanet/components/in_proj.py</code></td>
+        <td><span class="p p-ours">Ours</span> <span class="p p-lib">wraps nkilib</span></td>
+        <td><code>hidden</code>, <code>proj_w [2048, 3088]</code>, <code>gamma</code></td>
+        <td><code>proj_sb [T, 3088]</code> SBUF</td>
+      </tr>
+      <tr>
+        <td class="nm">qkv_tkg</td>
+        <td><code>nkilib.core.qkv</code></td>
+        <td><span class="p p-lib">nkilib</span></td>
+        <td><code>[B,S,H]</code> HBM <em>or</em> <code>[128,T,H1]</code> SBUF</td>
+        <td><code>[B,S,I]</code> BSD, SBUF</td>
+      </tr>
+      <tr>
+        <td class="nm">qkv_to_channel_partition</td>
+        <td><code>deltanet/components/conv.py</code></td>
+        <td><span class="p p-ours">Ours</span></td>
+        <td><code>proj_sb[:, 0:conv_dim]</code></td>
+        <td><code>qkv_cp [128, 16T]</code> SBUF</td>
+      </tr>
+      <tr>
+        <td class="nm">conv_qkv_sbuf</td>
+        <td><code>deltanet/components/conv.py</code></td>
+        <td><span class="p p-ours">Ours</span></td>
+        <td><code>qkv_cp</code>, <code>conv_state [2048,K-1]</code>, <code>conv_weight [2048,K]</code></td>
+        <td><code>q,k [2T,128]</code>, <code>v [4T,128]</code> SBUF; writes <code>conv_cand</code></td>
+      </tr>
+      <tr>
+        <td class="nm">gated_delta_rule_tkg</td>
+        <td><code>deltanet/components/recurrence.py</code></td>
+        <td><span class="p p-ours">Ours</span></td>
+        <td><code>q,k,v</code> SBUF, <code>A_log[8]</code>, <code>dt_bias[8]</code>, <code>init_state [8,128,128]</code></td>
+        <td><code>attn_sb [T, 512]</code> SBUF; writes <code>cand_state</code></td>
+      </tr>
+      <tr>
+        <td class="nm">norm_gate_row</td>
+        <td><code>deltanet/components/norm_gate.py</code></td>
+        <td><span class="p p-ours">Ours</span></td>
+        <td><code>O_row</code>, <code>z_row</code>, <code>z_gamma [128]</code></td>
+        <td>gated-RMSNorm row, in place</td>
+      </tr>
+      <tr>
+        <td class="nm">out_proj_compose</td>
+        <td><code>deltanet/components/out_proj.py</code></td>
+        <td><span class="p p-ours">Ours</span> <span class="p p-lib">wraps nkilib</span></td>
+        <td><code>attn_sb</code>, <code>out_w [1024, 2048]</code></td>
+        <td><code>[128, H1_shard*T]</code> SBUF</td>
+      </tr>
+      <tr>
+        <td class="nm">output_projection_tkg</td>
+        <td><code>nkilib.core.output_projection</code></td>
+        <td><span class="p p-lib">nkilib</span></td>
+        <td><code>[D,B,N,S]</code>, <code>weight [N*D, H]</code></td>
+        <td><code>[H_1, H_0, H_2, T]</code> SBUF when <code>TRANSPOSE_OUT</code></td>
+      </tr>
+
+      <tr class="grp"><td colspan="5">GQA path — 10 layers</td></tr>
+      <tr>
+        <td class="nm">gqa_fused_compose</td>
+        <td><code>gqa/decode/fused_layer.py</code></td>
+        <td><span class="p p-ours">Ours</span></td>
+        <td><code>[H0,T,H1]</code> SBUF + 6 weights + caches + <code>cos/sin/mask</code></td>
+        <td><code>(o_out SBUF, active_k, active_v)</code></td>
+      </tr>
+      <tr>
+        <td class="nm">pre_attn_rmsnorm_compose</td>
+        <td><code>gqa/components/pre_attn_norm.py</code></td>
+        <td><span class="p p-ours">Ours</span> <span class="p p-lib">wraps nkilib</span></td>
+        <td><code>hidden</code>, <code>gamma_in [1, 2048]</code></td>
+        <td><code>normed_sb [128, T, 16]</code> SBUF</td>
+      </tr>
+      <tr>
+        <td class="nm">rmsnorm_tkg</td>
+        <td><code>nkilib.core.subkernels</code></td>
+        <td><span class="p p-lib">nkilib</span></td>
+        <td>hidden tile + gamma</td>
+        <td>normed tile, H-sharded by <code>lnc</code></td>
+      </tr>
+      <tr>
+        <td class="nm">qk_norm_compose</td>
+        <td><code>gqa/components/qk_norm.py</code></td>
+        <td><span class="p p-ours">Ours</span></td>
+        <td><code>[T, N=6, D=256]</code>, <code>gamma_q/k [256]</code></td>
+        <td><code>[T, 6, 256]</code> SBUF</td>
+      </tr>
+      <tr>
+        <td class="nm">rope_partial_compose</td>
+        <td><code>gqa/components/rope.py</code></td>
+        <td><span class="p p-ours">Ours</span></td>
+        <td><code>[T,6,256]</code>, <code>cos/sin [T, 64]</code></td>
+        <td><code>[T,6,256]</code> SBUF (heads 0–4 rotated)</td>
+      </tr>
+      <tr>
+        <td class="nm">heads_free_to_partition</td>
+        <td><code>gqa/decode/fused_layer.py</code></td>
+        <td><span class="p p-ours">Ours</span></td>
+        <td><code>[T, head, D]</code> SBUF</td>
+        <td><code>[128, D_TILES=2, h*T]</code> SBUF (+ 1/√D scale)</td>
+      </tr>
+      <tr>
+        <td class="nm">gqa_attention_d256</td>
+        <td><code>gqa/components/attention.py</code></td>
+        <td><span class="p p-ours">Shim</span></td>
+        <td>q/k SBUF, k/v caches HBM, <code>v_active</code> SBUF, mask</td>
+        <td><code>out_sb [128, 2, 4T]</code>, written in place</td>
+      </tr>
+      <tr>
+        <td class="nm">attention_tkg</td>
+        <td><code>gqa/vendored/attention_tkg.py</code></td>
+        <td><span class="p p-fork">Forked</span></td>
+        <td>see shim contract</td>
+        <td>attention output, SBUF</td>
+      </tr>
+      <tr>
+        <td class="nm">attention_tkg_utils</td>
+        <td><code>gqa/vendored/</code></td>
+        <td><span class="p p-fork">Forked</span></td>
+        <td>—</td><td><code>AttnTKGConfig</code> (+ <code>v_in_sb</code> field)</td>
+      </tr>
+      <tr>
+        <td class="nm">scatter_kv_cache_inplace</td>
+        <td><code>gqa/decode/fused_layer.py</code></td>
+        <td><span class="p p-ours">Ours</span></td>
+        <td><code>kv_write_idx [1,1]</code> int32</td>
+        <td>mutated cache handles — <b>off in the megakernel</b></td>
+      </tr>
+
+      <tr class="grp"><td colspan="5">MoE path — all 40 layers</td></tr>
+      <tr>
+        <td class="nm">moe_layer_compose</td>
+        <td><code>moe/components/moe_layer.py</code></td>
+        <td><span class="p p-ours">Ours</span></td>
+        <td><code>[H0,T,H1]</code> SBUF + 8 weights</td>
+        <td><code>combined [H0,T,H1]</code> SBUF</td>
+      </tr>
+      <tr>
+        <td class="nm">post_attn_rmsnorm_compose</td>
+        <td><code>moe/components/post_attn_norm.py</code></td>
+        <td><span class="p p-ours">Ours</span> <span class="p p-lib">wraps nkilib</span></td>
+        <td><code>hidden</code>, <code>gamma [1,H]</code></td>
+        <td><code>normed_sb [H0,T,H1]</code> SBUF</td>
+      </tr>
+      <tr>
+        <td class="nm">routed_experts_compose</td>
+        <td><code>moe/components/routed_experts.py</code></td>
+        <td><span class="p p-ours">Ours</span></td>
+        <td><code>normed_sb</code>, <code>router_w [H,256]</code>, expert weights</td>
+        <td><code>routed_local [H0,T,H1]</code> SBUF</td>
+      </tr>
+      <tr>
+        <td class="nm">router_topk</td>
+        <td><code>moe/vendored/router_topk.py</code></td>
+        <td><span class="p p-fork">Forked</span></td>
+        <td><code>normed_sb</code>, <code>router_w [H, E=256]</code></td>
+        <td><code>index [T,8]</code> uint32, <code>eager [T,8]</code> fp32</td>
+      </tr>
+      <tr>
+        <td class="nm">routed_experts_selective</td>
+        <td><code>moe/components/routed_experts_nki.py</code></td>
+        <td><span class="p p-ours">Ours · raw NKI</span></td>
+        <td><code>gate_up_w [E,H,2,I]</code>, <code>down_w [E,I,H]</code>, index, affinities</td>
+        <td><code>[H0, H1, T_shard]</code> fp32 accumulator</td>
+      </tr>
+      <tr>
+        <td class="nm">shared_expert_compose</td>
+        <td><code>moe/components/shared_expert.py</code></td>
+        <td><span class="p p-ours">Ours · raw NKI</span></td>
+        <td><code>gate/up [H, I_s]</code>, <code>down [I_s, H]</code></td>
+        <td><code>shared_local [H0,T,H1]</code> SBUF</td>
+      </tr>
+      <tr>
+        <td class="nm">sigma_gate_compose</td>
+        <td><code>moe/components/moe_layer.py</code></td>
+        <td><span class="p p-ours">Ours</span></td>
+        <td><code>normed_sb</code>, <code>sigma_gate_w [H,1]</code></td>
+        <td><code>g [1,T]</code> fp32 SBUF</td>
+      </tr>
+      <tr>
+        <td class="nm">gated_sum</td>
+        <td><code>moe/components/moe_layer.py</code></td>
+        <td><span class="p p-ours">Ours</span></td>
+        <td><code>routed_local</code>, <code>shared_local</code>, <code>g</code></td>
+        <td><code>combined [H0,T,H1]</code> SBUF</td>
+      </tr>
+      <tr>
+        <td class="nm">moe_tkg_shard_decision</td>
+        <td><code>moe/components/shared_expert.py</code></td>
+        <td><span class="p p-ours">Ours · pure Python</span></td>
+        <td><code>(T, H, intermediate)</code></td>
+        <td><code>(shard_on_T, T_offset, T_per_shard)</code></td>
+      </tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="panel panel-cost">
+    <h4>Stale docstrings — do not trust these two</h4>
+    <p><code>moe/__init__.py</code> and <code>specs/moe_layer.md</code> still describe the routed
+    experts as nkilib <code>moe_tkg</code> and the shared expert as <code>mlp_tkg</code>.
+    <b>Neither is imported anywhere on the live path.</b> Both were replaced by hand-written raw NKI —
+    routed to fix a DMA fragmentation problem, shared because <code>mlp_tkg</code>'s weight loader
+    hardcodes a tp102 reshape that cannot express tp2013. The only surviving <code>moe_tkg</code>
+    reference is the torch oracle in <code>tests/</code>.</p>
+  </div>
+</section>
+
+<!-- ══════════════════════════ 5 · DELTANET ══════════════════════════ -->
+<section id="deltanet">
+  <h2>DeltaNet path</h2>
+  <p class="deck">Linear attention with a gated delta rule. Entirely hand-written except for the two
+     bookend GEMMs. No vendored code at all on this path.</p>
+
+  <div class="sig">
+    <div class="sig-head">
+      <span class="fn">attention_layer_compose(…)</span>
+      <span class="loc">deltanet/decode/fused_layer.py:441</span>
+    </div>
+    <div class="sig-body">
+      <div class="sig-col">
+        <h5>In</h5>
+        <ul class="io">
+          <li><span class="n">hidden</span> <span class="s">[H0=128, T, H1=16]</span> <span class="b">sbuf</span> — the residual</li>
+          <li><span class="n">proj_w</span> <span class="s">[2048, 3088]</span> <span class="b hbm">hbm</span> — fused in_proj</li>
+          <li><span class="n">gamma</span> <span class="s">[H]</span> — input RMSNorm, fused into <code>qkv_tkg</code></li>
+          <li><span class="n">conv_state</span> <span class="s">[2048, K-1]</span> · <span class="n">conv_weight</span> <span class="s">[2048, K]</span></li>
+          <li><span class="n">A_log</span>, <span class="n">dt_bias</span> <span class="s">[8]</span> fp32</li>
+          <li><span class="n">init_state</span> <span class="s">[8, 128, 128]</span> fp32 — SSM seed</li>
+          <li><span class="n">out_w</span> <span class="s">[1024, 2048]</span></li>
+          <li><span class="n">z_gamma</span> <span class="s">[128]</span> — gated-norm weight</li>
+          <li><span class="n">cand_state</span>, <span class="n">conv_cand</span> <span class="b hbm">shared_hbm</span> — <em>out-params, allocated by the caller</em></li>
+        </ul>
+      </div>
+      <div class="sig-col">
+        <h5>Out</h5>
+        <ul class="io">
+          <li><span class="n">return</span> <span class="s">[H0, H1_shard*T]</span> <span class="b">sbuf</span> — H-sharded o_proj partial, transposed layout</li>
+          <li><span class="n">cand_state</span> <span class="s">[T, Hv, 128, 128]</span> fp32 — written in place, per token</li>
+          <li><span class="n">conv_cand</span> <span class="s">[T, conv_dim, K-1]</span> — written in place, per token</li>
+        </ul>
+        <h5 style="margin-top:18px">Flags the megakernel pins</h5>
+        <ul class="io">
+          <li><span class="n">write_candidates=True</span>, <span class="n">cand_is_3d=True</span> — verify-only</li>
+          <li><span class="n">out_in_sb=True</span> — no HBM round-trip on output</li>
+          <li><span class="n">name_prefix=f"L{i}_"</span> — op-name de-collision</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <h3>Stage flow</h3>
+  <div class="tw">
+  <table>
+    <caption>Per-rank TP=4: H=2048, I=3088, key_dim=512, value_dim=1024, d=128</caption>
+    <thead><tr><th>Stage</th><th>Kernel</th><th>Produces</th><th>Shape</th></tr></thead>
+    <tbody>
+      <tr><td>Norm + in_proj</td><td class="nm">in_proj_compose → qkv_tkg <span class="p p-lib">nkilib</span></td><td><code>proj_sb</code></td><td><code>[T, 3088]</code> SBUF</td></tr>
+      <tr><td>Bridge 1</td><td class="nm">qkv_to_channel_partition</td><td><code>qkv_cp</code></td><td><code>[128, 16T]</code> SBUF</td></tr>
+      <tr><td>Causal conv</td><td class="nm">conv_qkv_sbuf</td><td><code>q, k</code> / <code>v</code></td><td><code>[2T,128]</code> / <code>[4T,128]</code></td></tr>
+      <tr><td>Recurrence</td><td class="nm">gated_delta_rule_tkg</td><td><code>attn_sb</code></td><td><code>[T, 512]</code> SBUF</td></tr>
+      <tr><td>Gated norm</td><td class="nm">norm_gate_row</td><td>in place</td><td>per-head, 128-wide</td></tr>
+      <tr><td>o_proj</td><td class="nm">out_proj_compose → output_projection_tkg <span class="p p-lib">nkilib</span></td><td><code>o_out</code></td><td><code>[128, H1_shard*T]</code> SBUF</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="duo">
+    <div class="panel panel-key">
+      <h4>LNC sharding: value heads</h4>
+      <p>Each core gets three disjoint channel segments — its slice of q, its slice of k, its slice
+      of v. Conv and recurrence then run as a <b>self-contained per-core pipeline with zero cross-core
+      traffic</b>. GQA expansion stays local because <code>Hv = rep · Hk</code> holds per core.</p>
+    </div>
+    <div class="panel panel-key">
+      <h4>The one cross-core exchange</h4>
+      <p>o_proj contracts over <em>all</em> value heads, but each core holds only its own. The fix is a
+      single <code>sendrecv</code> of the <em>small</em> attention tensor <b>before</b> the matmul —
+      then <code>output_projection_tkg</code> H-shards the <em>large</em> output. No reduce of the
+      result is needed, because the H-shards are disjoint.</p>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h4>Two different RMSNorms — don't confuse them</h4>
+    <p><code>gamma</code>/<code>eps</code> is the <b>input</b> norm, fused inside <code>qkv_tkg</code>.
+    <code>z_gamma</code>/<code>z_eps</code> is the <b>gated per-head</b> norm at the recurrence output
+    seam: <code>out = x·rsqrt(mean(x²)+eps)·gamma·silu(z)</code>. The gated norm affects only
+    <code>attn_out</code> — it never touches the SSM state or the candidates.</p>
+  </div>
+
+  <p><b>Reader's trap:</b> <code>attn_shape</code> in <code>attention_layer_compose</code> looks like a
+  live tensor but never receives data. It exists purely so the recurrence can read <code>T</code> and
+  <code>dim</code> off its shape on the SBUF path.</p>
+</section>
+
+<!-- ══════════════════════════ 6 · GQA ══════════════════════════ -->
+<section id="gqa">
+  <h2>GQA path</h2>
+  <p class="deck">Grouped-query attention at <code>head_dim=256</code> — double what stock nkilib
+     supports. The cap was a tiling gap, not a hardware limit, and lifting it took three patch sites.</p>
+
+  <div class="sig">
+    <div class="sig-head">
+      <span class="fn">gqa_fused_compose(…)</span>
+      <span class="loc">gqa/decode/fused_layer.py:153</span>
+    </div>
+    <div class="sig-body">
+      <div class="sig-col">
+        <h5>In</h5>
+        <ul class="io">
+          <li><span class="n">hidden</span> <span class="s">[128, T, 16]</span> <span class="b">sbuf</span></li>
+          <li><span class="n">qkv_w</span> <span class="s">[2048, 1536]</span> — head-major <code>[q0|q1|q2|q3|k0|v0]</code></li>
+          <li><span class="n">gate_w</span> <span class="s">[2048, 1024]</span> — sigmoid output gate</li>
+          <li><span class="n">gamma_q</span>, <span class="n">gamma_k</span> <span class="s">[256]</span></li>
+          <li><span class="n">gamma_in</span> <span class="s">[1, 2048]</span> — optional in-kernel input norm</li>
+          <li><span class="n">cos</span>, <span class="n">sin</span> <span class="s">[T, 64]</span> — partial RoPE, shared across all 10 layers</li>
+          <li><span class="n">k_cache</span> <span class="s">[1,1,256,L]</span> <span class="b hbm">BHDS</span></li>
+          <li><span class="n">v_cache</span> <span class="s">[1,1,L,256]</span> <span class="b hbm">BHSD</span></li>
+          <li><span class="n">mask</span> <span class="s">[L,1,4,T]</span> uint8 — 1 = keep</li>
+          <li><span class="n">o_proj_w</span> <span class="s">[1024, 2048]</span></li>
+        </ul>
+      </div>
+      <div class="sig-col">
+        <h5>Out</h5>
+        <ul class="io">
+          <li><span class="n">o_out</span> <span class="s">[H0, H1_shard*T]</span> <span class="b">sbuf</span> — H-sharded o_proj partial</li>
+          <li><span class="n">active_k</span> <span class="s">[1, 1, 256, T]</span> <span class="b hbm">shared_hbm</span> BHDS</li>
+          <li><span class="n">active_v</span> <span class="s">[1, 1, T, 256]</span> <span class="b hbm">shared_hbm</span> BHSD</li>
+        </ul>
+        <h5 style="margin-top:18px">Constants (TP=4)</h5>
+        <ul class="io">
+          <li>4 Q heads : 1 KV head · <code>D = 256</code> · <code>D_TILES = 2</code></li>
+          <li><code>N = 6</code> heads on the fused axis · <code>N_SUB = 8</code> o_proj sub-heads</li>
+          <li><code>L % 128 == 0</code>, and <code>% 256</code> when s_prior-sharded</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <h3>Stage flow</h3>
+  <div class="tw">
+  <table>
+    <caption>Norm and RoPE run with head_dim on the FREE axis; exactly one transpose follows</caption>
+    <thead><tr><th>Stage</th><th>Kernel</th><th>Produces</th><th>Shape</th></tr></thead>
+    <tbody>
+      <tr><td>Input norm</td><td class="nm">pre_attn_rmsnorm_compose → rmsnorm_tkg <span class="p p-lib">nkilib</span></td><td><code>normed_sb</code></td><td><code>[128, T, 16]</code> SBUF</td></tr>
+      <tr><td>Projections ×2</td><td class="nm">qkv_tkg <span class="p p-lib">nkilib</span></td><td><code>qkv_sb</code>, <code>gate_sb</code></td><td><code>[T,1536]</code>, <code>[T,1024]</code></td></tr>
+      <tr><td>qk-norm</td><td class="nm">qk_norm_compose</td><td><code>normed</code></td><td><code>[T, 6, 256]</code> SBUF</td></tr>
+      <tr><td>Partial RoPE</td><td class="nm">rope_partial_compose</td><td><code>roped</code></td><td><code>[T, 6, 256]</code>, heads 0–4</td></tr>
+      <tr><td>Bridge A · transpose</td><td class="nm">heads_free_to_partition</td><td><code>q_sb</code>, <code>k_active_sb</code>, <code>gate_p</code></td><td><code>[128, 2, ·]</code> SBUF</td></tr>
+      <tr><td>Bridge B · emit KV</td><td class="nm">inline DMA</td><td><code>active_k</code>, <code>active_v</code></td><td>shared_hbm</td></tr>
+      <tr><td>Attention</td><td class="nm">gqa_attention_d256 → attention_tkg <span class="p p-fork">Forked</span></td><td><code>out_sb</code></td><td><code>[128, 2, 4T]</code> in place</td></tr>
+      <tr><td>Gate + reorder</td><td class="nm">inline</td><td><code>attn_full</code></td><td><code>[128, 1, 8, T]</code></td></tr>
+      <tr><td>o_proj</td><td class="nm">output_projection_tkg <span class="p p-lib">nkilib</span></td><td><code>o_out</code></td><td><code>[128, H1_shard*T]</code> SBUF</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>What the fork actually changed</h3>
+  <p>The bf16 QK<sup>T</sup> / softmax / P·V compute path is byte-for-byte AWS code. Softmax never
+  touches head_dim, so it is untouched. Three sites needed tiling, plus one new flag:</p>
+  <div class="tw">
+  <table>
+    <caption>gqa/vendored/attention_tkg.py — patch inventory</caption>
+    <thead><tr><th>Site</th><th>Role of head_dim</th><th>Patch</th></tr></thead>
+    <tbody>
+      <tr><td>MM1 · QK<sup>T</sup></td><td>contraction</td><td>split-K: 2 partials PSUM-accumulate into one scores tile</td></tr>
+      <tr><td>MM2 · P·V</td><td>stationary-free → output partition</td><td>2 stationary V-slices produce 2 PSUM halves</td></tr>
+      <tr><td>Output store</td><td>on partition</td><td>store loops over <code>D_TILES</code></td></tr>
+      <tr><td><code>v_in_sb</code></td><td>—</td><td>new config flag: active V read from the caller's SBUF tile, killing an SBUF→HBM→SBUF round-trip</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Helpers (<code>SbufManager</code>, <code>TensorView</code>, <code>gen_mask_tkg</code>,
+  <code>stream_shuffle_broadcast</code>) are still imported from installed nkilib — only this one
+  file is patched.</p>
+
+  <div class="panel panel-key">
+    <h4>Why norm and RoPE come <em>before</em> the transpose</h4>
+    <p>With head_dim on the free axis, <code>D = 256</code> fits under the 512-wide free limit, so
+    RMSNorm over D is a single free-axis reduce per token — <b>no tiling at all</b>. A
+    head_dim-on-partition norm would have capped d at 128. The single free→partition transpose then
+    happens once, after RoPE, and folds the <code>1/√D</code> Q scale into a copy it had to do anyway.</p>
+  </div>
+</section>
+
+<!-- ══════════════════════════ 7 · MOE ══════════════════════════ -->
+<section id="moe">
+  <h2>MoE path</h2>
+  <p class="deck">The whole FFN as one SBUF composable: normalize once, then four consumers read that
+     same tile. Runs on all 40 layers, and is the largest DMA consumer in the kernel.</p>
+
+  <div class="sig">
+    <div class="sig-head">
+      <span class="fn">moe_layer_compose(…)</span>
+      <span class="loc">moe/components/moe_layer.py:152</span>
+    </div>
+    <div class="sig-body">
+      <div class="sig-col">
+        <h5>In</h5>
+        <ul class="io">
+          <li><span class="n">hidden</span> <span class="s">[H0, T, H1]</span> <span class="b">sbuf</span></li>
+          <li><span class="n">gamma</span> <span class="s">[1, 2048]</span> — post-attn norm</li>
+          <li><span class="n">router_w</span> <span class="s">[2048, 256]</span> — rank-replicated</li>
+          <li><span class="n">expert_gate_up_w</span> <span class="s">[256, 2048, 2, 128]</span> — fused gate+up</li>
+          <li><span class="n">expert_down_w</span> <span class="s">[256, 128, 2048]</span></li>
+          <li><span class="n">sigma_gate_w</span> <span class="s">[2048, 1]</span> — rank-replicated</li>
+          <li><span class="n">shared_gate/up_w</span> <span class="s">[2048, 128]</span> · <span class="n">shared_down_w</span> <span class="s">[128, 2048]</span></li>
+        </ul>
+      </div>
+      <div class="sig-col">
+        <h5>Out</h5>
+        <ul class="io">
+          <li><span class="n">combined</span> <span class="s">[H0, T, H1]</span> <span class="b">sbuf</span> — one per-rank partial</li>
+        </ul>
+        <h5 style="margin-top:18px">Config (A3B, TP=4)</h5>
+        <ul class="io">
+          <li><code>E = 256</code> experts, <code>K = 8</code> selected per token</li>
+          <li>routed <code>I = 128</code>, shared <code>I_s = 128</code> per rank</li>
+          <li>weights consumed in contraction-first layout, <b>no runtime transpose</b></li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+<pre><code><span class="cm"># the whole layer, in order</span>
+normed  = <b>rmsnorm</b>(hidden, gamma)                  <span class="cm"># ONCE — four consumers share this tile</span>
+idx, aff = <b>router_topk</b>(normed, router_w)          <span class="cm"># softmax → top-8 → L1-normalize</span>
+routed  = <b>routed_experts_selective</b>(normed, idx, aff, gate_up_w, down_w)
+shared  = <b>shared_expert</b>(normed, ...)              <span class="cm"># == one routed expert, no index, no affinity</span>
+g       = sigmoid(normed @ sigma_gate_w)          <span class="cm"># [1, T]</span>
+combined = routed + broadcast(g) * shared
+
+<span class="cm"># valid because the σ-gate is rank-replicated:</span>
+<span class="cm">#     AR(routed) + g*AR(shared)  ==  AR(routed + g*shared)</span>
+</code></pre>
+
+  <h3>Token sharding — and the garbage columns</h3>
+  <p>Each LNC core owns a <em>token slice</em> and computes the <b>full H</b> for it. There is no
+  H-split of MoE work, and no cross-core exchange inside the kernel.</p>
+
+  <div class="panel panel-cost">
+    <h4>The reason the megakernel calls <code>moe_tkg_shard_decision</code> a second time</h4>
+    <p><code>sigma_gate_compose</code> and <code>gated_sum</code> write <b>all T columns</b>, but
+    <code>routed_local</code>/<code>shared_local</code> are only valid on this core's slice. The
+    foreign-token columns are <b>garbage-but-populated</b>, not stale. The megakernel recomputes
+    <code>(T_offset, T_len)</code> at line 274 purely so it can slice out the valid block before the
+    all-reduce. Never read outside it.</p>
+  </div>
+
+  <h3>The DMA fix that made this path viable</h3>
+  <p>Stock <code>moe_tkg</code> loads each expert's gate and up weights as two separate strided
+  <code>[H, I]</code> views, so the innermost contiguous run is only <code>I</code> elements. That
+  fragments the load into tens of thousands of tiny packets — sync-engine bound, tensor engine
+  starved. The hand-written replacement loads gate+up as <b>one contiguous <code>[H0, H1, 2I]</code>
+  slab</b> and slices it in SBUF, with a 2-slot prefetch ring so expert <em>k</em>+1's DMA overlaps
+  expert <em>k</em>'s compute.</p>
+  <p><b>Measured: 129 µs → 71 µs</b>, sync-engine share 72% → 13%. The kernel became tensor-bound.</p>
+  <p class="foot">Note: the module docstring describes the run as 256 B → 512 B; a later audit of the
+  actual access pattern found both forms coalesce to 4 KB. The 129→71 µs result is the reliable number.</p>
+</section>
+
+<!-- ══════════════════════════ 8 · COLLECTIVES ══════════════════════════ -->
+<section id="collectives">
+  <h2>Collectives</h2>
+  <p class="deck">Both paths produce a per-rank partial that must be reduced across TP=4 and gathered
+     across the 2 LNC cores. They shard on different axes, so they need two different gathers.</p>
+
+  <div class="duo">
+    <div class="panel">
+      <h4>Attention · gather on H</h4>
+<pre style="margin-top:12px"><code><span class="cm"># _all_reduce_gather_h  :60</span>
+in : [H0, H1_shard*T] sbuf
+     <span class="cm"># each core owns disjoint H columns</span>
+
+nccl.all_reduce(reduced, sharded, add, rg)
+tensor_copy → gathered[my half]
+nisa.sendrecv → gathered[other half]
+rearrange (h1,bs) → (bs,h1)
+
+out: [H0, T*H1] sbuf   <span class="cm"># full H</span>
+</code></pre>
+      <p style="font-size:13.5px;margin-top:12px">Straightforward: the two cores hold disjoint
+      H-shards, so one swap completes the tile.</p>
+    </div>
+
+    <div class="panel">
+      <h4>MoE · gather on T</h4>
+<pre style="margin-top:12px"><code><span class="cm"># _all_reduce_gather_tokens  :88</span>
+in : [H0, T, H1] sbuf
+     <span class="cm"># only [T_offset, T_offset+T_len) is valid</span>
+
+flat  = in.reshape((H0, T*H1))
+block = flat[:, T_offset*H1 : ...]
+<b>tensor_copy(block_in, block)</b>   <span class="cm"># ← REQUIRED</span>
+nccl.all_reduce(reduced, block_in, add, rg)
+tensor_copy → out[my tokens]
+nisa.sendrecv → out[other tokens]
+
+out: [H0, T*H1] sbuf   <span class="cm"># all tokens</span>
+</code></pre>
+    </div>
+  </div>
+
+  <div class="panel panel-cost">
+    <h4>Why that extra copy is not redundant</h4>
+    <p>Tokens live on the free axis (<code>f = t·H1 + h1</code>), so a token block <em>is</em> a
+    contiguous free-slice — but the slice inherits the parent's partition stride (<code>T*H1</code>)
+    while spanning only <code>T_len*H1</code>. That is a <b>partition-strided view</b>, and nccl's SBUF
+    collectives require a densely packed 2-D operand. Feeding the sub-view directly is precisely the
+    bug that produced garbage output; the <code>tensor_copy</code> into a fresh tile is the fix.</p>
+  </div>
+
+  <h4>nccl constraints worth memorizing</h4>
+  <ul class="tight">
+    <li>SBUF operands must be <b>exactly 2-D</b> with a contiguous free dim. No PSUM, no HBM/SBUF mixing.</li>
+    <li>One tensor per SBUF call; <code>op ∈ {add, minimum, maximum}</code>.</li>
+    <li><code>sendrecv</code> and <code>core_barrier</code> are <b>ISA ops</b> (<code>nki.isa</code>),
+        not part of <code>nki.collectives</code>.</li>
+    <li><code>replica_groups</code> is a traced constant — a plain <code>List[List[int]]</code>, no
+        <code>torch.distributed</code> in the path.</li>
+  </ul>
+</section>
+
+<!-- ══════════════════════════ 9 · STATE ══════════════════════════ -->
+<section id="state">
+  <h2>State &amp; cache writes</h2>
+  <p class="deck">This is a <em>speculative verify</em> kernel: it processes T candidate tokens, but
+     not all will be accepted. So neither attention type commits its state. Both emit
+     <b>per-position candidates</b> and let the host pick one.</p>
+
+  <div class="panel panel-key">
+    <h4>The unifying idea</h4>
+    <p>Every state output carries a leading <code>T</code> axis indexed by <b>position = accept
+    count</b>. On a reject the host selects index <code>accept_count − 1</code>. No inversion, no
+    recompute — the rollback is a pointer select. DeltaNet's recurrent state and conv window are
+    candidate-tracked <em>in lockstep</em>, because a reject must roll back both.</p>
+  </div>
+
+  <h3>DeltaNet · SSM recurrent state</h3>
+  <div class="tw">
+  <table>
+    <thead><tr><th>Direction</th><th>Mechanism</th><th>Shape</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>Read (seed)</td>
+        <td>One 3-D access-pattern DMA pulls this core's <code>Hv</code> heads out of the full tensor
+            into a packed wide SBUF tile <code>S0[i, h*128+j]</code>. 512 B.</td>
+        <td><code>init_state [8, 128, 128]</code> fp32</td>
+      </tr>
+      <tr>
+        <td>Write</td>
+        <td>A <b>single 3-D AP store DMA</b> per token, walking (partition <em>i</em>, local head
+            <em>h</em>, value index <em>j</em>). Only <code>base_off</code> differs between the
+            candidate and final layouts — head stride is <code>d²</code> in both.</td>
+        <td><code>cand_state [T, Hv, 128, 128]</code> fp32</td>
+      </tr>
+      <tr>
+        <td>Internals</td>
+        <td>S0/S1 ping-pong buffers break the inter-token write-after-read dependency. Token 0 reads
+            S0 and writes S1.</td>
+        <td><code>[128, 512]</code> fp32 SBUF ×2</td>
+      </tr>
+    </tbody>
+  </table>
+  </div>
+
+<pre><code><span class="cm"># recurrence.py:152 — the entire state write</span>
+nisa.dma_copy(
+    dst=state_hbm.ap(pattern=[[dim, P_MAX], [head_stride, Hv], [1, dim]], offset=base_off),
+    src=Sp.ap(       pattern=[[W,   P_MAX], [dim,         Hv], [1, dim]], offset=0),
+)
+<span class="cm"># write_candidates=True  → base_off = t*Hv_full*d² + vh_off*d²   (per token, inside the loop)</span>
+<span class="cm"># write_candidates=False → base_off =            vh_off*d²        (once, after the loop)</span>
+</code></pre>
+
+  <h3>DeltaNet · conv sliding window</h3>
+  <p>The window after token <em>t</em> is a pure slice, <code>win[:, t+1 : t+1+state_w]</code>, of the
+  packed <code>[conv_state | qkv]</code> window. Each column is transposed and packed, then one DMA
+  per token scatters the segment into <code>conv_cand[t]</code>.</p>
+  <p><b>The property that makes this safe:</b> the candidate columns are exact copies of the
+  <em>raw projection output</em>, not of the conv output. A committed state is therefore bit-identical
+  to what a fresh forward pass would have carried.</p>
+
+  <h3>GQA · KV cache</h3>
+  <div class="tw">
+  <table>
+    <thead><tr><th></th><th>K</th><th>V</th></tr></thead>
+    <tbody>
+      <tr><td>Cache layout</td><td><code>[B,1,256,L]</code> BHDS — head_dim-major, <code>k_cache_transposed=True</code></td><td><code>[B,1,L,256]</code> BHSD</td></tr>
+      <tr><td>Read</td><td>One DMA per d-tile into <code>k_sb[0:d_sz, dt, :]</code>; each core reads only its s_prior shard</td><td>Sequential into <code>v_sb</code></td></tr>
+      <tr><td>Active tokens</td><td colspan="2">Appended <b>in SBUF only</b>, into the last <code>s_active</code> slots of the L-length tile. The caches supply prior context only.</td></tr>
+      <tr><td>Write</td><td colspan="2"><b>None inside the megakernel.</b> <code>active_k</code>/<code>active_v</code> are emitted to <code>shared_hbm</code> and scattered by NxDI's <code>update_kv_by_layer_id</code> after the accept decision.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="panel panel-cost">
+    <h4>Ordering trap, if in-place scatter is ever turned on</h4>
+    <p><code>scatter_kv_cache_inplace</code> exists (design B) but the megakernel does not use it.
+    If enabled, it must run <b>after</b> attention reads the cache — meaning slots
+    <code>[base_pos, base_pos+T)</code> hold stale data during the read, so the mask must key off
+    <code>base_pos</code> and the active K must come from the SBUF region, not the cache. Getting this
+    wrong fails silently. Note also that both cores hold replicated active K/V, so the writes are
+    gated by <code>prg_id</code> to avoid a duplicate write.</p>
+  </div>
+
+  <h3>Where the host picks up</h3>
+<pre><code><span class="cm"># modeling_qwen36_a3b.py:4492 — _commit_deltanet, spec_len=2 so k=1</span>
+sel = (index == 1)
+<span class="kw">for</span> S_stack, conv_cand <span class="kw">in</span> candidates:
+    out.append(torch.where(sel, S_stack[:, 1],  S_stack[:, 0]))
+    out.append(torch.where(sel, conv_cand[:, 1], conv_cand[:, 0]))
+<span class="cm"># in-graph torch.where; NEVER the eager offset-strided [:, idx] view</span>
+</code></pre>
+
+  <div class="panel">
+    <h4>Why every mutated handle is returned</h4>
+    <p>The kernel returns <code>(output, *active_k/v, *cand_state/conv_cand)</code> — 81 tensors at
+    N=40. This is not convenience: if a mutated buffer is not returned, <b>NCC dead-stores the
+    write</b>. The model then re-associates them per layer so NxDI aliases the mutated HBM buffers
+    rather than the pre-kernel ones.</p>
+  </div>
+</section>
+
+<!-- ══════════════════════════ 10 · DECISIONS ══════════════════════════ -->
+<section id="decisions">
+  <h2>Design decisions</h2>
+  <p class="deck">The choices that shaped the code, and what was rejected. Several rejections are
+     load-bearing — they explain why obvious-looking optimizations are absent.</p>
+
+  <div class="duo">
+    <div class="dec">
+      <h3>SBUF-resident residual</h3>
+      <p class="why">The residual is 8 KB and lives in SBUF for all 40 layers. Only the entry load and
+      final store touch HBM, killing ~120 hidden-state round-trips.</p>
+      <p class="alt"><b>Enabled by</b> <code>out_in_sb</code> / <code>output_in_sbuf</code> flags added
+      to all three composables — default-off, so the standalone HBM contracts stayed byte-identical.</p>
+    </div>
+
+    <div class="dec">
+      <h3>tp2013 as the shared layout</h3>
+      <p class="why">One index map, parameterized on <code>n_prgs</code>, that degenerates exactly to
+      tp102 at LNC=1 — so both core counts share one code path with no branch. Attention and MoE read
+      the same residual tile with no repacking.</p>
+      <p class="alt"><b>Cost accepted</b> +2.9% on the standalone MoE layer, and it forecloses an
+      unsplit 8 KB gate/up load — which the 2-way pipelining split had already given up.</p>
+    </div>
+
+    <div class="dec">
+      <h3>MoE token-shards; attention H-shards</h3>
+      <p class="why">Deliberately decoupled: the work split and the SBUF H-layout are two independent
+      decisions. MoE keeps token-sharding and gets a token-axis gather.</p>
+      <p class="alt"><b>Rejected: shard MoE on H.</b> The byte math is exactly break-even at T=2
+      (12 MiB/core either way), it buys zero bandwidth, and it would cost 32 cross-core sendrecvs per
+      layer plus a re-derivation of the fused slab DMA.</p>
+    </div>
+
+    <div class="dec">
+      <h3>Raw-NKI routed experts</h3>
+      <p class="why">Replaced nkilib <code>moe_tkg</code> to fix DMA fragmentation: one contiguous
+      <code>[H0,H1,2I]</code> gate+up slab plus a 2-slot prefetch ring. 129 µs → 71 µs.</p>
+      <p class="alt"><b>Contract preserved</b> exactly — top-K, SiLU, POST_SCALE by the already-L1-normalized
+      affinity with no re-normalization — so the torch <code>moe_tkg</code> oracle still validates it.</p>
+    </div>
+
+    <div class="dec">
+      <h3>Raw-NKI shared expert</h3>
+      <p class="why">nkilib's <code>mlp_tkg</code> gate/up loader hardcodes a tp102 reshape with no
+      layout parameter, so a core cannot address a full 16-wide tp2013 tile.</p>
+      <p class="alt"><b>Rejected: patch the vendored view.</b> It's one SwiGLU and the machinery
+      already existed in <code>routed_experts_nki</code>. (The public wrapper is also broken for the
+      SBUF + NO_NORM case — a second, independent reason.)</p>
+    </div>
+
+    <div class="dec">
+      <h3>Fork <code>attention_tkg</code>, don't rewrite it</h3>
+      <p class="why">Lifting <code>head_dim ≤ 128</code> touched three tiling sites; the entire bf16
+      compute path stayed byte-for-byte AWS code, with each region delimited by explicit patch markers.</p>
+      <p class="alt"><b>Also kept</b> a from-scratch reference core (<code>attention_fresh_ref.py</code>)
+      off the live path, purely for cross-checking.</p>
+    </div>
+
+    <div class="dec">
+      <h3>Name-prefix vendoring</h3>
+      <p class="why">Tracing a subkernel 40× collides on op names and will not compile. Most nkilib
+      kernels accept a caller-supplied <code>sbm</code> and de-collide for free — but
+      <code>router_topk</code> had <b>no prefix hook at all</b>, which made it the one hard blocker.</p>
+      <p class="alt"><b>Vendored for this reason alone</b> — the fork adds a <code>name_prefix</code>
+      kwarg threaded to 7 explicit op-name sites. Not a math change.</p>
+    </div>
+
+    <div class="dec">
+      <h3><code>exec()</code>-generated flat signature</h3>
+      <p class="why">NKI's frontend classifies tuple/list top-level args as scalars — no HBM binding,
+      and aliasing breaks. So every weight and cache must be its own positional arg: ~675 of them at
+      N=40, code-generated and cached per <code>layer_is_gqa</code> pattern.</p>
+      <p class="alt"><b>Also rejected: stacked-by-layer tensors.</b> The outer-dim stride trips
+      NCC_IBIR158/243 out-of-bounds.</p>
+    </div>
+
+    <div class="dec">
+      <h3>No cross-layer weight ring</h3>
+      <p class="why">One layer is ~22.6 MiB per core; two would be ~45 MiB against ~30 MiB usable.
+      Weights stream per layer, and only intra-layer overlap is available.</p>
+      <p class="alt"><b>Consequence</b> grouping layers is free — there is no ring to lose — which is
+      why the build could de-risk at N=4 before scaling to 40 at zero perf cost.</p>
+    </div>
+
+    <div class="dec">
+      <h3>Candidates in HBM, not SBUF</h3>
+      <p class="why">Holding 30 layers' candidate states in SBUF would be 7.5–15 MiB/core and would
+      collide with the streaming weights. They are written to HBM per layer.</p>
+      <p class="alt"><b>Rejected: <code>router_w</code> pre-permute.</b> The predicted descriptor split
+      was real and exactly as forecast, but measured at −0.02 µs — inside the noise. Per-packet DMA
+      throughput already saturates at 4 KB.</p>
+    </div>
+
+    <div class="dec">
+      <h3>Where the win actually comes from</h3>
+      <p class="why">Not FLOPs. It is 120 kernel launches → 1, 80 XLA all-reduces → in-kernel
+      collectives that overlap with compute, and ~120 HBM round-trips of the hidden state removed.</p>
+      <p class="alt"><b>Watch for</b> in-kernel all-reduce cost <em>rising</em> per layer — prior art
+      saw 13.45 → 27.77 µs — and still netting a large win because sync-engine and DMA time fell further.</p>
+    </div>
+
+    <div class="dec">
+      <h3>Not decorated with <code>nki.jit</code></h3>
+      <p class="why">The body function is plain Python; <code>build_verify_megakernel</code> wraps the
+      generated flat signature at the call site. Decorating both would double-jit and overflow the stack.</p>
+      <p class="alt"><b>Practical effect</b> the kernel is traced through a cached, code-generated
+      wrapper keyed on the layer-type tuple.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════ 11 · READING GUIDE ══════════════════════════ -->
+<section id="reading">
+  <h2>Reading guide</h2>
+  <p class="deck">Suggested order for a first pass through the code, given everything above.</p>
+
+  <ol class="steps">
+    <li><b>The shell first.</b> <code>qwen36_verify_megakernel.py</code> is only ~380 lines and the
+    layer loop is 100 of them. Read it top to bottom, ignoring the composable bodies — you are reading
+    for the residual lifecycle and the two gathers.</li>
+
+    <li><b>Then the layout.</b> Convince yourself of the tp2013 index map. Nearly every access pattern
+    in the MoE kernels is an expression of it, and they are unreadable until it clicks.</li>
+
+    <li><b>Then one composable, end to end.</b> <code>moe_layer.py</code> is the best first choice —
+    it's the shortest, and its norm-once → four-consumers structure is the clearest example of the
+    SBUF-resident pattern.</li>
+
+    <li><b>Then the state paths.</b> <code>recurrence.py::_write_state</code> and the GQA
+    <code>active_k</code>/<code>active_v</code> emission. Both are small, and they explain why the
+    return tuple is 81 tensors long.</li>
+
+    <li><b>Leave the vendored files for last.</b> <code>attention_tkg.py</code> is ~4000 lines of AWS
+    code with ~40 lines of patch. Grep <code>D256 PATCH</code> and read only those regions — the rest
+    is not ours and does not need to be understood to work on this kernel.</li>
+  </ol>
+
+  <div class="panel panel-cost">
+    <h4>Two docstrings that will mislead you</h4>
+    <ul class="tight" style="margin-bottom:0">
+      <li><code>moe/__init__.py</code> and <code>specs/moe_layer.md</code> claim the routed experts use
+      <code>moe_tkg</code> and the shared expert uses <code>mlp_tkg</code>. Both are wrong — the live
+      code is raw NKI in this repo.</li>
+      <li><code>moe_layer.py</code> says "No cross-rank all-reduce here (megakernel/model boundary)".
+      True of the composable, but the megakernel has since crossed that boundary and calls
+      <code>nccl.all_reduce</code> itself.</li>
+    </ul>
+  </div>
+
+  <div class="panel">
+    <h4>Naming that isn't what it sounds like</h4>
+    <ul class="tight" style="margin-bottom:0">
+      <li><code>moe_tkg_shard_decision</code> is a vestigial name — it wraps a 15-line pure-Python
+      function in this repo and calls nothing from <code>moe_tkg</code>.</li>
+      <li><code>attn_shape</code> in the DeltaNet composable is a shape carrier, never a live buffer.</li>
+      <li><code>affinities</code> passed into <code>router_topk</code> is <b>never written</b> — the
+      router rebinds its output internally. Consume the returned tensors.</li>
+    </ul>
+  </div>
+
+  <hr>
+  <p class="foot">
+    Sources: <code>nki_kernels/megakernel/qwen36_verify_megakernel.py</code>,
+    the three composables and their components,
+    <code>nki_kernels/specs/target_megakernel.md</code>, and
+    <code>modeling_qwen36_a3b.py:4299–4506</code>.
+    Branch <code>qwen36-moe-gqa-tkg-kernels</code>.
+  </p>
+</section>
+
+</main>
+</div>
+</body>
+</html>
