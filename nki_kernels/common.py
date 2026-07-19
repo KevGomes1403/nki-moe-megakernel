@@ -31,6 +31,7 @@ def rmsnorm_to_sbuf(
     normed_sb=None,
     single_core_forced=False,
     name_prefix="",
+    sbm=None,
 ):
     """RMSNorm a raw hidden tile into an SBUF-resident [H0, T, H1] tile (zero HBM round-trip).
 
@@ -47,6 +48,10 @@ def rmsnorm_to_sbuf(
         single_core_forced: True forces num_H_shards=1 (tp102) on every core; False keys
                        num_H_shards to the LNC count -- the tp2013 megakernel residual layout.
         name_prefix:   SBUF allocation-name prefix (an instantiating caller must make this unique).
+        sbm:           optional BufferManager. Default None allocates a fresh auto-alloc manager (the
+                       behaviour every existing caller relies on). A caller running its own MANUAL
+                       manager must pass it, so rmsnorm_tkg's tiles are placed inside the region that
+                       manager owns instead of being placed independently by the compiler.
 
     Returns:
         normed_sb: [H0=128, T, H1=H//128] SBUF (same dtype as hidden).
@@ -67,7 +72,8 @@ def rmsnorm_to_sbuf(
     if normed_sb is None:
         normed_sb = nl.ndarray((H0, T, h1), dtype=hidden.dtype, buffer=nl.sbuf)
 
-    sbm = create_auto_alloc_manager()
+    if sbm is None:
+        sbm = create_auto_alloc_manager()
     sbm.set_name_prefix(name_prefix)
     rmsnorm_tkg(
         input=hidden,

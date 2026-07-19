@@ -21,9 +21,8 @@ GATES (cosine is BANNED repo-wide as a gate/metric):
     shared + gate stages on top of the routed path). max_abs / max_rel reported for every case.
   * Sub-check: sigma-gate g scalar allclose vs oracle sigmoid.
 
-Cases: cores=1 {T=1, T=2}, cores=2 {T=2} (the verify priority). cores=2/T=1 (decode) is SKIPPED:
-the routed path needs an H-sharded norm at T=1 while the shared path needs the full tile -- the norm
-layouts diverge and decode is deprioritized (see moe_layer.md / shared_expert.py docstring).
+Cases: cores=1 {T=1, T=2}, cores=2 {T=2} (token-shard, the verify priority), cores=2 {T=1} (decode:
+LNC H-shard -- each core owns half the tp2013 free axis, gate/up cross-core reduced, down disjoint).
 
 Run (CORES 0,1):
     cd /home/ubuntu/trainium-model-translation && \
@@ -54,6 +53,7 @@ from models.qwen3_6_moe.nki_kernels.moe.components.post_attn_norm import (  # no
     post_attn_rmsnorm_compose,
 )
 from models.qwen3_6_moe.nki_kernels.moe.components.shared_expert import (  # noqa: E402
+    moe_h_shard_decision,
     moe_tkg_shard_decision,
 )
 
@@ -181,13 +181,19 @@ def _unpermute(sbuf_out, T, n_s):
 
 
 def _assemble_store(src_sb, out_hbm, T, H, intermediate):
-    """Each LNC core DMAs ONLY its own valid slice into shared HBM [H0,T,H1] (token slice when
-    token-sharded, else the full tile -- both cores write identical data in the full-compute case)."""
+    """Each LNC core DMAs ONLY its own valid slice into shared HBM [H0,T,H1]: its token slice when
+    token-sharded, its free-index block when H-sharded, else the full tile (single core)."""
     shard_on_T, T_offset, T_per_shard = moe_tkg_shard_decision(T, H, intermediate)
+    shard_on_H, f_offset, H1_local = moe_h_shard_decision(T, H, H // H0, intermediate)
     if shard_on_T:
         nisa.dma_copy(
             dst=out_hbm[:, T_offset : T_offset + T_per_shard, :],
             src=src_sb[:, T_offset : T_offset + T_per_shard, :],
+        )
+    elif shard_on_H:
+        nisa.dma_copy(
+            dst=out_hbm[:, :, f_offset : f_offset + H1_local],
+            src=src_sb[:, :, f_offset : f_offset + H1_local],
         )
     else:
         nisa.dma_copy(dst=out_hbm[:, :, :], src=src_sb[:, :, :])
@@ -423,14 +429,16 @@ def test_fp32_t2_c2_e16_fast():
     run_case("fp32_T2_c2_E16", T=2, cores=2, seed=7, dtype=torch.float32, E=16, K=8)
 
 
-def test_skip_t1_c2_decode():
-    """cores=2/T=1 (decode) is out of scope: routed needs an H-sharded norm at T=1 while shared needs
-    the full tile -- the norm layouts diverge. Decode is deprioritized; skipped by design."""
-    import pytest
+def test_fp32_t1_c2():
+    run_case("fp32_T1_c2", T=1, cores=2, seed=1, dtype=torch.float32)  # LNC H-shard
 
-    pytest.skip(
-        "cores=2/T=1 decode: routed H-shard vs shared full-tile norm layout divergence"
-    )
+
+def test_fp32_t1_c2_hbm():
+    run_case("fp32_T1_c2_HBM", T=1, cores=2, seed=1, dtype=torch.float32, mode="hbm")
+
+
+def test_bf16_t1_c2():
+    run_case("bf16_T1_c2", T=1, cores=2, seed=1, dtype=torch.bfloat16)  # LNC H-shard
 
 
 def main():
@@ -440,12 +448,14 @@ def main():
     run_case("fp32_T1_c1", T=1, cores=1, seed=1, dtype=torch.float32)
     run_case("fp32_T2_c1", T=2, cores=1, seed=2, dtype=torch.float32)
     run_case("fp32_T2_c2", T=2, cores=2, seed=3, dtype=torch.float32)  # verify priority
+    run_case("fp32_T1_c2", T=1, cores=2, seed=1, dtype=torch.float32)  # LNC H-shard
 
     print(
         "\n=== FUSED MoE LAYER -- HBM natural readback (layout-independent cross-check) ==="
     )
     run_case("fp32_T2_c1_HBM", T=2, cores=1, seed=2, dtype=torch.float32, mode="hbm")
     run_case("fp32_T2_c2_HBM", T=2, cores=2, seed=3, dtype=torch.float32, mode="hbm")
+    run_case("fp32_T1_c2_HBM", T=1, cores=2, seed=1, dtype=torch.float32, mode="hbm")
 
     print(
         f"\n=== FUSED MoE LAYER -- BF16 (gate: max_abs <= floor * {BF16_HEADROOM:g}) ==="
@@ -454,13 +464,11 @@ def main():
     run_case(
         "bf16_T2_c2", T=2, cores=2, seed=3, dtype=torch.bfloat16
     )  # verify priority
+    run_case("bf16_T1_c2", T=1, cores=2, seed=1, dtype=torch.bfloat16)  # LNC H-shard
 
     print("\n=== REDUCED-E fast case (E=16) ===")
     run_case("fp32_T2_c2_E16", T=2, cores=2, seed=7, dtype=torch.float32, E=16, K=8)
 
-    print(
-        "\n=== SKIPPED: cores=2/T=1 (decode) -- routed H-shard vs shared full-tile norm divergence ==="
-    )
     print("\nALL HARD-GATED CASES PASSED")
 
 

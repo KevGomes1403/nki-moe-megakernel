@@ -8,6 +8,10 @@ partial back into the residual. Structure mirrors nkilib's transformer_tkg.
 Attention H-shards its o_proj output across the two LNC cores -> H-gather. MoE token-shards
 its output -> token-gather. Both reduce across the TP replica group first.
 
+The finished residual then runs the final norm + vocab head + greedy argmax, so the kernel returns
+token ids directly; the residual itself is still returned pre-final-norm because the caller needs
+it as the draft's rolling-buffer seed.
+
 Not decorated: wrap with nki.jit() at the call site (avoids a double-jit stack overflow).
 """
 
@@ -23,6 +27,7 @@ from nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
 
 from ..deltanet.decode.fused_layer import attention_layer_compose
 from ..gqa.decode.fused_layer import gqa_fused_compose
+from ..lm_head.components.lm_head import lm_head_compose
 from ..moe.components.moe_layer import moe_layer_compose
 from ..moe.components.shared_expert import moe_tkg_shard_decision
 
@@ -136,6 +141,74 @@ def all_reduce_gather_tokens(local_sb, rg, prg_id, n_prgs, T_offset, T_len):
     return out
 
 
+def all_gather_argmax(rank_max, rank_idx, rg, tp_degree, V_rank):
+    """LM-head path: fold the per-rank (max, index) winners into one global greedy token id.
+
+    The vocab is TP-sharded, so a rank-local winner is not yet the global one. Rather than gather
+    [T, V_global] logits, gather only each rank's [T, 1] winner pair -- the reduction NxD's
+    ``nxd_argmax`` does on the host. Gathering rather than reducing lands each rank's entry at a
+    known column, so the vocab offset is a compile-time constant and no dynamic rank id is needed.
+
+    Ties resolve to the lowest global id, matching torch.argmax: columns that do not hold the peak
+    are lifted past every real id, then the row is min-reduced. The rank owning the peak always
+    survives, so the reduce is never over an all-loser row.
+
+    ``rg=None`` skips the collective (identity at TP=1) so the head can still run in a
+    single-process launch, where collectives comms are uninitialized and fail at NEFF load.
+    """
+    if rg is None:
+        return rank_idx
+
+    T = rank_max.shape[0]
+    # Above any real global vocab id and exact in fp32, which holds ids up to 2**24.
+    loser = float(1 << 30)
+
+    val = nl.ndarray((T, 1), dtype=nl.float32, buffer=nl.sbuf)
+    idx = nl.ndarray((T, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=val, src=rank_max)
+    nisa.tensor_copy(dst=idx, src=rank_idx)
+
+    all_val = nl.ndarray((T, tp_degree), dtype=nl.float32, buffer=nl.sbuf)
+    all_idx = nl.ndarray((T, tp_degree), dtype=nl.float32, buffer=nl.sbuf)
+    nccl.all_gather(srcs=[val], dsts=[all_val], replica_group=rg, collective_dim=1)
+    nccl.all_gather(srcs=[idx], dsts=[all_idx], replica_group=rg, collective_dim=1)
+
+    peak = nl.ndarray((T, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_reduce(dst=peak, op=nl.maximum, data=all_val, axis=1)
+
+    cand = nl.ndarray((T, tp_degree), dtype=nl.float32, buffer=nl.sbuf)
+    penalty = nl.ndarray((T, tp_degree), dtype=nl.float32, buffer=nl.sbuf)
+    for r in nl.static_range(tp_degree):
+        nisa.tensor_scalar(
+            dst=cand[:, r : r + 1],
+            data=all_idx[:, r : r + 1],
+            op0=nl.add,
+            operand0=float(r * V_rank),
+        )
+    nisa.tensor_tensor(
+        dst=penalty,
+        data1=all_val,
+        data2=peak.ap([[1, T], [0, tp_degree]]),
+        op=nl.equal,
+    )
+    # (1 - owns_peak) * loser, fused into one instruction.
+    nisa.tensor_scalar(
+        dst=penalty,
+        data=penalty,
+        op0=nl.multiply,
+        operand0=-loser,
+        op1=nl.add,
+        operand1=loser,
+    )
+    nisa.tensor_tensor(dst=cand, data1=cand, data2=penalty, op=nl.add)
+
+    best = nl.ndarray((T, 1), dtype=nl.float32, buffer=nl.sbuf)
+    tokens = nl.ndarray((T, 1), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.tensor_reduce(dst=best, op=nl.minimum, data=cand, axis=1)
+    nisa.tensor_copy(dst=tokens, src=best)
+    return tokens
+
+
 def qwen36_verify_megakernel(
     X,
     layer_is_gqa,
@@ -173,13 +246,20 @@ def qwen36_verify_megakernel(
     moe_shared_gate_w,
     moe_shared_up_w,
     moe_shared_down_w,
+    # LM head
+    final_gamma,
+    lm_head_w,
 ):
     """Run all decoder layers, SBUF-resident residual, per-rank partials reduced in-kernel.
 
     ``layer_is_gqa[i]`` selects the attention type for layer i; DeltaNet/GQA weight lists are
-    indexed by each type's running position. Returns ``(hidden [B,S,H] HBM, gqa_active_kv, dn_cand)``:
-    per-GQA-layer (active_k, active_v) for the caller's KV scatter and per-DeltaNet-layer
-    (candidate_states, conv_cand) for the accept/reject commit. Final norm + lm_head stay outside.
+    indexed by each type's running position. Returns
+    ``(tokens [B,S] int32 HBM, hidden [B,S,H] HBM, gqa_active_kv, dn_cand)``: the greedy token ids,
+    the trunk hidden, per-GQA-layer (active_k, active_v) for the caller's KV scatter, and
+    per-DeltaNet-layer (candidate_states, conv_cand) for the accept/reject commit.
+
+    ``hidden`` is PRE-final-norm: the head applies its own norm, and the caller needs the un-normed
+    hidden as the draft's rolling-buffer seed.
     """
     B, S, H = X.shape
     dtype = X.dtype
@@ -191,6 +271,7 @@ def qwen36_verify_megakernel(
     H1_shard = H1 // n_prgs
     T = B * S
     rg = nccl.ReplicaGroup(replica_groups) if replica_groups is not None else None
+    tp_degree = len(replica_groups[0]) if replica_groups is not None else 1
 
     residual = nl.ndarray((H0, T * H1), dtype=dtype, buffer=nl.sbuf)
     load_residual_to_sbuf(residual, X, T, H0, H1, n_prgs)
@@ -292,7 +373,24 @@ def qwen36_verify_megakernel(
         store_residual_to_hbm(output, residual, T, H0, H1, n_prgs)
     if n_prgs > 1:
         nisa.core_barrier(data=output, cores=(0, 1))
-    return tuple([output] + gqa_out + dn_out)
+
+    # residual is still the pre-final-norm hidden stored above; the head norms its own copy.
+    rank_max, rank_idx, _ = lm_head_compose(
+        residual.reshape((H0, T, H1)),
+        final_gamma,
+        lm_head_w,
+        eps=eps,
+        name_prefix="lm_",
+    )
+    token_idx = all_gather_argmax(rank_max, rank_idx, rg, tp_degree, lm_head_w.shape[1])
+    # [T, 1] SBUF is one element per partition, so the HBM row is written through a [T, 1] view
+    # of it; a flat T-wide access pattern would read one partition and run off the end.
+    tokens = nl.ndarray((B, S), dtype=nl.int32, buffer=nl.shared_hbm)
+    if prg_id == 0:
+        nisa.dma_copy(dst=tokens.reshape((T, 1)), src=token_idx)
+    if n_prgs > 1:
+        nisa.core_barrier(data=tokens, cores=(0, 1))
+    return tuple([tokens, output] + gqa_out + dn_out)
 
 
 DN_FIELDS = (
@@ -329,7 +427,18 @@ MOE_FIELDS = (
 
 
 def flatten_megakernel_args(
-    X, dn, gqa, moe, cos, sin, gqa_mask, key_dim, eps, replica_groups
+    X,
+    dn,
+    gqa,
+    moe,
+    cos,
+    sin,
+    gqa_mask,
+    key_dim,
+    eps,
+    replica_groups,
+    final_gamma,
+    lm_head_w,
 ):
     """The one definition of the flat positional argument order.
 
@@ -345,16 +454,18 @@ def flatten_megakernel_args(
     flat += [cos, sin, gqa_mask]
     for f in MOE_FIELDS:
         flat += list(moe[f])
+    flat += [final_gamma, lm_head_w]
     flat += [key_dim, eps, replica_groups]
     return flat
 
 
 def split_megakernel_returns(rets, n_gqa, n_dn):
-    """Un-flatten the kernel's return tuple into (hidden, gqa_active_kv, dn_candidates)."""
-    gqa_flat = rets[1 : 1 + 2 * n_gqa]
-    dn_flat = rets[1 + 2 * n_gqa :]
+    """Un-flatten the return tuple into (tokens, hidden, gqa_active_kv, dn_candidates)."""
+    gqa_flat = rets[2 : 2 + 2 * n_gqa]
+    dn_flat = rets[2 + 2 * n_gqa :]
     return (
         rets[0],
+        rets[1],
         [(gqa_flat[2 * i], gqa_flat[2 * i + 1]) for i in range(n_gqa)],
         [(dn_flat[2 * i], dn_flat[2 * i + 1]) for i in range(n_dn)],
     )
@@ -380,7 +491,18 @@ def build_verify_megakernel(layer_is_gqa):
     moe = col("moe", MOE_FIELDS, n)
 
     flat = flatten_megakernel_args(
-        "X", dn, gqa, moe, "cos", "sin", "gqa_mask", "key_dim", "eps", "replica_groups"
+        "X",
+        dn,
+        gqa,
+        moe,
+        "cos",
+        "sin",
+        "gqa_mask",
+        "key_dim",
+        "eps",
+        "replica_groups",
+        "final_gamma",
+        "lm_head_w",
     )
 
     def tup(ns):
@@ -398,6 +520,7 @@ def build_verify_megakernel(layer_is_gqa):
     body_args += [f"gqa_{f}" for f in GQA_FIELDS]
     body_args += ["cos", "sin", "gqa_mask"]
     body_args += [f"moe_{f}" for f in MOE_FIELDS]
+    body_args += ["final_gamma", "lm_head_w"]
     lines.append(
         "    return _body(\n        " + ",\n        ".join(body_args) + ",\n    )"
     )

@@ -18,6 +18,7 @@ from .moe_layer import (
 from .post_attn_norm import post_attn_rmsnorm_compose
 from .routed_experts import moe_routed_compose, routed_experts_compose
 from .shared_expert import (
+    moe_h_shard_decision,
     moe_shared_compose,
     moe_tkg_shard_decision,
     shared_expert_compose,
@@ -30,6 +31,7 @@ __all__ = [
     "shared_expert_compose",
     "moe_shared_compose",
     "moe_tkg_shard_decision",
+    "moe_h_shard_decision",
     "moe_layer_compose",
     "moe_layer_fwd",
     "sigma_gate_compose",

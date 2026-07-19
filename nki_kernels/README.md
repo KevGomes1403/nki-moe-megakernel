@@ -27,7 +27,10 @@ nki_kernels/
 │       ├── chunked_step.py  # per-chunk-step, numerically stable  ← default
 │       └── chunked_fused.py # single-kernel fused; faster but overflows this
 │                            #   checkpoint (gated off — see model README)
-└── specs/                 # design specs (norm_gate.md, out_proj.md)
+├── lm_head/
+│   └── components/
+│       └── lm_head.py     # final RMSNorm + vocab projection + per-rank greedy argmax
+└── specs/                 # design specs (norm_gate.md, out_proj.md, lm_head.md, ...)
 ```
 
 ## Kernel map
@@ -43,6 +46,7 @@ nki_kernels/
 | `decode/recurrent.py` | per-token recurrence | decode | fallback (gated) |
 | `prefill/chunked_step.py` | per-chunk-step forward | prefill | **default** |
 | `prefill/chunked_fused.py` | single-kernel fused forward | prefill | gated off (fp32 overflow) |
+| `lm_head/components/lm_head.py` | final norm + vocab projection + per-rank argmax | shared | building block |
 
 `decode/fused_layer.py` composes the `components/` kernels; that is the megakernel
 under active development. New stage kernels go in `components/`; new model-block

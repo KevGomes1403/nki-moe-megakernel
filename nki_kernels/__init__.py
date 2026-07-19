@@ -45,6 +45,9 @@ from .gqa import gqa_fused_tkg_fwd
 # MoE (post-attention FFN) fused-layer verify kernel.
 from .moe import moe_layer_fwd
 
+# LM head (final norm + vocab projection + per-rank greedy argmax), shared by both heads.
+from .lm_head import lm_head_fwd
+
 __all__ = [
     "deltanet_fused_tkg_fwd",
     "deltanet_fused_tkg_fwd_state",
@@ -58,4 +61,5 @@ __all__ = [
     "_make_identity",
     "gqa_fused_tkg_fwd",
     "moe_layer_fwd",
+    "lm_head_fwd",
 ]

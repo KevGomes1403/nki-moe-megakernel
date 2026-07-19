@@ -15,8 +15,10 @@ combined TP all-reduce are the NEXT slice; ``normed_sb`` is returned/reused so t
 SAME tile.
 
 TWO INDEPENDENT DECISIONS, never welded together:
-  * WORK SPLIT (``moe_token_shard``): the experts token-shard across the LNC cores whenever cores>1,
-    T>1 and the config is not the big one. Each core then owns a token slice over the FULL H.
+  * WORK SPLIT (``moe_token_shard`` / ``moe_h_shard``): the experts token-shard across the LNC cores
+    whenever cores>1, T>1 and the config is not the big one -- each core then owns a token slice over the
+    FULL H. When the token-shard cannot engage (T == 1) the cores H-shard instead: each owns half the
+    tp2013 free axis. Exactly one of the two is active at cores>1.
   * SBUF H-LAYOUT: always tp2013 -- ``n_s = n_prgs`` H-shards, ``H2 = H1 // n_s``, free index
     ``f = s*H2 + h2`` <-> H-column ``s*(H0*H2) + h0*H2 + h2`` -- so the hidden tile matches the
     attention kernels' SBUF residual. ``rmsnorm_tkg`` keys the emitted permutation off ``lnc``, so
@@ -83,6 +85,21 @@ def moe_token_shard(T, H, moe_intermediate, n_prgs, shard_id):
     return shard_on_T, T_offset, T_per_shard
 
 
+def moe_h_shard(H1, n_prgs, shard_id, shard_on_T):
+    """Per-LNC-core H-shard geometry over the tp2013 free axis: (shard_on_H, f_offset, H1_per_shard).
+
+    The fallback taken whenever the token-shard cannot engage (mirrors nkilib's
+    ``shard_on_h_disabled = shard_on_T`` switch). Core p owns free indices ``[p*H2, (p+1)*H2)``, i.e. the
+    contiguous H-column block ``[p*H0*H2, (p+1)*H0*H2)``: gate/up contract only their half of H (H is the
+    CONTRACTION dim -> one cross-core reduce before the activation) while down writes disjoint output
+    columns (H is the OUTPUT dim -> no reduce).
+    """
+    if n_prgs > 1 and not shard_on_T:
+        H2 = H1 // n_prgs
+        return True, shard_id * H2, H2
+    return False, 0, H1
+
+
 def routed_experts_compose(
     normed_sb,
     router_w,
@@ -121,7 +138,10 @@ def routed_experts_compose(
     kernel_assert(
         n_prgs in (1, 2), "routed experts support 1 or 2 LNC cores (tp2013 n_s)"
     )
-    _, T_offset, T_per_shard = moe_token_shard(T, H, moe_intermediate, n_prgs, shard_id)
+    shard_on_T, T_offset, T_per_shard = moe_token_shard(
+        T, H, moe_intermediate, n_prgs, shard_id
+    )
+    shard_on_H, f_offset, H1_local = moe_h_shard(H1, n_prgs, shard_id, shard_on_T)
 
     # Router: fp32 softmax-over-E -> top-k -> L1-normalize (norm_topk_prob). SBUF outputs; eager returned.
     # NOTE: for SBUF expert_affinities the router REBINDS its output to an internal scattered tile, so the
@@ -162,6 +182,9 @@ def routed_experts_compose(
         T_per_shard,
         n_s=n_prgs,
         output_in_sbuf=output_in_sbuf,
+        shard_on_H=shard_on_H,
+        f_offset=f_offset,
+        H1_local=H1_local,
     )
     return routed_local
 

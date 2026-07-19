@@ -18,9 +18,11 @@ Layout (tp2013, shared with the attention kernels' SBUF residual): with ``n_s = 
 this degenerates to tp102. gate/up are SEPARATE ``[H, I_s]`` tensors, so each partition's H2 rows coalesce
 into an ``H2 * I_s`` run (2 KB at bf16); down is the contiguous ``[I_s, H]`` row load, permutation-agnostic.
 
-Work split: TOKEN-sharded, identical to the routed path (``moe_token_shard``), so ``shared_local`` keeps
-the same per-core layout as ``routed_local`` and the gated sum is a plain per-core add. At cores>1 / T==1
-there is no token split, so both cores compute the full tile -- redundant but correct on every core.
+Work split: identical to the routed path, so ``shared_local`` keeps the same per-core layout as
+``routed_local`` and the gated sum is a plain per-core add. TOKEN-sharded (``moe_token_shard``) when it
+can engage, else H-sharded (``moe_h_shard``): at cores>1 / T==1 each core owns half the tp2013 free axis,
+loading half the weights, with one fused ``[I_s, 2T]`` fp32 sendrecv+add reducing the gate/up partial
+sums (H is their contraction dim) before the SiLU; down's H-columns are disjoint and need no reduce.
 Weights are rank-replicated; ``shared_local`` stays the per-rank partial (cross-rank all-reduce deferred).
 
 Per-rank (TP=4) A3B dims: H=2048 (H0=128, H1=16), I_s=128 (shared_expert_intermediate_size 512 / TP=4).
@@ -32,7 +34,7 @@ import nki.language as nl
 from nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
 
 from .post_attn_norm import post_attn_rmsnorm_compose
-from .routed_experts import NORM_SINGLE_CORE_FORCED, moe_token_shard
+from .routed_experts import NORM_SINGLE_CORE_FORCED, moe_h_shard, moe_token_shard
 from .routed_experts_nki import store_tile_to_hbm_th
 
 P_MAX = 128
@@ -51,27 +53,45 @@ def moe_tkg_shard_decision(T, H, intermediate):
     return moe_token_shard(T, H, intermediate, n_prgs, shard_id)
 
 
-def load_shared_weights(gate_w, up_w, down_w, H0, H1, H2, n_s, I_s, H, dtype):
+def moe_h_shard_decision(T, H, H1, intermediate):
+    """This core's (shard_on_H, f_offset, H1_per_shard) over the tp2013 free axis (routed == shared)."""
+    _, n_prgs, shard_id = get_verified_program_sharding_info("moe_shared", (0, 1), 2)
+    shard_on_T, _, _ = moe_token_shard(T, H, intermediate, n_prgs, shard_id)
+    return moe_h_shard(H1, n_prgs, shard_id, shard_on_T)
+
+
+def load_shared_weights(
+    gate_w, up_w, down_w, H0, H1_local, H2, s_offset, s_count, I_s, H, dtype
+):
     """Load the shared expert's [H,I_s] gate/up (tp2013) and [I_s,H] down (contiguous) into SBUF.
 
-    gate/up slabs: slab[h0, s*H2 + h2, c] = w[s*H0*H2 + h0*H2 + h2, c]; dim1 step (I_s) equals the inner
-    extent, so each partition's H2 rows coalesce into one H2*I_s run. Static (non-indirect) DMAs.
+    Only this core's H-shards [s_offset, s_offset+s_count) are loaded. gate/up slabs:
+    slab[h0, s_local*H2 + h2, c] = w[(s_offset+s_local)*H0*H2 + h0*H2 + h2, c]; dim1 step (I_s) equals the
+    inner extent, so each partition's H2 rows coalesce into one H2*I_s run. down takes the contiguous
+    H_local-column block this core owns (the whole H row when not H-sharded). Static (non-indirect) DMAs.
     """
-    gate_sb = nl.ndarray((H0, H1, I_s), dtype=dtype, buffer=nl.sbuf)
-    up_sb = nl.ndarray((H0, H1, I_s), dtype=dtype, buffer=nl.sbuf)
-    for s in range(n_s):
+    H_local = H1_local * H0
+    gate_sb = nl.ndarray((H0, H1_local, I_s), dtype=dtype, buffer=nl.sbuf)
+    up_sb = nl.ndarray((H0, H1_local, I_s), dtype=dtype, buffer=nl.sbuf)
+    for s_local in range(s_count):
         pattern = [[H2 * I_s, H0], [I_s, H2], [1, I_s]]
-        offset = s * H0 * H2 * I_s
+        offset = (s_offset + s_local) * H0 * H2 * I_s
         nisa.dma_copy(
-            dst=gate_sb[0:H0, s * H2 : (s + 1) * H2, 0:I_s],
+            dst=gate_sb[0:H0, s_local * H2 : (s_local + 1) * H2, 0:I_s],
             src=gate_w.ap(pattern=pattern, offset=offset),
         )
         nisa.dma_copy(
-            dst=up_sb[0:H0, s * H2 : (s + 1) * H2, 0:I_s],
+            dst=up_sb[0:H0, s_local * H2 : (s_local + 1) * H2, 0:I_s],
             src=up_w.ap(pattern=pattern, offset=offset),
         )
-    down_sb = nl.ndarray((I_s, H), dtype=dtype, buffer=nl.sbuf)
-    nisa.dma_copy(dst=down_sb[0:I_s, 0:H], src=down_w)
+    down_sb = nl.ndarray((I_s, H_local), dtype=dtype, buffer=nl.sbuf)
+    if H_local == H:
+        nisa.dma_copy(dst=down_sb[0:I_s, 0:H], src=down_w)
+    else:
+        nisa.dma_copy(
+            dst=down_sb[0:I_s, 0:H_local],
+            src=down_w.ap(pattern=[[H, I_s], [1, H_local]], offset=s_offset * H0 * H2),
+        )
     return gate_sb, up_sb, down_sb
 
 
@@ -88,7 +108,7 @@ def shared_expert_compose(normed_sb, gate_w, up_w, down_w, output_in_sbuf=True):
 
     Returns:
         shared_local: SBUF [H0,T,H1] (output_in_sbuf=True) or HBM [T,H] (False) -- per-rank partial with
-                      the SAME per-LNC-core token-shard layout as routed_local.
+                      the SAME per-LNC-core shard layout as routed_local.
     """
     H0, T, H1 = normed_sb.shape
     H = H0 * H1
@@ -111,50 +131,104 @@ def shared_expert_compose(normed_sb, gate_w, up_w, down_w, output_in_sbuf=True):
     )
     n_s = n_prgs
     H2 = H1 // n_s
-    _, T_offset, T_per_shard = moe_token_shard(T, H, I_s, n_prgs, shard_id)
+    shard_on_T, T_offset, T_per_shard = moe_token_shard(T, H, I_s, n_prgs, shard_id)
+    shard_on_H, f_offset, H1_local = moe_h_shard(H1, n_prgs, shard_id, shard_on_T)
+    s_offset = f_offset // H2
+    s_count = H1_local // H2
+    H_local = s_count * H0 * H2
+    peer_rank = 1 - s_offset
 
     gate_sb, up_sb, down_sb = load_shared_weights(
-        gate_w, up_w, down_w, H0, H1, H2, n_s, I_s, H, dtype
+        gate_w,
+        up_w,
+        down_w,
+        H0,
+        H1_local,
+        H2,
+        s_offset,
+        s_count,
+        I_s,
+        H,
+        dtype,
     )
 
-    # gate/up: contract H0 over the H1 free indices for this core's whole token slice at once.
+    # gate/up: contract H0 over this core's free indices for its whole token slice at once.
     gate_psum = nl.ndarray((I_s, T_per_shard), dtype=nl.float32, buffer=nl.psum)
     up_psum = nl.ndarray((I_s, T_per_shard), dtype=nl.float32, buffer=nl.psum)
-    for f in range(H1):
-        moving = normed_sb[:, T_offset : T_offset + T_per_shard, f]
+    for f in range(H1_local):
+        moving = normed_sb[:, T_offset : T_offset + T_per_shard, f_offset + f]
         nisa.nc_matmul(dst=gate_psum, stationary=gate_sb[:, f, 0:I_s], moving=moving)
         nisa.nc_matmul(dst=up_psum, stationary=up_sb[:, f, 0:I_s], moving=moving)
 
+    if shard_on_H:
+        # H is the gate/up CONTRACTION dim: each core holds a partial sum. ONE fused [I_s, 2T] fp32
+        # sendrecv + add reduces gate and up together before the SiLU.
+        two_T = 2 * T_per_shard
+        gate_up_sb = nl.ndarray((I_s, two_T), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=gate_up_sb[:, 0:T_per_shard], src=gate_psum)
+        nisa.tensor_copy(dst=gate_up_sb[:, T_per_shard:two_T], src=up_psum)
+        gate_up_recv = nl.ndarray((I_s, two_T), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.sendrecv(
+            src=gate_up_sb,
+            dst=gate_up_recv,
+            send_to_rank=peer_rank,
+            recv_from_rank=peer_rank,
+            pipe_id=0,
+        )
+        nisa.tensor_tensor(
+            dst=gate_up_sb, data1=gate_up_sb, data2=gate_up_recv, op=nl.add
+        )
+        gate_src = gate_up_sb[:, 0:T_per_shard]
+        up_src = gate_up_sb[:, T_per_shard:two_T]
+    else:
+        gate_src, up_src = gate_psum, up_psum
+
     gate_act = nl.ndarray((I_s, T_per_shard), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.activation(dst=gate_act, data=gate_psum, op=nl.silu)
+    nisa.activation(dst=gate_act, data=gate_src, op=nl.silu)
     up_act = nl.ndarray((I_s, T_per_shard), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=up_act, src=up_psum)
+    nisa.tensor_copy(dst=up_act, src=up_src)
     intermediate = nl.ndarray((I_s, T_per_shard), dtype=dtype, buffer=nl.sbuf)
     nisa.tensor_tensor(dst=intermediate, data1=gate_act, data2=up_act, op=nl.multiply)
 
-    # down: contract I_s -> [H0,1] per free index f, the strided stationary picking the tp2013 H-columns
-    # {s*H0*H2 + h0*H2 + h2} (s, h2 = divmod(f, H2)). Each core writes ONLY its own token slice.
+    # down: contract I_s -> [H0,1] per free index f_offset+f, the strided stationary picking the tp2013
+    # H-columns {s*H0*H2 + h0*H2 + h2} (s, h2 = divmod(f_offset+f, H2)). H is the OUTPUT dim here, so the
+    # H-shard's columns are disjoint per core -- no reduce. Each core writes ONLY its own slice.
     shared_local = nl.ndarray((H0, T, H1), dtype=dtype, buffer=nl.sbuf)
     for local_token_idx in range(T_per_shard):
-        down_psum = nl.ndarray((H0, H1), dtype=nl.float32, buffer=nl.psum)
-        for f in range(H1):
-            s, h2 = f // H2, f % H2
+        down_psum = nl.ndarray((H0, H1_local), dtype=nl.float32, buffer=nl.psum)
+        for f in range(H1_local):
+            s, h2 = (f_offset + f) // H2, (f_offset + f) % H2
             nisa.nc_matmul(
                 dst=down_psum[0:H0, f : f + 1],
                 stationary=down_sb.ap(
-                    pattern=[[H, I_s], [H2, H0]], offset=s * H0 * H2 + h2
+                    pattern=[[H_local, I_s], [H2, H0]],
+                    offset=(s - s_offset) * H0 * H2 + h2,
                 ),
                 moving=intermediate[0:I_s, local_token_idx : local_token_idx + 1],
             )
         nisa.tensor_copy(
-            dst=shared_local[:, T_offset + local_token_idx, :], src=down_psum
+            dst=shared_local[
+                :, T_offset + local_token_idx, f_offset : f_offset + H1_local
+            ],
+            src=down_psum,
         )
 
     if output_in_sbuf:
         return shared_local
 
     out_hbm = nl.ndarray((T, H), dtype=dtype, buffer=nl.shared_hbm)
-    store_tile_to_hbm_th(out_hbm, shared_local, H0, H2, n_s, H, T_offset, T_per_shard)
+    store_tile_to_hbm_th(
+        out_hbm,
+        shared_local,
+        H0,
+        H2,
+        n_s,
+        H,
+        T_offset,
+        T_per_shard,
+        s_offset=s_offset,
+        s_count=s_count,
+    )
     return out_hbm
 
 

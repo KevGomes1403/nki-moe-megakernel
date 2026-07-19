@@ -4264,9 +4264,19 @@ class Qwen36SpecTarget(NeuronQwen36A3BModel):
         )
 
     def _verify_epilogue(
-        self, hidden_states, next_decoder_cache, layer_candidates, position_ids, seq_ids
+        self,
+        hidden_states,
+        next_decoder_cache,
+        layer_candidates,
+        position_ids,
+        seq_ids,
+        tokens=None,
     ):
-        """Shared exit work for both verify paths: cache commit, final norm, lm_head, argmax."""
+        """Shared exit work for both verify paths: cache commit, final norm, lm_head, argmax.
+
+        ``tokens`` short-circuits the head: the megakernel already fused the final norm, vocab
+        matmul and greedy argmax, and ``hidden_states`` is pre-final-norm either way.
+        """
         updated_kv = self.kv_mgr.update_cache(
             is_for_context_encoding=False,
             seq_ids=seq_ids,
@@ -4276,13 +4286,14 @@ class Qwen36SpecTarget(NeuronQwen36A3BModel):
         )
 
         verify_trunk_hidden = hidden_states  # pre-final-norm, both positions
-        logits = self.lm_head(self.norm(hidden_states)).float()
-        tokens = _greedy_argmax(  # [B, spec_len]
-            self.lm_head,
-            logits,
-            self.rank_util,
-            disable_argmax_kernel=self.neuron_config.disable_argmax_kernel,
-        )
+        if tokens is None:
+            logits = self.lm_head(self.norm(hidden_states)).float()
+            tokens = _greedy_argmax(  # [B, spec_len]
+                self.lm_head,
+                logits,
+                self.rank_util,
+                disable_argmax_kernel=self.neuron_config.disable_argmax_kernel,
+            )
 
         self._verify_candidates = layer_candidates
         return [tokens, *updated_kv, verify_trunk_hidden]
@@ -4428,10 +4439,12 @@ class Qwen36SpecTarget(NeuronQwen36A3BModel):
             key_dim,
             eps,
             replica_groups,
+            self.norm.weight.reshape(1, H),
+            self.lm_head.weight,
         )
         n_gqa = sum(layer_is_gqa)
         n_dn = len(layer_is_gqa) - n_gqa
-        output, gqa_active_kv, dn_cand = split_megakernel_returns(
+        tokens, output, gqa_active_kv, dn_cand = split_megakernel_returns(
             megakernel[2](*flat), n_gqa, n_dn
         )
         hidden_states = output.to(inputs_embeds.dtype)
@@ -4453,7 +4466,12 @@ class Qwen36SpecTarget(NeuronQwen36A3BModel):
                 di += 1
 
         return self._verify_epilogue(
-            hidden_states, next_decoder_cache, layer_candidates, position_ids, seq_ids
+            hidden_states,
+            next_decoder_cache,
+            layer_candidates,
+            position_ids,
+            seq_ids,
+            tokens=tokens,
         )
 
 

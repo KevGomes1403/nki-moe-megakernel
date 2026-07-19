@@ -17,7 +17,8 @@ Two things are proven:
         assemble across cores, and gate vs ``oracle_routed + oracle_shared`` at fp32 allclose. Gate=1
         (skip the sigma-gate -- that is the next slice); here we only prove the shapes/layouts add.
 
-Cases: cores=1 {T=1,T=2}, cores=2 {T=2} (token-shard), cores=2 {T=1} (H-shard).
+Cases: cores=1 {T=1,T=2}, cores=2 {T=2} (token-shard), cores=2 {T=1} (LNC H-shard: each core owns half
+the tp2013 free axis, gate/up cross-core reduced before the SiLU, down's H-columns disjoint).
 
 GATES (cosine is BANNED repo-wide as a gate/metric):
   * FP32 IO: torch.allclose(atol=1e-5, rtol=1e-2) -- the HARD gate.
@@ -53,6 +54,7 @@ from models.qwen3_6_moe.nki_kernels.moe.components.routed_experts import (  # no
     moe_routed_compose,
 )
 from models.qwen3_6_moe.nki_kernels.moe.components.shared_expert import (  # noqa: E402
+    moe_h_shard_decision,
     moe_shared_compose,
     moe_tkg_shard_decision,
     shared_expert_compose,
@@ -162,14 +164,20 @@ def _unpermute(sbuf_out, T, n_s):
 
 
 def _assemble_store(src_sb, out_hbm, T, H, intermediate):
-    """Each LNC core DMAs ONLY its own valid slice into shared HBM [H0,T,H1] (mirrors moe_tkg's per-core
-    SBUF store): its token slice when token-sharded, else the full tile (both cores write identical data
-    in the full-compute case)."""
+    """Each LNC core DMAs ONLY its own valid slice into shared HBM [H0,T,H1] (mirrors the kernel's
+    per-core SBUF store): its token slice when token-sharded, its free-index block when H-sharded, else
+    the full tile (single core)."""
     shard_on_T, T_offset, T_per_shard = moe_tkg_shard_decision(T, H, intermediate)
+    shard_on_H, f_offset, H1_local = moe_h_shard_decision(T, H, H // H0, intermediate)
     if shard_on_T:
         nisa.dma_copy(
             dst=out_hbm[:, T_offset : T_offset + T_per_shard, :],
             src=src_sb[:, T_offset : T_offset + T_per_shard, :],
+        )
+    elif shard_on_H:
+        nisa.dma_copy(
+            dst=out_hbm[:, :, f_offset : f_offset + H1_local],
+            src=src_sb[:, :, f_offset : f_offset + H1_local],
         )
     else:
         nisa.dma_copy(dst=out_hbm[:, :, :], src=src_sb[:, :, :])
@@ -217,8 +225,15 @@ def moe_combined_asm_fwd(
         "[NCC_INKI016] shared_local/routed_local shape mismatch -- layouts not aligned"
     )
     H0_, T, H1 = routed_local.shape
+    _, f_offset, H1_local = moe_h_shard_decision(T, H0_ * H1, H1, up_w.shape[1])
+    fs = slice(f_offset, f_offset + H1_local)
     combined = nl.ndarray((H0_, T, H1), dtype=routed_local.dtype, buffer=nl.sbuf)
-    nisa.tensor_tensor(dst=combined, data1=routed_local, data2=shared_local, op=nl.add)
+    nisa.tensor_tensor(
+        dst=combined[:, :, fs],
+        data1=routed_local[:, :, fs],
+        data2=shared_local[:, :, fs],
+        op=nl.add,
+    )
     out = nl.ndarray((H0_, T, H1), dtype=routed_local.dtype, buffer=nl.shared_hbm)
     _assemble_store(combined, out, T, H0_ * H1, up_w.shape[1])
     return out
@@ -289,9 +304,8 @@ def _bf16_floor(ref_fp32):
     return (r.to(torch.bfloat16).float() - r).abs().max().item()
 
 
-def _check(name, ker, ref_fp32, dtype, hard=True):
-    """Gate a partial against the fp32 oracle. Prints max_abs / max_rel for every case. When hard=False
-    (cores=2/T=1: moe_tkg's H-shard limitation), the divergence is REPORTED but not asserted."""
+def _check(name, ker, ref_fp32, dtype):
+    """Gate a partial against the fp32 oracle. Prints max_abs / max_rel for every case."""
     max_abs, max_rel = _metrics(ker, ref_fp32)
     if dtype == torch.float32:
         ok = torch.allclose(ker.double(), ref_fp32.double(), atol=ATOL, rtol=RTOL)
@@ -304,24 +318,18 @@ def _check(name, ker, ref_fp32, dtype, hard=True):
         ok = max_abs <= limit
         gate = f"max_abs<=floor*{BF16_HEADROOM:g}"
         extra = f"  floor={floor:.3e}  limit={limit:.3e}  ratio={ratio:.2f}x"
-    if hard:
-        status = "PASS" if ok else "FAIL"
-    else:
-        status = (
-            "ALIGNED" if ok else "DIVERGENT (expected -- moe_tkg H-shard limitation)"
-        )
+    status = "PASS" if ok else "FAIL"
     print(
         f"[{name}] {status}  max_abs={max_abs:.3e}  max_rel={max_rel:.3e}  gate={gate}{extra}"
     )
-    if hard:
-        assert ok, (
-            f"{name}: gate {gate} failed (max_abs={max_abs:.3e} max_rel={max_rel:.3e})"
-        )
+    assert ok, (
+        f"{name}: gate {gate} failed (max_abs={max_abs:.3e} max_rel={max_rel:.3e})"
+    )
 
 
 def run_case(name, T, cores, seed, dtype, mode="asm"):
-    """Shared expert alone vs the SwiGLU oracle (token-shard-aware readback). All 4 configs pass: cores>1
-    token-shards on T>1 and full-computes at T==1 (correct on every core)."""
+    """Shared expert alone vs the SwiGLU oracle (shard-aware readback). All 4 configs pass: cores>1
+    token-shards on T>1 and H-shards at T==1."""
     inp = make_inputs(T=T, seed=seed)
     ref = oracle_swiglu(*inp)  # [T,H] fp32
     ker = run_shared(inp, T, cores=cores, dtype=dtype, mode=mode)
@@ -329,16 +337,16 @@ def run_case(name, T, cores, seed, dtype, mode="asm"):
     return ker
 
 
-def run_align_case(name, T, cores, seed, dtype=torch.float32, hard=True):
+def run_align_case(name, T, cores, seed, dtype=torch.float32):
     """Combined-add smoke: device routed_local + shared_local vs oracle_routed + oracle_shared. Proves the
-    gated sum is a plain per-core add. hard=False for cores=2/T=1 (routed itself H-shard-broken there)."""
+    gated sum is a plain per-core add under both work splits (token-shard and H-shard)."""
     shared_inp = make_inputs(T=T, seed=seed)
     routed_w = make_routed_weights(seed)
     ref = oracle_swiglu(*shared_inp) + oracle_routed_hf(
         shared_inp[0], shared_inp[1], *routed_w, K_ROUTED
     )  # [T,H]
     ker = run_combined(shared_inp, routed_w, T, cores=cores, dtype=dtype)
-    _check(name, ker, ref, dtype, hard=hard)
+    _check(name, ker, ref, dtype)
     return ker
 
 
@@ -358,9 +366,7 @@ def test_fp32_t2_c2():
 
 
 def test_fp32_t1_c2():
-    run_case(
-        "fp32_T1_c2", T=1, cores=2, seed=1, dtype=torch.float32
-    )  # full-compute both cores
+    run_case("fp32_T1_c2", T=1, cores=2, seed=1, dtype=torch.float32)  # LNC H-shard
 
 
 def test_fp32_t2_c2_hbm():
@@ -388,9 +394,7 @@ def test_align_t2_c2():
 
 
 def test_align_t1_c2():
-    run_align_case(
-        "align_T1_c2", T=1, cores=2, seed=6, hard=False
-    )  # moe_tkg H-shard limitation
+    run_align_case("align_T1_c2", T=1, cores=2, seed=6)  # LNC H-shard
 
 
 def main():
@@ -421,9 +425,7 @@ def main():
     )
     run_align_case("align_T1_c1", T=1, cores=1, seed=4)
     run_align_case("align_T2_c2", T=2, cores=2, seed=5)  # LNC2 token-shard
-    run_align_case(
-        "align_T1_c2", T=1, cores=2, seed=6, hard=False
-    )  # LNC2 T=1: moe_tkg H-shard limitation (routed itself broken there)
+    run_align_case("align_T1_c2", T=1, cores=2, seed=6)  # LNC2 T=1: H-shard
 
     print("\nALL HARD-GATED CASES PASSED")
 

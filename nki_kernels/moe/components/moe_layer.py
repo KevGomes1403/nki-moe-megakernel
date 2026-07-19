@@ -35,7 +35,11 @@ from nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
 from .post_attn_norm import post_attn_rmsnorm_compose
 from .routed_experts import NORM_SINGLE_CORE_FORCED, routed_experts_compose
 from .routed_experts_nki import store_tile_to_hbm_th
-from .shared_expert import moe_tkg_shard_decision, shared_expert_compose
+from .shared_expert import (
+    moe_h_shard_decision,
+    moe_tkg_shard_decision,
+    shared_expert_compose,
+)
 
 
 def kernel_assert(condition, error_text):
@@ -87,23 +91,27 @@ def sigma_gate_compose(normed_sb, sigma_gate_w):
     return g
 
 
-def gated_sum(routed_local, shared_local, g):
+def gated_sum(routed_local, shared_local, g, f_offset=0, H1_local=None):
     """combined = routed_local + broadcast(g) * shared_local, in [H0, T, H1] SBUF.
 
     ``g`` is [1, T] but T is the MIDDLE axis of [H0,T,H1]; broadcast it across the H0 partitions (one
     ones-matmul: [H0,T] = ones[1,H0].T @ g[1,T]) then multiply each H1 slice (T on the free axis) and add
-    routed. Operates on the full tile -- at cores=2/T>1 routed/shared hold only their token slice, so only
-    that slice is valid, which the caller's per-core store selects.
+    routed. Operates on this core's free-index block only -- at cores=2/T>1 routed/shared hold their token
+    slice over the full H (f_offset=0, H1_local=H1) and at cores=2/T==1 their H-shard; either way only the
+    core's own slice is valid, which the caller's per-core store selects.
 
     Args:
         routed_local / shared_local: [H0, T, H1] SBUF per-rank partials in identical per-core layout.
-        g:                           [1, T] SBUF fp32 sigmoid gate.
+        g:                           [1, T] SBUF fp32 sigmoid gate (rank- and core-replicated).
+        f_offset / H1_local:         this core's H-shard geometry (``moe_h_shard``); default = full H.
 
     Returns:
         combined: [H0, T, H1] SBUF per-rank partial (same dtype/layout as the inputs).
     """
     H0, T, H1 = routed_local.shape
     dtype = routed_local.dtype
+    if H1_local is None:
+        H1_local = H1
 
     ones_sb = nl.ndarray((1, H0), dtype=nl.float32, buffer=nl.sbuf)
     nisa.memset(dst=ones_sb, value=1.0)
@@ -115,7 +123,9 @@ def gated_sum(routed_local, shared_local, g):
     nisa.tensor_copy(dst=g_bc, src=g_bc_ps)
 
     combined = nl.ndarray((H0, T, H1), dtype=dtype, buffer=nl.sbuf)
-    for j in range(H1):  # T on free -> plain [H0,T] elementwise per H1 slice
+    for j in range(
+        f_offset, f_offset + H1_local
+    ):  # T on free -> plain [H0,T] elementwise per H1 slice
         nisa.tensor_tensor(
             dst=combined[:, :, j],
             data1=shared_local[:, :, j],
@@ -135,17 +145,29 @@ def _store_combined_hbm(combined, moe_intermediate, output_bsh=False):
     """Store the tp2013 combined [H0,T,H1] tile -> HBM [T,H] natural (or [1,T,H] if output_bsh).
 
     ``output_bsh`` emits the [B=1,S=T,H] shape the model's residual stream expects (free -- same memory
-    layout as [T,H]), so the caller needs no reshape. Token-shard aware: each core writes only its slice."""
+    layout as [T,H]), so the caller needs no reshape. Shard aware: each core writes only its slice."""
     H0, T, H1 = combined.shape
     H = H0 * H1
     _, n_s, _ = get_verified_program_sharding_info("moe_store", (0, 1), 2)
     H2 = H1 // n_s
     _, T_offset, T_per_shard = moe_tkg_shard_decision(T, H, moe_intermediate)
+    _, f_offset, H1_local = moe_h_shard_decision(T, H, H1, moe_intermediate)
     out_hbm = nl.ndarray(
         (1, T, H) if output_bsh else (T, H), dtype=combined.dtype, buffer=nl.shared_hbm
     )
     dst2d = out_hbm.reshape((T, H)) if output_bsh else out_hbm
-    store_tile_to_hbm_th(dst2d, combined, H0, H2, n_s, H, T_offset, T_per_shard)
+    store_tile_to_hbm_th(
+        dst2d,
+        combined,
+        H0,
+        H2,
+        n_s,
+        H,
+        T_offset,
+        T_per_shard,
+        s_offset=f_offset // H2,
+        s_count=H1_local // H2,
+    )
     return out_hbm
 
 
@@ -214,8 +236,12 @@ def moe_layer_compose(
         "shared_local/routed_local shape mismatch -- per-core layouts not aligned",
     )
 
+    # The sigma-gate stays FULL-H and rank/core-replicated: that replication is what makes
+    # AR(routed) + g*AR(shared) == AR(routed + g*shared) valid. Only the gated sum follows the H-shard.
     g = sigma_gate_compose(normed_sb, sigma_gate_w)
-    combined = gated_sum(routed_local, shared_local, g)
+    H0, T, H1 = routed_local.shape
+    _, f_offset, H1_local = moe_h_shard_decision(T, H0 * H1, H1, moe_intermediate)
+    combined = gated_sum(routed_local, shared_local, g, f_offset, H1_local)
 
     if output_in_sbuf:
         return combined

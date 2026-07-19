@@ -6,8 +6,9 @@ nkilib torch references (router_topk_torch_ref + moe_tkg_torch_ref), cross-check
 HF-style routed reference.
 
 Two readback paths share the norm+router+experts chain:
-  * HBM  (output_in_sbuf=False): moe_tkg returns natural [T, H] and assembles across LNC cores in HBM.
-    This is the AUTHORITATIVE correctness gate -- no layout assumption on the output. cores in {1, 2}.
+  * HBM  (output_in_sbuf=False): the kernel returns natural [T, H] and assembles across LNC cores in HBM.
+    This is the AUTHORITATIVE correctness gate -- no layout assumption on the output. cores in {1, 2},
+    covering both LNC work splits: token-shard (T>1) and H-shard (T==1).
   * SBUF (output_in_sbuf=True):  moe_tkg returns the megakernel-API SBUF [H0, T, H1]; the harness
     dma_copies it to HBM and the host un-permutes rmsnorm's [H0,T,H1] layout back to [T, H]. cores=1
     (at cores=2 each core holds only its H-shard; the cross-core gather belongs to the AR slice).
@@ -298,6 +299,10 @@ def test_fp32_t2_c2_e256():
     run_case("fp32_T2_c2_E256", T=2, cores=2, seed=3, dtype=torch.float32)
 
 
+def test_fp32_t1_c2_e256():
+    run_case("fp32_T1_c2_E256", T=1, cores=2, seed=1, dtype=torch.float32)  # H-shard
+
+
 def test_fp32_t1_c1_sbuf_e256():
     run_case(
         "fp32_T1_c1_SBUF_E256", T=1, cores=1, seed=1, dtype=torch.float32, sbuf_out=True
@@ -318,6 +323,10 @@ def test_bf16_t2_c2_e256():
     run_case("bf16_T2_c2_E256", T=2, cores=2, seed=3, dtype=torch.bfloat16)
 
 
+def test_bf16_t1_c2_e256():
+    run_case("bf16_T1_c2_E256", T=1, cores=2, seed=1, dtype=torch.bfloat16)  # H-shard
+
+
 def test_fp32_t2_c2_e16_fast():
     run_case("fp32_T2_c2_E16", T=2, cores=2, seed=7, dtype=torch.float32, E=16, K=8)
 
@@ -330,7 +339,10 @@ def main():
     run_case("fp32_T2_c1_E256", T=2, cores=1, seed=2, dtype=torch.float32)
     run_case(
         "fp32_T2_c2_E256", T=2, cores=2, seed=3, dtype=torch.float32
-    )  # LNC2 composition
+    )  # LNC2 token-shard
+    run_case(
+        "fp32_T1_c2_E256", T=1, cores=2, seed=1, dtype=torch.float32
+    )  # LNC2 H-shard
 
     print(
         "\n=== ROUTED-EXPERTS -- SBUF readback (megakernel API, un-permuted); FP32 HARD gate ==="
@@ -348,7 +360,10 @@ def main():
     run_case("bf16_T1_c1_E256", T=1, cores=1, seed=1, dtype=torch.bfloat16)
     run_case(
         "bf16_T2_c2_E256", T=2, cores=2, seed=3, dtype=torch.bfloat16
-    )  # LNC2 composition
+    )  # LNC2 token-shard
+    run_case(
+        "bf16_T1_c2_E256", T=1, cores=2, seed=1, dtype=torch.bfloat16
+    )  # LNC2 H-shard
 
     print("\n=== REDUCED-E fast case (E=16) ===")
     run_case("fp32_T2_c2_E16", T=2, cores=2, seed=7, dtype=torch.float32, E=16, K=8)
