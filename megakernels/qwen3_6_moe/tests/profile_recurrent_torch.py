@@ -5,7 +5,7 @@ Mirrors NeuronGatedDeltaNet._recurrent_step's post-l2norm math, vectorized over
 batched tensor ops. Lets us compare device total_time against the NKI kernel.
 
 Usage:
-    python -m models.qwen3_6_moe.tests.profile_recurrent_torch <H> <S> <outdir>
+    python -m megakernels.qwen3_6_moe.tests.profile_recurrent_torch <H> <S> <outdir>
 """
 
 import math

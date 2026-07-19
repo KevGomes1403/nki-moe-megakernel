@@ -19,7 +19,7 @@ By default this exercises the gated per-head RMSNorm path (z/gamma passed). Pass
 "raw" as the 3rd arg to profile the bare recurrence (z/gamma None) for an A/B baseline.
 
 Usage:
-    python -m models.qwen3_6_moe.tests.profile_fused_kernel <decode|verify> <outdir> [raw] [bf16]
+    python -m megakernels.qwen3_6_moe.tests.profile_fused_kernel <decode|verify> <outdir> [raw] [bf16]
       decode -> deltanet_fused_tkg_fwd        (T=1 commit)
       verify -> deltanet_fused_tkg_fwd_state  (T=2 verify)
       raw    -> skip z/gamma (no gated RMSNorm) for an A/B baseline
@@ -55,7 +55,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 import torch_xla.core.xla_model as xm  # noqa: E402
 
-from models.qwen3_6_moe.nki_kernels.deltanet.decode.fused_layer import (  # noqa: E402
+from megakernels.qwen3_6_moe.nki_kernels.deltanet.decode.fused_layer import (  # noqa: E402
     deltanet_fused_tkg_fwd,
     deltanet_fused_tkg_fwd_state,
 )

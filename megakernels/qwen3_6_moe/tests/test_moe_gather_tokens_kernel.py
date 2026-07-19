@@ -21,10 +21,10 @@ Gate: fp32 torch.allclose(atol=1e-5, rtol=1e-2) (exact expected). Prints max_abs
 reports WHICH token/column is wrong (swap? sentinel leak? wrong offset?). NO cosine.
 
 Run (CORES 0,1):
-    cd /home/ubuntu/trainium-model-translation && \
+    cd /home/ubuntu/nki-moe && \
     NEURON_RT_VISIBLE_CORES=0,1 NEURON_PLATFORM_TARGET_OVERRIDE=trn3pre \
     NEURON_CC_FLAGS="--target trn3pre --lnc 2" \
-    python -m models.qwen3_6_moe.tests.test_moe_gather_tokens_kernel
+    python -m megakernels.qwen3_6_moe.tests.test_moe_gather_tokens_kernel
 """
 
 import sys
@@ -45,10 +45,10 @@ from nkilib.core.utils.kernel_helpers import (  # noqa: E402
 )
 from nkilib.core.utils.tensor_view import TensorView  # noqa: E402
 
-from models.qwen3_6_moe.nki_kernels.megakernel.qwen36_verify_megakernel import (  # noqa: E402
+from megakernels.qwen3_6_moe.nki_kernels.megakernel.qwen36_verify_megakernel import (  # noqa: E402
     all_reduce_gather_tokens,
 )
-from models.qwen3_6_moe.nki_kernels.moe.components.routed_experts import (  # noqa: E402
+from megakernels.qwen3_6_moe.nki_kernels.moe.components.routed_experts import (  # noqa: E402
     MOE_BIG_CONFIG_HI,
     moe_token_shard,
 )

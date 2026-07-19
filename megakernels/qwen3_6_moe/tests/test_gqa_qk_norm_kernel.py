@@ -20,11 +20,11 @@ Precision (two dtypes per case, one CPU reference each):
     fp32 gate establish correctness; same precedent as Phase 1 / test_deltanet_in_proj_kernel).
 
 Run (USE ONLY CORE 2, single logical core, grid [1]):
-    cd /home/ubuntu/trainium-model-translation && \
+    cd /home/ubuntu/nki-moe && \
     source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate && \
     NEURON_RT_VISIBLE_CORES=2 NEURON_PLATFORM_TARGET_OVERRIDE=trn3pre \
     NEURON_CC_FLAGS="--target trn3pre --lnc 2" \
-    python -m models.qwen3_6_moe.tests.test_gqa_qk_norm_kernel
+    python -m megakernels.qwen3_6_moe.tests.test_gqa_qk_norm_kernel
 """
 
 import sys
@@ -40,7 +40,7 @@ import nki  # noqa: E402
 import nki.isa as nisa  # noqa: E402
 import nki.language as nl  # noqa: E402
 
-from models.qwen3_6_moe.nki_kernels.gqa.components.qk_norm import (  # noqa: E402
+from megakernels.qwen3_6_moe.nki_kernels.gqa.components.qk_norm import (  # noqa: E402
     HEAD_DIM,
     NUM_HEADS,
     NUM_KV_HEADS,

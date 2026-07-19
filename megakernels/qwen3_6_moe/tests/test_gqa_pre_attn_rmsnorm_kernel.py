@@ -19,11 +19,11 @@ Numeric gates (repo rule -- cosine similarity BANNED as a gate):
     SAME bf16-rounded inputs/gamma (avoids a false fail from gamma rounding).
 
 Run (USE ONLY CORE 2, one logical core, grid [2], LNC=2):
-    cd /home/ubuntu/trainium-model-translation && \
+    cd /home/ubuntu/nki-moe && \
     source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate && \
     NEURON_RT_VISIBLE_CORES=2 NEURON_PLATFORM_TARGET_OVERRIDE=trn3pre \
     NEURON_CC_FLAGS="--target trn3pre --lnc 2" \
-    python -m models.qwen3_6_moe.tests.test_gqa_pre_attn_rmsnorm_kernel
+    python -m megakernels.qwen3_6_moe.tests.test_gqa_pre_attn_rmsnorm_kernel
 """
 
 import sys
@@ -39,7 +39,7 @@ import nki  # noqa: E402
 import nki.isa as nisa  # noqa: E402
 import nki.language as nl  # noqa: E402
 
-from models.qwen3_6_moe.nki_kernels.gqa.components.pre_attn_norm import (  # noqa: E402
+from megakernels.qwen3_6_moe.nki_kernels.gqa.components.pre_attn_norm import (  # noqa: E402
     H,
     H0,
     pre_attn_rmsnorm_compose,

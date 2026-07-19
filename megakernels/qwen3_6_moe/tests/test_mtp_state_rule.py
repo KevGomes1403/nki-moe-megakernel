@@ -26,7 +26,7 @@ token. The SAME surrogate drives both the reference and the MTP-style path, so
 equivalence of the committed stream/state is meaningful.
 
 Run:
-    cd /home/ubuntu/trainium-model-translation && \
+    cd /home/ubuntu/nki-moe && \
     source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate && \
     python -m pytest models/qwen3_6_moe/tests/test_mtp_state_rule.py -x -q
 """
@@ -42,7 +42,7 @@ import torch
 # RMSNorm/parallel layers take their host paths.
 os.environ.setdefault("NXD_CPU_MODE", "1")
 
-# Repo root on sys.path so `models.qwen3_6_moe.*` resolves.
+# Repo root on sys.path so `megakernels.qwen3_6_moe.*` resolves.
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
@@ -54,7 +54,7 @@ from neuronx_distributed_inference.models.config import (  # noqa: E402
     OnDeviceSamplingConfig,
 )
 
-from models.qwen3_6_moe.modeling_qwen36_a3b import (  # noqa: E402
+from megakernels.qwen3_6_moe.modeling_qwen36_a3b import (  # noqa: E402
     NeuronGatedDeltaNet,
     Qwen36A3BInferenceConfig,
     commit_accept,

@@ -8,7 +8,7 @@ the NEW 10-arg contract (all f32):
     z (T,Hv*d) head-major; norm_weight (d,); init_state (Hv,d,d)
 
 Usage:
-    python -m models.qwen3_6_moe.tests.profile_tkg_kernel <decode|verify> <outdir>
+    python -m megakernels.qwen3_6_moe.tests.profile_tkg_kernel <decode|verify> <outdir>
       decode -> deltanet_tkg_fwd        (T=1 commit)
       verify -> deltanet_tkg_fwd_state  (T=2 verify, per-position candidate states)
 """
@@ -42,7 +42,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 import torch_xla.core.xla_model as xm  # noqa: E402
 
-from models.qwen3_6_moe.nki_kernels.deltanet.components.recurrence import (  # noqa: E402
+from megakernels.qwen3_6_moe.nki_kernels.deltanet.components.recurrence import (  # noqa: E402
     deltanet_tkg_fwd,
     deltanet_tkg_fwd_state,
 )

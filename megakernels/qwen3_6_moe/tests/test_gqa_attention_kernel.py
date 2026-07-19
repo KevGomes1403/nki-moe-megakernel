@@ -31,11 +31,11 @@ GATES:
   * Cross-check: vendored vs fresh_ref outputs agree (per-dtype floor).
 
 Run (CORES 0,1):
-    cd /home/ubuntu/trainium-model-translation && \
+    cd /home/ubuntu/nki-moe && \
     source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate && \
     NEURON_RT_VISIBLE_CORES=0,1 NEURON_PLATFORM_TARGET_OVERRIDE=trn3pre \
     NEURON_CC_FLAGS="--target trn3pre --lnc 2" \
-    python -m models.qwen3_6_moe.tests.test_gqa_attention_kernel
+    python -m megakernels.qwen3_6_moe.tests.test_gqa_attention_kernel
 """
 
 import math
@@ -52,10 +52,10 @@ import nki  # noqa: E402
 import nki.isa as nisa  # noqa: E402
 import nki.language as nl  # noqa: E402
 
-from models.qwen3_6_moe.nki_kernels.gqa.components.attention import (  # noqa: E402
+from megakernels.qwen3_6_moe.nki_kernels.gqa.components.attention import (  # noqa: E402
     gqa_attention_d256,
 )
-from models.qwen3_6_moe.nki_kernels.gqa.components.attention_fresh_ref import (  # noqa: E402
+from megakernels.qwen3_6_moe.nki_kernels.gqa.components.attention_fresh_ref import (  # noqa: E402
     gqa_attention_core,
 )
 

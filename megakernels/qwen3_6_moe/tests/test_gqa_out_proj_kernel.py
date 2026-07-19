@@ -27,11 +27,11 @@ Optional output gate: a separate case folds in gated = attn_in * sigmoid(gate) b
 exercising the real attn -> gate -> o_proj tail. Tested in both FP32 (hard gate) and BF16.
 
 Run:
-    cd /home/ubuntu/trainium-model-translation && \
+    cd /home/ubuntu/nki-moe && \
     source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate && \
     NEURON_RT_VISIBLE_CORES=0,1 NEURON_PLATFORM_TARGET_OVERRIDE=trn3pre \
     NEURON_CC_FLAGS="--target trn3pre --lnc 2" \
-    python -m models.qwen3_6_moe.tests.test_gqa_out_proj_kernel
+    python -m megakernels.qwen3_6_moe.tests.test_gqa_out_proj_kernel
 """
 
 import sys
@@ -47,7 +47,7 @@ import nki  # noqa: E402
 import nki.isa as nisa  # noqa: E402
 import nki.language as nl  # noqa: E402
 
-from models.qwen3_6_moe.nki_kernels.gqa.components.out_proj import (  # noqa: E402
+from megakernels.qwen3_6_moe.nki_kernels.gqa.components.out_proj import (  # noqa: E402
     out_proj_compose,
 )
 

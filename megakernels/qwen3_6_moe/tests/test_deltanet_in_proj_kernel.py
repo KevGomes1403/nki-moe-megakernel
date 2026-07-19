@@ -27,11 +27,11 @@ structural error a loose elementwise tol would miss). These thresholds are tight
 bug (wrong slice, missing norm, a regressed matmul pass) still fails; see the printed metrics.
 
 Run:
-    cd /home/ubuntu/trainium-model-translation && \
+    cd /home/ubuntu/nki-moe && \
     source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate && \
     NEURON_RT_VISIBLE_CORES=0 NEURON_PLATFORM_TARGET_OVERRIDE=trn3pre \
     NEURON_CC_FLAGS="--target trn3pre --lnc 2" \
-    python -m models.qwen3_6_moe.tests.test_deltanet_in_proj_kernel
+    python -m megakernels.qwen3_6_moe.tests.test_deltanet_in_proj_kernel
 """
 
 import sys
@@ -43,7 +43,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from models.qwen3_6_moe.nki_kernels.deltanet.components.in_proj import (  # noqa: E402
+from megakernels.qwen3_6_moe.nki_kernels.deltanet.components.in_proj import (  # noqa: E402
     deltanet_in_proj_fwd,
 )
 

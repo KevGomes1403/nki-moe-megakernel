@@ -23,11 +23,11 @@ the fp32 HARD gate at its literal tolerance -- at SMALL_VOCAB, which still exerc
 reduce. Nothing is relaxed but the vocab width.
 
 Run (LNC=2, two logical cores):
-    cd /home/ubuntu/trainium-model-translation && \
+    cd /home/ubuntu/nki-moe && \
     source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate && \
     NEURON_RT_VISIBLE_CORES=0,1 NEURON_PLATFORM_TARGET_OVERRIDE=trn3pre \
     NEURON_CC_FLAGS="--target trn3pre --lnc 2" \
-    python -m models.qwen3_6_moe.tests.test_lm_head_kernel
+    python -m megakernels.qwen3_6_moe.tests.test_lm_head_kernel
 
 Single-core cases pin NEURON_RT_VISIBLE_CORES=2.
 """
@@ -41,7 +41,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from models.qwen3_6_moe.nki_kernels.lm_head.components.lm_head import (  # noqa: E402
+from megakernels.qwen3_6_moe.nki_kernels.lm_head.components.lm_head import (  # noqa: E402
     lm_head_fwd,
 )
 

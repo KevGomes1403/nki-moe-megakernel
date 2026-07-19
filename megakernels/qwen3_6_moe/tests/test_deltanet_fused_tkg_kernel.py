@@ -21,11 +21,11 @@ Staged so a failure localizes:
 Tolerance: atol=1e-5, rtol=1e-2 on every output.
 
 Run:
-    cd /home/ubuntu/trainium-model-translation && \
+    cd /home/ubuntu/nki-moe && \
     source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate && \
     NEURON_RT_VISIBLE_CORES=0 NEURON_PLATFORM_TARGET_OVERRIDE=trn3pre \
     NEURON_CC_FLAGS="--target trn3pre --lnc 2" \
-    python -m models.qwen3_6_moe.tests.test_deltanet_fused_tkg_kernel
+    python -m megakernels.qwen3_6_moe.tests.test_deltanet_fused_tkg_kernel
 """
 
 import sys
@@ -43,11 +43,11 @@ _HF_REF = Path(__file__).resolve().parent.parent / "_hf_reference"
 if str(_HF_REF) not in sys.path:
     sys.path.insert(0, str(_HF_REF))
 
-from models.qwen3_6_moe.nki_kernels.deltanet.decode.fused_layer import (  # noqa: E402
+from megakernels.qwen3_6_moe.nki_kernels.deltanet.decode.fused_layer import (  # noqa: E402
     deltanet_fused_tkg_fwd,
     deltanet_fused_tkg_fwd_state,
 )
-from models.qwen3_6_moe.tests.test_deltanet_conv_tkg_kernel import (  # noqa: E402
+from megakernels.qwen3_6_moe.tests.test_deltanet_conv_tkg_kernel import (  # noqa: E402
     CONV_DIM,
     HEAD_DIM,
     HV,
@@ -55,7 +55,7 @@ from models.qwen3_6_moe.tests.test_deltanet_conv_tkg_kernel import (  # noqa: E4
     KEY_DIM,
     ref_conv,
 )
-from models.qwen3_6_moe.tests.test_deltanet_tkg_kernel import ref_full  # noqa: E402
+from megakernels.qwen3_6_moe.tests.test_deltanet_tkg_kernel import ref_full  # noqa: E402
 from modeling_qwen3_5_moe import Qwen3_5MoeRMSNormGated  # noqa: E402
 
 STATE_W = K - 1

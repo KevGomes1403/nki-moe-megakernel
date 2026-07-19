@@ -14,7 +14,7 @@ from pathlib import Path
 
 import torch
 
-# Repo root on sys.path so `models.qwen3_6_moe.*` resolves.
+# Repo root on sys.path so `megakernels.qwen3_6_moe.*` resolves.
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
@@ -30,7 +30,7 @@ from neuronx_distributed_inference.models.config import (
     OnDeviceSamplingConfig,
 )
 
-from models.qwen3_6_moe.modeling_qwen36_a3b import (
+from megakernels.qwen3_6_moe.modeling_qwen36_a3b import (
     NeuronGatedDeltaNet,
     Qwen36A3BInferenceConfig,
     build_deltanet_in_proj_fused,

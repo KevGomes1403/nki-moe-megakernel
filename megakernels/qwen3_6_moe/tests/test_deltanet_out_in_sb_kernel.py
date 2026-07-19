@@ -26,10 +26,10 @@ If SBUF-in diverges from deltanet_attention_layer_state (while GQA matched), tha
 megakernel bug -- the test characterizes the divergence; it does NOT edit the kernel to make it pass.
 
 Run (CORES 0,1):
-    cd /home/ubuntu/trainium-model-translation && \
+    cd /home/ubuntu/nki-moe && \
     NEURON_RT_VISIBLE_CORES=0,1 NEURON_PLATFORM_TARGET_OVERRIDE=trn3pre \
     NEURON_CC_FLAGS="--target trn3pre --lnc 2" \
-    python -m models.qwen3_6_moe.tests.test_deltanet_out_in_sb_kernel
+    python -m megakernels.qwen3_6_moe.tests.test_deltanet_out_in_sb_kernel
 """
 
 import sys
@@ -50,16 +50,16 @@ from nkilib.core.utils.kernel_helpers import (  # noqa: E402
 )
 from nkilib.core.utils.tensor_view import TensorView  # noqa: E402
 
-from models.qwen3_6_moe.nki_kernels.deltanet.decode.fused_layer import (  # noqa: E402
+from megakernels.qwen3_6_moe.nki_kernels.deltanet.decode.fused_layer import (  # noqa: E402
     attention_layer_compose,
     deltanet_attention_layer_state,
 )
-from models.qwen3_6_moe.nki_kernels.megakernel.qwen36_verify_megakernel import (  # noqa: E402
+from megakernels.qwen3_6_moe.nki_kernels.megakernel.qwen36_verify_megakernel import (  # noqa: E402
     load_residual_to_sbuf,
 )
 
 # Reuse the trusted recurrence reference + input construction VERBATIM (do not re-derive).
-from models.qwen3_6_moe.tests.test_deltanet_in_proj_out_fused_kernel import (  # noqa: E402
+from megakernels.qwen3_6_moe.tests.test_deltanet_in_proj_out_fused_kernel import (  # noqa: E402
     ATOL,
     CONV_DIM,
     EPS,

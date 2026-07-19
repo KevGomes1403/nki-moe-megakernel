@@ -39,7 +39,7 @@ Single-TP-shard PyTorch-reference tests, fp32 hard gate `atol=1e-5, rtol=1e-2`
 (bf16 reported with cosine/floor — deep-contraction bf16-vs-fp32 noise is expected):
 
 ```
-cd /home/ubuntu/trainium-model-translation && source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate && \
+cd /home/ubuntu/nki-moe && source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate && \
 NEURON_RT_VISIBLE_CORES=0,1 NEURON_PLATFORM_TARGET_OVERRIDE=trn3pre NEURON_CC_FLAGS="--target trn3pre --lnc 2" \
 python -m models.qwen3_6_moe.tests.test_gqa_<phase>_kernel
 ```

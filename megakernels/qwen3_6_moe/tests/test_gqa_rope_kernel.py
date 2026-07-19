@@ -30,11 +30,11 @@ Precision (two dtypes per case):
 Cases: T=1 (position [13]) and T=2 (distinct positions [13, 27]) so the rotation is non-trivial.
 
 Run (USE CORE 3 ONLY):
-    cd /home/ubuntu/trainium-model-translation && \
+    cd /home/ubuntu/nki-moe && \
     source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate && \
     NEURON_RT_VISIBLE_CORES=3 NEURON_PLATFORM_TARGET_OVERRIDE=trn3pre \
     NEURON_CC_FLAGS="--target trn3pre --lnc 2" \
-    python -m models.qwen3_6_moe.tests.test_gqa_rope_kernel
+    python -m megakernels.qwen3_6_moe.tests.test_gqa_rope_kernel
 """
 
 import sys
@@ -50,7 +50,7 @@ import nki  # noqa: E402
 import nki.isa as nisa  # noqa: E402
 import nki.language as nl  # noqa: E402
 
-from models.qwen3_6_moe.nki_kernels.gqa.components.rope import (  # noqa: E402
+from megakernels.qwen3_6_moe.nki_kernels.gqa.components.rope import (  # noqa: E402
     HEAD_DIM,
     NUM_HEADS,
     NUM_ROPE_HEADS,

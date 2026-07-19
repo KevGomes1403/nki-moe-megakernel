@@ -7,7 +7,7 @@ the modeling-side valid_mask). The length-sweep showed the model NaNs even at
 1 real token, so this probe replicates exactly that kernel-input regime to see
 whether the kernel itself produces the NaN (structurally, not via decay).
 
-Run:  NEURON_RT_VISIBLE_CORES=0 python -m models.qwen3_6_moe.tests.probe_kernel_padding
+Run:  NEURON_RT_VISIBLE_CORES=0 python -m megakernels.qwen3_6_moe.tests.probe_kernel_padding
 """
 
 import math
@@ -20,7 +20,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from models.qwen3_6_moe.nki_kernels.deltanet.prefill.chunked_fused import (  # noqa: E402
+from megakernels.qwen3_6_moe.nki_kernels.deltanet.prefill.chunked_fused import (  # noqa: E402
     deltanet_fused_chunked_fwd,
     _make_lower_mask,
     _make_identity,

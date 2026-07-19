@@ -37,7 +37,7 @@ import torch
 import transformers
 from transformers import AutoTokenizer, GenerationConfig
 
-# Make `models.qwen3_6_moe.*` importable when running this file directly.
+# Make `megakernels.qwen3_6_moe.*` importable when running this file directly.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
@@ -62,7 +62,7 @@ from neuronx_distributed_inference.utils.benchmark import (  # noqa: E402
     register_latency_collectors,
 )
 
-from models.qwen3_6_moe.modeling_qwen36_a3b import (  # noqa: E402
+from megakernels.qwen3_6_moe.modeling_qwen36_a3b import (  # noqa: E402
     NeuronQwen36A3BForCausalLM,
     NeuronQwen36MTPDraftForCausalLM,
     Qwen36A3BInferenceConfig,

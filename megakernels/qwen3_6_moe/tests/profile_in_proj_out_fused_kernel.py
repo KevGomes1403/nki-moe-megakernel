@@ -21,7 +21,7 @@ gather + transpose + output_projection_tkg matmul that fusion adds). Reference m
     z_eps       python float      gated per-head RMSNorm epsilon
 
 Usage:
-    python -m models.qwen3_6_moe.tests.profile_in_proj_out_fused_kernel <decode|verify> <outdir> [bf16]
+    python -m megakernels.qwen3_6_moe.tests.profile_in_proj_out_fused_kernel <decode|verify> <outdir> [bf16]
       decode -> deltanet_attention_layer        (T=1 commit)
       verify -> deltanet_attention_layer_state  (T=2 verify)
       bf16   -> bf16 inputs (default f32) for an fp32-vs-bf16 perf A/B
@@ -52,7 +52,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 import torch_xla.core.xla_model as xm  # noqa: E402
 
-from models.qwen3_6_moe.nki_kernels.deltanet.decode.fused_layer import (  # noqa: E402
+from megakernels.qwen3_6_moe.nki_kernels.deltanet.decode.fused_layer import (  # noqa: E402
     deltanet_attention_layer,
     deltanet_attention_layer_state,
 )

@@ -20,11 +20,11 @@ Staged simplest -> hardest so a failure localizes:
 Tolerance: atol=1e-5, rtol=1e-2 on every output.
 
 Run (pin to core 0):
-    cd /home/ubuntu/trainium-model-translation && \
+    cd /home/ubuntu/nki-moe && \
     source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate && \
     NEURON_RT_VISIBLE_CORES=0 NEURON_PLATFORM_TARGET_OVERRIDE=trn3pre \
     NEURON_CC_FLAGS="--target trn3pre --lnc 2" \
-    python -m models.qwen3_6_moe.tests.test_deltanet_tkg_kernel
+    python -m megakernels.qwen3_6_moe.tests.test_deltanet_tkg_kernel
 """
 
 import math
@@ -37,7 +37,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from models.qwen3_6_moe.nki_kernels.deltanet.components.recurrence import (  # noqa: E402
+from megakernels.qwen3_6_moe.nki_kernels.deltanet.components.recurrence import (  # noqa: E402
     deltanet_tkg_fwd,
     deltanet_tkg_fwd_state,
 )

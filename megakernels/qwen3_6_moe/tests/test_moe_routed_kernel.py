@@ -25,11 +25,11 @@ Real A3B routed dims: H=2048, E=256, K=8, I=128 (per-rank, TP=4). A reduced-E (E
 also run for quick iteration; at least one real-dims case is always exercised.
 
 Run (CORES 0,1):
-    cd /home/ubuntu/trainium-model-translation && \
+    cd /home/ubuntu/nki-moe && \
     source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate && \
     NEURON_RT_VISIBLE_CORES=0,1 NEURON_PLATFORM_TARGET_OVERRIDE=trn3pre \
     NEURON_CC_FLAGS="--target trn3pre --lnc 2" \
-    python -m models.qwen3_6_moe.tests.test_moe_routed_kernel
+    python -m megakernels.qwen3_6_moe.tests.test_moe_routed_kernel
 """
 
 import math
@@ -55,7 +55,7 @@ from nkilib.core.utils.common_types import (  # noqa: E402
     RouterActFnType,
 )
 
-from models.qwen3_6_moe.nki_kernels.moe.components.routed_experts import (  # noqa: E402
+from megakernels.qwen3_6_moe.nki_kernels.moe.components.routed_experts import (  # noqa: E402
     moe_routed_compose,
 )
 

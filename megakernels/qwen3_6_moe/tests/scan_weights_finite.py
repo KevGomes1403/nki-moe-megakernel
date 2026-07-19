@@ -5,7 +5,7 @@ ruled out. A single non-finite weight on disk would explain a NaN at any
 length (incl. via 0*inf in the all-experts MoE path). This scans the loaded
 shards tensor-by-tensor (lazily) and reports any non-finite key.
 
-Run:  python -m models.qwen3_6_moe.tests.scan_weights_finite [shard.safetensors ...]
+Run:  python -m megakernels.qwen3_6_moe.tests.scan_weights_finite [shard.safetensors ...]
 """
 
 import sys

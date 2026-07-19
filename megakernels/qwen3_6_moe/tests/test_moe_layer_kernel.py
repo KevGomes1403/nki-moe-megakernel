@@ -25,11 +25,11 @@ Cases: cores=1 {T=1, T=2}, cores=2 {T=2} (token-shard, the verify priority), cor
 LNC H-shard -- each core owns half the tp2013 free axis, gate/up cross-core reduced, down disjoint).
 
 Run (CORES 0,1):
-    cd /home/ubuntu/trainium-model-translation && \
+    cd /home/ubuntu/nki-moe && \
     source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate && \
     NEURON_RT_VISIBLE_CORES=0,1 NEURON_PLATFORM_TARGET_OVERRIDE=trn3pre \
     NEURON_CC_FLAGS="--target trn3pre --lnc 2" \
-    python -m models.qwen3_6_moe.tests.test_moe_layer_kernel
+    python -m megakernels.qwen3_6_moe.tests.test_moe_layer_kernel
 """
 
 import math
@@ -45,14 +45,14 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from models.qwen3_6_moe.nki_kernels.moe.components.moe_layer import (  # noqa: E402
+from megakernels.qwen3_6_moe.nki_kernels.moe.components.moe_layer import (  # noqa: E402
     moe_layer_compose,
     sigma_gate_compose,
 )
-from models.qwen3_6_moe.nki_kernels.moe.components.post_attn_norm import (  # noqa: E402
+from megakernels.qwen3_6_moe.nki_kernels.moe.components.post_attn_norm import (  # noqa: E402
     post_attn_rmsnorm_compose,
 )
-from models.qwen3_6_moe.nki_kernels.moe.components.shared_expert import (  # noqa: E402
+from megakernels.qwen3_6_moe.nki_kernels.moe.components.shared_expert import (  # noqa: E402
     moe_h_shard_decision,
     moe_tkg_shard_decision,
 )

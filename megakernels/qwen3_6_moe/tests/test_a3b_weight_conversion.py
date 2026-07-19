@@ -19,14 +19,14 @@ import unittest
 
 import torch
 
-# Ensure the parent project root is on sys.path so 'models.qwen3_6_moe.*' resolves.
+# Ensure the parent project root is on sys.path so 'megakernels.qwen3_6_moe.*' resolves.
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from neuronx_distributed_inference.models.config import OnDeviceSamplingConfig  # noqa: E402
 
-from models.qwen3_6_moe.modeling_qwen36_a3b import (  # noqa: E402
+from megakernels.qwen3_6_moe.modeling_qwen36_a3b import (  # noqa: E402
     NeuronQwen36A3BForCausalLM,
     Qwen36A3BInferenceConfig,
     convert_qwen36_a3b_hf_to_neuron_state_dict,

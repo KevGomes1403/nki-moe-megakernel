@@ -22,10 +22,10 @@ Gate: fp32 torch.allclose(atol=1e-5, rtol=1e-2). max_abs / max_rel printed for e
 cosine similarity (banned repo-wide).
 
 Run (CORES 0,1):
-    cd /home/ubuntu/trainium-model-translation && \
+    cd /home/ubuntu/nki-moe && \
     NEURON_RT_VISIBLE_CORES=0,1 NEURON_PLATFORM_TARGET_OVERRIDE=trn3pre \
     NEURON_CC_FLAGS="--target trn3pre --lnc 2" \
-    python -m models.qwen3_6_moe.tests.test_gqa_out_in_sb_kernel
+    python -m megakernels.qwen3_6_moe.tests.test_gqa_out_in_sb_kernel
 """
 
 import sys
@@ -47,17 +47,17 @@ from nkilib.core.utils.kernel_helpers import (  # noqa: E402
 )
 from nkilib.core.utils.tensor_view import TensorView  # noqa: E402
 
-from models.qwen3_6_moe.nki_kernels.gqa.decode.fused_layer import (  # noqa: E402
+from megakernels.qwen3_6_moe.nki_kernels.gqa.decode.fused_layer import (  # noqa: E402
     gqa_fused_compose,
     gqa_fused_tkg_fwd,
 )
-from models.qwen3_6_moe.nki_kernels.megakernel.qwen36_verify_megakernel import (  # noqa: E402
+from megakernels.qwen3_6_moe.nki_kernels.megakernel.qwen36_verify_megakernel import (  # noqa: E402
     all_reduce_gather_h,
     load_residual_to_sbuf,
 )
 
 # Reuse the trusted reference + input construction VERBATIM (do not re-derive).
-from models.qwen3_6_moe.tests.test_gqa_fused_layer_kernel import (  # noqa: E402
+from megakernels.qwen3_6_moe.tests.test_gqa_fused_layer_kernel import (  # noqa: E402
     ATOL,
     EPS,
     HIDDEN,

@@ -28,11 +28,11 @@ Staged so a failure localizes:
   3. cores=1 vs cores=2 on the verify path -- same hard gate.
 
 Run:
-    cd /home/ubuntu/trainium-model-translation && \
+    cd /home/ubuntu/nki-moe && \
     source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate && \
     NEURON_RT_VISIBLE_CORES=0 NEURON_PLATFORM_TARGET_OVERRIDE=trn3pre \
     NEURON_CC_FLAGS="--target trn3pre --lnc 2" \
-    python -m models.qwen3_6_moe.tests.test_deltanet_in_proj_fused_kernel
+    python -m megakernels.qwen3_6_moe.tests.test_deltanet_in_proj_fused_kernel
 """
 
 import math
@@ -46,11 +46,11 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from models.qwen3_6_moe.nki_kernels.deltanet.decode.fused_layer import (  # noqa: E402
+from megakernels.qwen3_6_moe.nki_kernels.deltanet.decode.fused_layer import (  # noqa: E402
     deltanet_in_proj_fused_tkg_fwd,
     deltanet_in_proj_fused_tkg_fwd_state,
 )
-from models.qwen3_6_moe.tests.test_deltanet_conv_tkg_kernel import (  # noqa: E402
+from megakernels.qwen3_6_moe.tests.test_deltanet_conv_tkg_kernel import (  # noqa: E402
     CONV_DIM,
     HEAD_DIM,
     HV,

@@ -17,7 +17,7 @@ kernel's NEFF. Reference math is NOT computed. Inputs mirror tests/test_deltanet
     z_eps       python float      gated per-head RMSNorm epsilon
 
 Usage:
-    python -m models.qwen3_6_moe.tests.profile_in_proj_fused_kernel <decode|verify> <outdir> [bf16]
+    python -m megakernels.qwen3_6_moe.tests.profile_in_proj_fused_kernel <decode|verify> <outdir> [bf16]
       decode -> deltanet_in_proj_fused_tkg_fwd        (T=1 commit)
       verify -> deltanet_in_proj_fused_tkg_fwd_state  (T=2 verify)
       bf16   -> bf16 inputs (default f32) for an fp32-vs-bf16 perf A/B
@@ -48,7 +48,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 import torch_xla.core.xla_model as xm  # noqa: E402
 
-from models.qwen3_6_moe.nki_kernels.deltanet.decode.fused_layer import (  # noqa: E402
+from megakernels.qwen3_6_moe.nki_kernels.deltanet.decode.fused_layer import (  # noqa: E402
     deltanet_in_proj_fused_tkg_fwd,
     deltanet_in_proj_fused_tkg_fwd_state,
 )

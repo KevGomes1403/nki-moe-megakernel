@@ -73,7 +73,7 @@ device at a time. To run isolated single-core kernel work in parallel, set
    resolve:
 
    ```bash
-   cd /home/ubuntu/trainium-model-translation
+   cd /home/ubuntu/nki-moe
    ```
 
 ## Running inference

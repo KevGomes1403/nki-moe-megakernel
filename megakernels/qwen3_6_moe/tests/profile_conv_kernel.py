@@ -9,7 +9,7 @@ at the NEW contract (qkv token-major [T, conv_dim]):
     conv_weight(conv_dim, K)    per-channel taps
 
 Usage:
-    python -m models.qwen3_6_moe.tests.profile_conv_kernel <decode|verify> <outdir>
+    python -m megakernels.qwen3_6_moe.tests.profile_conv_kernel <decode|verify> <outdir>
       decode -> deltanet_conv_tkg_fwd       (T=1 commit)
       verify -> deltanet_conv_tkg_fwd_cand  (T=2 verify)
 """
@@ -43,7 +43,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 import torch_xla.core.xla_model as xm  # noqa: E402
 
-from models.qwen3_6_moe.nki_kernels.deltanet.components.conv import (  # noqa: E402
+from megakernels.qwen3_6_moe.nki_kernels.deltanet.components.conv import (  # noqa: E402
     deltanet_conv_tkg_fwd,
     deltanet_conv_tkg_fwd_cand,
 )

@@ -32,11 +32,11 @@ Precision (two dtypes per case):
 Out of scope: the model's separate sigmoid output-gate projection (a later phase).
 
 Run (USE CORES 2,3):
-    cd /home/ubuntu/trainium-model-translation && \
+    cd /home/ubuntu/nki-moe && \
     source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate && \
     NEURON_RT_VISIBLE_CORES=2,3 NEURON_PLATFORM_TARGET_OVERRIDE=trn3pre \
     NEURON_CC_FLAGS="--target trn3pre --lnc 2" \
-    python -m models.qwen3_6_moe.tests.test_gqa_qkv_proj_kernel
+    python -m megakernels.qwen3_6_moe.tests.test_gqa_qkv_proj_kernel
 """
 
 import sys
@@ -52,7 +52,7 @@ import nki  # noqa: E402
 import nki.isa as nisa  # noqa: E402
 import nki.language as nl  # noqa: E402
 
-from models.qwen3_6_moe.nki_kernels.gqa.components.qkv_proj import (  # noqa: E402
+from megakernels.qwen3_6_moe.nki_kernels.gqa.components.qkv_proj import (  # noqa: E402
     HEAD_DIM,
     I_DIM,
     NUM_HEADS,
