@@ -25,8 +25,8 @@ reduce. Nothing is relaxed but the vocab width.
 Run (LNC=2, two logical cores):
     cd /home/ubuntu/nki-moe && \
     source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate && \
-    NEURON_RT_VISIBLE_CORES=0,1 NEURON_PLATFORM_TARGET_OVERRIDE=trn3pre \
-    NEURON_CC_FLAGS="--target trn3pre --lnc 2" \
+    NEURON_RT_VISIBLE_CORES=0,1 NEURON_PLATFORM_TARGET_OVERRIDE=trn2 \
+    NEURON_CC_FLAGS="--target trn2 --lnc 2" \
     python -m megakernels.qwen3_6_moe.tests.test_lm_head_kernel
 
 Single-core cases pin NEURON_RT_VISIBLE_CORES=2.

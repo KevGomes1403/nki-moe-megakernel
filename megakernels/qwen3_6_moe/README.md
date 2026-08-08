@@ -1,7 +1,7 @@
 # Qwen3.6-35B-A3B on AWS Trainium
 
 A self-contained port of the text stack of `Qwen/Qwen3.6-35B-A3B` to AWS Trainium
-(trn3) using NxD Inference (NxDI). The model has roughly 35B total parameters with
+(trn2) using NxD Inference (NxDI). The model has roughly 35B total parameters with
 about 3B active per token (the "A3B" mixture-of-experts configuration). This
 directory contains the modeling code, the DeltaNet NKI kernels, an inference driver,
 and diagnostics.
@@ -48,7 +48,7 @@ and the draft-verify-accept loop runs in one fused on-device graph
 
 ## Hardware and parallelism
 
-- Target platform: trn3. Validated on a `trn3pd98.3xlarge` instance, which exposes one
+- Target platform: trn2. Validated on a `trn2.3xlarge` instance, which exposes one
   Neuron device with 4 NeuronCores.
 - Logical NeuronCore configuration (LNC): 2.
 - Tensor parallel degree (TP): 4. Expert parallel degree (EP): 1.

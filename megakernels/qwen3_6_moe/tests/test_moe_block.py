@@ -1,7 +1,7 @@
 """Hardware block test for NeuronMoEBlock.
 
 Compares NxDI's compiled MoE block against the HF reference
-(Qwen3_5MoeSparseMoeBlock) on trn3 with TP=4, LNC=2.
+(Qwen3_5MoeSparseMoeBlock) on trn2 with TP=4, LNC=2.
 
 Reference is vendored at models/qwen3_6_moe/_hf_reference/ from
 huggingface/transformers main; the dimensions are deliberately tiny so the

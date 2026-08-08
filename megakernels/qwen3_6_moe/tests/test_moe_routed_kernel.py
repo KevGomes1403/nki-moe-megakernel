@@ -27,8 +27,8 @@ also run for quick iteration; at least one real-dims case is always exercised.
 Run (CORES 0,1):
     cd /home/ubuntu/nki-moe && \
     source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate && \
-    NEURON_RT_VISIBLE_CORES=0,1 NEURON_PLATFORM_TARGET_OVERRIDE=trn3pre \
-    NEURON_CC_FLAGS="--target trn3pre --lnc 2" \
+    NEURON_RT_VISIBLE_CORES=0,1 NEURON_PLATFORM_TARGET_OVERRIDE=trn2 \
+    NEURON_CC_FLAGS="--target trn2 --lnc 2" \
     python -m megakernels.qwen3_6_moe.tests.test_moe_routed_kernel
 """
 

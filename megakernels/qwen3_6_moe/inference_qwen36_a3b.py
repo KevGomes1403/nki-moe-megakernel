@@ -1,6 +1,6 @@
 """End-to-end inference driver for Qwen3.6-35B-A3B on Trainium.
 
-Default config: trn3pre, TP=4, LNC=2, bf16, seq_len=128, greedy sampling.
+Default config: trn2, TP=4, LNC=2, bf16, seq_len=128, greedy sampling.
 Compiles once into --compiled-path, then loads and generates for a few
 short prompts to validate that the port produces sensible tokens.
 
@@ -30,8 +30,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-# Pre-release trn3 silicon reports its platform as "trn3pre"
-os.environ.setdefault("NEURON_PLATFORM_TARGET_OVERRIDE", "trn3pre")
+os.environ.setdefault("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
 
 import torch
 import transformers

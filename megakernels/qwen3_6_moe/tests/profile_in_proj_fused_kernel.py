@@ -28,8 +28,8 @@ import sys
 
 # Profiling env vars MUST be set before importing torch_xla.
 _OUTDIR = sys.argv[2] if len(sys.argv) > 2 else "./output"
-os.environ.setdefault("NEURON_PLATFORM_TARGET_OVERRIDE", "trn3pre")
-os.environ.setdefault("NEURON_CC_FLAGS", "--target trn3pre --lnc 2")
+os.environ.setdefault("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
+os.environ.setdefault("NEURON_CC_FLAGS", "--target trn2 --lnc 2")
 os.environ["NEURON_RT_INSPECT_ENABLE"] = "1"
 os.environ["NEURON_RT_INSPECT_DEVICE_PROFILE"] = "1"
 os.environ["NEURON_RT_INSPECT_OUTPUT_DIR"] = _OUTDIR

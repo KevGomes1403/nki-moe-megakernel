@@ -22,8 +22,8 @@ Precision (two dtypes per case, one CPU reference each):
 Run (USE ONLY CORE 2, single logical core, grid [1]):
     cd /home/ubuntu/nki-moe && \
     source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate && \
-    NEURON_RT_VISIBLE_CORES=2 NEURON_PLATFORM_TARGET_OVERRIDE=trn3pre \
-    NEURON_CC_FLAGS="--target trn3pre --lnc 2" \
+    NEURON_RT_VISIBLE_CORES=2 NEURON_PLATFORM_TARGET_OVERRIDE=trn2 \
+    NEURON_CC_FLAGS="--target trn2 --lnc 2" \
     python -m megakernels.qwen3_6_moe.tests.test_gqa_qk_norm_kernel
 """
 

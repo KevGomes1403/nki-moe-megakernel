@@ -19,11 +19,10 @@ import sys
 
 # Profiling env vars MUST be set before importing torch_xla.
 _OUTDIR = sys.argv[2] if len(sys.argv) > 2 else "./output"
-# Pre-release trn3 silicon reports its platform as "trn3pre"; the NEFF must be
-# compiled for that exact target (and LNC=2, as the model runs) or the runtime
-# rejects it as a newer/invalid arch revision.
-os.environ.setdefault("NEURON_PLATFORM_TARGET_OVERRIDE", "trn3pre")
-os.environ.setdefault("NEURON_CC_FLAGS", "--target trn3pre --lnc 2")
+# The NEFF must be compiled for the exact target and LNC the model runs at,
+# or the runtime rejects it as an invalid arch revision.
+os.environ.setdefault("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
+os.environ.setdefault("NEURON_CC_FLAGS", "--target trn2 --lnc 2")
 os.environ["NEURON_RT_INSPECT_ENABLE"] = "1"
 os.environ["NEURON_RT_INSPECT_DEVICE_PROFILE"] = "1"
 os.environ["NEURON_RT_INSPECT_OUTPUT_DIR"] = _OUTDIR
