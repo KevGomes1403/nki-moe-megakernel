@@ -117,6 +117,7 @@ def build_inference_config(
     tkg_attention_kernel: bool = False,
     moe_layer_kernel: bool = False,
     verify_megakernel: bool = False,
+    draft_megakernel: bool = False,
 ) -> Qwen36A3BInferenceConfig:
     """Build the NxDI config from the HF config.json on disk.
 
@@ -135,7 +136,8 @@ def build_inference_config(
             "rope_theta", 10_000_000
         )
     config_dict.setdefault("tie_word_embeddings", False)
-    if verify_megakernel:
+    if verify_megakernel or draft_megakernel:
+        # Both megakernels read the kernel-layout weights those flags create.
         tkg_attention_kernel = True
         moe_layer_kernel = True
     # Route the DeltaNet verify/decode recurrence through the TKG NKI kernel.
@@ -144,6 +146,8 @@ def build_inference_config(
     # Route the verify-pass MoE FFN through the fused MoE layer NKI kernel (T>1 only).
     config_dict["use_moe_layer_kernel"] = moe_layer_kernel
     config_dict["use_verify_megakernel"] = verify_megakernel
+    # Route the draft step and the replay through the draft megakernel (prefill stays XLA).
+    config_dict["use_draft_megakernel"] = draft_megakernel
 
     # block_size must exceed (seq_len * num_experts_per_tok) so prefill takes
     # forward_all_experts instead of forward_blockwise (the NKI blockwise
@@ -489,6 +493,14 @@ def main():
         help="Run the whole verify pass through the single fused megakernel (implies the TKG "
         "attention + MoE layer kernels). Pair with --mtp-spec-decode.",
     )
+    parser.add_argument(
+        "--draft-megakernel",
+        action="store_true",
+        default=os.environ.get("A3B_DRAFT_MEGAKERNEL") == "1",
+        help="Run the MTP draft step and replay through the draft megakernel "
+        "(implies the TKG attention + MoE layer kernels). Pair with "
+        "--mtp-spec-decode.",
+    )
     args = parser.parse_args()
 
     # Header label only; the real per-prompt budget is seq_len - prompt_len when
@@ -513,6 +525,7 @@ def main():
         tkg_attention_kernel=args.tkg_attention_kernel,
         moe_layer_kernel=args.use_moe_layer_kernel,
         verify_megakernel=args.verify_megakernel,
+        draft_megakernel=args.draft_megakernel,
     )
     if args.tkg_attention_kernel:
         # Hard-fail if the flag didn't reach the configs, so we never silently
@@ -551,6 +564,14 @@ def main():
                 False,
             ), "use_verify_megakernel did not propagate to the draft (MTP) config"
         print("[assert] Verify-trunk megakernel ENABLED on target + draft configs")
+    if args.draft_megakernel:
+        assert args.mtp_spec_decode, "--draft-megakernel requires --mtp-spec-decode"
+        assert inf_config.fused_spec_config is not None and getattr(
+            inf_config.fused_spec_config.draft_config,
+            "use_draft_megakernel",
+            False,
+        ), "use_draft_megakernel did not propagate to the draft (MTP) config"
+        print("[assert] Draft megakernel ENABLED on the draft (MTP) config")
     maybe_compile(args.model_path, compiled_path, inf_config)
     model = load_model(compiled_path)
 

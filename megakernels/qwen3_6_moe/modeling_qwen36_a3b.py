@@ -82,7 +82,9 @@ from nki_kernels.megakernel import (
     DN_FIELDS,
     GQA_FIELDS,
     MOE_FIELDS,
+    build_draft_megakernel,
     build_verify_megakernel,
+    flatten_draft_args,
     flatten_megakernel_args,
     split_megakernel_returns,
 )
@@ -1616,6 +1618,7 @@ class Qwen36A3BInferenceConfig(InferenceConfig):
         kwargs.setdefault("use_tkg_attention_kernel", False)
         kwargs.setdefault("use_moe_layer_kernel", False)
         kwargs.setdefault("use_verify_megakernel", False)
+        kwargs.setdefault("use_draft_megakernel", False)
 
         # MoE
         kwargs.setdefault("num_experts", 256)
@@ -2405,7 +2408,9 @@ class NeuronMTPHead(nn.Module):
 
         self.embed_norm = rms_cls(h, eps=eps)
         self.hidden_norm = rms_cls(h, eps=eps)
-        self.eh_proj = ColumnParallelLinear(
+        # Stored transposed [2H, H_rank] (contraction first) for the draft megakernel;
+        # the transposed matmul is numerically identical on the XLA path.
+        self.eh_proj = TransposedColumnParallelLinear(
             2 * h,
             h,
             bias=False,
@@ -2455,8 +2460,8 @@ class NeuronMTPHead(nn.Module):
         consumes). ``layer_kwargs`` (active_mask, is_for_context_encoding, seq_ids,
         ...) pass through to the GQA decoder layer.
         """
-        # Concat order is [embed | hidden]: the eh_proj weight is loaded straight
-        # from the checkpoint's `mtp.fc` (no column repacking), whose input is
+        # Concat order is [embed | hidden]: the eh_proj weight is the checkpoint's
+        # `mtp.fc` transposed at load (no column repacking), whose input is
         # laid out as [normed embedding of t+1 | normed trunk hidden at t]. Each
         # norm is applied to its own tensor before the join.
         combined = torch.cat(
@@ -3779,6 +3784,11 @@ def convert_qwen36_a3b_hf_to_neuron_state_dict(neuron_state_dict, config):
             if old in neuron_state_dict:
                 neuron_state_dict[new] = neuron_state_dict.pop(old).detach().clone()
 
+        # Store eh_proj transposed ([2H, hidden]) for TransposedColumnParallelLinear.
+        ehk = "mtp_head.eh_proj.weight"
+        if ehk in neuron_state_dict:
+            neuron_state_dict[ehk] = neuron_state_dict[ehk].t().contiguous()
+
         layer_pfx = "mtp.layers.0."
         for k in [k for k in neuron_state_dict if k.startswith(layer_pfx)]:
             neuron_state_dict[f"mtp_head.decoder_layer.{k[len(layer_pfx) :]}"] = (
@@ -4102,6 +4112,13 @@ class Qwen36MTPDraft(NeuronBaseModel):
         position_ids = position_ids.view(-1, q).long()
         spec_len = self.neuron_config.speculation_length
 
+        # Draft step (q == 1) and replay (q == spec_len) each as one NKI launch;
+        # prefill keeps the XLA path.
+        if getattr(self.config, "use_draft_megakernel", False) and q in (1, spec_len):
+            return self._forward_draft_megakernel(
+                input_ids, position_ids, seq_ids, prev_hidden
+            )
+
         next_embeds = self.embed_tokens(input_ids)
         cos_cache, sin_cache = self.mrope_emb(next_embeds, position_ids)
 
@@ -4179,6 +4196,102 @@ class Qwen36MTPDraft(NeuronBaseModel):
         )
         return [sampled, *updated_kv, hidden]
 
+    def _forward_draft_megakernel(self, input_ids, position_ids, seq_ids, prev_hidden):
+        """Draft step or replay as one NKI launch: ids + hidden -> [token, kv, hidden].
+
+        The kernel embeds, runs the eh_proj front end, the GQA+MoE draft layer and
+        the fused vocab head, and scatters the active K/V into the cache in place
+        at position_ids -- so ``kv_mgr.update_cache`` is skipped and the mutated
+        cache handles are the updated KV. ``hidden`` is pre-final-norm.
+
+        The replay (q == spec_len) rewrites the whole block, so its logits are dead:
+        it takes the headless build and returns None in the token slot.
+        """
+        bsz, q = input_ids.shape[:2]
+        H = self.hidden_size
+        cfg = self.config
+        head = self.mtp_head
+        layer = head.decoder_layer
+        sa = layer.self_attn
+        mlp = layer.mlp
+
+        cos_cache, sin_cache = self.mrope_emb(self.embed_tokens.weight, position_ids)
+        past_key_values = self.kv_mgr.get_cache(
+            seq_ids=seq_ids,
+            seq_len=self.n_positions,
+            is_for_context_encoding=False,
+        )
+        k_cache, v_cache = past_key_values[0]
+
+        cache_positions = torch.arange(
+            self.n_positions, device=input_ids.device
+        ).view(1, 1, 1, -1)
+        committed_len = position_ids[:, 0:1].view(bsz, 1, 1, 1)
+        prior_mask = (cache_positions < committed_len).expand(
+            bsz, 1, q, self.n_positions
+        )
+        block_idx = torch.arange(q, device=input_ids.device)
+        active_mask = (
+            block_idx.view(1, 1, q, 1) >= block_idx.view(1, 1, 1, q)
+        ).expand(bsz, 1, q, q)
+        mask = sa._build_kernel_mask(
+            prior_mask, active_mask, bsz, q, k_cache.shape[-1], input_ids.device
+        )
+
+        E = cfg.num_experts
+        i_rank = cfg.moe_intermediate_size // cfg.neuron_config.tp_degree
+        gqa = {
+            "in_gamma": layer.input_layernorm.weight.reshape(1, H),
+            "qkv_w": sa.gqa_qkv_w.weight,
+            "gate_w": sa.gqa_gate_w.weight,
+            "gamma_q": sa.q_layernorm.weight,
+            "gamma_k": sa.k_layernorm.weight,
+            "o_proj_w": sa.gqa_o_proj_w.weight,
+            "k_cache": k_cache,
+            "v_cache": v_cache,
+        }
+        moe = {
+            "gamma": layer.post_attention_layernorm.weight.reshape(1, H),
+            "router_w": mlp.moe_router_w_t,
+            "gate_up_w": mlp.moe.expert_mlps.mlp_op.gate_up_proj.weight.reshape(
+                E, H, 2, i_rank
+            ),
+            "down_w": mlp.moe.expert_mlps.mlp_op.down_proj.weight,
+            "sigma_gate_w": mlp.moe_sigma_gate_t,
+            "shared_gate_w": mlp.shared_expert.gate_proj.weight,
+            "shared_up_w": mlp.shared_expert.up_proj.weight,
+            "shared_down_w": mlp.shared_expert.down_proj.weight,
+        }
+
+        replica_groups = (list(range(cfg.neuron_config.tp_degree)),)
+        with_lm_head = q == 1
+        megakernel = build_draft_megakernel(with_lm_head=with_lm_head)
+        flat = flatten_draft_args(
+            input_ids.to(torch.int32),
+            prev_hidden,
+            position_ids[:, 0:1].to(torch.int32),
+            cos_cache[0],
+            sin_cache[0],
+            mask,
+            self.embed_tokens.weight,
+            head.embed_norm.weight.reshape(1, H),
+            head.hidden_norm.weight.reshape(1, H),
+            head.eh_proj.weight,
+            gqa,
+            moe,
+            cfg.rms_norm_eps,
+            replica_groups,
+            final_gamma=head.final_norm.weight.reshape(1, H) if with_lm_head else None,
+            lm_head_w=head.mtp_lm_head.weight if with_lm_head else None,
+        )
+        if with_lm_head:
+            tokens, hidden, k_cache, v_cache, _, _ = megakernel[2](*flat)
+        else:
+            tokens = None
+            hidden, k_cache, v_cache, _, _ = megakernel[2](*flat)
+        hidden = hidden.to(cfg.neuron_config.torch_dtype)
+        return [tokens, k_cache, v_cache, hidden]
+
 
 class Qwen36SpecTarget(NeuronQwen36A3BModel):
     """Verify-mode target for fused speculation.
@@ -4227,12 +4340,16 @@ class Qwen36SpecTarget(NeuronQwen36A3BModel):
         )
 
     def _verify_prologue(self, input_ids, position_ids, seq_ids):
-        """Shared entry work for both verify paths: embeds, rope, cache handles, masks."""
+        """Shared entry work for both verify paths: rope, cache handles, masks.
+
+        The embedding is left to each path: the XLA path takes it from ``embed_tokens``, the
+        megakernel embeds in-kernel. ``mrope_emb`` reads its first argument for device AND
+        dtype -- an integer tensor there truncates cos/sin to {0, 1} and destroys RoPE.
+        """
         batch_size, seq_len = input_ids.shape[:2]
         position_ids = position_ids.view(-1, seq_len).long()
 
-        inputs_embeds = self.embed_tokens(input_ids)
-        cos_cache, sin_cache = self.mrope_emb(inputs_embeds, position_ids)
+        cos_cache, sin_cache = self.mrope_emb(self.embed_tokens.weight, position_ids)
         past_key_values = self.kv_mgr.get_cache(
             seq_ids=seq_ids,
             seq_len=self.n_positions,
@@ -4255,7 +4372,6 @@ class Qwen36SpecTarget(NeuronQwen36A3BModel):
 
         return (
             position_ids,
-            inputs_embeds,
             cos_cache,
             sin_cache,
             past_key_values,
@@ -4308,14 +4424,13 @@ class Qwen36SpecTarget(NeuronQwen36A3BModel):
         seq_ids = seq_ids.to(torch.int32)
         (
             position_ids,
-            inputs_embeds,
             cos_cache,
             sin_cache,
             past_key_values,
             prior_mask,
             verify_active_mask,
         ) = self._verify_prologue(input_ids, position_ids, seq_ids)
-        hidden_states = inputs_embeds
+        hidden_states = self.embed_tokens(input_ids)
 
         next_decoder_cache = ()
         layer_candidates = []
@@ -4351,7 +4466,6 @@ class Qwen36SpecTarget(NeuronQwen36A3BModel):
         batch_size, seq_len = input_ids.shape[:2]
         (
             position_ids,
-            inputs_embeds,
             cos_cache,
             sin_cache,
             past_key_values,
@@ -4429,7 +4543,7 @@ class Qwen36SpecTarget(NeuronQwen36A3BModel):
         replica_groups = (list(range(self.config.neuron_config.tp_degree)),)
         megakernel = build_verify_megakernel(layer_is_gqa)
         flat = flatten_megakernel_args(
-            inputs_embeds,
+            self.embed_tokens(input_ids),
             dn,
             gqa,
             moe,
@@ -4447,7 +4561,7 @@ class Qwen36SpecTarget(NeuronQwen36A3BModel):
         tokens, output, gqa_active_kv, dn_cand = split_megakernel_returns(
             megakernel[2](*flat), n_gqa, n_dn
         )
-        hidden_states = output.to(inputs_embeds.dtype)
+        hidden_states = output.to(self.config.neuron_config.torch_dtype)
 
         next_decoder_cache = ()
         layer_candidates = []

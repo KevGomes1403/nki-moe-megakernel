@@ -1,16 +1,18 @@
 """Qwen3.6-A3B verify-trunk megakernel: all decoder layers in one LNC2 launch.
 
-The residual stays SBUF-resident across every layer (tp2013 shard-interleaved [H0, T*H1]);
-only the entry load and final store touch HBM. Each layer runs attention (DeltaNet or GQA)
-then the MoE FFN, each followed by an in-kernel TP all-reduce + LNC gather of its per-rank
-partial back into the residual. Structure mirrors nkilib's transformer_tkg.
+The residual stays SBUF-resident across every layer (tp2013 shard-interleaved [H0, T*H1]); the
+kernel embeds the input token ids itself, so only that gather and the final store touch HBM. Each
+layer runs attention (DeltaNet or GQA) then the MoE FFN, each followed by an in-kernel TP all-reduce
++ LNC gather of its per-rank partial back into the residual. Structure mirrors nkilib's
+transformer_tkg.
 
 Attention H-shards its o_proj output across the two LNC cores -> H-gather. MoE token-shards
 its output -> token-gather. Both reduce across the TP replica group first.
 
 The finished residual then runs the final norm + vocab head + greedy argmax, so the kernel returns
 token ids directly; the residual itself is still returned pre-final-norm because the caller needs
-it as the draft's rolling-buffer seed.
+it as the draft's rolling-buffer seed. Taking ids in and emitting ids out keeps the whole
+id -> hidden -> id step inside one launch.
 
 Not decorated: wrap with nki.jit() at the call site (avoids a double-jit stack overflow).
 """
@@ -22,191 +24,21 @@ import nki.language as nl
 import nki.collectives as nccl
 from nki import jit as nki_jit
 
-from nkilib.core.utils.tensor_view import TensorView
 from nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
 
 from ..deltanet.decode.fused_layer import attention_layer_compose
+from ..embed.components.embed import embed_compose, load_token_ids_to_sbuf
 from ..gqa.decode.fused_layer import gqa_fused_compose
 from ..lm_head.components.lm_head import lm_head_compose
 from ..moe.components.moe_layer import moe_layer_compose
 from ..moe.components.shared_expert import moe_tkg_shard_decision
-
-
-def load_residual_to_sbuf(dst_sb, src_hbm, T, H0, H1, n_prgs):
-    """[B, S, H] HBM -> [H0, T*H1] SBUF, tp2013 shard-interleaved (free = t*H1 + shard*H1_shard + h2)."""
-    src_view = TensorView(src_hbm.reshape((T, H0 * H1))).rearrange(
-        ("bs", ("lnc", "h0", "h1")),
-        ("h0", "bs", "lnc", "h1"),
-        {"lnc": n_prgs, "h0": H0},
-    )
-    dst = dst_sb.reshape((H0, T, n_prgs, H1 // n_prgs))
-    for lnc in nl.static_range(n_prgs):
-        nisa.dma_copy(
-            src=src_view.slice(dim=2, start=lnc, end=lnc + 1).get_view(),
-            dst=dst[:, :, lnc : lnc + 1, :],
-        )
-
-
-def store_residual_to_hbm(dst_hbm, src_sb, T, H0, H1, n_prgs):
-    """Inverse of load_residual_to_sbuf: [H0, T*H1] SBUF -> [B, S, H] HBM."""
-    src = src_sb.reshape((H0, T, n_prgs, H1 // n_prgs))
-    dst_view = TensorView(dst_hbm.reshape((T, H0 * H1))).rearrange(
-        ("bs", ("lnc", "h0", "h1")),
-        ("h0", "bs", "lnc", "h1"),
-        {"lnc": n_prgs, "h0": H0},
-    )
-    for lnc in nl.static_range(n_prgs):
-        nisa.dma_copy(
-            src=src[:, :, lnc : lnc + 1, :],
-            dst=dst_view.slice(dim=2, start=lnc, end=lnc + 1).get_view(),
-        )
-
-
-def all_reduce_gather_h(sharded_sb, rg, prg_id, n_prgs, T):
-    """Attention path: TP all-reduce the [H0, H1_shard*T] H-shard, LNC-gather to full [H0, T*H1].
-
-    ``rg=None`` skips the collective (identity at TP=1) so the LNC gather can run in a
-    single-process launch, where collectives comms are uninitialized and fail at NEFF load.
-    """
-    dtype = sharded_sb.dtype
-    H0 = sharded_sb.shape[0]
-    H1_shard = sharded_sb.shape[1] // T
-    H1 = H1_shard * n_prgs
-    if rg is None:
-        reduced = sharded_sb
-    else:
-        reduced = nl.ndarray(sharded_sb.shape, dtype=dtype, buffer=nl.sbuf)
-        nccl.all_reduce(dsts=[reduced], srcs=[sharded_sb], op=nl.add, replica_group=rg)
-
-    gathered = nl.ndarray((H0, H1 * T), dtype=dtype, buffer=nl.sbuf)
-    nisa.tensor_copy(
-        dst=gathered[:, nl.ds(start=prg_id * T * H1_shard, size=T * H1_shard)],
-        src=reduced,
-    )
-    if n_prgs > 1:
-        other = 1 - prg_id
-        nisa.sendrecv(
-            src=reduced,
-            dst=gathered[:, nl.ds(start=other * T * H1_shard, size=T * H1_shard)],
-            send_to_rank=other,
-            recv_from_rank=other,
-            pipe_id=0,
-        )
-
-    out = nl.ndarray((H0, T * H1), dtype=dtype, buffer=nl.sbuf)
-    src_view = TensorView(gathered).rearrange(
-        ("h0", ("h1", "bs")), ("h0", "bs", "h1"), {"h1": H1}
-    )
-    nisa.tensor_copy(dst=out.reshape((H0, T, H1)), src=src_view.get_view())
-    return out
-
-
-def all_reduce_gather_tokens(local_sb, rg, prg_id, n_prgs, T_offset, T_len):
-    """MoE path: TP all-reduce this core's token block, LNC-gather the other core's block -> full [H0, T*H1].
-
-    Token-sharded MoE lays tokens on the free axis (f = t*H1 + h1), so a token block is a contiguous
-    free-slice; nccl SBUF collectives require 2D, so the reduce runs on the flat [H0, T*H1] view.
-
-    ``rg=None`` skips the collective (identity at TP=1) so the LNC gather can run in a
-    single-process launch, where collectives comms are uninitialized and fail at NEFF load.
-    """
-    dtype = local_sb.dtype
-    H0, T, H1 = local_sb.shape
-    flat = local_sb.reshape((H0, T * H1))
-    # This core's token block is a free-slice of flat, so it inherits flat's partition stride (T*H1)
-    # while spanning only T_len*H1 -- a partition-strided view. nccl SBUF all_reduce needs a densely
-    # packed operand, so copy into a fresh [H0, T_len*H1] tile first.
-    block = flat[:, T_offset * H1 : (T_offset + T_len) * H1]
-    block_in = nl.ndarray((H0, T_len * H1), dtype=dtype, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=block_in, src=block)
-    if rg is None:
-        reduced = block_in
-    else:
-        reduced = nl.ndarray((H0, T_len * H1), dtype=dtype, buffer=nl.sbuf)
-        nccl.all_reduce(dsts=[reduced], srcs=[block_in], op=nl.add, replica_group=rg)
-
-    out = nl.ndarray((H0, T * H1), dtype=dtype, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=out[:, T_offset * H1 : (T_offset + T_len) * H1], src=reduced)
-    if n_prgs > 1:
-        other = 1 - prg_id
-        other_off = 0 if prg_id == 1 else T_offset + T_len
-        other_len = T - T_len
-        nisa.sendrecv(
-            src=reduced,
-            dst=out[:, other_off * H1 : (other_off + other_len) * H1],
-            send_to_rank=other,
-            recv_from_rank=other,
-            pipe_id=0,
-        )
-    return out
-
-
-def all_gather_argmax(rank_max, rank_idx, rg, tp_degree, V_rank):
-    """LM-head path: fold the per-rank (max, index) winners into one global greedy token id.
-
-    The vocab is TP-sharded, so a rank-local winner is not yet the global one. Rather than gather
-    [T, V_global] logits, gather only each rank's [T, 1] winner pair -- the reduction NxD's
-    ``nxd_argmax`` does on the host. Gathering rather than reducing lands each rank's entry at a
-    known column, so the vocab offset is a compile-time constant and no dynamic rank id is needed.
-
-    Ties resolve to the lowest global id, matching torch.argmax: columns that do not hold the peak
-    are lifted past every real id, then the row is min-reduced. The rank owning the peak always
-    survives, so the reduce is never over an all-loser row.
-
-    ``rg=None`` skips the collective (identity at TP=1) so the head can still run in a
-    single-process launch, where collectives comms are uninitialized and fail at NEFF load.
-    """
-    if rg is None:
-        return rank_idx
-
-    T = rank_max.shape[0]
-    # Above any real global vocab id and exact in fp32, which holds ids up to 2**24.
-    loser = float(1 << 30)
-
-    val = nl.ndarray((T, 1), dtype=nl.float32, buffer=nl.sbuf)
-    idx = nl.ndarray((T, 1), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=val, src=rank_max)
-    nisa.tensor_copy(dst=idx, src=rank_idx)
-
-    all_val = nl.ndarray((T, tp_degree), dtype=nl.float32, buffer=nl.sbuf)
-    all_idx = nl.ndarray((T, tp_degree), dtype=nl.float32, buffer=nl.sbuf)
-    nccl.all_gather(srcs=[val], dsts=[all_val], replica_group=rg, collective_dim=1)
-    nccl.all_gather(srcs=[idx], dsts=[all_idx], replica_group=rg, collective_dim=1)
-
-    peak = nl.ndarray((T, 1), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_reduce(dst=peak, op=nl.maximum, data=all_val, axis=1)
-
-    cand = nl.ndarray((T, tp_degree), dtype=nl.float32, buffer=nl.sbuf)
-    penalty = nl.ndarray((T, tp_degree), dtype=nl.float32, buffer=nl.sbuf)
-    for r in nl.static_range(tp_degree):
-        nisa.tensor_scalar(
-            dst=cand[:, r : r + 1],
-            data=all_idx[:, r : r + 1],
-            op0=nl.add,
-            operand0=float(r * V_rank),
-        )
-    nisa.tensor_tensor(
-        dst=penalty,
-        data1=all_val,
-        data2=peak.ap([[1, T], [0, tp_degree]]),
-        op=nl.equal,
-    )
-    # (1 - owns_peak) * loser, fused into one instruction.
-    nisa.tensor_scalar(
-        dst=penalty,
-        data=penalty,
-        op0=nl.multiply,
-        operand0=-loser,
-        op1=nl.add,
-        operand1=loser,
-    )
-    nisa.tensor_tensor(dst=cand, data1=cand, data2=penalty, op=nl.add)
-
-    best = nl.ndarray((T, 1), dtype=nl.float32, buffer=nl.sbuf)
-    tokens = nl.ndarray((T, 1), dtype=nl.int32, buffer=nl.sbuf)
-    nisa.tensor_reduce(dst=best, op=nl.minimum, data=cand, axis=1)
-    nisa.tensor_copy(dst=tokens, src=best)
-    return tokens
+from .collectives import (
+    all_gather_argmax,
+    all_reduce_gather_h,
+    all_reduce_gather_tokens,
+    load_residual_to_sbuf,  # noqa: F401  (re-exported for the layer-level tests)
+    store_residual_to_hbm,
+)
 
 
 def qwen36_verify_megakernel(
@@ -260,18 +92,21 @@ def qwen36_verify_megakernel(
 
     ``hidden`` is PRE-final-norm: the head applies its own norm, and the caller needs the un-normed
     hidden as the draft's rolling-buffer seed.
+
+    ``embed_w`` is [V, H/TP] -- ParallelEmbedding shards on hidden, so H is recovered from it only
+    after tp_degree is known, and the per-rank slices are all-gathered inside embed_compose.
     """
     B, S, H = X.shape
     dtype = X.dtype
     _, n_prgs, prg_id = get_verified_program_sharding_info(
         "qwen36_verify_megakernel", (0, 1), 2
     )
+    rg = nccl.ReplicaGroup(replica_groups) if replica_groups is not None else None
+    tp_degree = len(replica_groups[0]) if replica_groups is not None else 1
     H0 = nl.tile_size.pmax
     H1 = H // H0
     H1_shard = H1 // n_prgs
     T = B * S
-    rg = nccl.ReplicaGroup(replica_groups) if replica_groups is not None else None
-    tp_degree = len(replica_groups[0]) if replica_groups is not None else 1
 
     residual = nl.ndarray((H0, T * H1), dtype=dtype, buffer=nl.sbuf)
     load_residual_to_sbuf(residual, X, T, H0, H1, n_prgs)
@@ -367,6 +202,7 @@ def qwen36_verify_megakernel(
             moe_partial, rg, prg_id, n_prgs, T_offset, T_len
         )
         nisa.tensor_tensor(dst=residual, data1=residual, data2=moe_out, op=nl.add)
+
 
     output = nl.ndarray((B, S, H), dtype=dtype, buffer=nl.shared_hbm)
     if prg_id == 0:
@@ -515,7 +351,13 @@ def build_verify_megakernel(layer_is_gqa):
         lines.append(f"    gqa_{f} = {tup(gqa[f])}")
     for f in MOE_FIELDS:
         lines.append(f"    moe_{f} = {tup(moe[f])}")
-    body_args = ["X", repr(key), "key_dim", "eps", "replica_groups"]
+    body_args = [
+        "X",
+        repr(key),
+        "key_dim",
+        "eps",
+        "replica_groups",
+    ]
     body_args += [f"dn_{f}" for f in DN_FIELDS]
     body_args += [f"gqa_{f}" for f in GQA_FIELDS]
     body_args += ["cos", "sin", "gqa_mask"]
