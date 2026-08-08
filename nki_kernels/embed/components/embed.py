@@ -113,6 +113,38 @@ def natural_to_tp2013(emb_full, dst_sb, n_prgs):
                 ),
             )
             nisa.tensor_copy(dst=dst4[:, :, s, h2], src=tp[0:H0, 0:T])
+    return dst_sb
+
+
+def tp2013_to_natural(src_sb, T, n_prgs, out_nat=None):
+    """[H0, T*H1] SBUF -> [T, H] SBUF: the inverse of ``natural_to_tp2013``.
+
+    Same one-transpose-per-free-index shape, run the other way: the (s, h2) source block is the
+    [H0, T] tp2013 slice at free stride H1, and its transpose lands on the natural columns
+    s*(H0*H2) + h0*H2 + h2.
+
+    Lets a caller hand a tp2013 residual to a token-major consumer (the MTP draft's eh_proj front
+    end) without a round trip through HBM.
+    """
+    H1 = src_sb.shape[1] // T
+    H = H0 * H1
+    H2 = H1 // n_prgs
+    src4 = src_sb.reshape((H0, T, n_prgs, H2))
+    if out_nat is None:
+        out_nat = nl.ndarray((T, H), dtype=src_sb.dtype, buffer=nl.sbuf)
+    tp = nl.ndarray((T, H0), dtype=src_sb.dtype, buffer=nl.psum)
+    for s in range(n_prgs):
+        for h2 in range(H2):
+            nisa.nc_transpose(dst=tp[0:T, 0:H0], data=src4[:, :, s, h2])
+            nisa.tensor_copy(
+                dst=out_nat.ap(
+                    pattern=[[H, T], [H2, H0]],
+                    offset=s * (H0 * H2) + h2,
+                ),
+                src=tp[0:T, 0:H0],
+            )
+    return out_nat
+    return dst_sb
 
 
 def embed_compose(

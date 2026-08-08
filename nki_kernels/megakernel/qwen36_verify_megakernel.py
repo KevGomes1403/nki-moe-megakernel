@@ -41,13 +41,15 @@ from .collectives import (
 )
 
 
-def qwen36_verify_megakernel(
-    X,
+def verify_trunk_compose(
+    residual,
+    T,
     layer_is_gqa,
     key_dim,
     eps,
-    replica_groups,
-    # DeltaNet layers (indexed by DeltaNet position)
+    rg,
+    tp_degree,
+    n_prgs,
     dn_proj_w,
     dn_in_gamma,
     dn_conv_state,
@@ -57,7 +59,6 @@ def qwen36_verify_megakernel(
     dn_init_state,
     dn_out_w,
     dn_z_gamma,
-    # GQA layers (indexed by GQA position; cos/sin/mask shared)
     gqa_qkv_w,
     gqa_gate_w,
     gqa_gamma_q,
@@ -69,7 +70,6 @@ def qwen36_verify_megakernel(
     cos,
     sin,
     gqa_mask,
-    # MoE (every layer)
     moe_gamma,
     moe_router_w,
     moe_gate_up_w,
@@ -78,45 +78,34 @@ def qwen36_verify_megakernel(
     moe_shared_gate_w,
     moe_shared_up_w,
     moe_shared_down_w,
-    # LM head
     final_gamma,
     lm_head_w,
+    name_prefix="",
 ):
-    """Run all decoder layers, SBUF-resident residual, per-rank partials reduced in-kernel.
+    """All decoder layers plus the vocab head over an already-seeded SBUF residual.
 
-    ``layer_is_gqa[i]`` selects the attention type for layer i; DeltaNet/GQA weight lists are
-    indexed by each type's running position. Returns
-    ``(tokens [B,S] int32 HBM, hidden [B,S,H] HBM, gqa_active_kv, dn_cand)``: the greedy token ids,
-    the trunk hidden, per-GQA-layer (active_k, active_v) for the caller's KV scatter, and
-    per-DeltaNet-layer (candidate_states, conv_cand) for the accept/reject commit.
+    The caller owns the seam on both ends: it seeds ``residual`` (from HBM hidden, or from an
+    in-kernel embed) and it stores whatever it needs. ``residual`` is updated IN PLACE and is left
+    PRE-final-norm, because a fused round feeds it straight to the next draft stage.
 
-    ``hidden`` is PRE-final-norm: the head applies its own norm, and the caller needs the un-normed
-    hidden as the draft's rolling-buffer seed.
-
-    ``embed_w`` is [V, H/TP] -- ParallelEmbedding shards on hidden, so H is recovered from it only
-    after tp_degree is known, and the per-rank slices are all-gathered inside embed_compose.
+    Returns:
+        ``(token_idx [T, 1] int32 SBUF, gqa_out, dn_out)`` -- the greedy ids, the flat per-GQA-layer
+        (active_k, active_v) and the flat per-DeltaNet-layer (cand_state, conv_cand).
     """
-    B, S, H = X.shape
-    dtype = X.dtype
-    _, n_prgs, prg_id = get_verified_program_sharding_info(
-        "qwen36_verify_megakernel", (0, 1), 2
-    )
-    rg = nccl.ReplicaGroup(replica_groups) if replica_groups is not None else None
-    tp_degree = len(replica_groups[0]) if replica_groups is not None else 1
     H0 = nl.tile_size.pmax
-    H1 = H // H0
+    H1 = residual.shape[1] // T
+    H = H0 * H1
     H1_shard = H1 // n_prgs
-    T = B * S
-
-    residual = nl.ndarray((H0, T * H1), dtype=dtype, buffer=nl.sbuf)
-    load_residual_to_sbuf(residual, X, T, H0, H1, n_prgs)
+    _, _, prg_id = get_verified_program_sharding_info(
+        "qwen36_verify_trunk", (0, 1), 2
+    )
 
     gqa_out = []
     dn_out = []
     dn = 0
     gqa = 0
     for i in range(len(layer_is_gqa)):
-        pfx = f"L{i}_"
+        pfx = f"{name_prefix}L{i}_"
         x_sb = residual.reshape((H0, T, H1))
 
         if layer_is_gqa[i]:
@@ -203,6 +192,127 @@ def qwen36_verify_megakernel(
         )
         nisa.tensor_tensor(dst=residual, data1=residual, data2=moe_out, op=nl.add)
 
+    # residual stays the pre-final-norm hidden; the head norms its own copy.
+    rank_max, rank_idx, _ = lm_head_compose(
+        residual.reshape((H0, T, H1)),
+        final_gamma,
+        lm_head_w,
+        eps=eps,
+        name_prefix=name_prefix + "lm_",
+    )
+    token_idx = all_gather_argmax(rank_max, rank_idx, rg, tp_degree, lm_head_w.shape[1])
+    return token_idx, gqa_out, dn_out
+
+
+def qwen36_verify_megakernel(
+    X,
+    layer_is_gqa,
+    key_dim,
+    eps,
+    replica_groups,
+    # DeltaNet layers (indexed by DeltaNet position)
+    dn_proj_w,
+    dn_in_gamma,
+    dn_conv_state,
+    dn_conv_weight,
+    dn_A_log,
+    dn_dt_bias,
+    dn_init_state,
+    dn_out_w,
+    dn_z_gamma,
+    # GQA layers (indexed by GQA position; cos/sin/mask shared)
+    gqa_qkv_w,
+    gqa_gate_w,
+    gqa_gamma_q,
+    gqa_gamma_k,
+    gqa_in_gamma,
+    gqa_o_proj_w,
+    gqa_k_cache,
+    gqa_v_cache,
+    cos,
+    sin,
+    gqa_mask,
+    # MoE (every layer)
+    moe_gamma,
+    moe_router_w,
+    moe_gate_up_w,
+    moe_down_w,
+    moe_sigma_gate_w,
+    moe_shared_gate_w,
+    moe_shared_up_w,
+    moe_shared_down_w,
+    # LM head
+    final_gamma,
+    lm_head_w,
+):
+    """Run all decoder layers, SBUF-resident residual, per-rank partials reduced in-kernel.
+
+    ``layer_is_gqa[i]`` selects the attention type for layer i; DeltaNet/GQA weight lists are
+    indexed by each type's running position. Returns
+    ``(tokens [B,S] int32 HBM, hidden [B,S,H] HBM, gqa_active_kv, dn_cand)``: the greedy token ids,
+    the trunk hidden, per-GQA-layer (active_k, active_v) for the caller's KV scatter, and
+    per-DeltaNet-layer (candidate_states, conv_cand) for the accept/reject commit.
+
+    ``hidden`` is PRE-final-norm: the head applies its own norm, and the caller needs the un-normed
+    hidden as the draft's rolling-buffer seed.
+
+    ``embed_w`` is [V, H/TP] -- ParallelEmbedding shards on hidden, so H is recovered from it only
+    after tp_degree is known, and the per-rank slices are all-gathered inside embed_compose.
+    """
+    B, S, H = X.shape
+    dtype = X.dtype
+    _, n_prgs, prg_id = get_verified_program_sharding_info(
+        "qwen36_verify_megakernel", (0, 1), 2
+    )
+    rg = nccl.ReplicaGroup(replica_groups) if replica_groups is not None else None
+    tp_degree = len(replica_groups[0]) if replica_groups is not None else 1
+    H0 = nl.tile_size.pmax
+    H1 = H // H0
+    T = B * S
+
+    residual = nl.ndarray((H0, T * H1), dtype=dtype, buffer=nl.sbuf)
+    load_residual_to_sbuf(residual, X, T, H0, H1, n_prgs)
+
+    token_idx, gqa_out, dn_out = verify_trunk_compose(
+        residual,
+        T,
+        layer_is_gqa,
+        key_dim,
+        eps,
+        rg,
+        tp_degree,
+        n_prgs,
+        dn_proj_w,
+        dn_in_gamma,
+        dn_conv_state,
+        dn_conv_weight,
+        dn_A_log,
+        dn_dt_bias,
+        dn_init_state,
+        dn_out_w,
+        dn_z_gamma,
+        gqa_qkv_w,
+        gqa_gate_w,
+        gqa_gamma_q,
+        gqa_gamma_k,
+        gqa_in_gamma,
+        gqa_o_proj_w,
+        gqa_k_cache,
+        gqa_v_cache,
+        cos,
+        sin,
+        gqa_mask,
+        moe_gamma,
+        moe_router_w,
+        moe_gate_up_w,
+        moe_down_w,
+        moe_sigma_gate_w,
+        moe_shared_gate_w,
+        moe_shared_up_w,
+        moe_shared_down_w,
+        final_gamma,
+        lm_head_w,
+    )
 
     output = nl.ndarray((B, S, H), dtype=dtype, buffer=nl.shared_hbm)
     if prg_id == 0:
@@ -210,15 +320,6 @@ def qwen36_verify_megakernel(
     if n_prgs > 1:
         nisa.core_barrier(data=output, cores=(0, 1))
 
-    # residual is still the pre-final-norm hidden stored above; the head norms its own copy.
-    rank_max, rank_idx, _ = lm_head_compose(
-        residual.reshape((H0, T, H1)),
-        final_gamma,
-        lm_head_w,
-        eps=eps,
-        name_prefix="lm_",
-    )
-    token_idx = all_gather_argmax(rank_max, rank_idx, rg, tp_degree, lm_head_w.shape[1])
     # [T, 1] SBUF is one element per partition, so the HBM row is written through a [T, 1] view
     # of it; a flat T-wide access pattern would read one partition and run off the end.
     tokens = nl.ndarray((B, S), dtype=nl.int32, buffer=nl.shared_hbm)

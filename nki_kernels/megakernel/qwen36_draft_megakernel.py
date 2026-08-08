@@ -75,6 +75,141 @@ def moe_output_free_block(T, H, H1, moe_intermediate):
     return 0, T * H1
 
 
+def draft_stage_compose(
+    ids_sb,
+    prev_hidden,
+    kv_write_idx,
+    cos,
+    sin,
+    mask,
+    embed_w,
+    gamma_e,
+    gamma_h,
+    eh_w,
+    gamma_in,
+    qkv_w,
+    gate_w,
+    gamma_q,
+    gamma_k,
+    o_proj_w,
+    k_cache,
+    v_cache,
+    moe_gamma,
+    moe_router_w,
+    moe_gate_up_w,
+    moe_down_w,
+    moe_sigma_gate_w,
+    moe_shared_gate_w,
+    moe_shared_up_w,
+    moe_shared_down_w,
+    final_gamma,
+    lm_head_w,
+    eps,
+    rg,
+    tp_degree,
+    n_prgs,
+    name_prefix="",
+):
+    """The draft step as one SBUF-resident stage: ids + trunk hidden -> residual + token id.
+
+    Everything the launch shell adds around this is HBM: the residual store and the token store.
+    A fused round calls it twice with no store in between, threading the mutated cache handles from
+    the first call into the second so the ordering edge on the shared MTP KV cache is explicit.
+
+    Args:
+        ids_sb:      [T, 1] int32 SBUF token ids.
+        prev_hidden: [B, T, H] HBM or [T, H] SBUF -- the trunk hidden to condition on.
+        final_gamma: None selects the headless stage (no vocab head, ``token_idx`` is None).
+
+    Returns:
+        ``(residual [H0, T*H1] SBUF PRE-final-norm, token_idx [T, 1] int32 SBUF or None,
+        k_cache, v_cache, active_k, active_v)``.
+    """
+    T = ids_sb.shape[0]
+    dtype = embed_w.dtype
+    H0 = nl.tile_size.pmax
+    H = embed_w.shape[1] * tp_degree
+    H1 = H // H0
+    H1_shard = H1 // n_prgs
+    _, _, prg_id = get_verified_program_sharding_info(
+        "qwen36_draft_stage", (0, 1), 2
+    )
+
+    residual = nl.ndarray((H0, T * H1), dtype=dtype, buffer=nl.sbuf)
+    eh_proj_compose(
+        ids_sb,
+        embed_w,
+        prev_hidden,
+        gamma_e,
+        gamma_h,
+        eh_w,
+        eps=eps,
+        rg=rg,
+        tp_degree=tp_degree,
+        n_prgs=n_prgs,
+        out_sb=residual,
+        name_prefix=name_prefix,
+    )
+
+    attn_partial, active_k, active_v, k_cache, v_cache = gqa_fused_compose(
+        residual.reshape((H0, T, H1)),
+        qkv_w,
+        gate_w,
+        gamma_q,
+        gamma_k,
+        cos,
+        sin,
+        k_cache,
+        v_cache,
+        mask,
+        o_proj_w,
+        eps,
+        kv_write_idx=kv_write_idx,
+        gamma_in=gamma_in,
+        out_in_sb=True,
+        name_prefix=name_prefix,
+    )
+    attn_out = all_reduce_gather_h(
+        attn_partial.reshape((H0, H1_shard * T)), rg, prg_id, n_prgs, T
+    )
+    nisa.tensor_tensor(dst=residual, data1=residual, data2=attn_out, op=nl.add)
+
+    moe_partial = moe_layer_compose(
+        residual.reshape((H0, T, H1)),
+        moe_gamma,
+        moe_router_w,
+        moe_gate_up_w,
+        moe_down_w,
+        moe_sigma_gate_w,
+        moe_shared_gate_w,
+        moe_shared_up_w,
+        moe_shared_down_w,
+        eps=eps,
+        output_in_sbuf=True,
+        name_prefix=name_prefix,
+    )
+    f_offset, f_len = moe_output_free_block(T, H, H1, moe_gate_up_w.shape[3])
+    moe_out = all_reduce_gather_free_block(
+        moe_partial.reshape((H0, T * H1)), f_offset, f_len, rg, prg_id, n_prgs
+    )
+    nisa.tensor_tensor(dst=residual, data1=residual, data2=moe_out, op=nl.add)
+
+    token_idx = None
+    if final_gamma is not None:
+        # residual stays the pre-final-norm hidden; the head norms its own copy.
+        rank_max, rank_idx, _ = lm_head_compose(
+            residual.reshape((H0, T, H1)),
+            final_gamma,
+            lm_head_w,
+            eps=eps,
+            name_prefix=name_prefix + "lm_",
+        )
+        token_idx = all_gather_argmax(
+            rank_max, rank_idx, rg, tp_degree, lm_head_w.shape[1]
+        )
+    return residual, token_idx, k_cache, v_cache, active_k, active_v
+
+
 def qwen36_draft_megakernel(
     input_ids,
     prev_hidden,
@@ -132,50 +267,27 @@ def qwen36_draft_megakernel(
     H0 = nl.tile_size.pmax
     H = embed_w.shape[1] * tp_degree
     H1 = H // H0
-    H1_shard = H1 // n_prgs
     T = B * S
 
-    residual = nl.ndarray((H0, T * H1), dtype=dtype, buffer=nl.sbuf)
-    eh_proj_compose(
+    residual, token_idx, k_cache, v_cache, active_k, active_v = draft_stage_compose(
         load_token_ids_to_sbuf(input_ids, T),
-        embed_w,
         prev_hidden,
+        kv_write_idx,
+        cos,
+        sin,
+        mask,
+        embed_w,
         gamma_e,
         gamma_h,
         eh_w,
-        eps=eps,
-        rg=rg,
-        tp_degree=tp_degree,
-        n_prgs=n_prgs,
-        out_sb=residual,
-        name_prefix=name_prefix,
-    )
-
-    attn_partial, active_k, active_v, k_cache, v_cache = gqa_fused_compose(
-        residual.reshape((H0, T, H1)),
+        gamma_in,
         qkv_w,
         gate_w,
         gamma_q,
         gamma_k,
-        cos,
-        sin,
+        o_proj_w,
         k_cache,
         v_cache,
-        mask,
-        o_proj_w,
-        eps,
-        kv_write_idx=kv_write_idx,
-        gamma_in=gamma_in,
-        out_in_sb=True,
-        name_prefix=name_prefix,
-    )
-    attn_out = all_reduce_gather_h(
-        attn_partial.reshape((H0, H1_shard * T)), rg, prg_id, n_prgs, T
-    )
-    nisa.tensor_tensor(dst=residual, data1=residual, data2=attn_out, op=nl.add)
-
-    moe_partial = moe_layer_compose(
-        residual.reshape((H0, T, H1)),
         moe_gamma,
         moe_router_w,
         moe_gate_up_w,
@@ -184,15 +296,14 @@ def qwen36_draft_megakernel(
         moe_shared_gate_w,
         moe_shared_up_w,
         moe_shared_down_w,
-        eps=eps,
-        output_in_sbuf=True,
+        final_gamma,
+        lm_head_w,
+        eps,
+        rg,
+        tp_degree,
+        n_prgs,
         name_prefix=name_prefix,
     )
-    f_offset, f_len = moe_output_free_block(T, H, H1, moe_gate_up_w.shape[3])
-    moe_out = all_reduce_gather_free_block(
-        moe_partial.reshape((H0, T * H1)), f_offset, f_len, rg, prg_id, n_prgs
-    )
-    nisa.tensor_tensor(dst=residual, data1=residual, data2=moe_out, op=nl.add)
 
     hidden = nl.ndarray((B, S, H), dtype=dtype, buffer=nl.shared_hbm)
     if prg_id == 0:
@@ -203,15 +314,6 @@ def qwen36_draft_megakernel(
     if final_gamma is None:
         return hidden, k_cache, v_cache, active_k, active_v
 
-    # residual is still the pre-final-norm hidden stored above; the head norms its own copy.
-    rank_max, rank_idx, _ = lm_head_compose(
-        residual.reshape((H0, T, H1)),
-        final_gamma,
-        lm_head_w,
-        eps=eps,
-        name_prefix=name_prefix + "lm_",
-    )
-    token_idx = all_gather_argmax(rank_max, rank_idx, rg, tp_degree, lm_head_w.shape[1])
     # [T, 1] SBUF is one element per partition, so the HBM row is written through a [T, 1] view
     # of it; a flat T-wide access pattern would read one partition and run off the end.
     tokens = nl.ndarray((B, S), dtype=nl.int32, buffer=nl.shared_hbm)

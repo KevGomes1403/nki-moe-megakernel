@@ -14,6 +14,7 @@ from .components.embed import (
     gather_embed_rows,
     load_token_ids_to_sbuf,
     natural_to_tp2013,
+    tp2013_to_natural,
 )
 
 __all__ = [
@@ -23,4 +24,5 @@ __all__ = [
     "gather_embed_rows",
     "load_token_ids_to_sbuf",
     "natural_to_tp2013",
+    "tp2013_to_natural",
 ]

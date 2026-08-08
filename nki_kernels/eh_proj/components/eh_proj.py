@@ -119,7 +119,8 @@ def eh_proj_compose(
                      ``load_token_ids_to_sbuf`` for the first step of a round.
         embed_w:     [V, H/TP] HBM, ``ParallelEmbedding(shard_across_embedding=True).weight``
                      consumed verbatim.
-        prev_hidden: [B, T, H] HBM. The trunk hidden the draft step conditions on.
+        prev_hidden: [B, T, H] HBM, or a [T, H] token-major SBUF tile (a fused round hands the
+                     trunk hidden straight across from the verify stage).
         gamma_e:     [1, H] HBM ``embed_norm.weight``, standard form (no +1 applied here).
         gamma_h:     [1, H] HBM ``hidden_norm.weight``, standard form.
         eh_w:        [2H, H_out/TP] HBM ``eh_proj.weight`` transposed (contraction first); rows
@@ -155,8 +156,11 @@ def eh_proj_compose(
     emb_local = gather_embed_rows(ids_sb, embed_w)
     emb_nat = all_gather_embed_h(emb_local, rg, tp_degree)
 
-    hid_nat = nl.ndarray((T, H), dtype=io_dtype, buffer=nl.sbuf)
-    nisa.dma_copy(dst=hid_nat, src=prev_hidden.reshape((T, H)))
+    if prev_hidden.buffer == nl.sbuf:
+        hid_nat = prev_hidden  # read-only below, so the caller's tile is used in place
+    else:
+        hid_nat = nl.ndarray((T, H), dtype=io_dtype, buffer=nl.sbuf)
+        nisa.dma_copy(dst=hid_nat, src=prev_hidden.reshape((T, H)))
 
     eps_t = nl.ndarray((T, 1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.memset(dst=eps_t, value=float(eps))

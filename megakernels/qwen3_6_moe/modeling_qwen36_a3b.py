@@ -83,10 +83,13 @@ from nki_kernels.megakernel import (
     GQA_FIELDS,
     MOE_FIELDS,
     build_draft_megakernel,
+    build_round_megakernel,
     build_verify_megakernel,
     flatten_draft_args,
     flatten_megakernel_args,
+    flatten_round_args,
     split_megakernel_returns,
+    split_round_returns,
 )
 
 from neuronx_distributed_inference.models.config import (
@@ -1619,6 +1622,7 @@ class Qwen36A3BInferenceConfig(InferenceConfig):
         kwargs.setdefault("use_moe_layer_kernel", False)
         kwargs.setdefault("use_verify_megakernel", False)
         kwargs.setdefault("use_draft_megakernel", False)
+        kwargs.setdefault("use_round_megakernel", False)
 
         # MoE
         kwargs.setdefault("num_experts", 256)
@@ -4052,6 +4056,24 @@ def _greedy_argmax(lm_head, logits, rank_util, disable_argmax_kernel=False):
     ).to(torch.int32)
 
 
+def _decode_kernel_mask(sa, committed_len, bsz, q, L, n_positions, device):
+    """The fused-kernel GQA mask for a decode block of q tokens at ``committed_len``.
+
+    Prior over the committed cache, intra-block causal over the active tokens. ``committed_len``
+    is [B, 1]; slots below it are the block's attendable history, which is how a stage sees a slot
+    an earlier stage in the same launch has just written.
+    """
+    cache_positions = torch.arange(n_positions, device=device).view(1, 1, 1, -1)
+    prior = (cache_positions < committed_len.view(bsz, 1, 1, 1)).expand(
+        bsz, 1, q, n_positions
+    )
+    block_idx = torch.arange(q, device=device)
+    active = (block_idx.view(1, 1, q, 1) >= block_idx.view(1, 1, 1, q)).expand(
+        bsz, 1, q, q
+    )
+    return sa._build_kernel_mask(prior, active, bsz, q, L, device)
+
+
 class Qwen36MTPDraft(NeuronBaseModel):
     """MTP head as an EAGLE draft worker.
 
@@ -4196,50 +4218,27 @@ class Qwen36MTPDraft(NeuronBaseModel):
         )
         return [sampled, *updated_kv, hidden]
 
-    def _forward_draft_megakernel(self, input_ids, position_ids, seq_ids, prev_hidden):
-        """Draft step or replay as one NKI launch: ids + hidden -> [token, kv, hidden].
+    def _collect_mtp_weights(self, k_cache, v_cache):
+        """The MTP head's kernel-layout weights, keyed by the megakernels' own field names.
 
-        The kernel embeds, runs the eh_proj front end, the GQA+MoE draft layer and
-        the fused vocab head, and scatters the active K/V into the cache in place
-        at position_ids -- so ``kv_mgr.update_cache`` is skipped and the mutated
-        cache handles are the updated KV. ``hidden`` is pre-final-norm.
-
-        The replay (q == spec_len) rewrites the whole block, so its logits are dead:
-        it takes the headless build and returns None in the token slot.
+        Shared by the standalone draft launch and the fused round, so the two cannot pick up
+        different tensors for the same field.
         """
-        bsz, q = input_ids.shape[:2]
         H = self.hidden_size
         cfg = self.config
         head = self.mtp_head
         layer = head.decoder_layer
         sa = layer.self_attn
         mlp = layer.mlp
-
-        cos_cache, sin_cache = self.mrope_emb(self.embed_tokens.weight, position_ids)
-        past_key_values = self.kv_mgr.get_cache(
-            seq_ids=seq_ids,
-            seq_len=self.n_positions,
-            is_for_context_encoding=False,
-        )
-        k_cache, v_cache = past_key_values[0]
-
-        cache_positions = torch.arange(
-            self.n_positions, device=input_ids.device
-        ).view(1, 1, 1, -1)
-        committed_len = position_ids[:, 0:1].view(bsz, 1, 1, 1)
-        prior_mask = (cache_positions < committed_len).expand(
-            bsz, 1, q, self.n_positions
-        )
-        block_idx = torch.arange(q, device=input_ids.device)
-        active_mask = (
-            block_idx.view(1, 1, q, 1) >= block_idx.view(1, 1, 1, q)
-        ).expand(bsz, 1, q, q)
-        mask = sa._build_kernel_mask(
-            prior_mask, active_mask, bsz, q, k_cache.shape[-1], input_ids.device
-        )
-
         E = cfg.num_experts
         i_rank = cfg.moe_intermediate_size // cfg.neuron_config.tp_degree
+
+        front = {
+            "embed_w": self.embed_tokens.weight,
+            "gamma_e": head.embed_norm.weight.reshape(1, H),
+            "gamma_h": head.hidden_norm.weight.reshape(1, H),
+            "eh_w": head.eh_proj.weight,
+        }
         gqa = {
             "in_gamma": layer.input_layernorm.weight.reshape(1, H),
             "qkv_w": sa.gqa_qkv_w.weight,
@@ -4262,6 +4261,45 @@ class Qwen36MTPDraft(NeuronBaseModel):
             "shared_up_w": mlp.shared_expert.up_proj.weight,
             "shared_down_w": mlp.shared_expert.down_proj.weight,
         }
+        mtp_head_w = {
+            "final_gamma": head.final_norm.weight.reshape(1, H),
+            "lm_head_w": head.mtp_lm_head.weight,
+        }
+        return front, gqa, moe, mtp_head_w
+
+    def _forward_draft_megakernel(self, input_ids, position_ids, seq_ids, prev_hidden):
+        """Draft step or replay as one NKI launch: ids + hidden -> [token, kv, hidden].
+
+        The kernel embeds, runs the eh_proj front end, the GQA+MoE draft layer and
+        the fused vocab head, and scatters the active K/V into the cache in place
+        at position_ids -- so ``kv_mgr.update_cache`` is skipped and the mutated
+        cache handles are the updated KV. ``hidden`` is pre-final-norm.
+
+        The replay (q == spec_len) rewrites the whole block, so its logits are dead:
+        it takes the headless build and returns None in the token slot.
+        """
+        bsz, q = input_ids.shape[:2]
+        cfg = self.config
+
+        cos_cache, sin_cache = self.mrope_emb(self.embed_tokens.weight, position_ids)
+        past_key_values = self.kv_mgr.get_cache(
+            seq_ids=seq_ids,
+            seq_len=self.n_positions,
+            is_for_context_encoding=False,
+        )
+        k_cache, v_cache = past_key_values[0]
+
+        mask = _decode_kernel_mask(
+            self.mtp_head.decoder_layer.self_attn,
+            position_ids[:, 0:1],
+            bsz,
+            q,
+            k_cache.shape[-1],
+            self.n_positions,
+            input_ids.device,
+        )
+
+        front, gqa, moe, mtp_head_w = self._collect_mtp_weights(k_cache, v_cache)
 
         replica_groups = (list(range(cfg.neuron_config.tp_degree)),)
         with_lm_head = q == 1
@@ -4273,16 +4311,16 @@ class Qwen36MTPDraft(NeuronBaseModel):
             cos_cache[0],
             sin_cache[0],
             mask,
-            self.embed_tokens.weight,
-            head.embed_norm.weight.reshape(1, H),
-            head.hidden_norm.weight.reshape(1, H),
-            head.eh_proj.weight,
+            front["embed_w"],
+            front["gamma_e"],
+            front["gamma_h"],
+            front["eh_w"],
             gqa,
             moe,
             cfg.rms_norm_eps,
             replica_groups,
-            final_gamma=head.final_norm.weight.reshape(1, H) if with_lm_head else None,
-            lm_head_w=head.mtp_lm_head.weight if with_lm_head else None,
+            final_gamma=mtp_head_w["final_gamma"] if with_lm_head else None,
+            lm_head_w=mtp_head_w["lm_head_w"] if with_lm_head else None,
         )
         if with_lm_head:
             tokens, hidden, k_cache, v_cache, _, _ = megakernel[2](*flat)
@@ -4339,14 +4377,14 @@ class Qwen36SpecTarget(NeuronQwen36A3BModel):
             **kwargs,
         )
 
-    def _verify_prologue(self, input_ids, position_ids, seq_ids):
-        """Shared entry work for both verify paths: rope, cache handles, masks.
+    def _verify_prologue(self, batch_size, seq_len, position_ids, seq_ids, device):
+        """Shared entry work for every verify path: rope, cache handles, masks.
 
-        The embedding is left to each path: the XLA path takes it from ``embed_tokens``, the
-        megakernel embeds in-kernel. ``mrope_emb`` reads its first argument for device AND
-        dtype -- an integer tensor there truncates cos/sin to {0, 1} and destroys RoPE.
+        Takes the block shape rather than the ids: no path needs the ids here, and the fused round
+        does not have them on the host at all -- its speculative token never leaves the kernel.
+        ``mrope_emb`` reads its first argument for device AND dtype -- an integer tensor there
+        truncates cos/sin to {0, 1} and destroys RoPE.
         """
-        batch_size, seq_len = input_ids.shape[:2]
         position_ids = position_ids.view(-1, seq_len).long()
 
         cos_cache, sin_cache = self.mrope_emb(self.embed_tokens.weight, position_ids)
@@ -4358,14 +4396,14 @@ class Qwen36SpecTarget(NeuronQwen36A3BModel):
 
         # Prior over the committed cache (shared by both block tokens) + intra-
         # block causal active mask. The in-block tokens' K/V is not cached yet.
-        cache_positions = torch.arange(self.n_positions, device=input_ids.device).view(
+        cache_positions = torch.arange(self.n_positions, device=device).view(
             1, 1, 1, -1
         )
         committed_len = position_ids[:, 0:1].view(batch_size, 1, 1, 1)
         prior_mask = (cache_positions < committed_len).expand(
             batch_size, 1, seq_len, self.n_positions
         )
-        block_idx = torch.arange(seq_len, device=input_ids.device)
+        block_idx = torch.arange(seq_len, device=device)
         verify_active_mask = (
             block_idx.view(1, 1, seq_len, 1) >= block_idx.view(1, 1, 1, seq_len)
         ).expand(batch_size, 1, seq_len, seq_len)
@@ -4422,6 +4460,7 @@ class Qwen36SpecTarget(NeuronQwen36A3BModel):
                 input_ids, attention_mask, position_ids, seq_ids, sampling_params
             )
         seq_ids = seq_ids.to(torch.int32)
+        batch_size, seq_len = input_ids.shape[:2]
         (
             position_ids,
             cos_cache,
@@ -4429,7 +4468,9 @@ class Qwen36SpecTarget(NeuronQwen36A3BModel):
             past_key_values,
             prior_mask,
             verify_active_mask,
-        ) = self._verify_prologue(input_ids, position_ids, seq_ids)
+        ) = self._verify_prologue(
+            batch_size, seq_len, position_ids, seq_ids, input_ids.device
+        )
         hidden_states = self.embed_tokens(input_ids)
 
         next_decoder_cache = ()
@@ -4459,30 +4500,29 @@ class Qwen36SpecTarget(NeuronQwen36A3BModel):
             hidden_states, next_decoder_cache, layer_candidates, position_ids, seq_ids
         )
 
-    def _verify_forward_megakernel(
-        self, input_ids, attention_mask, position_ids, seq_ids, sampling_params
+    def _collect_verify_weights(
+        self,
+        past_key_values,
+        seq_ids,
+        prior_mask,
+        verify_active_mask,
+        batch_size,
+        seq_len,
+        device,
     ):
-        seq_ids = seq_ids.to(torch.int32)
-        batch_size, seq_len = input_ids.shape[:2]
-        (
-            position_ids,
-            cos_cache,
-            sin_cache,
-            past_key_values,
-            prior_mask,
-            verify_active_mask,
-        ) = self._verify_prologue(input_ids, position_ids, seq_ids)
+        """Per-field weight lists for the trunk, keyed by the megakernels' own field names.
 
+        Shared by the standalone verify launch and the fused round, so the flat positional order
+        stays owned by the flatten_* helpers and the two paths cannot pick up different tensors.
+        Returns ``(layer_is_gqa, dn, gqa, moe, key_dim, gqa_mask)``.
+        """
         H = self.config.hidden_size
-        eps = self.config.rms_norm_eps
         E = self.config.num_experts
         i_rank = (
             self.config.moe_intermediate_size // self.config.neuron_config.tp_degree
         )
         layer_is_gqa = [l.layer_type != "linear_attention" for l in self.layers]
 
-        # Per-field weight lists, keyed by the megakernel's own field names so the flat
-        # positional order stays owned by flatten_megakernel_args.
         dn = {f: [] for f in DN_FIELDS}
         gqa = {f: [] for f in GQA_FIELDS}
         moe = {f: [] for f in MOE_FIELDS}
@@ -4520,7 +4560,7 @@ class Qwen36SpecTarget(NeuronQwen36A3BModel):
                         batch_size,
                         seq_len,
                         k_cache.shape[-1],
-                        input_ids.device,
+                        device,
                     )
             else:
                 la = layer.linear_attn
@@ -4539,6 +4579,36 @@ class Qwen36SpecTarget(NeuronQwen36A3BModel):
                 )
                 dn["out_w"].append(la.out_proj.weight)
                 dn["z_gamma"].append(la.norm.weight)
+
+        return layer_is_gqa, dn, gqa, moe, key_dim, gqa_mask
+
+    def _verify_forward_megakernel(
+        self, input_ids, attention_mask, position_ids, seq_ids, sampling_params
+    ):
+        seq_ids = seq_ids.to(torch.int32)
+        batch_size, seq_len = input_ids.shape[:2]
+        (
+            position_ids,
+            cos_cache,
+            sin_cache,
+            past_key_values,
+            prior_mask,
+            verify_active_mask,
+        ) = self._verify_prologue(
+            batch_size, seq_len, position_ids, seq_ids, input_ids.device
+        )
+
+        H = self.config.hidden_size
+        eps = self.config.rms_norm_eps
+        layer_is_gqa, dn, gqa, moe, key_dim, gqa_mask = self._collect_verify_weights(
+            past_key_values,
+            seq_ids,
+            prior_mask,
+            verify_active_mask,
+            batch_size,
+            seq_len,
+            input_ids.device,
+        )
 
         replica_groups = (list(range(self.config.neuron_config.tp_degree)),)
         megakernel = build_verify_megakernel(layer_is_gqa)
@@ -4614,6 +4684,154 @@ class Qwen36FusedSpecModel(NeuronFusedSpecModel):
             out.append(torch.where(sel_c, conv_cand[:, 1], conv_cand[:, 0]).to(dtype))
         return out
 
+    def _round_epilogue(
+        self, candidate_input_ids, target_tokens, hidden_state, candidates
+    ):
+        """The greedy accept and the state commit, shared by the 3-launch and 1-launch rounds.
+
+        Returns ``(index, committed, hidden_state)`` -- the accept count, the flat selected
+        DeltaNet states and the rolling-buffer hidden gathered at the last accepted position.
+        """
+        index = (
+            (
+                (~(candidate_input_ids[:, 1:] == target_tokens[:, :-1])).cumsum(dim=-1)
+                < 1
+            )
+            .sum(dim=-1, keepdim=True, dtype=torch.int32)
+            .view(self.batch_size, -1)
+        )
+        committed = self._commit_deltanet(candidates, index)
+        hidx = index.reshape(self.batch_size, -1, 1).expand(
+            self.batch_size, 1, self.rolling_buffer_hidden_size
+        )
+        return index, committed, torch.gather(hidden_state, dim=1, index=hidx)
+
+    def _round_token_gen_forward(self, input_ids, position_ids, seq_ids):
+        """The whole round -- draft, verify, replay -- as one NKI launch.
+
+        The three stages read at three different positions, so rope, mask and cache-write index are
+        per stage: D1 at t, the verify block at [t+1, t+2], D2 at t+1. D2's mask counts MTP slot t
+        as committed prior, which is the slot D1 wrote earlier in the same launch.
+        """
+        spec_len = self.neuron_config.speculation_length
+        assert spec_len == 2, "the round megakernel is derived for spec_len == 2 (k == 1)"
+        draft, target = self.draft_model, self.target_model
+        cfg = target.config
+        H = cfg.hidden_size
+        dtype = self.neuron_config.torch_dtype
+        device = input_ids.device
+        seq_ids = seq_ids.to(torch.int32)
+        bsz = input_ids.shape[0]
+
+        prev_hidden = self.hidden_state_rolling_buffer.get_state(seq_ids, position_ids)
+        pos = position_ids.view(bsz, 1).long()  # t+1, the first candidate's position
+        d1_pos, d2_pos = pos - 1, pos
+        v_pos = torch.cat([pos, pos + 1], dim=1)
+
+        mtp_k, mtp_v = draft.kv_mgr.get_cache(
+            seq_ids=seq_ids, seq_len=draft.n_positions, is_for_context_encoding=False
+        )[0]
+        mtp_sa = draft.mtp_head.decoder_layer.self_attn
+        mtp_L = mtp_k.shape[-1]
+        stage = []
+        for p, q in ((d1_pos, 1), (d2_pos, 1)):
+            cos, sin = draft.mrope_emb(draft.embed_tokens.weight, p)
+            stage.append(
+                {
+                    "kv_write_idx": p.to(torch.int32),
+                    "cos": cos[0],
+                    "sin": sin[0],
+                    "mask": _decode_kernel_mask(
+                        mtp_sa, p, bsz, q, mtp_L, draft.n_positions, device
+                    ),
+                }
+            )
+        front, mtp_gqa, mtp_moe, mtp_head_w = draft._collect_mtp_weights(mtp_k, mtp_v)
+
+        (
+            v_position_ids,
+            cos_cache,
+            sin_cache,
+            past_key_values,
+            prior_mask,
+            verify_active_mask,
+        ) = target._verify_prologue(bsz, spec_len, v_pos, seq_ids, device)
+        layer_is_gqa, dn, gqa, moe, key_dim, gqa_mask = target._collect_verify_weights(
+            past_key_values,
+            seq_ids,
+            prior_mask,
+            verify_active_mask,
+            bsz,
+            spec_len,
+            device,
+        )
+
+        replica_groups = (list(range(cfg.neuron_config.tp_degree)),)
+        flat = flatten_round_args(
+            input_ids.to(torch.int32),
+            prev_hidden,
+            front,
+            mtp_gqa,
+            mtp_moe,
+            mtp_head_w,
+            stage[0],
+            stage[1],
+            dn,
+            gqa,
+            moe,
+            cos_cache[0],
+            sin_cache[0],
+            gqa_mask,
+            target.norm.weight.reshape(1, H),
+            target.lm_head.weight,
+            key_dim,
+            cfg.rms_norm_eps,
+            replica_groups,
+        )
+        n_gqa = sum(layer_is_gqa)
+        n_dn = len(layer_is_gqa) - n_gqa
+        cand_token, target_tokens, hidden, gqa_active_kv, dn_cand, mtp_kv = (
+            split_round_returns(
+                build_round_megakernel(layer_is_gqa)[2](*flat), n_gqa, n_dn
+            )
+        )
+        hidden_state = hidden.to(dtype)
+
+        next_decoder_cache = ()
+        gi = 0
+        for idx, layer in enumerate(target.layers):
+            if layer_is_gqa[idx]:
+                next_decoder_cache += (gqa_active_kv[gi],)
+                gi += 1
+            else:
+                next_decoder_cache += (
+                    layer.linear_attn._dummy_kv(bsz, spec_len, dtype, device),
+                )
+        target_cache = list(
+            target.kv_mgr.update_cache(
+                is_for_context_encoding=False,
+                seq_ids=seq_ids,
+                position_ids=v_position_ids,
+                new_key_values=next_decoder_cache,
+                seq_len=target.n_positions,
+            )
+        )
+        candidates = [(s.unsqueeze(0), c.unsqueeze(0)) for s, c in dn_cand]
+
+        candidate_input_ids = torch.cat(
+            (input_ids, cand_token.view(bsz, -1)), dim=-1
+        )
+        _, committed, hidden_state = self._round_epilogue(
+            candidate_input_ids, target_tokens, hidden_state, candidates
+        )
+        return (
+            [candidate_input_ids, target_tokens]
+            + list(mtp_kv)
+            + target_cache
+            + committed
+            + [hidden_state]
+        )
+
     def _eagle_token_gen_forward(
         self,
         input_ids,
@@ -4626,6 +4844,9 @@ class Qwen36FusedSpecModel(NeuronFusedSpecModel):
         num_queries=None,
         computed_context_lens=None,
     ):
+        if getattr(self.config, "use_round_megakernel", False):
+            return self._round_token_gen_forward(input_ids, position_ids, seq_ids)
+
         spec_len = self.neuron_config.speculation_length
         bs = input_ids.shape[0]
         hidden_state = self.hidden_state_rolling_buffer.get_state(seq_ids, position_ids)
@@ -4703,21 +4924,9 @@ class Qwen36FusedSpecModel(NeuronFusedSpecModel):
         flat_draft_cache = list(model_output[1:-1])
 
         # Greedy accept count - 1 (0 reject -> S1, 1 accept -> S2).
-        index = (
-            (
-                (~(candidate_input_ids[:, 1:] == target_tokens[:, :-1])).cumsum(dim=-1)
-                < 1
-            )
-            .sum(dim=-1, keepdim=True, dtype=torch.int32)
-            .view(self.batch_size, -1)
+        _, committed, hidden_state = self._round_epilogue(
+            candidate_input_ids, target_tokens, hidden_state, candidates
         )
-
-        committed = self._commit_deltanet(candidates, index)
-
-        hidx = index.reshape(self.batch_size, -1, 1).expand(
-            self.batch_size, 1, self.rolling_buffer_hidden_size
-        )
-        hidden_state = torch.gather(hidden_state, dim=1, index=hidx)
 
         # Layout: [cand, target_tokens, *draft_kv, *target_kv, *committed, hidden].
         # token_gen_outs[-1] (hidden) is consumed by the parent forward's rolling
