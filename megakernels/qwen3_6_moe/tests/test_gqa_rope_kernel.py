@@ -50,7 +50,7 @@ import nki  # noqa: E402
 import nki.isa as nisa  # noqa: E402
 import nki.language as nl  # noqa: E402
 
-from megakernels.qwen3_6_moe.nki_kernels.gqa.components.rope import (  # noqa: E402
+from nki_kernels.gqa.components.rope import (  # noqa: E402
     HEAD_DIM,
     NUM_HEADS,
     NUM_ROPE_HEADS,

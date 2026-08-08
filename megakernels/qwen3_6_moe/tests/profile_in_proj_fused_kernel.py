@@ -48,7 +48,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 import torch_xla.core.xla_model as xm  # noqa: E402
 
-from megakernels.qwen3_6_moe.nki_kernels.deltanet.decode.fused_layer import (  # noqa: E402
+from nki_kernels.deltanet.decode.fused_layer import (  # noqa: E402
     deltanet_in_proj_fused_tkg_fwd,
     deltanet_in_proj_fused_tkg_fwd_state,
 )

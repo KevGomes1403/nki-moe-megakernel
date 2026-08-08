@@ -55,7 +55,7 @@ from nkilib.core.utils.common_types import (  # noqa: E402
     RouterActFnType,
 )
 
-from megakernels.qwen3_6_moe.nki_kernels.moe.components.routed_experts import (  # noqa: E402
+from nki_kernels.moe.components.routed_experts import (  # noqa: E402
     moe_routed_compose,
 )
 

@@ -50,11 +50,11 @@ from nkilib.core.utils.kernel_helpers import (  # noqa: E402
 )
 from nkilib.core.utils.tensor_view import TensorView  # noqa: E402
 
-from megakernels.qwen3_6_moe.nki_kernels.deltanet.decode.fused_layer import (  # noqa: E402
+from nki_kernels.deltanet.decode.fused_layer import (  # noqa: E402
     attention_layer_compose,
     deltanet_attention_layer_state,
 )
-from megakernels.qwen3_6_moe.nki_kernels.megakernel.qwen36_verify_megakernel import (  # noqa: E402
+from nki_kernels.megakernel.qwen36_verify_megakernel import (  # noqa: E402
     load_residual_to_sbuf,
 )
 

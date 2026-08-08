@@ -39,7 +39,7 @@ import nki  # noqa: E402
 import nki.isa as nisa  # noqa: E402
 import nki.language as nl  # noqa: E402
 
-from megakernels.qwen3_6_moe.nki_kernels.gqa.components.pre_attn_norm import (  # noqa: E402
+from nki_kernels.gqa.components.pre_attn_norm import (  # noqa: E402
     H,
     H0,
     pre_attn_rmsnorm_compose,

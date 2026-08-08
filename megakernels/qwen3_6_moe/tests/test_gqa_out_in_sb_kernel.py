@@ -47,11 +47,11 @@ from nkilib.core.utils.kernel_helpers import (  # noqa: E402
 )
 from nkilib.core.utils.tensor_view import TensorView  # noqa: E402
 
-from megakernels.qwen3_6_moe.nki_kernels.gqa.decode.fused_layer import (  # noqa: E402
+from nki_kernels.gqa.decode.fused_layer import (  # noqa: E402
     gqa_fused_compose,
     gqa_fused_tkg_fwd,
 )
-from megakernels.qwen3_6_moe.nki_kernels.megakernel.qwen36_verify_megakernel import (  # noqa: E402
+from nki_kernels.megakernel.qwen36_verify_megakernel import (  # noqa: E402
     all_reduce_gather_h,
     load_residual_to_sbuf,
 )

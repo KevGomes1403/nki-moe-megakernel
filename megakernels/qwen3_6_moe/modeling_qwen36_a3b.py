@@ -64,7 +64,7 @@ except ImportError:
     from torch_neuronx.xla_impl.ops import nki_jit  # NKI 0.2.x (SDK 2.28)
 from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeRMSNorm
 
-from .nki_kernels import (
+from nki_kernels import (
     deltanet_recurrent_fwd as _deltanet_nki_kernel,
     deltanet_recurrent_fwd_state as _deltanet_nki_kernel_state,
     deltanet_chunk_step as _deltanet_nki_chunk_step,
@@ -78,7 +78,7 @@ from .nki_kernels import (
     gqa_fused_tkg_fwd,
     moe_layer_fwd,
 )
-from .nki_kernels.megakernel import (
+from nki_kernels.megakernel import (
     DN_FIELDS,
     GQA_FIELDS,
     MOE_FIELDS,

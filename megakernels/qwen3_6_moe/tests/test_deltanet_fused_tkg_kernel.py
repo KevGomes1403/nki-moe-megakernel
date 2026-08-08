@@ -43,7 +43,7 @@ _HF_REF = Path(__file__).resolve().parent.parent / "_hf_reference"
 if str(_HF_REF) not in sys.path:
     sys.path.insert(0, str(_HF_REF))
 
-from megakernels.qwen3_6_moe.nki_kernels.deltanet.decode.fused_layer import (  # noqa: E402
+from nki_kernels.deltanet.decode.fused_layer import (  # noqa: E402
     deltanet_fused_tkg_fwd,
     deltanet_fused_tkg_fwd_state,
 )

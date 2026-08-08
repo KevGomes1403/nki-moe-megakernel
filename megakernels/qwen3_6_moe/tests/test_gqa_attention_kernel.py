@@ -52,10 +52,10 @@ import nki  # noqa: E402
 import nki.isa as nisa  # noqa: E402
 import nki.language as nl  # noqa: E402
 
-from megakernels.qwen3_6_moe.nki_kernels.gqa.components.attention import (  # noqa: E402
+from nki_kernels.gqa.components.attention import (  # noqa: E402
     gqa_attention_d256,
 )
-from megakernels.qwen3_6_moe.nki_kernels.gqa.components.attention_fresh_ref import (  # noqa: E402
+from nki_kernels.gqa.components.attention_fresh_ref import (  # noqa: E402
     gqa_attention_core,
 )
 

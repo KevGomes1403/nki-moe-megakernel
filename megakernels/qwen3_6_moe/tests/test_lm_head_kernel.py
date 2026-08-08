@@ -41,7 +41,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from megakernels.qwen3_6_moe.nki_kernels.lm_head.components.lm_head import (  # noqa: E402
+from nki_kernels.lm_head.components.lm_head import (  # noqa: E402
     lm_head_fwd,
 )
 

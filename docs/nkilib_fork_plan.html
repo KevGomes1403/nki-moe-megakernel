@@ -1,0 +1,631 @@
+<title>Forking nkilib — Refactor Scope</title>
+
+<style>
+  :root {
+    --ground: #F6F8F7;
+    --surface: #FFFFFF;
+    --surface-2: #EEF2F1;
+    --ink: #14201E;
+    --ink-2: #354341;
+    --muted: #5F6D6B;
+    --faint: #8A9795;
+    --rule: #DBE2E0;
+    --accent: #146B66;
+    --accent-soft: #E0EDEB;
+    --ok: #3B6B4C;
+    --ok-soft: #E2EEE5;
+    --warn: #9A5622;
+    --warn-soft: #F5E9DE;
+    --crit: #8B342E;
+    --crit-soft: #F6E4E2;
+    --shadow: 0 1px 2px rgba(20,32,30,.05), 0 8px 24px -12px rgba(20,32,30,.14);
+
+    --serif: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, "Times New Roman", serif;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground: #0E1413; --surface: #151C1B; --surface-2: #1C2524;
+      --ink: #E6ECEA; --ink-2: #C3CECC; --muted: #8D9B99; --faint: #6B7877;
+      --rule: #26302F;
+      --accent: #55B7B0; --accent-soft: #172E2C;
+      --ok: #79B187; --ok-soft: #17281C;
+      --warn: #D68A50; --warn-soft: #2E2116;
+      --crit: #D9736A; --crit-soft: #2E1A18;
+      --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px -12px rgba(0,0,0,.6);
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground: #0E1413; --surface: #151C1B; --surface-2: #1C2524;
+    --ink: #E6ECEA; --ink-2: #C3CECC; --muted: #8D9B99; --faint: #6B7877;
+    --rule: #26302F;
+    --accent: #55B7B0; --accent-soft: #172E2C;
+    --ok: #79B187; --ok-soft: #17281C;
+    --warn: #D68A50; --warn-soft: #2E2116;
+    --crit: #D9736A; --crit-soft: #2E1A18;
+    --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px -12px rgba(0,0,0,.6);
+  }
+  :root[data-theme="light"] {
+    --ground: #F6F8F7; --surface: #FFFFFF; --surface-2: #EEF2F1;
+    --ink: #14201E; --ink-2: #354341; --muted: #5F6D6B; --faint: #8A9795;
+    --rule: #DBE2E0;
+    --accent: #146B66; --accent-soft: #E0EDEB;
+    --ok: #3B6B4C; --ok-soft: #E2EEE5;
+    --warn: #9A5622; --warn-soft: #F5E9DE;
+    --crit: #8B342E; --crit-soft: #F6E4E2;
+    --shadow: 0 1px 2px rgba(20,32,30,.05), 0 8px 24px -12px rgba(20,32,30,.14);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 16.5px;
+    line-height: 1.62;
+    -webkit-font-smoothing: antialiased;
+    margin: 0;
+    padding: 0 1.25rem 6rem;
+  }
+
+  .wrap { max-width: 60rem; margin: 0 auto; }
+  .prose { max-width: 40rem; }
+
+  /* ---------- masthead ---------- */
+  header.masthead {
+    padding: 4.5rem 0 2.25rem;
+    border-bottom: 2px solid var(--ink);
+    margin-bottom: 2.75rem;
+  }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: .72rem;
+    letter-spacing: .13em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 1.1rem;
+  }
+  h1 {
+    font-family: var(--serif);
+    font-weight: 600;
+    font-size: clamp(2.1rem, 5.2vw, 3.15rem);
+    line-height: 1.08;
+    letter-spacing: -.018em;
+    text-wrap: balance;
+    margin: 0 0 1rem;
+  }
+  .standfirst {
+    font-size: 1.09rem;
+    color: var(--ink-2);
+    max-width: 38rem;
+    margin: 0;
+  }
+  .meta {
+    display: flex; flex-wrap: wrap; gap: .5rem 1.5rem;
+    font-family: var(--mono); font-size: .74rem;
+    color: var(--faint); margin-top: 1.75rem;
+  }
+
+  /* ---------- sections ---------- */
+  section { margin-bottom: 3.5rem; }
+  h2 {
+    font-family: var(--serif);
+    font-weight: 600;
+    font-size: 1.62rem;
+    letter-spacing: -.011em;
+    line-height: 1.22;
+    text-wrap: balance;
+    margin: 0 0 .35rem;
+    padding-top: 1.4rem;
+    border-top: 1px solid var(--rule);
+  }
+  h2 .h2num {
+    font-family: var(--mono);
+    font-size: .72rem;
+    letter-spacing: .1em;
+    color: var(--accent);
+    display: block;
+    margin-bottom: .5rem;
+    font-weight: 500;
+  }
+  h3 {
+    font-family: var(--sans);
+    font-size: .96rem;
+    font-weight: 650;
+    letter-spacing: .005em;
+    margin: 2rem 0 .5rem;
+  }
+  p { margin: 0 0 1rem; }
+  .prose li { margin-bottom: .45rem; }
+  ul, ol { padding-left: 1.15rem; margin: 0 0 1rem; }
+  strong { font-weight: 650; color: var(--ink); }
+  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  a:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 2px; }
+
+  code {
+    font-family: var(--mono);
+    font-size: .855em;
+    background: var(--surface-2);
+    padding: .1em .34em;
+    border-radius: 3px;
+    color: var(--ink-2);
+    word-break: break-word;
+  }
+
+  /* ---------- verdict ---------- */
+  .verdict {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-left: 3px solid var(--accent);
+    border-radius: 3px;
+    padding: 1.6rem 1.75rem;
+    box-shadow: var(--shadow);
+    margin-bottom: 3rem;
+  }
+  .verdict h2 { border: 0; padding: 0; margin: 0 0 .75rem; font-size: 1.32rem; }
+  .verdict p:last-child { margin-bottom: 0; }
+
+  /* ---------- stat grid ---------- */
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(11.5rem, 1fr));
+    gap: 1px;
+    background: var(--rule);
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    overflow: hidden;
+    margin: 1.75rem 0;
+  }
+  .stat { background: var(--surface); padding: 1.1rem 1.15rem; }
+  .stat .val {
+    font-family: var(--mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 1.65rem;
+    line-height: 1.1;
+    letter-spacing: -.02em;
+    color: var(--ink);
+    display: block;
+  }
+  .stat .val.is-crit { color: var(--crit); }
+  .stat .val.is-ok { color: var(--ok); }
+  .stat .val.is-accent { color: var(--accent); }
+  .stat .lbl {
+    display: block;
+    font-size: .78rem;
+    color: var(--muted);
+    margin-top: .4rem;
+    line-height: 1.4;
+  }
+
+  /* ---------- tables ---------- */
+  .scroll { overflow-x: auto; margin: 1.5rem 0; border: 1px solid var(--rule); border-radius: 3px; background: var(--surface); }
+  table { border-collapse: collapse; width: 100%; font-size: .855rem; }
+  caption {
+    text-align: left;
+    font-family: var(--mono);
+    font-size: .715rem;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--faint);
+    padding: .85rem 1rem .1rem;
+  }
+  th, td { padding: .58rem .95rem; text-align: left; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  thead th {
+    font-size: .715rem; letter-spacing: .07em; text-transform: uppercase;
+    color: var(--muted); font-weight: 600; white-space: nowrap;
+    border-bottom: 1px solid var(--ink-2);
+  }
+  tbody tr:last-child td { border-bottom: 0; }
+  td.num, th.num { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  td.file { font-family: var(--mono); font-size: .8rem; white-space: nowrap; }
+
+  .pill {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: .68rem;
+    letter-spacing: .05em;
+    text-transform: uppercase;
+    padding: .16rem .48rem;
+    border-radius: 2px;
+    white-space: nowrap;
+    font-weight: 600;
+  }
+  .pill.ok { background: var(--ok-soft); color: var(--ok); }
+  .pill.warn { background: var(--warn-soft); color: var(--warn); }
+  .pill.crit { background: var(--crit-soft); color: var(--crit); }
+  .pill.accent { background: var(--accent-soft); color: var(--accent); }
+
+  /* ---------- proof block ---------- */
+  pre {
+    font-family: var(--mono);
+    font-size: .79rem;
+    line-height: 1.6;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    padding: 1rem 1.1rem;
+    overflow-x: auto;
+    margin: 1.25rem 0;
+    color: var(--ink-2);
+  }
+  pre .c { color: var(--faint); }
+  pre .g { color: var(--ok); }
+
+  /* ---------- phases ---------- */
+  .phase {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    padding: 1.35rem 1.5rem;
+    margin-bottom: 1rem;
+    box-shadow: var(--shadow);
+  }
+  .phase-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: .75rem; margin-bottom: .3rem; }
+  .phase-n {
+    font-family: var(--mono); font-size: .72rem; letter-spacing: .1em;
+    color: var(--accent); font-weight: 600;
+  }
+  .phase-t { font-weight: 650; font-size: 1.03rem; }
+  .phase-cost { margin-left: auto; font-family: var(--mono); font-size: .72rem; color: var(--muted); white-space: nowrap; }
+  .phase ul { margin-top: .7rem; margin-bottom: 0; }
+  .phase li { margin-bottom: .4rem; font-size: .92rem; color: var(--ink-2); }
+
+  .callout {
+    border-left: 3px solid var(--warn);
+    background: var(--warn-soft);
+    padding: .95rem 1.15rem;
+    border-radius: 0 3px 3px 0;
+    margin: 1.5rem 0;
+    font-size: .93rem;
+  }
+  .callout.crit { border-left-color: var(--crit); background: var(--crit-soft); }
+  .callout p:last-child { margin-bottom: 0; }
+  .callout .ttl { font-weight: 650; display: block; margin-bottom: .3rem; }
+
+  footer {
+    border-top: 1px solid var(--rule);
+    margin-top: 4rem; padding-top: 1.5rem;
+    font-size: .83rem; color: var(--faint);
+  }
+  @media (max-width: 34rem) {
+    body { font-size: 16px; }
+    .stat .val { font-size: 1.4rem; }
+  }
+</style>
+
+<div class="wrap">
+
+<header class="masthead">
+  <p class="eyebrow">Refactor scoping · Trainium kernel library</p>
+  <h1>Stop vendoring. Fork the library AWS already publishes.</h1>
+  <p class="standfirst">Your diagnosis is right and your proposed cure is close — but the mechanism you need already exists, is sanctioned by AWS, and I verified it working on this box without installing anything.</p>
+  <div class="meta">
+    <span>19 Jul 2026</span>
+    <span>nki-moe ↔ trainium-model-translation</span>
+    <span>neuronx-cc 2.25.3371.0 · nkilib 295 files</span>
+  </div>
+</header>
+
+<div class="verdict">
+  <h2>The short version</h2>
+  <p><strong>Fork <a href="https://github.com/aws-neuron/nki-library">aws-neuron/nki-library</a>, don't vendor files.</strong> nkilib ships inside the <code>neuronx-cc</code> wheel, but AWS also publishes the whole tree publicly under Apache-2.0 — and <code>nkilib/__init__.py</code> contains a supported override hook: if a package providing <code>nkilib_src</code> is importable, nkilib <em>replaces itself</em> and aliases every submodule. Every existing <code>from nkilib.core…</code> import in both repos then resolves to your fork with <strong>zero import rewrites</strong>, and <code>NKILIB_FORCE_BUNDLED_LIBRARY=1</code> flips back to stock instantly.</p>
+  <p>I found the exact commit that is <strong>byte-identical</strong> to your installed nkilib, so the fork has a verifiable zero-delta starting point. The hard part of this project is not the fork — it's that the two repos' kernels are <em>not two versions of one library</em>, and reconciling them is a port, not a merge.</p>
+</div>
+
+<section>
+  <h2><span class="h2num">Verified on this box</span>The mechanism works, and I proved it without touching your venv</h2>
+
+  <p class="prose">Rather than argue from documentation, I put the fork on <code>PYTHONPATH</code> and watched nkilib swap itself out. Nothing was installed, nothing in <code>/opt</code> was modified.</p>
+
+  <pre><span class="c">A) baseline, no override</span>
+   nkilib -> /opt/aws_neuronx_venv_…/site-packages/nkilib/__init__.py
+
+<span class="c">B) fork on PYTHONPATH — swaps transparently</span>
+   nkilib      -> …/nki-library/src/nkilib_src/nkilib/__init__.py
+   tensor_view -> …/nki-library/src/nkilib_src/nkilib/core/utils/tensor_view.py
+   deep imports OK: True TensorView
+
+<span class="c">C) escape hatch, fork present but forced bundled</span>
+   nkilib -> /opt/aws_neuronx_venv_…/site-packages/nkilib/__init__.py
+
+<span class="c">D) your qwen3_6_moe kernels, imported against the fork</span>
+   fork active: True
+   <span class="g">repo B under FORK: 23 ok / 0 fail of 23</span></pre>
+
+  <p class="prose">That third state matters more than it looks: it's a built-in A/B bisect. When something breaks after an SDK bump, one env var tells you whether your fork caused it or AWS did. You have no such control today.</p>
+
+  <div class="stats">
+    <div class="stat"><span class="val is-ok">23/23</span><span class="lbl">qwen3_6_moe kernels import green against the fork</span></div>
+    <div class="stat"><span class="val is-accent">26628c5</span><span class="lbl">Commit byte-identical to your bundled nkilib (295/295 files)</span></div>
+    <div class="stat"><span class="val">18 MB</span><span class="lbl">Full public repo — forking all of it is the cheap option</span></div>
+    <div class="stat"><span class="val is-ok">341</span><span class="lbl">AWS test files you inherit for free</span></div>
+  </div>
+
+  <h3>The fork point, and a trap</h3>
+  <p class="prose">The public repo carries branches and tags <code>2.27</code> through <code>2.31</code> — these are <em>SDK umbrella</em> versions, not <code>neuronx-cc</code> versions, exactly the distinction your <code>CLAUDE.md</code> warns about. Note the skew that follows from it: your runtime and collectives are 2.32.x, but your compiler bundles the nkilib tagged <code>2.30</code>. The compiler is what determines nkilib, so <code>2.30</code> is the correct line for you. I diffed every published snapshot against your installed tree:</p>
+
+  <div class="scroll">
+    <table>
+      <caption>Which published snapshot matches your bundled nkilib</caption>
+      <thead><tr><th>Commit</th><th>Snapshot</th><th class="num">Files</th><th class="num">Identical</th><th>Verdict</th></tr></thead>
+      <tbody>
+        <tr><td class="file">181b205</td><td>2026-02-27</td><td class="num">139</td><td class="num">27%</td><td>too old</td></tr>
+        <tr><td class="file">ddbca35</td><td>2026-04-13</td><td class="num">172</td><td class="num">46%</td><td>too old</td></tr>
+        <tr><td class="file">26628c5</td><td>2026-05-25 <span class="pill accent">tag 2.30</span></td><td class="num">295</td><td class="num">100%</td><td><span class="pill ok">fork here</span></td></tr>
+        <tr><td class="file">1ee6257</td><td>2026-07-07</td><td class="num">442</td><td class="num">56%</td><td>next release, already public</td></tr>
+        <tr><td class="file">ee20d3f</td><td>2026-07-14 (head)</td><td class="num">442</td><td class="num">56%</td><td>next release, already public</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <span class="ttl">Don't trust <code>__version__</code></span>
+    <p>Your bundled tree reports <code>0.1.0+g1a95891</code> / built <em>Apr 01</em>, but it actually matches the <em>May 25</em> snapshot exactly. Three separate branches report that same version string while their trees differ by hundreds of files. Identify fork points by diffing trees, never by the version file.</p>
+  </div>
+</section>
+
+<section>
+  <h2><span class="h2num">The decay, measured</span>Vendoring is what's rotting — here is the rate</h2>
+
+  <p class="prose">Four of the five venvs on this box still carry the Mar 17 nkilib your <code>_vendor_meta.md</code> pinned; only <code>nxd_inference</code> was upgraded. That let me measure a real release boundary (2.29 → 2.30) instead of guessing.</p>
+
+  <div class="stats">
+    <div class="stat"><span class="val is-crit">53%</span><span class="lbl">of common files changed in one release (91 of 171)</span></div>
+    <div class="stat"><span class="val is-crit">24,920</span><span class="lbl">lines changed, in 15 days</span></div>
+    <div class="stat"><span class="val is-crit">+124</span><span class="lbl">new files added (172 → 295)</span></div>
+    <div class="stat"><span class="val is-crit">15/15</span><span class="lbl">of your vendored files drifted from upstream</span></div>
+  </div>
+
+  <p class="prose">Every file in <code>nki-moe/nki_kernels/</code> has diverged. Worse, the diff <em>conflates three different things</em> — your deliberate <code>name=</code> prefix edits, your functional changes (the indirect-DMA fusion), and genuine upstream drift — with no way to separate them mechanically. That's precisely why the vendor set rots: you cannot tell your work from AWS's. On <code>attention_tkg.py</code>, only 24 of 113 differing lines are your prefix edits; the other 89 are upstream moving underneath you.</p>
+
+  <p class="prose">The most decayed file is the one nobody noticed: <code>nki-moe/nki_kernels/norm/rmsnorm_tkg.py</code> sits at <strong>0.71 similarity</strong> to upstream and is missing two entire functions that have since been added. Repo B avoids that failure mode simply by importing it live.</p>
+
+  <h3>nkilib has a stable floor and a volatile ceiling</h3>
+  <p class="prose">This is the finding that should shape where you put your patches. The primitives everything rests on barely move; the kernel and config layer churns violently.</p>
+
+  <div class="scroll">
+    <table>
+      <caption>Changed lines per file across the 2.29 → 2.30 boundary</caption>
+      <thead><tr><th>File</th><th class="num">Changed</th><th>Layer</th></tr></thead>
+      <tbody>
+        <tr><td class="file">core/utils/stream_shuffle_broadcast.py</td><td class="num">0</td><td><span class="pill ok">substrate</span></td></tr>
+        <tr><td class="file">core/utils/interleave_copy.py</td><td class="num">0</td><td><span class="pill ok">substrate</span></td></tr>
+        <tr><td class="file">core/utils/cross_partition_copy.py</td><td class="num">0</td><td><span class="pill ok">substrate</span></td></tr>
+        <tr><td class="file">core/embeddings/rope.py</td><td class="num">0</td><td><span class="pill ok">substrate</span></td></tr>
+        <tr><td class="file">core/utils/allocator.py</td><td class="num">4</td><td><span class="pill ok">substrate</span></td></tr>
+        <tr><td class="file">core/utils/tensor_view.py</td><td class="num">4</td><td><span class="pill ok">substrate</span></td></tr>
+        <tr><td class="file">core/utils/kernel_helpers.py</td><td class="num">36</td><td><span class="pill warn">config</span></td></tr>
+        <tr><td class="file">core/utils/common_types.py</td><td class="num">156</td><td><span class="pill warn">config</span></td></tr>
+        <tr><td class="file">core/mlp/mlp_parameters.py</td><td class="num">173</td><td><span class="pill warn">config</span></td></tr>
+        <tr><td class="file">core/mlp/mlp_tkg/mlp_tkg_constants.py</td><td class="num">308</td><td><span class="pill crit">69% rewritten</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Your next upgrade is already published — here's the bill</h3>
+  <p class="prose">Because the repo head is 147 files ahead of what you run, you can read your next migration today rather than discovering it on upgrade day. The head-vs-yours delta is <strong>284 files, +65,351 / −8,616 lines</strong>.</p>
+
+  <div class="scroll">
+    <table>
+      <caption>Next-upgrade impact on files you depend on or have patched</caption>
+      <thead><tr><th>File</th><th class="num">Changed</th><th>Why it matters to you</th></tr></thead>
+      <tbody>
+        <tr><td class="file">core/attention/attention_cte.py</td><td class="num">1,748</td><td>repo B imports <code>attention_cte</code>, <code>_MAX_HEAD_DIM</code></td></tr>
+        <tr><td class="file">core/attention/attention_tkg.py</td><td class="num">1,633</td><td><span class="pill crit">you have a 4,283-line patched copy of this</span></td></tr>
+        <tr><td class="file">core/qkv/qkv_tkg.py</td><td class="num">417</td><td>3 live call sites in repo B</td></tr>
+        <tr><td class="file">core/subkernels/rmsnorm_tkg.py</td><td class="num">217</td><td>backs every norm composable</td></tr>
+        <tr><td class="file">core/mlp/mlp_parameters.py</td><td class="num">144</td><td>8 symbols in repo A</td></tr>
+        <tr><td class="file">core/moe/moe_tkg/moe_tkg.py</td><td class="num">97</td><td>repo A vendored</td></tr>
+        <tr><td class="file">core/utils/common_types.py</td><td class="num">85</td><td>shared with NxDI — see risk below</td></tr>
+        <tr><td class="file">core/utils/tensor_view.py</td><td class="num">0</td><td><span class="pill ok">substrate holds</span></td></tr>
+        <tr><td class="file">core/utils/kernel_assert.py</td><td class="num">0</td><td><span class="pill ok">substrate holds</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p class="prose">The single largest reconciliation item in this entire project is that <code>attention_tkg.py</code> row: AWS is changing 1,633 lines of the exact file you carry a 4,283-line head_dim=256 patch of. Under a fork that becomes a <code>git merge</code> with conflict markers. Under today's vendoring it's a manual re-port.</p>
+
+  <div class="callout" style="border-left-color: var(--ok); background: var(--ok-soft);">
+    <span class="ttl">Better than expected: these are real merges, not tree collisions</span>
+    <p>I assumed the snapshot-drop release style would make upstream merges into hostile tree-replacements. It doesn't. Your fork point <code>26628c5</code> is a <strong>direct ancestor</strong> of the <code>2.31_release</code> head — <code>git merge-base</code> returns <code>26628c5</code> itself. So <code>git merge upstream/2.31_release</code> is a genuine three-way merge with a true common ancestor, and git will correctly separate your patches from AWS's changes. That is the whole benefit of forking over vendoring, and it is available immediately.</p>
+  </div>
+</section>
+
+<section>
+  <h2><span class="h2num">Scope correction</span>Fork the whole tree — but for a reason you didn't state</h2>
+
+  <p class="prose">Your instinct to clone everything is correct, though not because you need everything. The union of what both repos actually import is <strong>37 nkilib modules</strong>; the transitive closure is <strong>78–99 of 295 files</strong>. Seventy-three percent of the library is unreachable from your code.</p>
+
+  <p class="prose">The reason to take the whole tree anyway is that <strong>the override is atomic</strong>. When <code>nkilib_src</code> is present it displaces bundled nkilib for <em>every</em> consumer in the process — and NxDI and NxD import nkilib directly in 18 files (<code>attention_base.py</code>, <code>gqa.py</code>, <code>modeling_llama.py</code>, <code>sampling.py</code>, …). A partial fork would leave those importing a tree that no longer exists. Taking all 18 MB and touching only what you need is both simpler and safer than curating a subset.</p>
+
+  <div class="callout crit">
+    <span class="ttl">The one genuine hazard of this approach</span>
+    <p>Your fork serves NxDI too. <code>core/utils/common_types.py</code> holds enums (<code>QuantizationType</code>, <code>NormType</code>, …) that cross the NxDI ↔ kernel boundary, and it changed 156 lines last release and 85 more in the next. If you edit those enums, NxDI breaks in ways that won't look like your change. Treat <code>common_types.py</code> and the <code>core/utils/</code> substrate as read-only in your fork; put your patches in the kernel layer where AWS expects divergence anyway.</p>
+  </div>
+</section>
+
+<section>
+  <h2><span class="h2num">The real work</span>The two repos aren't two versions of one library</h2>
+
+  <p class="prose">This is where the estimate lives, and it's worth being blunt: <strong>"reconcile the divergence" is a port, not a merge.</strong> Only <em>two</em> files share lineage across the repos, and the parts you'd most want to unify share none at all.</p>
+
+  <div class="scroll">
+    <table>
+      <caption>What actually overlaps between nki-moe and qwen3_6_moe</caption>
+      <thead><tr><th>Area</th><th>Relationship</th><th>Reconciliation</th></tr></thead>
+      <tbody>
+        <tr><td><code>router_topk.py</code></td><td>Same lineage, ~97% identical. Both independently added the same <code>name_prefix</code> kwarg at the same 7 sites.</td><td><span class="pill ok">trivial</span> keep B's</td></tr>
+        <tr><td><code>attention_tkg.py</code></td><td>Same lineage, ~95%. B adds the head_dim=256 patch; A's base is a generation older.</td><td><span class="pill warn">port patch into fork</span></td></tr>
+        <tr><td><code>rmsnorm_tkg.py</code></td><td>A vendored a now-stale copy; B imports live and wraps it.</td><td><span class="pill ok">delete A's</span></td></tr>
+        <tr><td>MoE expert path</td><td><strong>Zero shared lineage.</strong> B rewrote it in raw NKI with a written rationale for why nkilib couldn't express the tp2013 layout.</td><td><span class="pill crit">B's wins outright</span></td></tr>
+        <tr><td>Attention orchestration</td><td>A's <code>attention_block_tkg</code> has no B counterpart; B's <code>gqa_fused_compose</code> replaces the concept.</td><td><span class="pill warn">port A's block-KV</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Both repos independently invented the same design — B's version is better</h3>
+  <p class="prose">Encouragingly, the two codebases converged without coordination on the two-tier <em>compose / jit</em> pattern (undecorated SBUF-in/SBUF-out subkernel, thin <code>@nki.jit</code> entry point), and on the identical fused-slab plus two-slot prefetch ring fix for gate/up DMA fragmentation. That convergence is the strongest evidence your library vision is sound.</p>
+
+  <p class="prose">But repo A's kernels are <strong>not drop-in</strong> under repo B's contract, for five concrete reasons — the first two are the expensive ones:</p>
+
+  <ul class="prose">
+    <li><strong>Layout.</strong> B's entire composable set assumes the tp2013 H-permutation; A uses column-major <code>[PMAX, H_free*T]</code>. Not interconvertible without a transpose at every boundary, which defeats the no-round-trip premise.</li>
+    <li><strong>Caller-visible heap discipline.</strong> A's subkernels require the caller to <code>pop_heap</code> in LIFO order at specific points; B's megakernel loop just chains composables. Dropping A's code in would silently corrupt SBUF.</li>
+    <li><strong>Hardcoded dims.</strong> A pins <code>_E=128, _I=192, d=PMAX</code>; it structurally cannot express head_dim=256. B derives dims from tensor shapes.</li>
+    <li><strong>Weight layout.</strong> A requires pre-transposed checkpoints; B consumes contraction-first native.</li>
+    <li><strong>Allocator mode.</strong> A mandates a manual <code>SbufManager</code>; B defaults to auto-alloc with optional injection.</li>
+  </ul>
+
+  <p class="prose">One premise in your framing turned out to be wrong, in your favour: <strong>repo B already does per-layer name prefixing.</strong> Its megakernel runs <code>pfx = f"L{i}_"</code> through every composable, and it does so at the <em>caller</em> (<code>sbm.set_name_prefix</code>) rather than by rewriting <code>name=</code> literals inside vendored files. That's the cleaner mechanism and it keeps vendored code closer to upstream — it's the approach the fork should standardise on. Repo A's 61 rewritten literals largely become unnecessary.</p>
+
+  <p class="prose">The residual gap is narrow and worth logging rather than fixing now: about 30 <code>name=</code> sites inside B's vendored <code>attention_tkg.py</code> are unprefixed, concentrated on block-KV-cache and debug paths the current megakernel never exercises. Enable block KV cache across two or more layers and NKI's duplicate-name checker will fire.</p>
+</section>
+
+<section>
+  <h2><span class="h2num">Validation</span>The uncomfortable part: you can't currently run all the models</h2>
+
+  <p class="prose">You framed this as "validated by running all the models." That gate does not exist today, and pretending otherwise would sink the refactor. The facts:</p>
+
+  <div class="stats">
+    <div class="stat"><span class="val is-crit">1 of 7</span><span class="lbl">repo B models are runnable — only qwen3_6_moe has weights</span></div>
+    <div class="stat"><span class="val is-crit">0</span><span class="lbl">tests in repo A — deleted in commit 03846e0, only .pyc survive</span></div>
+    <div class="stat"><span class="val is-crit">0</span><span class="lbl">CI configs, pytest configs, or CPU-simulation paths in either repo</span></div>
+    <div class="stat"><span class="val is-warn">77 GB</span><span class="lbl">free disk — one full A3B build is ~65 GB</span></div>
+  </div>
+
+  <ul class="prose">
+    <li>Six of repo B's seven models are stale single-commit drops with no weights on this box. All 12 recent commits touch <code>qwen3_6_moe</code> exclusively.</li>
+    <li>Repo A's gpt-oss needs a ~40 GB download you don't have room for alongside a new build. Its documented <code>--model-path</code> values are also wrong (weights actually live under <code>/home/ubuntu/models/</code>).</li>
+    <li>36 of 38 qwen3_6_moe test files are <code>python -m</code> hardware scripts, not pytest targets. Every one compiles and runs on real silicon; there is no <code>nki.simulate_kernel</code> fallback anywhere.</li>
+    <li>Repo A's logit-parity gate is silently disabled on trn2 and under fused speculation — it only really runs on trn3, non-spec.</li>
+    <li>Realistic full revalidation: <strong>6–8 hours of serial hardware time</strong>, and it still can't cover most models.</li>
+  </ul>
+
+  <p class="prose">The fork materially improves this rather than worsening it: you inherit <strong>341 AWS test files</strong> under <code>test/unit</code> and <code>test/integration</code> — a regression harness neither repo has today, written by the people who wrote the kernels. Standing that up is the highest-leverage thing in this whole plan, and it costs no hardware to start.</p>
+</section>
+
+<section>
+  <h2><span class="h2num">Migration surface</span>nki-moe's vendored library is four symbols, not fifteen files</h2>
+
+  <p class="prose">Doing this in <code>~/nki-moe/</code> is the right call — it's the destination, so fixing the library before Qwen 3.6 lands means migrating once rather than twice. The vendored tree also turns out to be far less entangled than its size implies.</p>
+
+  <div class="stats">
+    <div class="stat"><span class="val is-ok">2</span><span class="lbl">files in the whole repo import <code>nki_kernels/</code></span></div>
+    <div class="stat"><span class="val is-ok">4</span><span class="lbl">public symbols exported, plus layout enums</span></div>
+    <div class="stat"><span class="val is-ok">0</span><span class="lbl">vendored files used by the flagship 1.76× megakernel</span></div>
+    <div class="stat"><span class="val is-crit">0</span><span class="lbl">of the 2 consumers have a working accuracy gate</span></div>
+  </div>
+
+  <p class="prose">The entire 23,000-line vendored tree is reachable through exactly four entry points — <code>attention_block_tkg</code>, <code>moe_tkg</code>, <code>rmsnorm_tkg</code>, <code>router_topk</code> — consumed by <code>transformer_qwen3_moe_speculative.py</code> and <code>transformer_gpt_oss.py</code>. Everything else is implementation that got dragged along because those four were vendored wholesale to apply name prefixes. <strong>You are re-pointing four imports, not porting fifteen files.</strong></p>
+
+  <p class="prose">Better still, your flagship result is insulated: <code>transformer_qwen.py</code> — the 1.76× megakernel — imports <code>attn_fused_nki</code> and <code>moe_fused_nki</code> and touches the vendored tree not at all. It cannot regress from this migration.</p>
+
+  <h3>Triage: most of the tree is deletable, not portable</h3>
+  <div class="scroll">
+    <table>
+      <caption>What to do with each class of vendored file</caption>
+      <thead><tr><th>Class</th><th>Files</th><th>Disposition</th></tr></thead>
+      <tbody>
+        <tr><td>Name-prefix edits only</td><td class="num">~11</td><td><span class="pill ok">delete</span> replaced by fork + one prefix patch</td></tr>
+        <tr><td><code>rmsnorm_tkg.py</code></td><td class="num">1</td><td><span class="pill ok">delete</span> 0.71 similarity, missing 2 upstream fns</td></tr>
+        <tr><td>Indirect-DMA fusion divergence</td><td class="num">2</td><td><span class="pill warn">retire, don't port</span> — see below</td></tr>
+        <tr><td>Real reusable capability (MX/FP8, all-expert)</td><td class="num">~3</td><td><span class="pill warn">port to fork</span> as patch commits</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p class="prose">The two files that look most expensive to port — <code>selective_expert_impl.py</code> (369 non-prefix diff lines) and <code>mlp_tkg_gate_up_projection.py</code> (1,136) — carry the indirect-DMA fusion work behind three env vars that <strong>all default to <code>"0"</code></strong>. Production never executes that path. And repo B independently reimplemented the same fused-slab plus prefetch-ring fix in raw NKI, always-on, with no env gate. Retiring A's version in favour of B's removes the single largest porting cost in the project.</p>
+
+  <div class="callout crit">
+    <span class="ttl">The real risk of starting here: both consumers are unvalidated</span>
+    <p><code>transformer_gpt_oss.py</code> can't run at all — no weights on this box, ~40 GB download. And <code>transformer_qwen3_moe_speculative.py</code> runs under <code>--enable-fused-speculation</code>, where the logit-parity check is <strong>hardcoded to pass</strong> because NxDI's <code>logit_validation</code> doesn't support spec graphs. So the only two files that consume the vendored library are precisely the two paths with no working accuracy gate. Migrating them blind is how you get a silent numerical regression.</p>
+  </div>
+
+  <h3>The mitigation is the env var</h3>
+  <p class="prose"><code>NKILIB_FORCE_BUNDLED_LIBRARY</code> is not just a bisect tool — it's the gate you're missing. Because it toggles fork-versus-stock nkilib <em>in-process without changing a line of your code</em>, you can run the same kernel on the same inputs both ways and diff the output tensors directly. That gives you a kernel-level numerical regression test for exactly the paths that have no model-level one, and it costs one compile per side rather than a full logit-parity run.</p>
+
+  <h3>Keep the prefix patch as a codemod, not a diff</h3>
+  <p class="prose">The name-prefix rewrite touches 61 literals across the vendored tree — as a hand-maintained diff it will conflict on every upstream merge, forever. It is also perfectly mechanical, so it should live as a rerunnable script that re-applies the transform after each merge. Worth noting: your <code>_vendor_meta.md</code> maintenance protocol already instructs you to "re-run the AST scan from <code>docs/vendor_nkilib_for_megakernel_plan.md</code>" — <strong>and that file no longer exists.</strong> There is no <code>docs/</code> directory in the repo. The tooling the protocol depends on has already decayed, which is a small but exact illustration of why the current approach doesn't hold.</p>
+</section>
+
+<section>
+  <h2><span class="h2num">Plan</span>Five phases, run entirely inside nki-moe</h2>
+
+  <p class="prose">The ordering change from doing this in nki-moe: the accuracy gate has to come <em>before</em> the vendor migration, not after, because nki-moe's two vendored-library consumers have no working gate of their own.</p>
+
+  <div class="phase">
+    <div class="phase-head"><span class="phase-n">PHASE 0</span><span class="phase-t">Fork, pin, and prove the no-op</span><span class="phase-cost">~half a day · no hardware</span></div>
+    <ul>
+      <li>Fork <code>aws-neuron/nki-library</code> (not nki-moe — that stays your own repo). Branch from <strong>tag <code>2.30</code> = commit <code>26628c5</code> = head of <code>2.30_release</code></strong> — a tagged release head that is byte-identical to your bundled nkilib. <strong>Do not fork from <code>main</code></strong>: it diverged in Dec 2025 and its snapshot commits are mislabelled (two separate commits both titled "NKI Lib 2026-04-13").</li>
+      <li>Add it to nki-moe as a <strong>submodule</strong>, e.g. <code>third_party/nki-library</code>. A submodule is a full git repo, so <code>git merge upstream/2.31_release</code> works inside it, and nki-moe records the exact SHA in its own history — the pinning comes for free. Set two remotes there: <code>origin</code> = your fork, <code>upstream</code> = AWS.</li>
+      <li><code>pip install -e third_party/nki-library</code>. The submodule alone is invisible to Python; the editable install is what makes <code>nkilib_src</code> importable and fires the override. <strong>No import in either repo changes</strong> — the swap happens inside nkilib's own <code>__init__.py</code>.</li>
+      <li>Because the fork point is byte-identical, <strong>nothing should change</strong> — that is the test. If any behaviour shifts, stop and find out why before going further.</li>
+      <li>Add the pinning nki-moe has never had: <code>constraints.txt</code> recording <code>neuronx-cc 2.25.3371.0</code>, the fork commit SHA, and the venv. This absence is the root cause of "AWS ships an update and things break."</li>
+      <li>Stand up the inherited 341-file AWS test suite and record what passes at the fork point.</li>
+    </ul>
+  </div>
+
+  <div class="phase">
+    <div class="phase-head"><span class="phase-n">PHASE 1</span><span class="phase-t">Build the gate you don't have</span><span class="phase-cost">~2–3 days · light hardware</span></div>
+    <ul>
+      <li>Write an A/B harness that runs a kernel twice — once with the fork, once under <code>NKILIB_FORCE_BUNDLED_LIBRARY=1</code> — and diffs output tensors. Same inputs, same seeds, exact comparison at the fork point.</li>
+      <li>Cover the four entry points that matter: <code>attention_block_tkg</code>, <code>moe_tkg</code>, <code>rmsnorm_tkg</code>, <code>router_topk</code>.</li>
+      <li>Recover repo A's deleted tests if cheap — the <code>.pyc</code> files under <code>tests/*/__pycache__/</code> are decompilable and include <code>test_attention_vs_hf</code> and <code>test_kv_cache_roundtrip</code>, exactly the parity checks this migration needs.</li>
+      <li><strong>Exit criteria:</strong> a command that tells you fork-versus-stock is numerically identical. Everything after this depends on it.</li>
+    </ul>
+  </div>
+
+  <div class="phase">
+    <div class="phase-head"><span class="phase-n">PHASE 2</span><span class="phase-t">Strangle the vendor tree, four symbols at a time</span><span class="phase-cost">~3–5 days · moderate hardware</span></div>
+    <ul>
+      <li>Port the name-prefix rewrite onto the fork as <strong>a codemod script plus its generated commit</strong>, not a hand-edited diff. This is the decision that determines whether merges stay cheap.</li>
+      <li>Re-point one entry point at a time — <code>rmsnorm_tkg</code> first (its vendored copy is the most decayed and carries no real patch), then <code>router_topk</code>, <code>moe_tkg</code>, <code>attention_block_tkg</code>. Gate each with Phase 1's harness before moving on.</li>
+      <li>Retire the indirect-DMA fusion files rather than porting them: default-off in production, and superseded by repo B's always-on raw-NKI version.</li>
+      <li>Delete <code>nki_kernels/</code> when the last import is re-pointed. <code>transformer_qwen.py</code> is untouched throughout — your 1.76× result never moves.</li>
+    </ul>
+  </div>
+
+  <div class="phase">
+    <div class="phase-head"><span class="phase-n">PHASE 3</span><span class="phase-t">Rehearse the upgrade you know is coming</span><span class="phase-cost">~2–4 days · moderate hardware</span></div>
+    <ul>
+      <li>Merge <code>ee20d3f</code> (the already-published next release) into a throwaway branch. You face the real 284-file conflict set on your schedule instead of AWS's.</li>
+      <li>Re-run the codemod, then the Phase 1 harness. That loop — merge, regenerate, verify — <em>is</em> the maintenance process, and this is where you find out what it actually costs.</li>
+      <li>Whatever it costs is your recurring per-release number, and the honest input to whether this library survives long-term.</li>
+    </ul>
+  </div>
+
+  <div class="phase">
+    <div class="phase-head"><span class="phase-n">PHASE 4</span><span class="phase-t">Bring Qwen 3.6 across onto the clean base</span><span class="phase-cost">~1–2 weeks · heavy hardware</span></div>
+    <ul>
+      <li>Move repo B's composables into nki-moe as the top-level kernel library, organised by architecture family rather than by model — the thing that makes the next model cheap. Its three <code>vendored/</code> patches become fork commits on the way in.</li>
+      <li>Fix the contract inconsistencies: SBUF seam defaults disagree (<code>output_in_sbuf=True</code> in MoE vs <code>out_in_sb=False</code> in GQA/DeltaNet), <code>gqa_fused_compose</code> returns a 3- or 5-tuple depending on a flag, and DeltaNet's <code>name_prefix</code> reaches only one of four callees.</li>
+      <li>Port repo A's genuinely unique capability onto the new contract: MX/FP8 paths, all-expert MoE, the block-KV orchestrator, cross-layer weight hoisting.</li>
+      <li><strong>Decide tp2013-versus-column-major here, deliberately.</strong> It is the one blocker with no mechanical answer, and it gates how much of A's code survives.</li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <h2><span class="h2num">Decisions</span>What I need from you before Phase 1</h2>
+  <ul class="prose">
+    <li><strong>Layout convergence.</strong> tp2013 everywhere, or a documented boundary where each layout applies? This gates Phase 4 and has no default answer.</li>
+    <li><strong>Is gpt-oss still alive?</strong> This one now gates Phase 2 rather than being a side question. It is one of only two consumers of the vendored tree, and it cannot be run or validated without a ~40 GB download and disk you don't have. If it's retired, the migration surface halves and every remaining step gets a working gate. If it's kept, budget the download and accept that half of Phase 2 ships unverified.</li>
+    <li><strong>Disk.</strong> At 77 GB free with ~65 GB per build, Phases 2–4 will contend. Worth reclaiming space before starting — the stray <code>MODULE_SyncTensorsGraph.*.neff</code> files in your working tree are a start.</li>
+    <li><strong>Fork visibility.</strong> Apache-2.0 permits a public fork, but your current <code>nki-moe</code> is public and would gain an AWS-derived tree; confirm that's intended.</li>
+  </ul>
+
+  <div class="callout">
+    <span class="ttl">What I did not verify</span>
+    <p>Everything above is static analysis plus import-level execution. <strong>Nothing was compiled or run on hardware</strong>, and no numerical validation was performed — import-green is not correctness. The one behavioural claim I can stand behind is that the override mechanism swaps correctly and your 23 kernels import against it. Phase 0's job is to convert the rest into measured facts.</p>
+  </div>
+</section>
+
+<footer>
+  Scoped against nkilib 295 files @ <code>26628c5</code> · neuronx-cc 2.25.3371.0 · runtime 2.32.28.0 · trn3pre.
+  Fork probe left in the session scratchpad; no changes were made to <code>/opt</code> or to either repository.
+</footer>
+
+</div>

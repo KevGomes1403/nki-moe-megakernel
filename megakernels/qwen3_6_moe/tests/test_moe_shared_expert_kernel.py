@@ -50,10 +50,10 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from megakernels.qwen3_6_moe.nki_kernels.moe.components.routed_experts import (  # noqa: E402
+from nki_kernels.moe.components.routed_experts import (  # noqa: E402
     moe_routed_compose,
 )
-from megakernels.qwen3_6_moe.nki_kernels.moe.components.shared_expert import (  # noqa: E402
+from nki_kernels.moe.components.shared_expert import (  # noqa: E402
     moe_h_shard_decision,
     moe_shared_compose,
     moe_tkg_shard_decision,

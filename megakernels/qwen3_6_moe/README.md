@@ -165,7 +165,7 @@ They are treated as validated code and are not edited.
 CPU weight-conversion tests:
 
 ```bash
-python -m pytest models/qwen3_6_moe/tests/test_a3b_weight_conversion.py
+python -m pytest megakernels/qwen3_6_moe/tests/test_a3b_weight_conversion.py
 ```
 
 Hardware block tests (require a Neuron device, TP=4, LNC=2):

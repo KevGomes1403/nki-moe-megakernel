@@ -45,10 +45,10 @@ from nkilib.core.utils.kernel_helpers import (  # noqa: E402
 )
 from nkilib.core.utils.tensor_view import TensorView  # noqa: E402
 
-from megakernels.qwen3_6_moe.nki_kernels.megakernel.qwen36_verify_megakernel import (  # noqa: E402
+from nki_kernels.megakernel.qwen36_verify_megakernel import (  # noqa: E402
     all_reduce_gather_tokens,
 )
-from megakernels.qwen3_6_moe.nki_kernels.moe.components.routed_experts import (  # noqa: E402
+from nki_kernels.moe.components.routed_experts import (  # noqa: E402
     MOE_BIG_CONFIG_HI,
     moe_token_shard,
 )
