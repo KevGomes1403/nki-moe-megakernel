@@ -3,9 +3,10 @@
 
 """Fused DeltaNet input RMSNorm + 4-way input projection for token generation.
 
-Thin @nki.jit wrapper over nkilib's qkv_tkg: norm(hidden) @ proj_w in one call. proj_w concatenates
-the in_proj_qkv|z|a|b weights on the output axis (I = conv_dim + value_dim + 2*num_v_heads); the
-caller slices the BSD output back into qkv/z/a/b at offsets conv_dim, +value_dim, +num_v_heads.
+Thin @nki.jit wrapper over the vendored qkv_tkg: norm(hidden) @ proj_w in one call. proj_w
+concatenates the in_proj_qkv|z|a|b weights on the output axis (I = conv_dim + value_dim +
+2*num_v_heads); the caller slices the BSD output back into qkv/z/a/b at offsets conv_dim,
++value_dim, +num_v_heads.
 proj_w is [H, I] -- the transpose of the nn.Linear [I, H] weights (qkv_tkg wants contraction H first).
 Per rank (TP=4): hidden=2048, I=3088, T<=2. The SBUF-resident fusion into conv+recurrence lives in
 deltanet/decode/fused_layer.py (deltanet_in_proj_fused_tkg_fwd).
@@ -15,9 +16,10 @@ import nki
 import nki.isa as nisa
 import nki.language as nl
 
-from nkilib.core.qkv.qkv_tkg import qkv_tkg
 from nkilib.core.utils.allocator import create_auto_alloc_manager
 from nkilib.core.utils.common_types import NormType, QKVOutputLayout, QuantizationType
+
+from ..vendored.qkv_tkg import qkv_tkg
 
 
 def in_proj_compose(hidden, proj_w, gamma, eps, output_in_sbuf, name_prefix=""):
@@ -44,6 +46,7 @@ def in_proj_compose(hidden, proj_w, gamma, eps, output_in_sbuf, name_prefix=""):
         fused_add=False,
         output_in_sbuf=output_in_sbuf,
         sbm=sbm,
+        i_column_tiling=True,
     )
 
 

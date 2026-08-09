@@ -58,7 +58,9 @@ import nki.language as nl
 
 from ..components.conv import (
     P_MAX,
+    conv_preload_taps,
     conv_qkv_sbuf,
+    conv_state_store_pending,
     kernel_assert,
     qkv_to_channel_partition,
 )
@@ -102,9 +104,10 @@ def fused_compose(
     Hv_full = (conv_dim - 2 * key_dim) // P_MAX
     kernel_assert(state_hbm.shape[-3] == Hv_full, "state head count must equal Hv")
 
-    q_sbuf, k_sbuf, v_sbuf = conv_qkv_sbuf(
+    q_sbuf, k_sbuf, v_sbuf, pending_cand = conv_qkv_sbuf(
         qkv, conv_state, conv_weight, key_dim, conv_cand, cand_is_3d
     )
+    conv_state_store_pending(pending_cand)
     gated_delta_rule_tkg(
         None,
         None,
@@ -280,13 +283,16 @@ def in_proj_fused_compose(
     a_off = conv_dim + value_dim
     b_off = a_off + Hv_full
 
+    # Layer-static conv taps/state: issue the DMAs before in_proj so they stream under its matmuls.
+    conv_taps = conv_preload_taps(conv_state, conv_weight, key_dim)
+
     # Stage 0: fused input RMSNorm + 4-projection, kept in SBUF [T, I].
     proj_sb = in_proj_compose(hidden, proj_w, gamma, eps, output_in_sbuf=True)
     T = proj_sb.shape[0]
 
     # Bridge 1: transpose the qkv sub-block to channel-on-partition, then run the conv off SBUF.
     qkv_cp = qkv_to_channel_partition(proj_sb, conv_dim, T)
-    q_sbuf, k_sbuf, v_sbuf = conv_qkv_sbuf(
+    q_sbuf, k_sbuf, v_sbuf, pending_cand = conv_qkv_sbuf(
         None,
         conv_state,
         conv_weight,
@@ -294,6 +300,7 @@ def in_proj_fused_compose(
         conv_cand,
         cand_is_3d,
         qkv_cp_sbuf=qkv_cp,
+        preloaded=conv_taps,
     )
 
     # Bridge 2: drive the recurrence off the conv SBUF tiles + source a/b/z from proj_sb.
@@ -322,6 +329,9 @@ def in_proj_fused_compose(
         b_off=b_off,
         z_off=z_off,
     )
+    # Drained here, not at the conv: the stores only read the conv windows, so their transposes stay
+    # off the conv -> recurrence hand-off.
+    conv_state_store_pending(pending_cand)
 
 
 @nki.jit
@@ -479,6 +489,9 @@ def attention_layer_compose(
     W_core = Hv_core * P_MAX
     W_full = Hv_full * P_MAX
 
+    # Layer-static conv taps/state: issue the DMAs before in_proj so they stream under its matmuls.
+    conv_taps = conv_preload_taps(conv_state, conv_weight, key_dim)
+
     proj_sb = in_proj_compose(
         hidden, proj_w, gamma, eps, output_in_sbuf=True, name_prefix=name_prefix
     )
@@ -488,7 +501,7 @@ def attention_layer_compose(
     attn_sb = nl.ndarray((T, W_core), dtype=out_w.dtype, buffer=nl.sbuf)
 
     qkv_cp = qkv_to_channel_partition(proj_sb, conv_dim, T)
-    q_sbuf, k_sbuf, v_sbuf = conv_qkv_sbuf(
+    q_sbuf, k_sbuf, v_sbuf, pending_cand = conv_qkv_sbuf(
         None,
         conv_state,
         conv_weight,
@@ -496,6 +509,7 @@ def attention_layer_compose(
         conv_cand,
         cand_is_3d,
         qkv_cp_sbuf=qkv_cp,
+        preloaded=conv_taps,
     )
     gated_delta_rule_tkg(
         None,
@@ -523,6 +537,9 @@ def attention_layer_compose(
         z_off=z_off,
         attn_sb_out=attn_sb,
     )
+    # Drained here, not at the conv: the stores only read the conv windows, so their transposes stay
+    # off the conv -> recurrence hand-off.
+    conv_state_store_pending(pending_cand)
     return out_proj_from_recurrence(attn_sb, out_w, T, W_core, out_in_sb=out_in_sb)
 
 

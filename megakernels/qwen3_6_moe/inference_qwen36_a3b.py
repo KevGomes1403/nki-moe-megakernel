@@ -101,6 +101,10 @@ def _make_neuron_config(
         save_sharded_checkpoint=True,
         # GQA TKG kernel reads the K cache as BHDS (its k_prior layout).
         k_cache_transposed=tkg_attention_kernel,
+        # NxDI tiles the cache seq axis to [B,H,D,128,S/128] for fused spec above seq_len 128;
+        # our kernels own the in-place update and index a flat [B,H,D,S]. Gated so the XLA
+        # baseline keeps the tiling (and its cascaded reductions).
+        disable_kv_cache_tiling=tkg_attention_kernel,
         # A3B_SKIP_SHARD=1: trace graphs only; reuse an existing weights/ dir
         # (e.g. symlinked from another build with identical sharding).
         skip_sharding=os.environ.get("A3B_SKIP_SHARD") == "1",

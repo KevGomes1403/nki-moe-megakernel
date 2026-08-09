@@ -67,10 +67,49 @@ def kernel_assert(condition, error_text):
     )
 
 
+def conv_load_tap_blocks(conv_state, conv_weight, NT, K, state_w, ch0):
+    """Bulk-load one segment's per-channel taps and carried state window onto NT partitions.
+
+    conv_weight is row-major [(nt*128 + c), j] = [nt*(128*K) + c*K + j] and conv_state
+    [(nt*128 + c), w] likewise, so each NT block is one contiguous run: both land as a single wide,
+    descriptor-cheap DMA that ``conv_load_compute`` then transposes into channel-on-partition.
+    Returns the ``(w_blk, cs_blk)`` pair.
+    """
+    w_blk = nl.ndarray((NT, P_MAX * K), dtype=nl.float32, buffer=nl.sbuf)
+    cs_blk = nl.ndarray((NT, P_MAX * state_w), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.dma_copy(
+        dst=w_blk.ap(pattern=[[P_MAX * K, NT], [1, P_MAX * K]], offset=0),
+        src=conv_weight.ap(pattern=[[P_MAX * K, NT], [1, P_MAX * K]], offset=ch0 * K),
+    )
+    nisa.dma_copy(
+        dst=cs_blk.ap(pattern=[[P_MAX * state_w, NT], [1, P_MAX * state_w]], offset=0),
+        src=conv_state.ap(
+            pattern=[[P_MAX * state_w, NT], [1, P_MAX * state_w]], offset=ch0 * state_w
+        ),
+    )
+    return w_blk, cs_blk
+
+
+def conv_preload_taps(conv_state, conv_weight, key_dim):
+    """Load this core's tap/state blocks for all 3 owned segments, in ``shard_segments`` order.
+
+    Both tensors are layer-static, so a caller can issue these DMAs ahead of the conv (see
+    ``conv_qkv_sbuf(preloaded=)``); left to ``conv_qkv_sbuf`` they are issued at the point of use.
+    """
+    K = conv_weight.shape[1]
+    segments, _, _ = shard_segments(conv_weight.shape[0], key_dim)
+    preloaded = []
+    for seg in range(len(segments)):
+        t0, n_tiles = segments[seg]
+        preloaded.append(
+            conv_load_tap_blocks(conv_state, conv_weight, n_tiles, K, K - 1, t0 * P_MAX)
+        )
+    return preloaded
+
+
 def conv_load_compute(
     qkv,
-    conv_state,
-    conv_weight,
+    tap_blocks,
     win,
     acc,
     prod,
@@ -86,11 +125,12 @@ def conv_load_compute(
     """Batched load + depthwise MAC + SiLU over one segment's NT channel-tiles (from channel ch0).
 
     ``win`` [128, NT*(state_w+T)], fp32 ``acc``/``prod`` [128, NT*T]/[128, T*K], and ``out``
-    [NT*T, 128] in the I/O dtype are caller-owned. Bulk-loads the per-channel taps and the carried
-    state window (NT on partitions, large contiguous free axis) and transposes them into the
-    channel-on-partition compute layout, loads ``qkv`` (token-major) with a strided DMA, computes
-    ``acc[:, nt, t] = sum_j w*win``, then transposes head_dim onto the free axis and SiLUs into
-    ``out[nt*T+t, i]`` (head/token on partition, head_dim innermost) so the store is contiguous.
+    [NT*T, 128] in the I/O dtype are caller-owned, as is ``tap_blocks`` -- this segment's
+    ``(w_blk, cs_blk)`` pair from ``conv_load_tap_blocks``. Transposes the taps and the carried state
+    window into the channel-on-partition compute layout, loads ``qkv`` (token-major) with a strided
+    DMA, computes ``acc[:, nt, t] = sum_j w*win``, then transposes head_dim onto the free axis and
+    SiLUs into ``out[nt*T+t, i]`` (head/token on partition, head_dim innermost) so the store is
+    contiguous.
     Leaves ``win`` packed as ``[conv_state | qkv]`` per tile for candidate slicing. All source reads
     start at channel ``ch0`` so each segment touches only its tile range. ``out`` is written from
     partition 0 (the Activation engine output cannot target a partition offset); the caller places
@@ -107,21 +147,13 @@ def conv_load_compute(
     conv_dim = qkv.shape[1] if not from_sbuf else None
     img_w = state_w + T  # per-tile window width on the free axis
     prod_w = T * K  # per-tile (W_out * W_f) product width
+    w_blk, cs_blk = tap_blocks
 
     # Per-channel taps: w_p[:, nt, j] = conv_weight[nt*128 + c, j], channel c on partition.
-    # conv_weight is row-major [(nt*128 + c), j] = [nt*(128*K) + c*K + j], so the whole tensor
-    # is one contiguous run per NT block. Bulk-load it onto NT partitions with a 128*K-wide
-    # contiguous free axis (large, descriptor-cheap), then transpose each tap into the
-    # channel-on-partition layout with TensorE.
+    # w_blk[:, j::K] is [NT(part), 128(c)] for tap j; transpose -> [128(c), NT].
     w_p = nl.ndarray((P_MAX, NT * K), dtype=nl.float32, buffer=nl.sbuf)
-    w_blk = nl.ndarray((NT, P_MAX * K), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.dma_copy(
-        dst=w_blk.ap(pattern=[[P_MAX * K, NT], [1, P_MAX * K]], offset=0),
-        src=conv_weight.ap(pattern=[[P_MAX * K, NT], [1, P_MAX * K]], offset=ch0 * K),
-    )
     w_tap = nl.ndarray((P_MAX, NT), dtype=nl.float32, buffer=nl.psum)
     for j in range(K):
-        # w_blk[:, j::K] is [NT(part), 128(c)] for tap j; transpose -> [128(c), NT].
         nisa.nc_transpose(
             dst=w_tap[0:P_MAX, 0:NT],
             data=w_blk.ap(pattern=[[P_MAX * K, NT], [K, P_MAX]], offset=j),
@@ -132,17 +164,7 @@ def conv_load_compute(
         )
 
     # win = concat_free(conv_state, qkv). The carried state window (channel c on partition) is the
-    # first state_w columns of each tile's window. conv_state is row-major
-    # [(nt*128 + c), w] = [nt*(128*state_w) + c*state_w + w], one contiguous run per NT block, so
-    # bulk-load it onto NT partitions (state_w*128-wide contiguous free axis) and transpose each
-    # window column into the channel-on-partition state slots with TensorE.
-    cs_blk = nl.ndarray((NT, P_MAX * state_w), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.dma_copy(
-        dst=cs_blk.ap(pattern=[[P_MAX * state_w, NT], [1, P_MAX * state_w]], offset=0),
-        src=conv_state.ap(
-            pattern=[[P_MAX * state_w, NT], [1, P_MAX * state_w]], offset=ch0 * state_w
-        ),
-    )  # 4 B DMA packets
+    # first state_w columns of each tile's window.
     cs_tap = nl.ndarray((P_MAX, NT), dtype=nl.float32, buffer=nl.psum)
     for w in range(state_w):
         # cs_blk[:, w::state_w] is [NT(part), 128(c)] for state column w; transpose -> [128(c), NT]
@@ -207,18 +229,17 @@ def conv_load_compute(
     )
 
 
-def conv_state_store(
-    win, cand_blk, cand_tap, conv_cand, NT, T, state_w, ch0, cand_is_3d
-):
+def conv_state_store(win, conv_cand, NT, T, state_w, ch0, cand_is_3d):
     """Scatter one segment's per-token candidate windows to its global HBM channels.
 
-    Identical math to ``deltanet_conv``'s candidate store: the window after token t is
-    ``win[:, t+1 : t+1+state_w]`` (bit-exact slice). Each column is transposed into
-    ``cand_blk[nt, c*state_w + w]`` (TensorE), then scattered to the segment's global channels in
-    one DMA per token. ``cand_is_3d`` selects the [T,conv_dim,K-1] candidate stack vs the T=1
-    [conv_dim,K-1] state. Caller owns ``cand_blk``/``cand_tap`` (sized at the segment tile count).
+    The window after token t is ``win[:, t+1 : t+1+state_w]`` (bit-exact slice). Each column is
+    transposed into ``cand_blk[nt, c*state_w + w]`` (TensorE), then scattered to the segment's global
+    channels in one DMA per token. ``cand_is_3d`` selects the [T,conv_dim,K-1] candidate stack vs the
+    T=1 [conv_dim,K-1] state.
     """
     conv_dim = conv_cand.shape[-2]
+    cand_blk = nl.ndarray((NT, P_MAX * state_w), dtype=nl.float32, buffer=nl.sbuf)
+    cand_tap = nl.ndarray((NT, P_MAX), dtype=nl.float32, buffer=nl.psum)
     img_w = state_w + T
     for t in range(T):
         cand_offset = (t * conv_dim * state_w if cand_is_3d else 0) + ch0 * state_w
@@ -246,6 +267,17 @@ def conv_state_store(
         )  # 4 B DMA packets
 
 
+def conv_state_store_pending(pending_cand):
+    """Run the per-segment candidate-window stores ``conv_qkv_sbuf`` collected.
+
+    The stores read only the conv windows, so the caller chooses when to drain: draining after the
+    recurrence keeps their transposes off the conv -> recurrence hand-off.
+    """
+    for seg in range(len(pending_cand)):
+        win, conv_cand, NT, T, state_w, ch0, cand_is_3d = pending_cand[seg]
+        conv_state_store(win, conv_cand, NT, T, state_w, ch0, cand_is_3d)
+
+
 def qkv_to_channel_partition(proj_sb, conv_dim, T):
     """Bridge 1: transpose proj_sb's qkv sub-block [T, 0:conv_dim] to channel-on-partition qkv_cp [128, NT*T] for the conv's SBUF path (one nc_transpose per 128-channel tile, no HBM round-trip)."""
     NT = conv_dim // P_MAX
@@ -268,22 +300,35 @@ def qkv_to_channel_partition(proj_sb, conv_dim, T):
 
 
 def conv_qkv_sbuf(
-    qkv, conv_state, conv_weight, key_dim, conv_cand, cand_is_3d, qkv_cp_sbuf=None
+    qkv,
+    conv_state,
+    conv_weight,
+    key_dim,
+    conv_cand,
+    cand_is_3d,
+    qkv_cp_sbuf=None,
+    preloaded=None,
 ):
-    """Head-sharded conv -> three partition-0-based SBUF tiles (q/k/v) + scatter conv state to HBM.
+    """Head-sharded conv -> three partition-0-based SBUF tiles (q/k/v) + the pending conv-state stores.
 
     Runs the depthwise MAC + SiLU for this core's 3 owned channel segments (its q/k/v slices) and
     returns SEPARATE partition-0-based tiles ``(q_sbuf, k_sbuf, v_sbuf)`` -- each silu'd conv output
     with partition = ``local_head*T + t`` and free = head_dim j. Keeping them separate (rather than a
     combined out_sbuf) keeps every tile partition-0-based, which is exactly the layout the recurrence's
-    ``_load_normed_qk`` consumes (q/k) and the SBUF->SBUF v bridge gathers (v). This core's conv-state
-    slices are scattered to ``conv_cand`` (``new_conv_state`` decode / ``conv_cand`` verify) here.
+    ``_load_normed_qk`` consumes (q/k) and the SBUF->SBUF v bridge gathers (v).
 
-    SBUF-input (in_proj fusion) variant: when ``qkv_cp_sbuf`` (channel-on-partition qkv tile from
-    ``qkv_to_channel_partition``) is given the conv reads qkv from it instead of the HBM strided load;
-    ``qkv`` then carries only its shape (no qkv HBM round-trip).
+    The scatter of this core's conv-state slices to ``conv_cand`` (``new_conv_state`` decode /
+    ``conv_cand`` verify) is returned as a pending list rather than run here, so the caller can place
+    it; it MUST be drained with ``conv_state_store_pending`` or the conv state is never written.
 
-    Returns ``(q_sbuf [Hk_loc*T,128], k_sbuf [Hk_loc*T,128], v_sbuf [Hv_loc*T,128])``.
+    Optional kwargs:
+      qkv_cp_sbuf -- channel-on-partition qkv tile from ``qkv_to_channel_partition`` (in_proj fusion);
+                     the conv reads it instead of the HBM strided load and ``qkv`` then carries only
+                     its shape.
+      preloaded   -- per-segment ``(w_blk, cs_blk)`` from ``conv_preload_taps``, for callers that can
+                     issue those DMAs earlier; loaded here when omitted.
+
+    Returns ``(q_sbuf [Hk_loc*T,128], k_sbuf [Hk_loc*T,128], v_sbuf [Hv_loc*T,128], pending_cand)``.
     """
     K = conv_weight.shape[1]
     # Derive shape/dtype from qkv (HBM path) or from qkv_cp_sbuf + conv_weight when qkv is None (SBUF path).
@@ -306,23 +351,21 @@ def conv_qkv_sbuf(
     k_sbuf = nl.ndarray((Hk_loc * T, P_MAX), dtype=out_dtype, buffer=nl.sbuf)
     v_sbuf = nl.ndarray((Hv_loc * T, P_MAX), dtype=out_dtype, buffer=nl.sbuf)
     seg_out = [q_sbuf, k_sbuf, v_sbuf]
+    if preloaded is None:
+        preloaded = conv_preload_taps(conv_state, conv_weight, key_dim)
 
+    pending_cand = []
     for seg in range(len(segments)):
         t0, n_tiles = segments[seg]  # global start tile, tile count for this segment
         ch0 = t0 * P_MAX  # this segment's global channel offset
         win = nl.ndarray((P_MAX, n_tiles * img_w), dtype=nl.float32, buffer=nl.sbuf)
         acc = nl.ndarray((P_MAX, n_tiles * T), dtype=nl.float32, buffer=nl.sbuf)
         prod = nl.ndarray((P_MAX, T * K), dtype=nl.float32, buffer=nl.sbuf)
-        cand_blk = nl.ndarray(
-            (n_tiles, P_MAX * state_w), dtype=nl.float32, buffer=nl.sbuf
-        )
-        cand_tap = nl.ndarray((n_tiles, P_MAX), dtype=nl.float32, buffer=nl.psum)
         # SiLU writes from partition 0 directly into this segment's own tile (partition-0-based;
         # no combined-buffer placement DMA needed because q/k/v are kept separate).
         conv_load_compute(
             qkv,
-            conv_state,
-            conv_weight,
+            preloaded[seg],
             win,
             acc,
             prod,
@@ -335,11 +378,9 @@ def conv_qkv_sbuf(
             qkv_cp_sbuf=qkv_cp_sbuf,
             t0=t0,
         )
-        conv_state_store(
-            win, cand_blk, cand_tap, conv_cand, n_tiles, T, state_w, ch0, cand_is_3d
-        )
+        pending_cand.append((win, conv_cand, n_tiles, T, state_w, ch0, cand_is_3d))
 
-    return q_sbuf, k_sbuf, v_sbuf
+    return q_sbuf, k_sbuf, v_sbuf, pending_cand
 
 
 def shard_segments(conv_dim, key_dim):
@@ -398,11 +439,8 @@ def deltanet_conv(
         acc = nl.ndarray((P_MAX, NT * T), dtype=nl.float32, buffer=nl.sbuf)
         prod = nl.ndarray((P_MAX, T * K), dtype=nl.float32, buffer=nl.sbuf)
         out = nl.ndarray((NT * T, P_MAX), dtype=qkv_out.dtype, buffer=nl.sbuf)
-        cand_blk = nl.ndarray((NT, P_MAX * state_w), dtype=nl.float32, buffer=nl.sbuf)
-        cand_tap = nl.ndarray((NT, P_MAX), dtype=nl.float32, buffer=nl.psum)
-        conv_load_compute(
-            qkv, conv_state, conv_weight, win, acc, prod, out, NT, K, T, state_w, ch0
-        )
+        taps = conv_load_tap_blocks(conv_state, conv_weight, NT, K, state_w, ch0)
+        conv_load_compute(qkv, taps, win, acc, prod, out, NT, K, T, state_w, ch0)
 
         # Contiguous bulk store of this segment's tiles into qkv_out[NT,T,d] at its global rows.
         nisa.dma_copy(
@@ -413,9 +451,7 @@ def deltanet_conv(
         )
 
         # Scatter this segment's per-token candidate windows to its global HBM channels.
-        conv_state_store(
-            win, cand_blk, cand_tap, conv_cand, NT, T, state_w, ch0, cand_is_3d
-        )
+        conv_state_store(win, conv_cand, NT, T, state_w, ch0, cand_is_3d)
 
 
 @nki.jit
@@ -494,19 +530,11 @@ def deltanet_conv_tkg_fwd_sbuf(qkv, conv_state, conv_weight, key_dim):
         acc = nl.ndarray((P_MAX, n_tiles * T), dtype=nl.float32, buffer=nl.sbuf)
         prod = nl.ndarray((P_MAX, T * K), dtype=nl.float32, buffer=nl.sbuf)
         out_seg = nl.ndarray((n_tiles * T, P_MAX), dtype=qkv.dtype, buffer=nl.sbuf)
+        taps = conv_load_tap_blocks(
+            conv_state, conv_weight, n_tiles, K, state_w, t0 * P_MAX
+        )
         conv_load_compute(
-            qkv,
-            conv_state,
-            conv_weight,
-            win,
-            acc,
-            prod,
-            out_seg,
-            n_tiles,
-            K,
-            T,
-            state_w,
-            t0 * P_MAX,
+            qkv, taps, win, acc, prod, out_seg, n_tiles, K, T, state_w, t0 * P_MAX
         )
         # Place this segment's rows into the combined out_sbuf (SBUF->SBUF DMA can target a
         # partition offset; the Activation engine inside conv_load_compute cannot).

@@ -32,7 +32,8 @@
 #
 # The bf16 decode QK^T / softmax / P.V COMPUTE PATH is byte-for-byte AWS code.
 # Softmax (max/exp/sum over s_prior) never touches head_dim and is untouched.
-# Each patched region is delimited by `# --- D256 PATCH (...) ---` / end markers.
+# Each patched region is delimited by `# --- D256 PATCH (...) ---` / end markers;
+# the (tp_broadcast) region is a backport from a newer nkilib, not a head_dim change.
 #
 # Unchanged helpers (SbufManager, TensorView, stream_shuffle_broadcast,
 # gen_mask_tkg, attention_tkg_utils, kernel_assert, kernel_helpers,
@@ -2641,18 +2642,23 @@ def _transpose_broadcast_max(
     qk_max_copy = sbm.alloc_stack((TC.p_max, tile_size), dtype=bufs.qk_max.dtype)
 
     # For FA, use running max instead of tile max for exp computation
+    # --- D256 PATCH (tp_broadcast): backport of the column-selection form current
+    # nkilib uses. Slice partitions only and let tp_broadcast pick the column via
+    # src_offset, so the view keeps the buffer's true row pitch; pre-slicing the free
+    # dim makes TensorView infer a partition stride of 1, which is only legal while the
+    # buffer is one column wide. Drop when this file is refreshed from upstream. ---
     if atp.use_fa:
-        max_src_tensor = bufs.fa_running_max[:tile_size, nl.ds(index, 1)]
+        max_src_tensor = bufs.fa_running_max[:tile_size]
     else:
-        max_src_tensor = bufs.qk_max_buf[:tile_size, nl.ds(index, 1)]
+        max_src_tensor = bufs.qk_max_buf[:tile_size]
 
-    # FIXME: a hack was put into the tp_broadcast
     tp_broadcast(
         src=max_src_tensor,
         dst=qk_max_copy,
-        src_offset=0,
+        src_offset=index,
         psum_address=None if sbm.is_auto_alloc() else (0, 0),
     )
+    # --- end D256 PATCH (tp_broadcast) ---
     nisa.tensor_copy(
         bufs.qk_max[:, nl.ds(index * atp.s_active_bqh_tile, tile_size)],
         qk_max_copy,

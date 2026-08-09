@@ -33,9 +33,11 @@ Per token (math identical to NeuronGatedDeltaNet._recurrent_step):
 Implementation notes:
   * State is double-buffered (S0/S1 ping-pong): token t's output reads its working tile while
     token t+1's out-of-place decay writes the other, breaking the inter-token write-after-read.
-  * Per-head scalars (decay, beta) are partition-broadcast at width Hv (one small matmul) and
-    free-broadcast across j. beta is folded into the update's k-view (``k*beta``) off the serial
-    chain, so the delta step is a single subtract.
+  * The decay scalar is partition-broadcast once for the whole block (width T*Hv) and free-broadcast
+    across j; the per-token operand is an AP at offset t*Hv. beta is folded into the update's key
+    rows (``k*beta``) for all tokens up front, so the delta step is a single subtract.
+  * The update is a rank-1 matmul per value-head (key row stationary, delta segment moving), so the
+    outer product needs no partition broadcast of delta and no Vector product tile.
   * exp(g) for every (head, token) is computed once before the loop (one activation-table load).
   * key/query (Hk heads) are loaded once up front via a free-axis contiguous bulk DMA, l2-normed
     over d, then a single on-chip nc_transpose each, landing the dim index on the 128 partitions
@@ -43,8 +45,13 @@ Implementation notes:
     transposed tile -- value-head h sources k-head h//rep -- so only Hk copies live in SBUF.
     Requires Hk*T <= 128 (nc_transpose output partitions).
   * Partition broadcast/reduce results stay in PSUM and are consumed directly downstream.
-  * The read/output reduces are pipelined over 512-wide tiles so each reduce matmul overlaps the
-    next tile's multiply.
+  * The read is one matmul per GQA group: the group's key/query column pair is the stationary operand
+    and its state columns are the moving tile, so the elementwise multiply happens inside the PE array
+    (no [128, W] Vector product) and both reads come out of one pass over the state, landing on PSUM
+    partitions 0 (key) and 1 (query). A stream shuffle moves the query read to partition 0 on the
+    output branch (compute accesses must start on a quadrant boundary), off the state chain.
+  * The output takes its read on the PRE-update state and adds the update's rank-1 term in closed
+    form, ``(q.kbeta)*delta``, so it needs no second pass over the state.
 
 Entrypoints:
   deltanet_tkg_fwd        -> (attn_out, final_state)       decode / commit
@@ -69,7 +76,7 @@ import nki
 import nki.isa as nisa
 import nki.language as nl
 
-from .norm_gate import norm_gate_row
+from .norm_gate import fold_gamma_silu, norm_gate_row
 
 # Partition dimension max (NeuronCore SBUF tile width) = d.
 P_MAX = 128
@@ -108,43 +115,23 @@ def partition_broadcast_psum(row_1W, width, ones_row, psum):
         )
 
 
-def mul_then_reduce_tiled(
-    Sp, mat_t, t, T, Hk, Hv, rep, dim, W, mul_buf, ones_col, red_p
-):
-    """Partition-reduce of ``Sp * free_broadcast(GQA-mapped mat)``, pipelined over 512-wide tiles.
+def reduce_pair_by_head_group(Sp, kq_t, t, T, Hk, rep, dim, pair_p):
+    """Partition-reduce of ``Sp`` against the GQA-mapped query AND key columns in one state pass.
 
-    Computes ``red_p[0, h*dim+j] = sum_i Sp[i, h*dim+j] * mat_t[i, (h//rep)*T + t]`` (read uses
-    mat_t = k_t, output uses mat_t = q_t). ``mat_t`` is the transposed ``[128, Hk*T]`` Hk-head tile
-    (``mat_t[i, kh*T+t] = key/query[kh, t, i]``). The GQA broadcast: value-head h sources k-head
-    h//rep, free-broadcast across j -- expressed as a free axis [group, rep, dim] with strides
-    [T, 0, 0] so each k-head is reused rep times. Per 512-tile (4 value-heads), interleaving
-    mul_c -> reduce_c lets the next multiply (Vector) overlap this reduce matmul (Tensor).
+    Computes ``pair_p[r, h*dim+j] = sum_i Sp[i, h*dim+j] * kq_t[i, (h//rep)*T + t, r]`` for r = 0
+    (key) and r = 1 (query). ``kq_t`` is the transposed ``[128, Hk*T, 2]`` Hk-head tile
+    (``kq_t[i, kh*T+t, 0/1] = key/query[kh, t, i]``). A GQA group's ``rep`` value-heads share one
+    key/query column pair and occupy ``rep*dim`` contiguous state columns, so the pair is the
+    stationary tile and the group's state slice is the moving tile: the PE does the elementwise
+    multiply and the partition sum in one pass. Results land on PSUM partitions 0 (key) / 1 (query).
+    Requires ``rep*dim <= _PSUM_FMAX`` (one matmul per group).
     """
-    for c in nl.static_range(div_ceil(W, _PSUM_FMAX)):
-        c0 = c * _PSUM_FMAX
-        tile_w = min(_PSUM_FMAX, W - c0)
-        vh0 = c0 // dim  # first value-head in this tile
-        nvh = (
-            tile_w // dim
-        )  # value-heads in this tile (multiple of rep when rep>1 and tile>=rep*dim)
-        kh0 = vh0 // rep  # first k-head in this tile
-        ngrp = nvh // rep  # k-head groups in this tile
-        # mat_view[i, ((g*rep + r)*dim) + j] = mat_t[i, (kh0+g)*T + t]: groups stride T, the rep
-        # reuse and the dim free-broadcast both stride 0.
-        mat_view_c = mat_t.ap(
-            pattern=[[Hk * T, P_MAX], [T, ngrp], [0, rep], [0, dim]],
-            offset=t + kh0 * T,
-        )
-        nisa.tensor_tensor(
-            dst=mul_buf[0:P_MAX, c0 : c0 + tile_w],
-            data1=Sp[0:P_MAX, c0 : c0 + tile_w],
-            data2=mat_view_c,
-            op=nl.multiply,
-        )
+    grp_w = rep * dim
+    for g in nl.static_range(Hk):
         nisa.nc_matmul(
-            dst=red_p[0:1, c0 : c0 + tile_w],
-            stationary=ones_col[0:P_MAX, 0:1],
-            moving=mul_buf[0:P_MAX, c0 : c0 + tile_w],
+            dst=pair_p[0:2, g * grp_w : (g + 1) * grp_w],
+            stationary=kq_t[0:P_MAX, g * T + t, 0:2],
+            moving=Sp[0:P_MAX, g * grp_w : (g + 1) * grp_w],
             accumulate=False,
         )
 
@@ -166,13 +153,15 @@ def _write_state(state_hbm, Sp, Hv, dim, W, base_off, head_stride):
 
 
 def _load_normed_qk(src, heads, T, dim, scale, src_off, x_f_in=None):
-    """Load q or k (heads, T, dim), l2-norm over d, optionally scale, return transposed [dim, PS].
+    """Load q or k (heads, T, dim), l2-norm over d, optionally scale; returns ``(x_t, x_f)``.
 
     PS = heads*T (LOCAL head count). Loads dim-contiguous from this core's head slice (``src_off``
     skips earlier cores' heads in the full HBM tensor; partition p=head*T+t strides HBM by dim),
     reduces sum-of-squares over the free dim, rsqrt-normalizes (and scales), then nc_transpose so
     dim lands on the 128 partitions the reduce contracts over. Off the per-token critical path.
-    The transposed ``x_t`` is sized at the local PS (nc_transpose data-AP partition stride).
+    Returns the transposed ``x_t`` [dim, PS] (sized at the local PS, the nc_transpose data-AP
+    partition stride) and the pre-transpose normed rows ``x_f`` [PS, dim], which the update's rank-1
+    matmul takes as its stationary operand.
 
     SBUF-input variant: when ``x_f_in`` is given it is the pre-loaded ``[PS, dim]`` conv q/k tile
     (partition = head*T+t, free = dim -- exactly the conv's silu'd q/k sub-block); it is upcast-copied
@@ -204,7 +193,7 @@ def _load_normed_qk(src, heads, T, dim, scale, src_off, x_f_in=None):
     x_t_p = nl.ndarray((dim, PS), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_transpose(dst=x_t_p, data=x_f)
     nisa.tensor_copy(dst=x_t, src=x_t_p)
-    return x_t
+    return x_t, x_f
 
 
 def gated_delta_rule_tkg(
@@ -312,20 +301,20 @@ def gated_delta_rule_tkg(
         PS <= P_MAX,
         f"Hk_loc*T={PS} exceeds 128 (nc_transpose output partitions) -- tile the token axis",
     )
+    # The paired read is one matmul per GQA group, so a group's state columns must fit one PSUM bank.
+    kernel_assert(
+        rep * dim <= _PSUM_FMAX,
+        f"rep*dim={rep * dim} exceeds one PSUM bank ({_PSUM_FMAX} f32)",
+    )
 
-    # ones operands for the broadcast/reduce matmuls (alloc once).
-    ones_col = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.memset(dst=ones_col, value=1.0)
+    # ones operand for the broadcast matmuls (alloc once).
     ones_row = nl.ndarray((1, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
     nisa.memset(dst=ones_row, value=1.0)
 
-    # Reusable per-token SBUF tiles (alloc once). SK/SQ hold the read/output per-tile products.
-    SK = nl.ndarray((P_MAX, W), dtype=nl.float32, buffer=nl.sbuf)
-    SQ = nl.ndarray((P_MAX, W), dtype=nl.float32, buffer=nl.sbuf)
-    outer = nl.ndarray((P_MAX, W), dtype=nl.float32, buffer=nl.sbuf)
+    # Reusable per-token SBUF tiles (alloc once). qs_row is the query-read brought back to partition 0.
+    qs_row = nl.ndarray((1, W), dtype=nl.float32, buffer=nl.sbuf)
     delta_row = nl.ndarray((1, W), dtype=nl.float32, buffer=nl.sbuf)
     O_row = nl.ndarray((1, W), dtype=nl.float32, buffer=nl.sbuf)
-    kbeta_mat = nl.ndarray((P_MAX, Hv), dtype=nl.float32, buffer=nl.sbuf)
 
     # --- Gating math, hoisted (off the per-token critical path) ---
     # g_{t,h} = -exp(A_log_h) * softplus(a_{t,h} + dt_bias_h); then exp(g). All gating tables live
@@ -389,30 +378,93 @@ def gated_delta_rule_tkg(
     nisa.activation(dst=beta_all, op=nl.sigmoid, data=b_sb, bias=None, scale=1.0)
 
     # --- Hoisted q/k: l2norm over d (+ scale q), transpose so dim on partitions. GQA expansion is an
-    # AP broadcast in mul_then_reduce_tiled (no data replication). HBM path loads this core's Hk heads
+    # AP broadcast in reduce_pair_by_head_group (no data replication). HBM path loads this core's Hk heads
     # (from the full tensor, offset kv_off*T*dim); SBUF path consumes the conv tiles directly (already
     # this core's local heads -- no offset, no DMA). The conv tiles ARE the [Hk*T, dim] x_f layout.
     if from_sbuf:
-        k_t = _load_normed_qk(None, Hk, T, dim, 1.0, 0, x_f_in=k_sbuf)
-        q_t = _load_normed_qk(None, Hk, T, dim, inv_sqrt_d, 0, x_f_in=q_sbuf)
+        k_t, k_f = _load_normed_qk(None, Hk, T, dim, 1.0, 0, x_f_in=k_sbuf)
+        q_t, _ = _load_normed_qk(None, Hk, T, dim, inv_sqrt_d, 0, x_f_in=q_sbuf)
     else:
         qk_off = kv_off * T * dim
-        k_t = _load_normed_qk(k, Hk, T, dim, 1.0, qk_off)
-        q_t = _load_normed_qk(q, Hk, T, dim, inv_sqrt_d, qk_off)
+        k_t, k_f = _load_normed_qk(k, Hk, T, dim, 1.0, qk_off)
+        q_t, _ = _load_normed_qk(q, Hk, T, dim, inv_sqrt_d, qk_off)
 
-    # Optional gated per-head RMSNorm at the output seam: load the replicated [dim] gamma once.
+    # Key/query columns interleaved into one [dim, Hk*T, 2] stationary tile so a single pass over the
+    # state yields both per-token reads. Key takes PSUM partition 0 so the delta -- which gates the
+    # state update -- reads it directly; the query read is shuffled off the chain.
+    kq_t = nl.ndarray((dim, PS, 2), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=kq_t[0:dim, 0:PS, 0], src=k_t[0:dim, 0:PS])
+    nisa.tensor_copy(dst=kq_t[0:dim, 0:PS, 1], src=q_t[0:dim, 0:PS])
+
+    # a_{t,h} = q_t . kbeta_{t,h} = beta_{t,h} * (q_t . k_t): the weight of the token's own rank-1
+    # update in its output, which is what lets the output read the PRE-update state (see step 5).
+    # (q_t . k_t) is per GQA group -- one 1x1 matmul per (group, token) -- then expanded over rep.
+    qk_p = nl.ndarray((1, PS), dtype=nl.float32, buffer=nl.psum)
+    for g in nl.static_range(Hk):
+        for t in nl.static_range(T):
+            nisa.nc_matmul(
+                dst=qk_p[0:1, g * T + t : g * T + t + 1],
+                stationary=q_t[0:P_MAX, g * T + t : g * T + t + 1],
+                moving=k_t[0:P_MAX, g * T + t : g * T + t + 1],
+                accumulate=False,
+            )
+    a_all = nl.ndarray((1, TH), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(
+        dst=a_all.ap(pattern=[[TH, 1], [Hv, T], [rep, Hk], [1, rep]], offset=0),
+        data1=beta_all.ap(pattern=[[TH, 1], [Hv, T], [rep, Hk], [1, rep]], offset=0),
+        data2=qk_p.ap(pattern=[[PS, 1], [1, T], [T, Hk], [0, rep]], offset=0),
+        op=nl.multiply,
+    )
+
+    # Optional gated per-head RMSNorm at the output seam. The gate depends only on the projection, so
+    # the whole block's gamma*silu(z) is built here, leaving one multiply per token at the seam. The
+    # proj_sb gather stays per token (token t lives on partition t); the HBM z path is one DMA.
     apply_norm = gamma != None
     if apply_norm:
-        gamma_sb = nl.ndarray((1, dim), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.dma_copy(
-            dst=gamma_sb, src=gamma.ap(pattern=[[dim, 1], [1, dim]], offset=0)
-        )
+        gsz_all = nl.ndarray((1, T * W), dtype=nl.float32, buffer=nl.sbuf)
+        if gate_from_proj:
+            for t in range(T):
+                nisa.dma_copy(
+                    dst=gsz_all[0:1, t * W : (t + 1) * W],
+                    src=proj_sb[t : t + 1, z_off + col_off : z_off + col_off + W],
+                )
+        else:
+            nisa.dma_copy(
+                dst=gsz_all.ap(pattern=[[T * W, 1], [W, T], [1, W]], offset=0),
+                src=z.ap(pattern=[[1, 1], [W_full, T], [1, W]], offset=col_off),
+            )
+        fold_gamma_silu(gsz_all, gamma, T, W, dim)
 
     # Reusable per-token PSUM tiles (matmul outputs; alloc once).
-    eg_p = nl.ndarray((P_MAX, Hv), dtype=nl.float32, buffer=nl.psum)
-    beta_p = nl.ndarray((P_MAX, Hv), dtype=nl.float32, buffer=nl.psum)
-    bcast_p = nl.ndarray((P_MAX, W), dtype=nl.float32, buffer=nl.psum)
-    red_p = nl.ndarray((1, W), dtype=nl.float32, buffer=nl.psum)
+    upd_p = nl.ndarray((P_MAX, W), dtype=nl.float32, buffer=nl.psum)
+    pair_p = nl.ndarray((2, W), dtype=nl.float32, buffer=nl.psum)
+
+    # Decay scalars, partition-broadcast once for the whole block: the per-token operand is an AP at
+    # offset t*Hv into eg_p, free-broadcast across j.
+    eg_p = nl.ndarray((P_MAX, TH), dtype=nl.float32, buffer=nl.psum)
+    partition_broadcast_psum(exp_g_all, TH, ones_row, eg_p)
+
+    # kbeta rows, the update's rank-1 stationary operand, built once for the whole block:
+    # kb_rows[0, (t*Hv+h)*dim + i] = k_normed[(h//rep)*T+t, i] * beta_{t,h}. The GQA expansion is a
+    # stride-0 read of each group's key row, then one free-broadcast multiply by beta. Rows stay on
+    # partition 0, which is where nc_matmul takes a stationary tile.
+    kb_rows = nl.ndarray((1, T * W), dtype=nl.float32, buffer=nl.sbuf)
+    for t in range(T):
+        for g in range(Hk):
+            nisa.dma_copy(
+                dst=kb_rows[
+                    0:1, (t * Hv + g * rep) * dim : (t * Hv + (g + 1) * rep) * dim
+                ],
+                src=k_f.ap(
+                    pattern=[[dim, 1], [0, rep], [1, dim]], offset=(g * T + t) * dim
+                ),
+            )
+    nisa.tensor_tensor(
+        dst=kb_rows.ap(pattern=[[T * W, 1], [dim, TH], [1, dim]], offset=0),
+        data1=kb_rows.ap(pattern=[[T * W, 1], [dim, TH], [1, dim]], offset=0),
+        data2=beta_all.ap(pattern=[[TH, 1], [1, TH], [0, dim]], offset=0),
+        op=nl.multiply,
+    )
 
     # Two ping-pong state tiles. Each token reads the previous buffer and writes the other.
     S0 = nl.ndarray((P_MAX, W), dtype=nl.float32, buffer=nl.sbuf)
@@ -434,9 +486,6 @@ def gated_delta_rule_tkg(
         src = bufs[t % 2]
         Sp = bufs[(t + 1) % 2]
 
-        # Per-token GQA key view from the transposed Hk-head tile, value-head-expanded:
-        # k_mat[i, h] = k_t[i, (h//rep)*T + t]  (h in [0,Hv)). For the beta-fold only.
-        k_mat = k_t.ap(pattern=[[Hk * T, P_MAX], [T, Hk], [0, rep]], offset=t)
         # v_row [1, W]: [0, h*dim+j] <- value[h, t, j]  (this core's Hv heads, v on the free axis:
         # kv/delta index j). HBM path loads from the full [Hv_full,T,dim] tensor (offset by vh_off).
         # SBUF path gathers from the conv v tile (already this core's local heads, partition =
@@ -460,63 +509,43 @@ def gated_delta_rule_tkg(
                     offset=vh_off * T * dim + t * dim,
                 ),
             )
-        # Per-token slices of the precomputed gating tables (partition 0, free cols t*Hv:(t+1)*Hv).
-        beta_vec = beta_all[0:1, t * Hv : (t + 1) * Hv]
-        exp_g_vec = exp_g_all[0:1, t * Hv : (t + 1) * Hv]
-
-        # Fold beta into k off the serial chain: kbeta_mat[i, h] = k[i, h] * beta_h (per value-head,
-        # GQA-mapped). beta per-head -> partition-broadcast (Tensor) then one narrow multiply.
-        partition_broadcast_psum(beta_vec, Hv, ones_row, beta_p)
-        nisa.tensor_tensor(
-            dst=kbeta_mat, data1=k_mat, data2=beta_p[0:P_MAX, 0:Hv], op=nl.multiply
-        )
-        Kbeta_view = kbeta_mat.ap(pattern=[[Hv, P_MAX], [1, Hv], [0, dim]], offset=0)
-
-        # Step 1: decay  Sp = src * exp(g)  (out-of-place: src stays readable). Per-head scalar
-        # broadcast at width Hv into eg_p (PSUM), read via a free-broadcast view over j.
-        partition_broadcast_psum(exp_g_vec, Hv, ones_row, eg_p)
-        eg_view = eg_p.ap(pattern=[[Hv, P_MAX], [1, Hv], [0, dim]], offset=0)
+        # Step 1: decay  Sp = src * exp(g)  (out-of-place: src stays readable). Per-token slice of
+        # the block-wide broadcast, free-broadcast across j.
+        eg_view = eg_p.ap(pattern=[[TH, P_MAX], [1, Hv], [0, dim]], offset=t * Hv)
         nisa.tensor_tensor(dst=Sp, data1=src, data2=eg_view, op=nl.multiply)
 
-        # Step 2: read  kv[0, h*dim+j] = sum_i Sp[i, :] * k_h[i]  (into red_p, PSUM; pipelined).
-        mul_then_reduce_tiled(Sp, k_t, t, T, Hk, Hv, rep, dim, W, SK, ones_col, red_p)
+        # Step 2: one pass over the decayed state yields both reads -- kv = k^T Sp on PSUM partition 0
+        # and q^T Sp on partition 1.
+        reduce_pair_by_head_group(Sp, kq_t, t, T, Hk, rep, dim, pair_p)
 
         # Step 3: delta = v - kv  (single Vector op; *beta folded into the update).
         nisa.tensor_tensor(
-            dst=delta_row, data1=v_row, data2=red_p[0:1, 0:W], op=nl.subtract
+            dst=delta_row, data1=v_row, data2=pair_p[0:1, 0:W], op=nl.subtract
         )
 
-        # Step 4: update  Sp[i, :] += (k_h[i]*beta_h) * delta_h[j]. Broadcast delta, multiply by
-        # Kbeta_view PSUM-direct, accumulate into Sp.
-        partition_broadcast_psum(delta_row, W, ones_row, bcast_p)
-        nisa.tensor_tensor(
-            dst=outer, data1=Kbeta_view, data2=bcast_p[0:P_MAX, 0:W], op=nl.multiply
-        )
-        nisa.tensor_tensor(dst=Sp, data1=Sp, data2=outer, op=nl.add)
+        # Step 4: update  Sp[i, h*dim+j] += (k_h[i]*beta_h) * delta[h*dim+j] -- one rank-1 matmul per
+        # value-head (stationary = the head's kbeta row, moving = its delta segment), straight to PSUM.
+        for h in nl.static_range(Hv):
+            nisa.nc_matmul(
+                dst=upd_p[0:P_MAX, h * dim : (h + 1) * dim],
+                stationary=kb_rows[0:1, (t * Hv + h) * dim : (t * Hv + h + 1) * dim],
+                moving=delta_row[0:1, h * dim : (h + 1) * dim],
+                accumulate=False,
+            )
+        nisa.tensor_tensor(dst=Sp, data1=Sp, data2=upd_p[0:P_MAX, 0:W], op=nl.add)
 
-        # Step 5: output  O_row[0, h*dim+j] = sum_i Sp[i, :] * q_h[i]  (pipelined, like the read).
-        mul_then_reduce_tiled(Sp, q_t, t, T, Hk, Hv, rep, dim, W, SQ, ones_col, red_p)
-        nisa.tensor_copy(
-            dst=O_row[0:1, 0:W], src=red_p[0:1, 0:W], engine=nisa.scalar_engine
+        # Step 5: output  O = q^T Sp_post = q^T Sp + (q . kbeta) * delta -- step 2's pre-update query
+        # read plus the update's rank-1 term, which collapses to the per-head scalar a_{t,h}.
+        nisa.nc_stream_shuffle(
+            dst=qs_row[0:1, 0:W], src=pair_p[0:2, 0:W], shuffle_mask=[1] * 32
         )
+        a_view = a_all.ap(pattern=[[TH, 1], [1, Hv], [0, dim]], offset=t * Hv)
+        nisa.tensor_tensor(dst=O_row, data1=delta_row, data2=a_view, op=nl.multiply)
+        nisa.tensor_tensor(dst=O_row, data1=O_row, data2=qs_row, op=nl.add)
 
-        # Optional gated per-head RMSNorm of the raw row (norm over dim * silu(z)); z comes from HBM or,
-        # under in_proj fusion, from proj_sb's z slice (gathered onto partition 0, no HBM round-trip).
+        # Optional gated per-head RMSNorm of the raw row (norm over dim * this token's gate slice).
         if apply_norm:
-            z_row = nl.ndarray((1, W), dtype=nl.float32, buffer=nl.sbuf)
-            if gate_from_proj:
-                nisa.dma_copy(
-                    dst=z_row[0:1, 0:W],
-                    src=proj_sb[t : t + 1, z_off + col_off : z_off + col_off + W],
-                )
-            else:
-                nisa.dma_copy(
-                    dst=z_row[0:1, 0:W],
-                    src=z.ap(
-                        pattern=[[W_full, 1], [1, W]], offset=t * W_full + col_off
-                    ),
-                )
-            out_row = norm_gate_row(O_row, z_row, gamma_sb, eps, dim)
+            out_row = norm_gate_row(O_row, gsz_all[0:1, t * W : (t + 1) * W], eps, dim)
         else:
             out_row = O_row
 

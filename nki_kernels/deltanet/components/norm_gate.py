@@ -24,8 +24,33 @@ def kernel_assert(condition, error_text):
     )
 
 
-def norm_gate_row(o_row, z_row, gamma_sb, eps, d):
-    """One token's gated per-head RMSNorm (Layout A): o_row/z_row [1,W_core] SBUF, gamma_sb [1,d] -> gated [1,W_core] = RMSNorm(o_row)*silu(z)."""
+def fold_gamma_silu(gsz_all, gamma, T, W, d):
+    """In place, turn a block of raw z rows into the gate ``gamma*silu(z)``.
+
+    ``gsz_all`` [1, T*W] holds z on entry (caller-gathered, token-major) and the gate on exit;
+    ``gamma`` is the replicated [d] norm weight, free-broadcast across (token, head). Folding gamma
+    here rather than inside ``norm_gate_row`` costs one activation-table load and one multiply for
+    the whole block instead of two ops per token.
+    """
+    TH = T * (W // d)
+    gamma_sb = nl.ndarray((1, d), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=gamma_sb, src=gamma.ap(pattern=[[d, 1], [1, d]], offset=0))
+    nisa.activation(dst=gsz_all, op=nl.silu, data=gsz_all, bias=None, scale=1.0)
+    gsz_3d = gsz_all.ap(pattern=[[T * W, 1], [d, TH], [1, d]], offset=0)
+    nisa.tensor_tensor(
+        dst=gsz_3d,
+        data1=gsz_3d,
+        data2=gamma_sb.ap(pattern=[[d, 1], [0, TH], [1, d]], offset=0),
+        op=nl.multiply,
+    )
+
+
+def norm_gate_row(o_row, gsz_row, eps, d):
+    """One token's gated per-head RMSNorm (Layout A).
+
+    ``o_row``/``gsz_row`` are [1, W_core] SBUF rows with ``gsz_row = gamma*silu(z)`` folded by
+    ``fold_gamma_silu``; returns gated [1, W_core] = RMSNorm(o_row) * gsz_row.
+    """
     W = o_row.shape[1]
     kernel_assert(W % d == 0, "W_core must be a multiple of head_dim")
     kernel_assert(d == P_MAX, "head_dim must equal P_MAX")
@@ -44,19 +69,15 @@ def norm_gate_row(o_row, z_row, gamma_sb, eps, d):
     inv = nl.ndarray((1, Hv, 1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.activation(dst=inv, op=nl.rsqrt, data=sumsq, bias=eps, scale=1.0 / d)
 
-    # Normalize: x_j * inv_h (broadcast inv over j), then * gamma_j (broadcast gamma over heads).
+    # Normalize: x_j * inv_h (broadcast inv over j).
     out = nl.ndarray((1, Hv, d), dtype=nl.float32, buffer=nl.sbuf)
     inv_bc = inv.ap(pattern=[[Hv, 1], [1, Hv], [0, d]], offset=0)
     nisa.tensor_tensor(dst=out, data1=o_3d, data2=inv_bc, op=nl.multiply)
-    gamma_bc = gamma_sb.ap(pattern=[[d, 1], [0, Hv], [1, d]], offset=0)
-    nisa.tensor_tensor(dst=out, data1=out, data2=gamma_bc, op=nl.multiply)
 
-    # Gate by silu(z): o_j *= z_j * sigmoid(z_j).
-    sz = nl.ndarray((1, W), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.activation(dst=sz, op=nl.silu, data=z_row, bias=None, scale=1.0)
+    # Gate by the pre-folded gamma*silu(z).
     out_flat = out.ap(pattern=[[W, 1], [1, W]], offset=0)
     gated = nl.ndarray((1, W), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_tensor(dst=gated, data1=out_flat, data2=sz, op=nl.multiply)
+    nisa.tensor_tensor(dst=gated, data1=out_flat, data2=gsz_row, op=nl.multiply)
     return gated
 
 
@@ -76,9 +97,13 @@ def deltanet_gated_rmsnorm(attn_raw, gamma, z, eps):
     W = Hv * d
     col_off = c * W
 
-    # gamma is replicated; load once into [1, d].
-    gamma_sb = nl.ndarray((1, d), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.dma_copy(dst=gamma_sb, src=gamma.ap(pattern=[[d, 1], [1, d]], offset=0))
+    # Gather this core's z columns for the whole block, then fold gamma in off the per-token path.
+    gsz_all = nl.ndarray((1, T * W), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.dma_copy(
+        dst=gsz_all.ap(pattern=[[T * W, 1], [W, T], [1, W]], offset=0),
+        src=z.ap(pattern=[[1, 1], [W_full, T], [1, W]], offset=col_off),
+    )
+    fold_gamma_silu(gsz_all, gamma, T, W, d)
 
     for t in nl.static_range(T):
         o_row = nl.ndarray((1, W), dtype=nl.float32, buffer=nl.sbuf)
@@ -86,12 +111,7 @@ def deltanet_gated_rmsnorm(attn_raw, gamma, z, eps):
             dst=o_row[0:1, 0:W],
             src=attn_raw.ap(pattern=[[W_full, 1], [1, W]], offset=t * W_full + col_off),
         )
-        z_row = nl.ndarray((1, W), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.dma_copy(
-            dst=z_row[0:1, 0:W],
-            src=z.ap(pattern=[[W_full, 1], [1, W]], offset=t * W_full + col_off),
-        )
-        gated = norm_gate_row(o_row, z_row, gamma_sb, eps, d)
+        gated = norm_gate_row(o_row, gsz_all[0:1, t * W : (t + 1) * W], eps, d)
         nisa.dma_copy(
             dst=out.ap(pattern=[[W_full, 1], [1, W]], offset=t * W_full + col_off),
             src=gated[0:1, 0:W],
