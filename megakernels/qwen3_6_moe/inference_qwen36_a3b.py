@@ -122,7 +122,7 @@ def build_inference_config(
     moe_layer_kernel: bool = False,
     verify_megakernel: bool = False,
     draft_megakernel: bool = False,
-    round_megakernel: bool = False,
+    speculation_megakernel: bool = False,
 ) -> Qwen36A3BInferenceConfig:
     """Build the NxDI config from the HF config.json on disk.
 
@@ -141,8 +141,8 @@ def build_inference_config(
             "rope_theta", 10_000_000
         )
     config_dict.setdefault("tie_word_embeddings", False)
-    if round_megakernel:
-        # The round kernel subsumes both, and reuses their weight lists verbatim.
+    if speculation_megakernel:
+        # The speculation megakernel subsumes both, and reuses their weight lists verbatim.
         verify_megakernel = True
         draft_megakernel = True
     if verify_megakernel or draft_megakernel:
@@ -158,7 +158,7 @@ def build_inference_config(
     # Route the draft step and the replay through the draft megakernel (prefill stays XLA).
     config_dict["use_draft_megakernel"] = draft_megakernel
     # Collapse draft + verify + replay into a single launch per round.
-    config_dict["use_round_megakernel"] = round_megakernel
+    config_dict["use_speculation_megakernel"] = speculation_megakernel
 
     # block_size must exceed (seq_len * num_experts_per_tok) so prefill takes
     # forward_all_experts instead of forward_blockwise (the NKI blockwise
@@ -505,9 +505,9 @@ def main():
         "attention + MoE layer kernels). Pair with --mtp-spec-decode.",
     )
     parser.add_argument(
-        "--round-megakernel",
+        "--speculation-megakernel",
         action="store_true",
-        default=os.environ.get("A3B_ROUND_MEGAKERNEL") == "1",
+        default=os.environ.get("A3B_SPECULATION_MEGAKERNEL") == "1",
         help="Run the whole speculation round -- draft, verify and replay -- as one fused "
         "launch (implies --verify-megakernel and --draft-megakernel). Pair with "
         "--mtp-spec-decode.",
@@ -545,7 +545,7 @@ def main():
         moe_layer_kernel=args.use_moe_layer_kernel,
         verify_megakernel=args.verify_megakernel,
         draft_megakernel=args.draft_megakernel,
-        round_megakernel=args.round_megakernel,
+        speculation_megakernel=args.speculation_megakernel,
     )
     if args.tkg_attention_kernel:
         # Hard-fail if the flag didn't reach the configs, so we never silently
@@ -592,12 +592,12 @@ def main():
             False,
         ), "use_draft_megakernel did not propagate to the draft (MTP) config"
         print("[assert] Draft megakernel ENABLED on the draft (MTP) config")
-    if args.round_megakernel:
-        assert args.mtp_spec_decode, "--round-megakernel requires --mtp-spec-decode"
-        assert getattr(inf_config, "use_round_megakernel", False), (
-            "use_round_megakernel did not propagate to the target config"
+    if args.speculation_megakernel:
+        assert args.mtp_spec_decode, "--speculation-megakernel requires --mtp-spec-decode"
+        assert getattr(inf_config, "use_speculation_megakernel", False), (
+            "use_speculation_megakernel did not propagate to the target config"
         )
-        print("[assert] Round megakernel ENABLED (draft + verify + replay in one launch)")
+        print("[assert] Speculation megakernel ENABLED (draft + verify + replay in one launch)")
     maybe_compile(args.model_path, compiled_path, inf_config)
     model = load_model(compiled_path)
 

@@ -1622,7 +1622,7 @@ class Qwen36A3BInferenceConfig(InferenceConfig):
         kwargs.setdefault("use_moe_layer_kernel", False)
         kwargs.setdefault("use_verify_megakernel", False)
         kwargs.setdefault("use_draft_megakernel", False)
-        kwargs.setdefault("use_round_megakernel", False)
+        kwargs.setdefault("use_speculation_megakernel", False)
 
         # MoE
         kwargs.setdefault("num_experts", 256)
@@ -4844,7 +4844,7 @@ class Qwen36FusedSpecModel(NeuronFusedSpecModel):
         num_queries=None,
         computed_context_lens=None,
     ):
-        if getattr(self.config, "use_round_megakernel", False):
+        if getattr(self.config, "use_speculation_megakernel", False):
             return self._round_token_gen_forward(input_ids, position_ids, seq_ids)
 
         spec_len = self.neuron_config.speculation_length
