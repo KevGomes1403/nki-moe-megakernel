@@ -27,6 +27,18 @@ Round latency is nearly flat in sequence length: the only work that grows with t
 window is GQA attention over the KV cache, and only 10 of 40 layers use it.
 Tokens/round is prompt-dependent; small differences between rows are noise.
 
+### Against the XLA baseline
+
+Same fused-speculation structure and identical blockwise prefill at seq_len 1024;
+the baseline runs NxDI's stock XLA/torch graphs (PyTorch DeltaNet recurrence,
+selective-loading MoE) with every NKI kernel disabled.
+
+| seq_len 1024 | round p50 | decode | end-to-end |
+| --- | --- | --- | --- |
+| XLA fused speculation | 14.76 ms | 127 tok/s | 99 tok/s |
+| Speculation megakernel | 9.76 ms | 204 tok/s | 163 tok/s |
+| | **-34%** | **1.60x** | **1.64x** |
+
 ## What's novel here
 
 ### Speculation megakernel
