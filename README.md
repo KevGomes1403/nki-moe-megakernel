@@ -1,11 +1,21 @@
 # NKI Megakernels for MoE Models on Trainium
 
-A collection of full-model NKI megakernels for MoE inference on AWS Trainium. Each model's entire decoder stack runs in a single NKI jit invocation — residual stays in Sbuf, KV caches are scattered in place, and there are no HBM round-trips between layers.
+**One launch. The whole model.**
+
+A new frontier of decode performance on AWS Trainium through maximal fusion. At
+batch 1, decode is not compute-bound — it is kernel boundaries: weights re-fetched,
+the residual spilled to HBM, engines idling between launches. These kernels
+delete the boundaries. Each model's entire decoder stack — attention, 256-expert
+MoE, norms, vocab head, greedy argmax — runs as a single NKI invocation. The
+residual lives in SBUF from embedding to token id; KV caches update in place; TP
+all-reduces run in-kernel. On Qwen3.6, one launch goes further and executes the
+entire speculative-decoding round: draft, verify all 40 layers, replay.
 
 ## Models
 
 | Model | Path | Hardware | Status |
 |---|---|---|---|
+| Qwen3.6-35B-A3B | [`megakernels/qwen3_6_moe/`](megakernels/qwen3_6_moe/) | trn2 (TP=4, LNC=2) | Speculation megakernel: ~200 tok/s decode, flat from 128 to 2048 context ([results](megakernels/qwen3_6_moe/README.md#benchmarks)) |
 | Qwen3-30B-A3B | [`megakernels/qwen3_moe/`](megakernels/qwen3_moe/) | trn2, trn3 (TP=4, LNC=2) | 1.76× over XLA baseline ([results](megakernels/qwen3_moe/README.md#results)) |
 | GPT-OSS-20B | [`megakernels/gpt_oss/`](megakernels/gpt_oss/) | trn3 (TP=8, LNC=1) | In progress |
 
@@ -32,8 +42,6 @@ main.py                         # CLI: generate / validate / benchmark
 The shared primitives in `nki_kernels/` are vendored from `nkilib` so that per-layer invocations don't produce duplicate op names — see [`nki_kernels/_vendor_meta.md`](nki_kernels/_vendor_meta.md).
 
 ## Setup
-
-Tested with AWS Neuron SDK v2.27.
 
 ```bash
 source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
@@ -63,7 +71,10 @@ python main.py --model qwen3_moe --mode evaluate-single --enable-nki \
   --compiled-model-path ~/qwen-30b-a3b/traced_nki_model
 ```
 
-Swap `--model qwen3_moe` for `--model gpt_oss` to run the other model. See each model's README for weight download instructions and supported flags.
+Swap `--model qwen3_moe` for `--model gpt_oss` to run the other model. Qwen3.6 ships
+its own driver instead of the `main.py` registry — see
+[`megakernels/qwen3_6_moe/`](megakernels/qwen3_6_moe/) for its run command. See each
+model's README for weight download instructions and supported flags.
 
 When switching between baseline and megakernel, clear the compile cache:
 
