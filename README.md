@@ -17,7 +17,7 @@ entire speculative-decoding round: draft, verify all 40 layers, replay.
 |---|---|---|---|
 | Qwen3.6-35B-A3B | [`megakernels/qwen3_6_moe/`](megakernels/qwen3_6_moe/) | trn2 (TP=4, LNC=2) | Speculation megakernel: ~200 tok/s decode, flat from 128 to 2048 context ([results](megakernels/qwen3_6_moe/README.md#benchmarks)) |
 | Qwen3-30B-A3B | [`megakernels/qwen3_moe/`](megakernels/qwen3_moe/) | trn2, trn3 (TP=4, LNC=2) | 1.76× over XLA baseline ([results](megakernels/qwen3_moe/README.md#results)) |
-| GPT-OSS-20B | [`megakernels/gpt_oss/`](megakernels/gpt_oss/) | trn3 (TP=8, LNC=1) | In progress |
+| GPT-OSS-20B | [`megakernels/gpt_oss/`](megakernels/gpt_oss/) | trn3 (TP=8, LNC=1) | bs=1 decode ~200 tok/s, flat across 640–8192 context (up to 1.5× XLA); native MXFP4 experts ([results](megakernels/gpt_oss/README.md#results)) |
 
 Each model lives in its own folder under `megakernels/` and has its own README with results, design notes, and run instructions.
 

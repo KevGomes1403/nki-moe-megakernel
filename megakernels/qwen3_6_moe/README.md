@@ -29,26 +29,39 @@ Tokens/round is prompt-dependent; small differences between rows are noise.
 
 ## What's novel here
 
-**Speculation megakernel** (`nki_kernels/megakernel/qwen36_round_megakernel.py`):
-the draft step, the verify pass (all 40 layers + LM head + greedy argmax) and the
-MTP replay run as a single NKI launch spanning both logical cores. The residual stays SBUF-resident across every layer; TP all-reduces, LNC
-gathers and the vocab-argmax reduction run in-kernel; KV and MTP caches are updated
-in place. The seams between stages carry no HBM traffic: the draft stage hands its
-speculated token id to the verifier through an on-chip buffer, the verifier hands its
-hidden state to the replay stage through one on-chip transpose, and because all three
-stages share a launch, the replay can read cache entries the draft stage just wrote.
-Verify-only and draft-only megakernels exist as standalone building blocks.
+### Speculation megakernel
 
-**Fused DeltaNet decode kernel** (`nki_kernels/deltanet/`): input projection, causal
-convolution, gated delta-rule recurrence, gated RMSNorm and output projection in one
-launch, value-heads sharded across the two logical cores. When verifying speculated
-tokens it emits per-token candidate states, so the host can commit the recurrent and
-convolution state of whichever token was accepted.
+One NKI launch runs the entire speculative-decoding round — the draft step, the
+verify pass (all 40 layers + LM head + greedy argmax) and the MTP replay — spanning
+both logical cores (`nki_kernels/megakernel/qwen36_round_megakernel.py`).
 
-**Fused GQA decode layer** (`nki_kernels/gqa/`): QKV and sigmoid-gate projections,
-q/k RMSNorm, partial rotary embedding, attention over the HBM KV cache, gate apply
-and output projection with every intermediate kept in SBUF; the 256-wide head
-dimension is handled as two 128-partition tiles.
+- **The residual never leaves SBUF**, from embedding to token id, across all 40
+  layers and all three stages.
+- **Collectives run in-kernel**: TP all-reduces, cross-core gathers, and the
+  vocab-argmax reduction.
+- **Caches update in place** — KV and MTP, no host-side scatter.
+- **Stage seams carry zero HBM traffic**: the drafted token id reaches the verifier
+  through an on-chip buffer, the verify hidden state reaches the replay through one
+  on-chip transpose, and because all three stages share a launch, the replay can
+  read cache entries the draft stage just wrote.
+- Verify-only and draft-only megakernels exist as standalone building blocks.
+
+### Fused DeltaNet decode kernel
+
+The linear-attention layer as one launch (`nki_kernels/deltanet/`).
+
+- Input projection → causal convolution → gated delta-rule recurrence → gated
+  RMSNorm → output projection, value-heads sharded across the two logical cores.
+- When verifying speculated tokens it emits **per-token candidate states**, so the
+  host commits the recurrent and convolution state of whichever token was accepted.
+
+### Fused GQA decode layer
+
+The full-attention layer with every intermediate in SBUF (`nki_kernels/gqa/`).
+
+- QKV and sigmoid-gate projections, q/k RMSNorm, partial rotary embedding,
+  attention over the HBM KV cache, gate apply and output projection.
+- The 256-wide head dimension runs as two 128-partition tiles.
 
 ## Implementation notes
 
