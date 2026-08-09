@@ -12,7 +12,8 @@ Usage:
     --max-new-tokens defaults to filling the window (seq_len - prompt_len).
 
 Decode/spec graphs gather only the routed experts (NxDI selective loading);
-prefill streams all experts, which is optimal at 128 tokens x top-8.
+prefill runs the blockwise NKI MoE kernel (see the config in
+build_inference_config).
 
 Environment variables (override defaults without flags):
     A3B_TP_DEGREE   : tensor-parallel degree (default 4)
@@ -78,7 +79,7 @@ DEFAULT_PROMPTS = [
 
 
 def _make_neuron_config(
-    tp_degree, seq_len, blockwise_block_size, spec_decode, tkg_attention_kernel=False
+    tp_degree, seq_len, blockwise_config, spec_decode, tkg_attention_kernel=False
 ):
     """MoENeuronConfig shared by the target and draft; adds the EAGLE fused-spec
     flags (speculation_length=2 == k=1) when speculating."""
@@ -108,7 +109,7 @@ def _make_neuron_config(
         # A3B_SKIP_SHARD=1: trace graphs only; reuse an existing weights/ dir
         # (e.g. symlinked from another build with identical sharding).
         skip_sharding=os.environ.get("A3B_SKIP_SHARD") == "1",
-        blockwise_matmul_config={"block_size": blockwise_block_size},
+        blockwise_matmul_config=blockwise_config,
         **spec_kwargs,
     )
 
@@ -160,10 +161,17 @@ def build_inference_config(
     # Collapse draft + verify + replay into a single launch per round.
     config_dict["use_speculation_megakernel"] = speculation_megakernel
 
-    # block_size must exceed (seq_len * num_experts_per_tok) so prefill takes
-    # forward_all_experts instead of forward_blockwise (the NKI blockwise
-    # kernel is not bundled in this SDK build).
-    blockwise_block_size = max(2048, seq_len * 8 * 2)
+    # Prefill MoE runs the blockwise NKI kernel. With 256 experts the worst-case
+    # block count floors at E-1, so small blocks waste far less; all-experts instead
+    # of blockwise fails compilation above seq_len 512 (its intermediate is
+    # E x T x H per layer). The shard-on-block dynamic-while variant is the one
+    # present in this SDK build (shard-on-hidden is not), and it requires PING_PONG
+    # block sharding.
+    blockwise_config = {
+        "block_size": 128,
+        "use_shard_on_block_dynamic_while": True,
+        "block_sharding_strategy": "PING_PONG",
+    }
 
     fused_spec_config = None
     if spec_decode:
@@ -174,7 +182,7 @@ def build_inference_config(
             neuron_config=_make_neuron_config(
                 tp_degree,
                 seq_len,
-                blockwise_block_size,
+                blockwise_config,
                 spec_decode=True,
                 tkg_attention_kernel=tkg_attention_kernel,
             ),
@@ -193,7 +201,7 @@ def build_inference_config(
         neuron_config=_make_neuron_config(
             tp_degree,
             seq_len,
-            blockwise_block_size,
+            blockwise_config,
             spec_decode=spec_decode,
             tkg_attention_kernel=tkg_attention_kernel,
         ),

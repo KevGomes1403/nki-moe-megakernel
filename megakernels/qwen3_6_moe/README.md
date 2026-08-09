@@ -68,11 +68,12 @@ The full-attention layer with every intermediate in SBUF (`nki_kernels/gqa/`).
 - Prefill MoE must use the blockwise kernel above seq_len 512. The all-experts path
   materializes an experts x tokens x hidden intermediate per layer (1 MB per token
   per layer at bf16), which fails compilation on host RAM at 1024 and on device HBM
-  at 4096 — the KV cache is negligible by comparison (80 MB at 4096). Working config:
-  `block_size` 128 (with 256 experts the worst-case block count has a floor of 255,
-  so small blocks waste far less), `use_shard_on_block_dynamic_while`, and `PING_PONG`
-  block sharding. This SDK build lacks the default shard-on-hidden blockwise kernel.
-  Blockwise output has not yet been diffed against the all-experts path.
+  at 4096 — the KV cache is negligible by comparison (80 MB at 4096). The driver
+  configures this by default: `block_size` 128 (with 256 experts the worst-case
+  block count has a floor of 255, so small blocks waste far less),
+  `use_shard_on_block_dynamic_while`, and `PING_PONG` block sharding. This SDK build
+  lacks the default shard-on-hidden blockwise kernel. Blockwise output has not yet
+  been diffed against the all-experts path.
 - DeltaNet prefill uses the chunked-step kernel; the fused variant overflows fp32
   for this checkpoint's gating magnitude (NaN logits) — do not select it.
 - Decode MoE uses NxDI selective loading (~16/256 expert slices per layer per round),
