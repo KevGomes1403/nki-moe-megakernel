@@ -29,15 +29,18 @@ Tokens/round is prompt-dependent; small differences between rows are noise.
 
 ### Against the XLA baseline
 
-Same fused-speculation structure and identical blockwise prefill at seq_len 1024;
-the baseline runs NxDI's stock XLA/torch graphs (PyTorch DeltaNet recurrence,
-selective-loading MoE) with every NKI kernel disabled.
+Same fused-speculation structure and identical blockwise prefill; the baseline runs
+NxDI's stock XLA/torch graphs (PyTorch DeltaNet recurrence, selective-loading MoE)
+with every NKI kernel disabled.
 
-| seq_len 1024 | round p50 | decode | end-to-end |
-| --- | --- | --- | --- |
-| XLA fused speculation | 14.76 ms | 127 tok/s | 99 tok/s |
-| Speculation megakernel | 9.76 ms | 204 tok/s | 163 tok/s |
-| | **-34%** | **1.60x** | **1.64x** |
+| seq_len | XLA round p50 | megakernel round p50 | XLA decode | megakernel decode |
+| --- | --- | --- | --- | --- |
+| 1024 | 14.76 ms | **9.76 ms (-34%)** | 127 tok/s | **204 tok/s (1.60x)** |
+| 2048 | 14.96 ms | **9.84 ms (-34%)** | 131 tok/s | **194 tok/s (1.48x)** |
+
+The XLA round is flat in sequence length too, so the megakernel's win is fusion —
+launch overhead and HBM traffic removed — not attention scaling. The decode ratio
+moves with per-run acceptance noise; the stable per-round latency gap is -34%.
 
 ## What's novel here
 
