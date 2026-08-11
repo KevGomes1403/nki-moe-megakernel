@@ -30,7 +30,7 @@ nki_kernels/
 ├── lm_head/
 │   └── components/
 │       └── lm_head.py     # final RMSNorm + vocab projection + per-rank greedy argmax
-└── specs/                 # design specs (norm_gate.md, out_proj.md, lm_head.md, ...)
+└── specs/                 # design specs & implementation rationale (see below)
 ```
 
 ## Kernel map
@@ -51,6 +51,20 @@ nki_kernels/
 `decode/fused_layer.py` composes the `components/` kernels; that is the megakernel
 under active development. New stage kernels go in `components/`; new model-block
 kernels (e.g. MoE, GQA attention) get sibling packages under `deltanet/`'s parent.
+
+## Design specs
+
+Layout algebra, sharding decisions and perf rationale live in `specs/` rather than in the kernel
+source, so the source stays a low-friction entry point. Per-subsystem:
+
+| Spec | Covers |
+|---|---|
+| `specs/deltanet_tkg.md` | conv + recurrence: input contracts, per-token math, state double-buffering, the paired read, PSUM bank limits |
+| `specs/deltanet_prefill.md` | chunked prefill: which path is live and why, the fp32 overflow, the Neumann-series framework |
+| `specs/gqa_tkg.md` | head_dim=256 partition tiling, attention tensor layouts, o_proj sub-head ordering, KV cache write modes |
+| `specs/moe_tkg.md` | the tp2013 H-permutation, work-split vs. layout, the gate/up slab load and DMA fragmentation |
+| `specs/lm_head.md`, `specs/eh_proj.md`, `specs/norm_gate.md`, `specs/out_proj.md`, `specs/pre_attn_rmsnorm.md`, `specs/moe_layer.md` | per-kernel specs |
+| `specs/draft_megakernel.md`, `specs/round_megakernel_perf.md` | megakernel assembly and round-level perf |
 
 ## Adding a kernel
 

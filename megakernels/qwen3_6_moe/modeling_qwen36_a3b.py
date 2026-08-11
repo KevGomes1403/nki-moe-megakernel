@@ -3,24 +3,20 @@
 Architecture
 ------------
 40 decoder layers in a repeating [DN, DN, DN, GQA] x 10 pattern:
-  * 30 Gated DeltaNet layers (linear recurrent attention, causal conv1d on QKV,
-    delta-rule update, gated output)
-  * 10 Standard GQA layers (16 Q heads, 2 KV heads, head_dim=256, partial RoPE
-    on 64 of 256 dims, sigmoid output gate)
+  * 30 Gated DeltaNet layers -- linear recurrent attention, causal conv1d on QKV,
+    delta-rule update, gated output
+  * 10 standard GQA layers -- 16 Q heads, 2 KV heads, head_dim=256, partial RoPE
+    on 64 of 256 dims, sigmoid output gate
 
-Every layer's FFN is a MoE block: 256 routed experts (top-8) + 1 always-on
-shared expert, both with intermediate dim 512. Routing uses fp32 softmax
-with normalized top-k affinities.
-
-A multi-token-prediction (MTP) head sits alongside the main stack -- one
-extra decoder layer + RMSNorms + an LM head -- and is invoked off the main
-traced forward as a self-speculative drafter.
+Every layer's FFN is a MoE block: 256 routed experts (top-8) plus 1 always-on shared
+expert, both with intermediate dim 512. Routing uses fp32 softmax over normalized
+top-k affinities. An MTP head sits alongside the main stack -- one extra decoder
+layer, RMSNorms and an LM head -- invoked off the main traced forward as a drafter.
 
 State / caching
 ---------------
-GQA layers use NxDI's KVCacheManager.
-DeltaNet layers carry their recurrent state + 1-D conv state as nn.Parameter
-buffers and return dummy KV tuples from forward.
+GQA layers use NxDI's KVCacheManager. DeltaNet layers carry their recurrent state and
+1-D conv state as nn.Parameter buffers, and return dummy KV tuples from forward.
 """
 
 import contextlib
@@ -217,7 +213,6 @@ class TransposedColumnParallelLinear(ColumnParallelLinear):
     The matmul consumes the weight directly (``x @ W``), so the contraction dim is
     already on the partition axis and no runtime weight transpose is emitted.
     """
-
     def set_weight_and_bias_config(self) -> None:
         self.weight_shape = (self.input_size, self.output_size_per_partition)
         self.weight_partition_dim = 1
@@ -253,7 +248,6 @@ USE_PYTHON_RMSNORM = os.environ.get("USE_PYTHON_RMSNORM") == "1"
 
 class NewtonRMSNorm(nn.Module):
     """RMSNorm with Newton-Raphson refined rsqrt for improved numerical accuracy."""
-
     def __init__(self, hidden_size=None, eps=1e-6):
         super().__init__()
         self.weight = None
@@ -303,7 +297,6 @@ class NeuronGatedDeltaNet(nn.Module):
         norm        : (head_v_dim,)
         out_proj    : (hidden_size, value_dim)
     """
-
     def __init__(self, config, layer_idx: int):
         super().__init__()
         tc = config
@@ -367,11 +360,10 @@ class NeuronGatedDeltaNet(nn.Module):
             gather_output=False,
         )
 
-        # The four input projections (qkv|z|a|b) are fused into one weight stored
-        # contraction-first ([hidden, I]) so the TKG kernel needs no runtime
-        # cat/transpose. A RowParallelLinear container shards the output axis I
-        # (dim 1); convert_qwen36_a3b_hf_to_neuron_state_dict() builds the global
-        # weight with per-rank column order [qkv_r | z_r | a_r | b_r].
+        # The four input projections (qkv|z|a|b) are fused into one contraction-first
+        # [hidden, I] weight, so the TKG kernel needs no runtime cat/transpose. A
+        # RowParallelLinear container shards the output axis; the state-dict conversion
+        # builds the global weight with per-rank column order [qkv_r | z_r | a_r | b_r].
         self.in_proj_fused = RowParallelLinear(
             self.global_conv_dim + self.global_value_dim + 2 * self.global_num_v_heads,
             self.hidden_size,
@@ -1214,11 +1206,9 @@ class NeuronGatedDeltaNet(nn.Module):
         )
         is_decode = past_key_value is not None and not qwen_chunked_prefill_active
 
-        # Padding mask for DeltaNet: [B, S, 1] with 1.0 for real tokens, 0.0 for padding.
-        # Passed from get_model_output where it's computed from input_ids != pad_token_id.
-        # Embeddings are already zeroed for padding tokens; this mask additionally
-        # zeros the decay gate so the recurrent state is preserved unchanged
-        # through padding positions (no spurious decay).
+        # Padding mask for DeltaNet: [B, S, 1], 1.0 for real tokens and 0.0 for padding.
+        # Embeddings are already zeroed for padding; this additionally zeros the decay gate
+        # so the recurrent state passes through padding positions unchanged.
         valid_mask_1d = kwargs.get("deltanet_padding_mask", None)  # [B, S, 1] or None
         hybrid_cache_active = self.use_hybrid_cache_manager
         recurrent_state_cache = None
@@ -1463,10 +1453,9 @@ class NeuronGatedDeltaNet(nn.Module):
             else:
                 new_rec_state = new_state_bf16 + self.recurrent_state_buffer * 0
         else:
-            # CTE: chunked NKI kernel by default. It forms the within-chunk decay
-            # as exp(gc[i] - gc[j]) (always <= 1), which is numerically stable; the
-            # fused kernel's split form exp(gc[i])*exp(-gc[j]) overflows float32
-            # under this checkpoint's large decays. Env vars override the path.
+            # CTE: chunked NKI kernel by default. It forms the within-chunk decay as
+            # exp(gc[i] - gc[j]), always <= 1 and numerically stable; the fused kernel's split
+            # form overflows fp32 under this checkpoint's large decays. Env vars override.
             use_nki_fused = os.environ.get("USE_NKI_FUSED") == "1"
             use_nki = os.environ.get("USE_NKI") == "1"
             use_sequential = os.environ.get("DELTANET_SEQUENTIAL") == "1"
@@ -1591,7 +1580,6 @@ class NeuronGatedDeltaNet(nn.Module):
 
 class Qwen36A3BInferenceConfig(InferenceConfig):
     """Hybrid DeltaNet + GQA decoder with 256-expert MoE and an MTP head."""
-
     def __init__(self, *args, **kwargs):
         kwargs.setdefault("num_hidden_layers", 40)
 
@@ -1720,7 +1708,6 @@ class Qwen36A3BMRoPEEmbedding(nn.Module):
     Position IDs have shape (3, batch_size, seq_len) for T/H/W dimensions.
     For text-only (2D position_ids), broadcasts to 3D with identical positions.
     """
-
     def __init__(self, config):
         super().__init__()
         self.head_dim = config.head_dim  # 256
@@ -1794,7 +1781,6 @@ class NeuronQwen36A3BAttention(NeuronAttentionBase):
     RoPE, and attention computation. Overrides forward() to insert the
     sigmoid output gate between attention output and o_proj.
     """
-
     def __init__(self, config):
         # Partial RoPE: create mRoPE embedding with rope_dim (64)
         self.rope_dim = config.rope_dim
@@ -1837,10 +1823,9 @@ class NeuronQwen36A3BAttention(NeuronAttentionBase):
             gather_output=False,
         )
 
-        # Fused GQA TKG kernel weights (decode/verify only). Contraction-first /
-        # head-major, per-rank, mirroring the DeltaNet in_proj_fused / out_proj
-        # layout; built in _convert_full_attention_block. Prefill keeps the
-        # standard q/k/v/output_gate/o_proj modules above.
+        # Fused GQA TKG kernel weights (decode/verify only): contraction-first, head-major,
+        # per-rank, mirroring the DeltaNet in_proj_fused / out_proj layout. Prefill keeps
+        # the standard q/k/v/output_gate/o_proj modules above.
         self.use_tkg_attention_kernel = getattr(
             config, "use_tkg_attention_kernel", False
         )
@@ -2159,9 +2144,9 @@ class NeuronQwen36A3BAttention(NeuronAttentionBase):
     ):
         """Fused GQA decode/verify: input-normed hidden in, all-reduced [B,S,H] out.
 
-        ``hidden_states`` is already input-RMSNorm'd (the decoder applies input_layernorm).
-        Returns ``(output, (active_k, active_v), cos_cache, sin_cache)`` -- the same tuple shape
-        the standard forward returns, so NxDI scatters active_k/active_v exactly as today.
+        hidden_states is already input-RMSNorm'd, since the decoder applies input_layernorm.
+        Returns (output, (active_k, active_v), cos_cache, sin_cache) -- the same tuple shape the
+        standard forward returns, so NxDI scatters active_k/active_v unchanged.
         """
         bsz, T, _ = hidden_states.shape
         k_cache, v_cache = past_key_value  # [B,1,D,L] BHDS, [B,1,L,D] BHSD
@@ -2229,7 +2214,6 @@ class NeuronMoEBlock(nn.Module):
     gated sum is reduced once. Valid because the gate is rank-replicated:
     AR(routed) + gate*AR(shared) == AR(routed + gate*shared).
     """
-
     def __init__(self, config: "Qwen36A3BInferenceConfig"):
         super().__init__()
         self.config = config
@@ -2333,7 +2317,6 @@ class SharedExpertMLP(nn.Module):
     via direct matmuls (mirrors the DeltaNet in_proj_fused/out_proj layout). Both paths return the
     local partial (no reduce) so NeuronMoEBlock fuses it with the routed partial under one all-reduce.
     """
-
     def __init__(
         self, hidden_size: int, intermediate_size: int, transposed: bool = False
     ):
@@ -2392,7 +2375,6 @@ class NeuronMTPHead(nn.Module):
 
     Invoked off the traced main forward by the speculative-decoding driver.
     """
-
     def __init__(
         self,
         config: "Qwen36A3BInferenceConfig",
@@ -2464,10 +2446,8 @@ class NeuronMTPHead(nn.Module):
         consumes). ``layer_kwargs`` (active_mask, is_for_context_encoding, seq_ids,
         ...) pass through to the GQA decoder layer.
         """
-        # Concat order is [embed | hidden]: the eh_proj weight is the checkpoint's
-        # `mtp.fc` transposed at load (no column repacking), whose input is
-        # laid out as [normed embedding of t+1 | normed trunk hidden at t]. Each
-        # norm is applied to its own tensor before the join.
+        # Concat order is [embed | hidden], matching the checkpoint's mtp.fc transposed at
+        # load with no column repacking. Each norm is applied to its own tensor before the join.
         combined = torch.cat(
             [self.embed_norm(next_input_embeds), self.hidden_norm(prev_hidden)],
             dim=-1,
@@ -2494,7 +2474,6 @@ class NeuronMTPHead(nn.Module):
 
 class NeuronQwen36A3BDecoderLayer(nn.Module):
     """Hybrid decoder layer: dispatches to DeltaNet or standard attention, then MoE FFN."""
-
     def __init__(self, config: Qwen36A3BInferenceConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -2539,10 +2518,9 @@ class NeuronQwen36A3BDecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
 
         if verify_mode and self.layer_type == "linear_attention":
-            # Verify path: run the 2-token block as an exact single-step
-            # recurrence seeded read-only from the live committed DeltaNet buffers.
-            # The per-position recurrent S-candidates and conv windows are returned
-            # for the in-graph accept/reject state commit.
+            # Verify: run the 2-token block as an exact single-step recurrence, seeded read-only
+            # from the live committed buffers. The per-position S-candidates and conv windows
+            # come back for the in-graph accept/reject commit.
             seq_ids = kwargs.get("seq_ids", None)
             attn_out, S_stack, conv_cand = self.linear_attn.verify_block(
                 hidden_states, seq_ids, self.input_layernorm
@@ -2620,7 +2598,6 @@ class NeuronQwen36A3BDecoderLayer(nn.Module):
 
 class HybridDeltaNetCacheManager(KVCacheManager):
     """Layer-type-aware cache manager: DeltaNet (recurrent+conv state) or GQA (K/V)."""
-
     def __init__(self, config: Qwen36A3BInferenceConfig, num_kv_head, **kwargs):
         self.layer_types = list(config.layer_types)
         self._validate_hybrid_config(config)
@@ -3069,10 +3046,9 @@ class NeuronQwen36A3BModel(NeuronBaseModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        # Zero out embeddings for padding tokens: DeltaNet has no attention mask
-        # (it runs a linear recurrence over every position), so a padding token's
-        # real embedding would corrupt the recurrence state. The mask is [B, S, 1]
-        # float, 1.0 for real tokens and 0.0 for padding.
+        # Zero out embeddings for padding tokens: DeltaNet has no attention mask -- it runs
+        # a linear recurrence over every position -- so a padding token's real embedding
+        # would corrupt the recurrence state.
         if (
             is_for_context_encoding
             and attention_mask is not None
@@ -3164,11 +3140,9 @@ class NeuronQwen36A3BModel(NeuronBaseModel):
                 attention_mask.dtype
             )
 
-        # Pre-compute MRoPE-interleaved cos/sin. Qwen3.6 always uses the
-        # MRoPE form (even for text-only inputs); the HF reference broadcasts
-        # 2D position_ids to (3, B, S) with identical positions then runs the
-        # interleaved-MRoPE mixing. Plain RoPE on the first 64 dims is NOT
-        # equivalent and produces garbage logits.
+        # Pre-compute MRoPE-interleaved cos/sin. Qwen3.6 always uses the MRoPE form, even
+        # for text-only inputs. Plain RoPE on the first 64 dims is NOT equivalent and
+        # produces garbage logits.
         if rotary_position_ids is not None and rotary_position_ids.ndim == 3:
             cos_cache, sin_cache = self.mrope_emb(inputs_embeds, rotary_position_ids)
         elif cos_cache is None or sin_cache is None:
@@ -3608,11 +3582,10 @@ def _convert_moe_block(sd, prefix, config):
         if src in sd:
             sd[f"{prefix}.mlp.{nxdi_suffix}"] = sd.pop(src).transpose(1, 2).contiguous()
 
-    # Fused MoE layer kernel (verify path): stow the shared expert contraction-first IN PLACE (gate/up
-    # [I_s,H]->[H,I_s], down [H,I_s]->[I_s,H]) so the kernel reads it with no runtime transpose; the
-    # PyTorch SharedExpertMLP(transposed=True) forward consumes the same layout. Router/sigma stay in
-    # their standard layout for the decode/prefill path and get small rank-replicated transposed copies
-    # (NxDI owns the router, so it can't be restowed in place). Experts already match (no change).
+    # Fused MoE layer kernel: stow the shared expert contraction-first in place so the
+    # kernel reads it with no runtime transpose; SharedExpertMLP(transposed=True) consumes
+    # the same layout. Router/sigma stay standard for the decode/prefill path and get small
+    # rank-replicated transposed copies, since NxDI owns the router. Experts already match.
     if getattr(config, "use_moe_layer_kernel", False):
         for name in ("gate_proj", "up_proj", "down_proj"):
             skey = f"{prefix}.mlp.shared_expert.{name}.weight"
@@ -3762,11 +3735,9 @@ def convert_qwen36_a3b_hf_to_neuron_state_dict(neuron_state_dict, config):
 
         gc.collect()
 
-    # MTP head (Qwen3-Next layout). The checkpoint ships `mtp.fc`,
-    # `mtp.pre_fc_norm_{embedding,hidden}`, `mtp.norm`, and one full-attention
-    # decoder layer under `mtp.layers.0.*`; it ships neither a draft embedding
-    # nor a draft LM head, so both are tied to the main model. When MTP is
-    # disabled, drop the keys so they don't trip load_state_dict.
+    # MTP head (Qwen3-Next layout). The checkpoint ships no draft embedding and no draft
+    # LM head, so both are tied to the main model. When MTP is disabled, drop the keys
+    # so they don't trip load_state_dict.
 
     # Store lm_head transposed ([hidden, vocab]) for TransposedColumnParallelLinear.
     if "lm_head.weight" in neuron_state_dict:
@@ -3835,7 +3806,6 @@ def convert_qwen36_a3b_hf_to_neuron_state_dict(neuron_state_dict, config):
 
 class Qwen36A3BDecoderModelInstance(DecoderModelInstance):
     """Custom DecoderModelInstance that adds DeltaNet state buffers to input_output_aliases."""
-
     def get(self, bucket_rank, **kwargs):
         """Override to add DeltaNet state aliases after KV cache aliases."""
         module, input_output_aliases = super().get(bucket_rank, **kwargs)
@@ -3861,7 +3831,6 @@ class Qwen36A3BDecoderModelInstance(DecoderModelInstance):
 
 class Qwen36A3BModelWrapper(ModelWrapper):
     """Custom ModelWrapper for VL support with mRoPE and vision inputs."""
-
     def get_model_instance(self):
         return Qwen36A3BDecoderModelInstance(
             model_cls=self.model_cls,
@@ -4021,11 +3990,10 @@ class Qwen36A3BModelWrapper(ModelWrapper):
 # Fused speculative decoding (NxDI NeuronFusedSpecModel, EAGLE path)
 # ============================================================
 #
-# The MTP head is the draft (Qwen36MTPDraft); the 40-layer backbone is the
-# verify-mode target (Qwen36SpecTarget). Qwen36FusedSpecModel overrides the two
-# EAGLE sub-forwards to run DeltaNet verify and commit the accepted recurrent/
-# conv state in-graph. One CTE graph + one FUSED_SPECULATION_MODEL_TAG graph;
-# the draft->verify->accept loop runs device-side. See FUSED_SPEC_PLAN.md.
+# The MTP head drafts; the 40-layer backbone is the verify-mode target.
+# Qwen36FusedSpecModel overrides the two EAGLE sub-forwards to run DeltaNet verify
+# and commit the accepted recurrent/conv state in-graph. One CTE graph plus one
+# FUSED_SPECULATION_MODEL_TAG graph, with the draft->verify->accept loop device-side.
 
 
 def _greedy_argmax(lm_head, logits, rank_util, disable_argmax_kernel=False):
@@ -4084,7 +4052,6 @@ class Qwen36MTPDraft(NeuronBaseModel):
     (kv_mgr), so the threaded ``kv_cache`` arg is ignored (k=1: no within-trace
     chaining needed). Return: [sampled_tokens, *kv, hidden].
     """
-
     def setup_attr_for_model(self, config: "Qwen36A3BInferenceConfig"):
         self.on_device_sampling = False
         self.tp_degree = config.neuron_config.tp_degree
@@ -4341,7 +4308,6 @@ class Qwen36SpecTarget(NeuronQwen36A3BModel):
     ``self._verify_candidates`` for the in-graph commit. The per-position greedy
     argmax is a sharded vocab-parallel reduction (lm_head stays sharded).
     """
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._verify_candidates = []
@@ -4667,7 +4633,6 @@ class Qwen36FusedSpecModel(NeuronFusedSpecModel):
     per DeltaNet layer and ride them back into the live recurrent/conv buffers via
     the aliased state region (Qwen36FusedSpecModelInstance). spec_len=2 == k=1.
     """
-
     def _commit_deltanet(self, candidates, index):
         """Select S/conv by accept count (spec_len=2: 0 -> S1, 1 -> S2).
 
@@ -5002,7 +4967,6 @@ class Qwen36FusedSpecModelInstance(DecoderModelInstance):
     at [base, base+ns) (matching the graph layout) and shift the rolling-buffer
     hidden to base+ns.
     """
-
     def get(self, bucket_rank, **kwargs):
         module, aliases = super().get(bucket_rank, **kwargs)
 
@@ -5031,7 +4995,6 @@ class Qwen36FusedSpecModelInstance(DecoderModelInstance):
 class Qwen36A3BFusedSpecModelWrapper(ModelWrapper):
     """Base ModelWrapper (standard fused-spec input signature) wired to the
     DeltaNet-aware fused instance."""
-
     def get_model_instance(self):
         return Qwen36FusedSpecModelInstance(
             model_cls=self.model_cls,
@@ -5410,7 +5373,6 @@ class NeuronQwen36MTPDraftForCausalLM(NeuronQwen36A3BForCausalLM):
     """Draft holder for fused speculation: exposes Qwen36MTPDraft as _model_cls and
     a converter that keeps only the embedding + MTP head (the backbone lives in the
     target). Self-speculative: loads the same checkpoint as the target."""
-
     _model_cls = Qwen36MTPDraft
 
     @staticmethod

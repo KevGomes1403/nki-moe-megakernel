@@ -1,8 +1,7 @@
 """End-to-end inference driver for Qwen3.6-35B-A3B on Trainium.
 
-Default config: trn2, TP=4, LNC=2, bf16, seq_len=128, greedy sampling.
-Compiles once into --compiled-path, then loads and generates for a few
-short prompts to validate that the port produces sensible tokens.
+Default config: trn2, TP=4, LNC=2, bf16, seq_len=128, greedy sampling. Compiles once into
+--compiled-path, then loads and generates for a few short prompts to sanity-check the port.
 
 Usage:
     python inference_qwen36_a3b.py \\
@@ -11,9 +10,8 @@ Usage:
 
     --max-new-tokens defaults to filling the window (seq_len - prompt_len).
 
-Decode/spec graphs gather only the routed experts (NxDI selective loading);
-prefill runs the blockwise NKI MoE kernel (see the config in
-build_inference_config).
+Decode/spec graphs gather only the routed experts (NxDI selective loading); prefill runs the
+blockwise NKI MoE kernel, configured in build_inference_config.
 
 Environment variables (override defaults without flags):
     A3B_TP_DEGREE   : tensor-parallel degree (default 4)
@@ -161,12 +159,10 @@ def build_inference_config(
     # Collapse draft + verify + replay into a single launch per round.
     config_dict["use_speculation_megakernel"] = speculation_megakernel
 
-    # Prefill MoE runs the blockwise NKI kernel. With 256 experts the worst-case
-    # block count floors at E-1, so small blocks waste far less; all-experts instead
-    # of blockwise fails compilation above seq_len 512 (its intermediate is
-    # E x T x H per layer). The shard-on-block dynamic-while variant is the one
-    # present in this SDK build (shard-on-hidden is not), and it requires PING_PONG
-    # block sharding.
+    # Prefill MoE runs the blockwise NKI kernel: with 256 experts the worst-case block
+    # count floors at E-1, so small blocks waste far less, and all-experts fails
+    # compilation above seq_len 512. Only the shard-on-block dynamic-while variant exists
+    # in this SDK build, and it requires PING_PONG block sharding.
     blockwise_config = {
         "block_size": 128,
         "use_shard_on_block_dynamic_while": True,

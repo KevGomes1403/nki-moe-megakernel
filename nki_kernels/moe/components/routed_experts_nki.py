@@ -3,35 +3,23 @@
 
 """Raw-NKI selective routed-experts loop for the Qwen3.6-A3B MoE decode kernel (SBUF-resident).
 
-Replaces the nkilib ``moe_tkg`` selective path with a self-contained expert loop written in
-``nki`` / ``nki.isa`` / ``nki.language`` only. The reason to own the loop is a DMA-fragmentation
-fix: ``moe_tkg`` loads each selected expert's gate and up weights as TWO separate strided ``[H, I]``
-views (``[E,H,2,I].select(dim=0,e).select(dim=1, GATE/UP)``), so the innermost contiguous DMA run is
-only ``I`` elements (256 B at bf16). Interleaved gate/up on the middle "2" axis fragments the load
-into tens of thousands of tiny packets, leaving the sync engine bound and the tensor engine starved.
+A self-contained expert loop in nki / nki.isa / nki.language, replacing the nkilib moe_tkg selective
+path. Owning the loop is what makes the weight load contiguous: each selected expert's gate+up is
+loaded as ONE [H0, H1, 2I] slab, then sliced into gate and up on the SBUF free axis. The slab load is
+split per H-shard so the first shard's matmul can start before the second lands, and a 2-slot
+prefetch ring issues expert k+1's weight DMAs while expert k computes.
 
-The fix loads each selected expert's gate+up as ONE contiguous ``[H0, H1, 2I]`` slab (inner run ``2I``,
-512 B at bf16 -- half the descriptors), then slices ``gate = slab[:, :, 0:I]`` / ``up = slab[:, :, I:2I]``
-in SBUF (free). The slab load is split per H-shard ``s`` so the gate/up matmul over the first shard can
-start before the second lands, and a 2-slot cross-expert prefetch ring issues expert k+1's weight DMAs
-while expert k computes. This path is always on -- there is no legacy/env-gated fallback.
+Reproduces the moe_tkg selective contract exactly: top-K experts per token, SiLU activation,
+POST_SCALE by the already-L1-normalized affinity with no re-normalization, summed over the K experts.
+The stored [E,H,2,I] gate/up and [E,I,H] down weight layouts are unchanged.
 
-Reproduces the ``moe_tkg`` selective contract exactly: top-K experts per token, SiLU activation,
-POST_SCALE by the (already L1-normalized) affinity with NO re-normalization, summed over the K experts.
-The stored ``[E,H,2,I]`` gate/up and ``[E,I,H]`` down weight layouts are unchanged.
-
-Layout: consumes (and emits) the ``rmsnorm_tkg`` [H0,T,H1] tile in the "tp2013" H-permutation shared with
-the attention kernels' SBUF residual -- with ``n_s`` H-shards and ``H2 = H1 // n_s``, free index
-``f = s*H2 + h2`` maps to H-column ``s*(H0*H2) + h0*H2 + h2``. At ``n_s == 1`` this degenerates exactly to
-tp102 (H = h0*H1 + f). Only the AP index math into the (unmoved) HBM weights depends on it.
-
-Work-split aware, the caller supplying the geometry. TOKEN-shard: each LNC core computes over the full H
-for its ``[T_offset:T_offset+T_per_shard]`` token slice (no cross-core sendrecv). H-shard (the T == 1
-fallback): each core owns the free-index block ``[f_offset, f_offset+H1_local)``, loading only its half of
-every expert's weights -- gate/up contract half of H, so ONE fused ``[I,2]`` fp32 sendrecv+add reduces
-gate and up together before the SiLU; down writes disjoint H-columns and needs no reduce.
+Layout: consumes and emits the rmsnorm_tkg [H0,T,H1] tile in the tp2013 H-permutation shared with the
+attention kernels' SBUF residual; at one H-shard it degenerates to tp102. Only the AP index math into
+the (unmoved) HBM weights depends on it. Under an H-shard gate/up contract half of H, so one fused
+[I,2] fp32 sendrecv+add reduces them together before the SiLU; down needs no reduce.
 
 Per-rank (TP=4) A3B routed dims: H=2048 (H0=128, H1=16), E=256, K=8, I=128 (single I tile).
+Why the slab load matters, and the DMA-fragmentation numbers: specs/moe_tkg.md.
 """
 
 import nki.isa as nisa
@@ -137,6 +125,7 @@ def accumulate_expert_output(
     sum (fp32 accumulator).
     """
     H_local = H1_local * H0
+
     gate_psum = nl.ndarray((I, 1), dtype=nl.float32, buffer=nl.psum)
     up_psum = nl.ndarray((I, 1), dtype=nl.float32, buffer=nl.psum)
     for j in range(
@@ -150,6 +139,7 @@ def accumulate_expert_output(
         gate_up_sb = nl.ndarray((I, 2), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=gate_up_sb[:, 0:1], src=gate_psum)
         nisa.tensor_copy(dst=gate_up_sb[:, 1:2], src=up_psum)
+
         gate_up_recv = nl.ndarray((I, 2), dtype=nl.float32, buffer=nl.sbuf)
         nisa.sendrecv(
             src=gate_up_sb,
@@ -167,8 +157,10 @@ def accumulate_expert_output(
 
     gate_sb = nl.ndarray((I, 1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.activation(dst=gate_sb, data=gate_src, op=nl.silu)
+
     up_sb = nl.ndarray((I, 1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=up_sb, src=up_src)
+
     intermediate = nl.ndarray((I, 1), dtype=io_dtype, buffer=nl.sbuf)
     nisa.tensor_tensor(dst=intermediate, data1=gate_sb, data2=up_sb, op=nl.multiply)
 
@@ -276,6 +268,7 @@ def routed_experts_selective(
     slab_slot_0 = nl.ndarray((H0, H1_local, two_I), dtype=io_dtype, buffer=nl.sbuf)
     slab_slot_1 = nl.ndarray((H0, H1_local, two_I), dtype=io_dtype, buffer=nl.sbuf)
     slab_slots = [slab_slot_0, slab_slot_1]
+
     down_slot_0 = nl.ndarray((I0, H_local), dtype=io_dtype, buffer=nl.sbuf)
     down_slot_1 = nl.ndarray((I0, H_local), dtype=io_dtype, buffer=nl.sbuf)
     down_slots = [down_slot_0, down_slot_1]
@@ -296,10 +289,12 @@ def routed_experts_selective(
             op0=nl.equal,
             operand0=float(global_token_idx),
         )
+
         aff_psum = nl.ndarray((H0, K), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_matmul(
             dst=aff_psum, stationary=selector, moving=expert_affinities_eager
         )
+
         aff_bc = nl.ndarray((H0, K), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=aff_bc, src=aff_psum)
 

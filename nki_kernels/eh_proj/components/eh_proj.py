@@ -13,18 +13,13 @@ base, so the draft megakernel starts here instead of round-tripping ``h_in`` thr
     h_in     = concat @ eh_w                                     [T, H_out]
     residual = tp2013(h_in)                                      [H0, T*H1]
 
-Concat order is ``[embed | hidden]``: ``eh_w`` rows [0, H) contract the normed embedding and rows
-[H, 2H) the normed trunk hidden, matching the checkpoint's ``mtp.fc`` with no column repacking.
+Concat order is [embed | hidden], matching the checkpoint's mtp.fc with no column repacking. The
+concat is assembled in tp2013 and fed to one qkv_tkg(NO_NORM) over the full 2H contraction, which is
+layout-exact by construction. At LNC=2 the split lands on the half boundary; at LNC=1 it degenerates
+to tp102, with no layout branch here.
 
-The concat is assembled in tp2013 and fed to ONE ``qkv_tkg(NO_NORM)`` over the full 2H contraction.
-That is layout-exact by construction: tp2013's free index ``t*H1 + s*H2 + h2`` maps to source column
-``s*(H0*H2) + h0*H2 + h2``, which is exactly the weight row ``qkv_tkg``'s shard view selects for
-core ``s``. At LNC=2 the split lands on the half boundary -- core 0 contracts the embed half, core 1
-the hidden half -- and at LNC=1 it degenerates to tp102, with no layout branch here.
-
-Both norms run in natural [T, H] layout because that is what the all-gather and the ``prev_hidden``
-load emit; the single natural->tp2013 transpose set then serves the assembled concat.
-
+Both norms run in natural [T, H] layout, since that is what the all-gather and the prev_hidden load
+emit; the single natural->tp2013 transpose set then serves the assembled concat.
 A3B per-rank config (TP=4, LNC=2): H=2048, 2H=4096, H_out=512, H0=128, T in {1, 2}.
 """
 
@@ -52,13 +47,13 @@ REDUCE_CHUNK = 512  # free-axis reduce width; H is reduced in H//REDUCE_CHUNK pa
 def rms_norm_natural(x_nat, gamma_nat, eps_t, out_nat):
     """Free-axis RMSNorm of a natural [T, H] tile over the full hidden H.
 
-    y[t, :] = x[t, :] * rsqrt(mean_H(x[t, :]^2) + eps) * gamma   (fp32 reduce/scale; out in IO dtype).
+    y[t, :] = x[t, :] * rsqrt(mean_H(x[t, :]^2) + eps) * gamma, fp32 reduce with an IO-dtype store.
 
     Args:
-        x_nat:     [T, H] SBUF. Tokens on the partition axis, hidden H on the free axis.
-        gamma_nat: [T, H] SBUF. Norm weight, partition-broadcast to the T token rows.
-        eps_t:     [T, 1] SBUF fp32. RMSNorm epsilon (memset once, shared across both norms).
-        out_nat:   [T, H] SBUF. Normalized output (written), same dtype as x_nat.
+        x_nat:     [T, H] SBUF, tokens on partition and hidden on free.
+        gamma_nat: [T, H] SBUF norm weight, partition-broadcast to the T token rows.
+        eps_t:     [T, 1] SBUF fp32 epsilon, memset once and shared across both norms.
+        out_nat:   [T, H] SBUF, written.
     """
     T, H = x_nat.shape
     chunk = min(H, REDUCE_CHUNK)
@@ -73,6 +68,7 @@ def rms_norm_natural(x_nat, gamma_nat, eps_t, out_nat):
     nisa.tensor_reduce(
         dst=part, op=nl.add, data=sq.reshape((T, n_chunk, chunk)), axis=[2]
     )
+
     ss = nl.ndarray((T, 1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_reduce(dst=ss, op=nl.add, data=part, axis=[1], keepdims=True)
 
@@ -93,6 +89,7 @@ def rms_norm_natural(x_nat, gamma_nat, eps_t, out_nat):
 def _broadcast_gamma(gamma, T, dtype):
     """[1, H] HBM norm weight -> [T, H] SBUF, replicated across the token rows (zero-stride load)."""
     H = gamma.shape[1]
+
     gamma_sb = nl.ndarray((T, H), dtype=dtype, buffer=nl.sbuf)
     nisa.dma_copy(dst=gamma_sb, src=gamma.ap(pattern=[[0, T], [1, H]], offset=0))
     return gamma_sb
@@ -115,30 +112,26 @@ def eh_proj_compose(
     """Token ids + trunk hidden -> the tp2013 [H0, T*H1] draft residual seed, SBUF end to end.
 
     Args:
-        ids_sb:      [T, 1] int32 SBUF token ids -- from the fused greedy argmax, or from
-                     ``load_token_ids_to_sbuf`` for the first step of a round.
-        embed_w:     [V, H/TP] HBM, ``ParallelEmbedding(shard_across_embedding=True).weight``
-                     consumed verbatim.
-        prev_hidden: [B, T, H] HBM, or a [T, H] token-major SBUF tile (a fused round hands the
-                     trunk hidden straight across from the verify stage).
-        gamma_e:     [1, H] HBM ``embed_norm.weight``, standard form (no +1 applied here).
-        gamma_h:     [1, H] HBM ``hidden_norm.weight``, standard form.
-        eh_w:        [2H, H_out/TP] HBM ``eh_proj.weight`` transposed (contraction first); rows
-                     [0, H) contract the normed embedding, rows [H, 2H) the normed hidden.
-        eps:         RMSNorm epsilon (config.rms_norm_eps).
+        ids_sb:      [T, 1] int32 SBUF token ids, from the fused greedy argmax or load_token_ids_to_sbuf.
+        embed_w:     [V, H/TP] HBM ParallelEmbedding weight, consumed verbatim.
+        prev_hidden: [B, T, H] HBM, or a [T, H] token-major SBUF tile handed across from verify.
+        gamma_e:     [1, H] HBM embed_norm.weight, standard form.
+        gamma_h:     [1, H] HBM hidden_norm.weight, standard form.
+        eh_w:        [2H, H_out/TP] HBM eh_proj.weight transposed; rows [0, H) contract the normed
+                     embedding, rows [H, 2H) the normed hidden.
+        eps:         RMSNorm epsilon.
         rg:          nccl replica group, or None to skip the collectives (TP=1).
         tp_degree:   ranks in rg; sets the gathered widths H and H_out.
-        n_prgs:      LNC core count, which parameterizes tp2013 (n_prgs=1 degenerates to tp102).
-        out_sb:      optional [H0, T*H1] SBUF destination (the megakernel passes its residual).
-        name_prefix: SBUF allocation-name prefix for the qkv_tkg call (an instantiating caller must
-                     make this unique).
+        n_prgs:      LNC core count, which parameterizes tp2013.
+        out_sb:      optional [H0, T*H1] SBUF destination; the megakernel passes its residual.
+        name_prefix: SBUF allocation-name prefix for the qkv_tkg call; must be unique per caller.
 
     Returns:
-        out_sb: [H0, T*(H_out//H0)] SBUF tp2013 residual tile, same dtype as embed_w.
+        out_sb [H0, T*(H_out//H0)] SBUF tp2013 residual tile, same dtype as embed_w.
 
     Note:
-        Runs identically on both LNC cores. ``qkv_tkg`` splits the 2H contraction across cores and
-        combines internally, so the returned tile is the full result on every core.
+        Runs identically on both cores -- qkv_tkg splits the 2H contraction and combines internally,
+        so the returned tile is the full result everywhere.
     """
     T = ids_sb.shape[0]
     H = embed_w.shape[1] * tp_degree
@@ -178,6 +171,7 @@ def eh_proj_compose(
     )
 
     concat_h1 = 2 * H // H0
+
     concat_sb = nl.ndarray((H0, T * concat_h1), dtype=io_dtype, buffer=nl.sbuf)
     natural_to_tp2013(concat_nat, concat_sb, n_prgs)
 

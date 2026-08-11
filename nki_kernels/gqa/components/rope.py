@@ -1,25 +1,23 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Partial RoPE (rotate_half) for the GQA token-generation block (head_dim=256, Phase 3 of 5).
+"""Partial RoPE (rotate_half) for the GQA token-generation block (head_dim=256).
 
-Applies rotary position embedding to the first ROPE_DIM=64 dimensions of each rope head's
-HEAD_DIM=256 vector and passes the remaining 192 through unchanged. The Q heads and the K head are
-rotated; the V head is not.
+Rotates the first ROPE_DIM=64 dimensions of each rope head's 256-wide vector and passes the
+remaining 192 through unchanged. The Q heads and the K head are rotated; the V head is not.
 
-Layout (matches the upstream qk_norm output so the two chain with no transpose):
-    x_sb [T, N, D] -- T = B*S tokens on the PARTITION axis; on the FREE axis, N heads (head-major
-    [q.. | k.. | v..]) then head_dim D contiguous within each head. cos/sin are [T, rope_dim] (one
-    row per token) and are broadcast across the N heads internally -- the same rotation applies to
-    every rope head of a given token.
+Layout, matching the qk_norm output so the two chain with no transpose:
+    x_sb [T, N, D] -- T = B*S tokens on the partition axis; N heads head-major on the free axis,
+    then head_dim D contiguous within each head. cos/sin are [T, rope_dim], one row per token,
+    broadcast across heads internally.
 
-Rotation convention (rotate_half), with half = rope_dim // 2 (dim i pairs with i+half):
-    out[:, :half]      = x[:, :half]      * cos[:, :half]      - x[:, half:rope] * sin[:, :half]
-    out[:, half:rope]  = x[:, half:rope]  * cos[:, half:rope]  + x[:, :half]     * sin[:, half:rope]
-    out[:, rope:D]     = x[:, rope:D]                                            (pass-through copy)
+Rotation convention, with half = rope_dim // 2 (dim i pairs with i+half):
+    out[:, :half]     = x[:, :half]     * cos[:, :half]     - x[:, half:rope] * sin[:, :half]
+    out[:, half:rope] = x[:, half:rope] * cos[:, half:rope] + x[:, :half]     * sin[:, half:rope]
+    out[:, rope:D]    = x[:, rope:D]                                          pass-through
 
-The two halves of cos/sin are applied generally (not assumed equal). Precision: fp32 internal, IO
-dtype preserved (bf16 runtime / fp32 correctness gate); pass-through copied bit-exactly.
+The two halves of cos/sin are applied generally, not assumed equal.
+Precision: fp32 internal, IO dtype preserved; pass-through values copied bit-exactly.
 """
 
 import nki.isa as nisa
@@ -44,15 +42,10 @@ def kernel_assert(condition, error_text):
 
 
 def rotate_half_head(x_head, cos_sb, sin_sb, out_head):
-    """rotate_half RoPE on one head's rope slice [T, rope_dim] (fp32 internal, IO-dtype store).
+    """rotate_half RoPE on one head's rope slice, fp32 internal with an IO-dtype store.
 
-    Writes only out_head[:, 0:rope_dim]; the [rope_dim:] tail is the caller's responsibility.
-
-    Args:
-        x_head:   [T, D] SBUF view of one head (T tokens on partition, head_dim on free).
-        cos_sb:   [T, rope_dim] SBUF cosine (one row per token), shared across heads.
-        sin_sb:   [T, rope_dim] SBUF sine, same shape as cos_sb.
-        out_head: [T, D] SBUF view of the destination head; columns [0:rope_dim] are written.
+    Writes only out_head[:, 0:rope_dim]; the tail is the caller's responsibility.
+    x_head/out_head are [T, D] head views; cos_sb/sin_sb are [T, rope_dim], shared across heads.
     """
     T, rope_dim = cos_sb.shape
     half = rope_dim // 2
@@ -100,27 +93,16 @@ def rotate_half_head(x_head, cos_sb, sin_sb, out_head):
 def rope_partial_compose(
     x_sb, cos_sb, sin_sb, num_rope_heads=NUM_ROPE_HEADS, out_sb=None
 ):
-    """Partial RoPE (rotate_half) over a head-major [T, N, D] SBUF tile (head_dim on the free axis).
+    """Partial RoPE over a head-major [T, N, D] SBUF tile, head_dim on the free axis.
 
-    Rotates columns [0:rope_dim] of heads [0, num_rope_heads) and passes their [rope_dim:D] tail
-    through; heads [num_rope_heads, N) (the V head(s)) are copied through entirely. The same per-token
-    cos/sin [T, rope_dim] are broadcast across all rope heads.
+    Rotates columns [0:rope_dim] of the first num_rope_heads heads and passes their tail through;
+    the remaining heads (V) are copied through entirely.
 
     Args:
-        x_sb:   [T, N, D] SBUF. T = B*S tokens on partition; N heads (head-major [q.. | k.. | v..])
-                then head_dim D contiguous on free. Same layout as the qk_norm output.
-        cos_sb: [T, rope_dim] SBUF. Cosine, one row per token (partition-aligned with x_sb tokens).
-        sin_sb: [T, rope_dim] SBUF. Sine, same shape/alignment as cos_sb.
-        num_rope_heads: heads [0, num_rope_heads) are rotated (default NUM_ROPE_HEADS = q + k heads).
-        out_sb: optional [T, N, D] SBUF output; allocated if None. Pass out_sb=x_sb for true in-place.
-
-    Returns:
-        out_sb: [T, N, D] SBUF (same dtype as x_sb). Rope heads have RoPE on columns [0:rope_dim] and
-            pass columns [rope_dim:D] through; the remaining heads pass through entirely.
-
-    Notes:
-        Internal math is fp32; the rope slice is cast back to the IO dtype on store. Pass-through
-        values are copied bit-exactly.
+        x_sb:           [T, N, D] SBUF, same layout as the qk_norm output.
+        cos_sb, sin_sb: [T, rope_dim] SBUF, one row per token, partition-aligned with x_sb.
+        num_rope_heads: how many leading heads to rotate.
+        out_sb:         optional output; allocated if None. Pass out_sb=x_sb for true in-place.
     """
     T, N, D = x_sb.shape
     Tc, rope_dim = cos_sb.shape

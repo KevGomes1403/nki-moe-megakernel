@@ -11,11 +11,10 @@ already emits -- so a draft step can seed the trunk without a round trip through
     emb_full  = all_gather_embed_h(emb_local, rg)       [T, H]       TP concat on H
     residual  = natural_to_tp2013(emb_full)             [H0, T*H1]   H1 transposes
 
-``ParallelEmbedding`` is built with ``shard_across_embedding=True``, so the per-rank table is
-[V, H/TP] and a lookup is a pure row gather: no vocab-range mask and no per-rank ownership test.
-Rebuilding full H across ranks is therefore an all-gather, not a reduce -- ranks hold disjoint
-column blocks, and ``collective_dim=1`` lands rank r at [r*H_rank, (r+1)*H_rank) with no
-trace-time rank id, matching NxD's ``gather_from_tensor_model_parallel_region``.
+ParallelEmbedding is built with shard_across_embedding=True, so the per-rank table is [V, H/TP] and
+a lookup is a pure row gather -- no vocab-range mask, no per-rank ownership test. Rebuilding full H
+is therefore an all-gather, not a reduce: ranks hold disjoint column blocks, and collective_dim=1
+lands rank r at its own block with no trace-time rank id.
 
 Computes:
     residual[h0, t*H1 + s*H2 + h2] = embed_w_global[ids[t], s*(H0*H2) + h0*H2 + h2]
@@ -132,6 +131,7 @@ def tp2013_to_natural(src_sb, T, n_prgs, out_nat=None):
     src4 = src_sb.reshape((H0, T, n_prgs, H2))
     if out_nat is None:
         out_nat = nl.ndarray((T, H), dtype=src_sb.dtype, buffer=nl.sbuf)
+
     tp = nl.ndarray((T, H0), dtype=src_sb.dtype, buffer=nl.psum)
     for s in range(n_prgs):
         for h2 in range(H2):
@@ -159,24 +159,20 @@ def embed_compose(
     """Token ids in SBUF -> the tp2013 [H0, T*H1] residual tile, with no HBM or XLA round trip.
 
     Args:
-        ids_sb:    [T, 1] int32 SBUF token ids -- from the fused greedy argmax, or from
-                   ``load_token_ids_to_sbuf`` for the first step of a round.
-        embed_w:   [V, H/TP] HBM, ``ParallelEmbedding(shard_across_embedding=True).weight``
-                   consumed VERBATIM. ``padding_idx`` needs no handling: ``F.embedding`` applies it
-                   to gradients only, so the runtime value is w[id] for every id, pad row included.
+        ids_sb:    [T, 1] int32 SBUF token ids, from the fused greedy argmax or load_token_ids_to_sbuf.
+        embed_w:   [V, H/TP] HBM ParallelEmbedding weight, consumed verbatim. padding_idx needs no
+                   handling: F.embedding applies it to gradients only.
         rg:        nccl replica group, or None to skip the collective (TP=1).
         tp_degree: ranks in rg; sets the gathered width H = H_rank * tp_degree.
-        n_prgs:    LNC core count, which parameterizes tp2013 (n_prgs=1 degenerates to tp102).
-        out_sb:    optional [H0, T*H1] SBUF destination (the megakernel passes its residual).
-        return_natural: also return the [T, H] token-major tile -- an intermediate computed anyway,
-                   for a caller that wants token-major hidden (the MTP draft's eh_proj front end).
+        n_prgs:    LNC core count, which parameterizes tp2013.
+        out_sb:    optional [H0, T*H1] SBUF destination; the megakernel passes its residual.
+        return_natural: also return the [T, H] token-major tile, an intermediate computed anyway.
 
     Returns:
-        out_sb [H0, T*H1] SBUF, or (out_sb, emb_full [T, H]) when ``return_natural``.
+        out_sb [H0, T*H1] SBUF, or (out_sb, emb_full [T, H]) when return_natural.
 
     Note:
-        Runs identically on both LNC cores: the residual is replicated, so there is no H-shard and
-        no sendrecv. Mirrors ``load_residual_to_sbuf``.
+        Runs identically on both cores -- the residual is replicated, so no H-shard and no sendrecv.
     """
     T = ids_sb.shape[0]
     H = embed_w.shape[1] * tp_degree

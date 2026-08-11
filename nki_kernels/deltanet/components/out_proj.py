@@ -3,16 +3,17 @@
 
 """DeltaNet attention output projection (o_proj) for token generation.
 
-Thin composable over nkilib's output_projection_tkg. The DeltaNet recurrence + gated norm are
-value-head sharded across the LNC cores, so each core holds only its Hv_core heads of the gated
-output, but the o_proj matmul contracts over ALL value heads. Design A bridges this with a tiny
-cross-LNC sendrecv gather of the (small) attention tensor pre-matmul, then lets output_projection_tkg
-H-shard the (large) output across cores -- no LNC reduce of the result (disjoint H-shards).
+Thin composable over nkilib's output_projection_tkg.
 
-Input is (head-major [T, W_core], element [t, h_local*d+j]); the composable transposes each
-head to head_dim-on-partition and assembles [d, 1, Hv, T] (output_projection_tkg's `attention`
-layout) before the matmul. The TP all-reduce of the per-rank o_proj partial is deferred; this returns
-the per-rank partial [T, hidden].
+The recurrence and gated norm are value-head sharded, so each core holds only its own heads of the
+gated output -- but the o_proj matmul contracts over all value heads. A small cross-LNC sendrecv
+gathers the attention tensor before the matmul; output_projection_tkg then H-shards the large
+output across cores, so the result needs no LNC reduce.
+
+Input is head-major [T, W_core]. The composable transposes each head to head_dim-on-partition and
+assembles the [d, 1, Hv, T] layout output_projection_tkg expects.
+
+The TP all-reduce is deferred: this returns the per-rank partial.
 """
 
 import nki
@@ -34,23 +35,18 @@ def kernel_assert(condition, error_text):
 
 
 def out_proj_compose(attn_sb, out_w, sbm=None, out_in_sb=False):
-    """Per-rank DeltaNet output projection
+    """Per-rank DeltaNet output projection.
+
+    Gathers all heads across cores, transposes to head_dim-on-partition, then projects.
 
     Args:
-        attn_sb: [T, W_core] SBUF, this core's value heads in Layout A (head-major,
-            element [t, h_local*d + j] = local value-head h_local, head_dim j).
-        out_w:   [value_dim, hidden] HBM, transpose of the o_proj nn.Linear weight.
-        sbm:     optional BufferManager passed through to output_projection_tkg.
-        out_in_sb: True -> return the per-core H-shard as an SBUF [H0, H1_shard*T] tile
-            (TRANSPOSE_OUT, the layout the megakernel residual add consumes); False (default)
-            -> HBM [T, hidden].
+        attn_sb:   [T, W_core] SBUF, this core's value heads head-major.
+        out_w:     [value_dim, hidden] HBM, transpose of the o_proj nn.Linear weight.
+        sbm:       optional BufferManager passed through to output_projection_tkg.
+        out_in_sb: return the per-core H-shard as an SBUF tile instead of HBM [T, hidden].
 
     Returns:
-        o_out: per-rank o_proj PARTIAL -- HBM [T, hidden] (out_in_sb=False) or SBUF
-            [H0, H1_shard*T] (out_in_sb=True). Each core writes its disjoint hidden/n shard.
-
-    Steps: cross-LNC sendrecv gather of all heads -> transpose Layout A to [d, 1, Hv, T]
-    (head_dim on partition) -> output_projection_tkg(NONE quantization).
+        The per-rank o_proj partial; each core writes its disjoint hidden/n shard.
     """
     T, W_core = attn_sb.shape
     value_dim, hidden = out_w.shape
@@ -67,18 +63,17 @@ def out_proj_compose(attn_sb, out_w, sbm=None, out_in_sb=False):
     kernel_assert(T <= P_MAX, "B*S = T must not exceed P_MAX")
     kernel_assert(hidden % n == 0, "hidden must be divisible by the LNC core count")
 
-    # This core's local heads, transposed to head_dim-on-partition: [d, Hv_core, T] with element
-    # [j, h_local, t]. nc_transpose maps a [T, d] slice (T on partition) to a [d, T] PSUM tile.
+    # This core's heads, transposed to head_dim-on-partition.
     attn_loc = nl.ndarray((d, Hv_core, T), dtype=attn_sb.dtype, buffer=nl.sbuf)
     for h_local in nl.affine_range(Hv_core):
-        # nc_transpose uses matmul transpose mode; on gen3+ the PSUM dst dtype must match the input.
+        # gen3+ requires the PSUM dst dtype to match the input.
         head_t = nl.ndarray((d, T), dtype=attn_sb.dtype, buffer=nl.psum)
         nisa.nc_transpose(
             dst=head_t, data=attn_sb[0:T, h_local * d : (h_local + 1) * d]
         )
         nisa.tensor_copy(dst=attn_loc[0:d, h_local, 0:T], src=head_t[0:d, 0:T])
 
-    # Assemble all Hv heads on this core at GLOBAL head positions: core c's heads at [c*Hv_core, ...).
+    # Assemble all Hv heads at their global head positions.
     attn_full = nl.ndarray((d, 1, Hv, T), dtype=attn_sb.dtype, buffer=nl.sbuf)
     nisa.tensor_copy(
         dst=attn_full[0:d, 0, c * Hv_core : (c + 1) * Hv_core, 0:T],
@@ -86,7 +81,7 @@ def out_proj_compose(attn_sb, out_w, sbm=None, out_in_sb=False):
     )
 
     if n > 1:
-        # Exchange local heads with the other core; place them at the other core's head positions.
+        # Exchange heads with the other core.
         other = 1 - c
         nisa.sendrecv(
             src=attn_loc[0:d, 0:Hv_core, 0:T],
@@ -96,8 +91,7 @@ def out_proj_compose(attn_sb, out_w, sbm=None, out_in_sb=False):
             pipe_id=0,
         )
 
-    # output_projection_tkg H-shards the output across cores by program_id and writes each core's
-    # [T, hidden/n] slice into the full [T, hidden] shared_hbm output.
+    # output_projection_tkg H-shards by program_id, each core writing its own [T, hidden/n] slice.
     return output_projection_tkg(
         attention=attn_full,
         weight=out_w,

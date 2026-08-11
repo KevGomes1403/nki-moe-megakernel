@@ -12,13 +12,12 @@ traffic is the streamed lm_head weight.
     logits_sb  = output_projection_tkg(attn_sb, lm_head_w)   [T, V_core]  (vocab LNC-sharded)
     (max, idx) = staged_argmax(logits_sb)                    per core, then combined across cores
 
-``output_projection_tkg`` LNC-shards its OUTPUT dimension, so V_core = V_rank / n_prgs with no
+output_projection_tkg LNC-shards its output dimension, so V_core = V_rank / n_prgs with no
 collective. The composable stops at the per-rank (max, index); the cross-rank argmax belongs in the
 megakernel, next to its all-reduce helpers.
 
-Precision is bf16 end to end, matching the model's bare bf16 ``torch.matmul`` lm_head. Weights are
-consumed VERBATIM: TransposedColumnParallelLinear already stores [H, V_rank], which is
-``output_projection_tkg``'s [in, out] layout.
+Precision is bf16 end to end, matching the model's bare bf16 lm_head matmul. Weights are consumed
+verbatim: TransposedColumnParallelLinear already stores output_projection_tkg's [in, out] layout.
 
 A3B per-rank config (TP=4, LNC=2): H=2048, H0=128, H1=16, V_rank=62080, V_core=31040, T in {1,2}.
 Spec: nki_kernels/specs/lm_head.md.
@@ -59,19 +58,13 @@ def make_manual_sbuf_manager():
 
 
 def head_major_from_tp2013(normed_sb, n_prgs, sbm):
-    """Permute a tp2013 [H0, T, H1] tile into output_projection_tkg's [D=128, B=1, N=H1, S=T] layout.
+    """Permute a tp2013 [H0, T, H1] tile into output_projection_tkg's [D=128, B=1, N, S] layout.
 
-    The two layouts factor the hidden index differently and a free-axis reorder cannot bridge them:
-    tp2013 puts the partition axis at hidden-stride H2, output_projection_tkg at hidden-stride 1, and
-    H2 in {8, 16} never equals D = 128. Writing h0 = a*G + b with G = H0/H2 gives the target
-
-        attn[b*H2 + h2, 0, s*H2 + a, t] = normed_sb[a*G + b, t, s*H2 + h2]
-
-    which takes two moves, because neither engine can do it alone (spec §3):
-      1. one nc_transpose per (s, t) of the contiguous [H0, H2] block -> st[h2, h0];
-      2. one DMA per (b, s, t) of st[0:H2, b::G] into partitions [b*H2, (b+1)*H2) -- a free-axis
-         stride plus a partition BASE offset, which the DMA engine handles.
-    G*n_prgs*T <= 64 small DMAs, negligible against a ~127 MB/core weight stream.
+    A free-axis reorder cannot bridge the two: tp2013 puts the partition axis at hidden-stride H2,
+    output_projection_tkg at stride 1, and H2 never equals D = 128. It takes two moves, because
+    neither engine can do it alone:
+      1. one nc_transpose per (s, t) of the contiguous [H0, H2] block;
+      2. one DMA per (b, s, t), which needs a free-axis stride plus a partition base offset.
     """
     _, T, H1 = normed_sb.shape
     kernel_assert(H1 % n_prgs == 0, "tp2013 needs H1 divisible by the H-shard count")
@@ -106,7 +99,6 @@ class Epilogue(nl.NKIObject):
     is ever placed over the logits while they are still being read, without paying for a second
     [T, V_core] copy.
     """
-
     def __init__(self, T, n_chunks, logits_dtype, sbm):
         f32 = nl.float32
         # Per-core search (staged_argmax).
@@ -135,16 +127,14 @@ class Epilogue(nl.NKIObject):
 
 
 def staged_argmax(logits_sb, shard_base, ep):
-    """Greedy argmax over this core's vocab shard into ``ep.core_max`` / ``ep.core_idx``.
+    """Greedy argmax over this core's vocab shard into ep.core_max / ep.core_idx.
 
-    A DVE instruction is capped at MAX_REDUCE_WIDTH elements, so the V_core-wide search is staged
-    over n_chunks chunks of C. ``nc_find_index8`` reports the FIRST positions matching the value it
-    is given, so within a chunk the lowest index comes for free; across chunks the reversed index
-    r = V_core - g does the rest, since maximising r minimises g and "no match in this chunk" falls
-    out as r = 0 -- torch's LOWEST-index tie-break, which the gate at test_lm_head_kernel.py checks.
+    A DVE instruction is capped at MAX_REDUCE_WIDTH, so the V_core-wide search is staged over chunks.
+    nc_find_index8 reports the first matching position, so the lowest index comes for free within a
+    chunk; across chunks the reversed index r = V_core - g gives the same tie-break, since maximising
+    r minimises g and "no match" falls out as r = 0. That matches torch's lowest-index tie-break.
 
-    ``shard_base`` is this core's first vocab column within V_rank (prg_id * V_core); ``core_idx`` is
-    returned already offset by it.
+    shard_base is this core's first vocab column within V_rank; core_idx is returned already offset.
     """
     T, V_core = logits_sb.shape
     n_chunks = div_ceil(V_core, MAX_REDUCE_WIDTH)
@@ -204,16 +194,15 @@ def staged_argmax(logits_sb, shard_base, ep):
 
 
 def combine_across_cores(ep, V_rank, n_prgs, prg_id):
-    """Reduce the two cores' vocab-shard winners into ``ep.rank_max`` / ``ep.rank_idx``, on both cores.
+    """Reduce the two cores' vocab-shard winners into ep.rank_max / ep.rank_idx, on both cores.
 
-    Each core owns a disjoint vocab shard, so a core-local winner is not yet the rank winner. The
-    (max, index) pair is exchanged as one contiguous fp32 [T, 2] tile -- the repo idiom, since a
-    strided sendrecv destination silently delivers nothing.
+    The (max, index) pair is exchanged as one contiguous fp32 [T, 2] tile: a strided sendrecv
+    destination silently delivers nothing.
 
-    The winner is then chosen symmetrically, with no dependence on which core is which: reuse the
-    reversed index r = V_rank - idx, gated on holding the peak, and take the max. Maximising r
-    minimises idx, so a tie between the two shards resolves to the lower vocab index exactly as
-    torch.argmax does. Packing the max as fp32 keeps the equality test exact.
+    The winner is chosen symmetrically, with no dependence on which core is which -- the reversed
+    index r = V_rank - idx, gated on holding the peak, then a max. Maximising r minimises idx, so a
+    tie resolves to the lower vocab index as torch.argmax does. Packing the max as fp32 keeps the
+    equality test exact.
     """
     T, _ = ep.core_max.shape
     if n_prgs == 1:
@@ -295,13 +284,12 @@ def lm_head_compose(hidden, gamma, lm_head_w, eps=1e-6, sbm=None, name_prefix=""
         gamma:     [1, H] HBM final-norm weight in STANDARD form (no +1 applied here).
         lm_head_w: [H, V_rank] HBM bf16, consumed verbatim.
         eps:       RMSNorm epsilon (config.rms_norm_eps).
-        sbm:       optional MANUAL BufferManager. Default None creates one over SBM_SIZE_BYTES; a
-                   megakernel that runs its own manual manager must pass it, since two managers
-                   would each believe they own the same region.
+        sbm:       optional MANUAL BufferManager. A megakernel running its own manual manager must
+                   pass it, since two managers would each believe they own the same region.
 
     Returns:
-        (rank_max [T, 1], rank_idx [T, 1] int32, logits_sb [T, V_core]) -- all SBUF. The index is
-        within V_rank; the caller adds rank_id * V_rank. ``logits_sb`` is this core's vocab shard.
+        (rank_max [T, 1], rank_idx [T, 1] int32, logits_sb [T, V_core]), all SBUF. The index is
+        within V_rank; the caller adds rank_id * V_rank.
     """
     hdim, V_rank = lm_head_w.shape
     if hidden.buffer == nl.sbuf:

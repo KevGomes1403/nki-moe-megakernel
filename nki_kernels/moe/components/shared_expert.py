@@ -3,29 +3,24 @@
 
 """Shared-expert path of the Qwen3.6-A3B fused MoE layer (token generation), SBUF-resident.
 
-A plain SwiGLU FFN -- down(silu(gate(x)) * up(x)) -- on the SAME SBUF-resident ``normed_sb [H0,T,H1]``
-the routed path consumes (zero HBM round-trip). Returns the per-rank partial over H (down_proj without
-internal reduce); the sigma-gate, gated sum and combined TP all-reduce live in ``moe_layer``.
+A plain SwiGLU FFN -- down(silu(gate(x)) * up(x)) -- on the same SBUF-resident normed_sb the routed
+path consumes. Returns the per-rank partial over H; the sigma-gate, gated sum and TP all-reduce live
+in moe_layer.
 
-Written in raw NKI, structurally ONE routed expert without the expert index / affinity scale, reusing the
-same AP idioms as ``routed_experts_nki``. nkilib's ``mlp_tkg`` primitives cannot be used: their gate/up
-loader hardcodes ``weight.reshape_dim(dim=0, shape=(H0, H1_shard))`` -- the tp102 H-permutation -- and
-tp2013 needs H viewed as (s, h0, h2) and then PERMUTED so h0 is the partition axis, which ``reshape_dim``
-cannot express and no flag toggles.
+Written in raw NKI, structurally one routed expert without the expert index or affinity scale.
+nkilib's mlp_tkg primitives cannot be used: their gate/up loader hardcodes the tp102 H-permutation
+via reshape_dim, which cannot express the permutation tp2013 needs, and no flag toggles it.
 
-Layout (tp2013, shared with the attention kernels' SBUF residual): with ``n_s = n_prgs`` H-shards and
-``H2 = H1 // n_s``, free index ``f = s*H2 + h2`` maps to H-column ``s*(H0*H2) + h0*H2 + h2``; at one core
-this degenerates to tp102. gate/up are SEPARATE ``[H, I_s]`` tensors, so each partition's H2 rows coalesce
-into an ``H2 * I_s`` run (2 KB at bf16); down is the contiguous ``[I_s, H]`` row load, permutation-agnostic.
+Layout: tp2013, shared with the attention kernels' SBUF residual. gate/up are separate [H, I_s]
+tensors, so each partition's H2 rows coalesce into one run; down is the contiguous [I_s, H] row load
+and is permutation-agnostic.
 
-Work split: identical to the routed path, so ``shared_local`` keeps the same per-core layout as
-``routed_local`` and the gated sum is a plain per-core add. TOKEN-sharded (``moe_token_shard``) when it
-can engage, else H-sharded (``moe_h_shard``): at cores>1 / T==1 each core owns half the tp2013 free axis,
-loading half the weights, with one fused ``[I_s, 2T]`` fp32 sendrecv+add reducing the gate/up partial
-sums (H is their contraction dim) before the SiLU; down's H-columns are disjoint and need no reduce.
-Weights are rank-replicated; ``shared_local`` stays the per-rank partial (cross-rank all-reduce deferred).
+Work split matches the routed path, so shared_local keeps routed_local's per-core layout and the
+gated sum is a plain per-core add. Under an H-shard, one fused [I_s, 2T] fp32 sendrecv+add reduces
+the gate/up partial sums before the SiLU; down's H-columns are disjoint and need no reduce.
 
-Per-rank (TP=4) A3B dims: H=2048 (H0=128, H1=16), I_s=128 (shared_expert_intermediate_size 512 / TP=4).
+Per-rank (TP=4) A3B dims: H=2048 (H0=128, H1=16), I_s=128.
+Layout and sharding rationale: specs/moe_tkg.md.
 """
 
 import nki.isa as nisa
@@ -71,6 +66,7 @@ def load_shared_weights(
     H_local-column block this core owns (the whole H row when not H-sharded). Static (non-indirect) DMAs.
     """
     H_local = H1_local * H0
+
     gate_sb = nl.ndarray((H0, H1_local, I_s), dtype=dtype, buffer=nl.sbuf)
     up_sb = nl.ndarray((H0, H1_local, I_s), dtype=dtype, buffer=nl.sbuf)
     for s_local in range(s_count):
@@ -84,6 +80,7 @@ def load_shared_weights(
             dst=up_sb[0:H0, s_local * H2 : (s_local + 1) * H2, 0:I_s],
             src=up_w.ap(pattern=pattern, offset=offset),
         )
+
     down_sb = nl.ndarray((I_s, H_local), dtype=dtype, buffer=nl.sbuf)
     if H_local == H:
         nisa.dma_copy(dst=down_sb[0:I_s, 0:H], src=down_w)
@@ -103,12 +100,10 @@ def shared_expert_compose(normed_sb, gate_w, up_w, down_w, output_in_sbuf=True):
         gate_w:         [H, I_s] HBM gate weight (contraction-first; load-transposed from stored [I_s,H]).
         up_w:           [H, I_s] HBM up weight (contraction-first; load-transposed from stored [I_s,H]).
         down_w:         [I_s, H] HBM down weight (load-transposed from stored [H, I_s]).
-        output_in_sbuf: True -> shared_local SBUF [H0,T,H1] (megakernel API, matches routed_local);
-                        False -> HBM [T,H] natural (isolation authoritative gate).
+        output_in_sbuf: SBUF [H0,T,H1] when set (matching routed_local), else HBM [T,H].
 
     Returns:
-        shared_local: SBUF [H0,T,H1] (output_in_sbuf=True) or HBM [T,H] (False) -- per-rank partial with
-                      the SAME per-LNC-core shard layout as routed_local.
+        shared_local, the per-rank partial in the same per-core shard layout as routed_local.
     """
     H0, T, H1 = normed_sb.shape
     H = H0 * H1
@@ -164,9 +159,11 @@ def shared_expert_compose(normed_sb, gate_w, up_w, down_w, output_in_sbuf=True):
         # H is the gate/up CONTRACTION dim: each core holds a partial sum. ONE fused [I_s, 2T] fp32
         # sendrecv + add reduces gate and up together before the SiLU.
         two_T = 2 * T_per_shard
+
         gate_up_sb = nl.ndarray((I_s, two_T), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=gate_up_sb[:, 0:T_per_shard], src=gate_psum)
         nisa.tensor_copy(dst=gate_up_sb[:, T_per_shard:two_T], src=up_psum)
+
         gate_up_recv = nl.ndarray((I_s, two_T), dtype=nl.float32, buffer=nl.sbuf)
         nisa.sendrecv(
             src=gate_up_sb,
@@ -185,8 +182,10 @@ def shared_expert_compose(normed_sb, gate_w, up_w, down_w, output_in_sbuf=True):
 
     gate_act = nl.ndarray((I_s, T_per_shard), dtype=nl.float32, buffer=nl.sbuf)
     nisa.activation(dst=gate_act, data=gate_src, op=nl.silu)
+
     up_act = nl.ndarray((I_s, T_per_shard), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=up_act, src=up_src)
+
     intermediate = nl.ndarray((I_s, T_per_shard), dtype=dtype, buffer=nl.sbuf)
     nisa.tensor_tensor(dst=intermediate, data1=gate_act, data2=up_act, op=nl.multiply)
 
@@ -248,11 +247,12 @@ def moe_shared_compose(
         hidden:   [B, S, H] HBM raw post-attn residual (B=1), left untouched.
         gamma:    [1, H] HBM post_attention_layernorm.weight (standard form).
         gate_w / up_w / down_w: see ``shared_expert_compose``.
-        eps:      RMSNorm epsilon.  hidden_actual: H for the mean if padded.
-        output_in_sbuf: shared_local buffer (SBUF [H0,T,H1] default, else HBM [T,H]).
+        eps:      RMSNorm epsilon.
+        hidden_actual: H used for the mean, when the input is padded.
+        output_in_sbuf: shared_local buffer; SBUF [H0,T,H1] by default, else HBM [T,H].
 
     Returns:
-        (shared_local, normed_sb): the shared partial and the SBUF normed tile (shared by the routed slice).
+        (shared_local, normed_sb) -- the shared partial, and the normed tile for the routed slice.
     """
     normed_sb = post_attn_rmsnorm_compose(
         hidden,

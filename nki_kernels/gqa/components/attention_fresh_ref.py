@@ -1,32 +1,25 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""GQA token-generation attention core with head_dim tiled across the partition axis.
+"""GQA decode attention core with head_dim tiled across the partition axis.
 
-Computes one TP shard of decode attention for a head_dim D that exceeds the 128-wide
-partition/contraction limits of the PE array (D=256 here). nkilib's TKG attention caps
-head_dim at 128 because D sits on the SBUF/PSUM partition axis, and the PE contraction-K,
-stationary-free, and partition are all <= 128. This core lifts that cap by tiling D into
-D_TILES = ceil(D / 128) partition tiles and applying the tiling at the two matmul sites:
+From-scratch reference implementation, kept for cross-checking the vendored attention_tkg path in
+attention.py. Not on the perf-critical path.
 
-  * QK^T (contraction over D): split-K -- the D_TILES partial products PSUM-accumulate
-    into one scores tile.
-  * P.V  (D is the stationary-free -> output-partition): D_TILES stationary V-slices
-    produce D_TILES PSUM halves [128, Tq], one per head_dim tile.
+nkilib's TKG attention caps head_dim at 128 because D sits on the partition axis and the PE
+contraction-K, stationary-free, and partition are all <= 128. This core lifts that cap by tiling D
+into D_TILES = ceil(D/128) partition tiles at the two matmul sites:
+  QK^T  contraction over D: split-K, the D_TILES partial products PSUM-accumulate into one scores tile
+  P.V   D is the stationary-free: D_TILES stationary V-slices give D_TILES PSUM halves, one per tile
+Softmax reduces over the KV-length axis, which is on free, so the tiling leaves it untouched.
 
-Softmax reduces over the KV-length axis (free here), so it is untouched by the tiling.
+Scores are produced as [Tq, L] so softmax is a plain free-axis reduce -- no partition-axis reduction,
+no transpose-for-max, no cross-core online-softmax combine. The cost is one PE transpose of the
+probabilities before P.V, cheap at Tq <= 8.
 
-Layout choice: scores are produced as [Tq, L] (token*head on partition, KV-length on
-free) so softmax is a plain free-axis reduce -- no partition-axis reduction, no
-transpose-for-max, no cross-core online-softmax combine. The cost is one PE transpose of
-the probabilities [Tq, L] -> [L, Tq] before P.V (cheap: Tq <= 8). This is the minimal
-correct shape for tiny decode width T with a contiguous KV of length L.
-
-GQA: the query heads share a single kv head; the shared K/V tiles are simply reused as
-the matmul operand for every query head -- no explicit replication. The query heads are
-independent, so the caller may shard them across the LNC cores (head-sharded SPMD).
-
-Precision: bf16 IO, fp32 matmul/softmax accumulate.
+GQA: the query heads share one kv head, so the shared K/V tiles are reused as the matmul operand for
+every query head with no explicit replication. The heads are independent, so the caller may shard
+them across cores. Precision is bf16 IO with fp32 matmul/softmax accumulate.
 """
 
 import math
@@ -56,28 +49,22 @@ def kernel_assert(condition, error_text):
 
 
 def gqa_attention_core(q_sb, k_sb, v_sb, T):
-    """Head_dim-tiled GQA decode attention core (one TP shard, one or more query heads).
+    """Head_dim-tiled GQA decode attention core, one TP shard and one or more query heads.
 
     Args:
-        q_sb: [P_MAX, D_TILES, Tq] SBUF (bf16). Query, head_dim on partition. Element
-            [d_in, d_tile, h_local * T + t] = Q[t, h_local, d_tile * P_MAX + d_in].
-            Tq = T * q_heads_local; head-major so each head's T columns are contiguous.
-        k_sb: [P_MAX, D_TILES, L] SBUF (bf16). Key, head_dim on partition. Element
-            [d_in, d_tile, l] = K[l, d_tile * P_MAX + d_in]. Shared across query heads.
-        v_sb: [P_MAX, L_TILES, D] SBUF (bf16). Value, KV-length on partition (128-row
-            chunks; the last chunk holds L - (L_TILES - 1) * P_MAX valid rows). Element
-            [l_in, l_tile, d] = V[l_tile * P_MAX + l_in, d]. Shared across query heads.
-        T: decode width (active tokens). q_heads_local = Tq // T.
+        q_sb: [P_MAX, D_TILES, Tq] SBUF bf16 query, head_dim on partition.
+              Tq = T * q_heads_local, head-major so each head's T columns are contiguous.
+        k_sb: [P_MAX, D_TILES, L] SBUF bf16 key, head_dim on partition. Shared across query heads.
+        v_sb: [P_MAX, L_TILES, D] SBUF bf16 value, KV-length on partition in 128-row chunks; the
+              last chunk is partially valid. Shared across query heads.
+        T:    decode width; q_heads_local = Tq // T.
 
     Returns:
-        out_sb: [P_MAX, D_TILES, Tq] SBUF (bf16), head_dim on partition. Element
-            [d_in, d_tile, h_local * T + t] = attn_out[t, h_local, d_tile * P_MAX + d_in].
+        out_sb [P_MAX, D_TILES, Tq] SBUF bf16, head_dim on partition.
 
-    Notes:
-        The full KV length is L = prior_len + T (committed prior cache concatenated with
-        the T active tokens), so prior_len = L - T. The mask is causal over the active
-        block: active token t (global position prior_len + t) attends to keys
-        l <= prior_len + t. The entire prior region is always visible.
+    Note:
+        L = prior_len + T, the committed prior cache followed by the T active tokens. The mask is
+        causal over the active block; the entire prior region is always visible.
     """
     _, D_TILES, Tq = q_sb.shape
     L = k_sb.shape[2]
@@ -114,6 +101,7 @@ def gqa_attention_core(q_sb, k_sb, v_sb, T):
         for lc in range(div_ceil(L, MM1_FREE)):
             l0 = lc * MM1_FREE
             lp = min(MM1_FREE, L - l0)
+
             sc_psum = nl.ndarray((T, lp), dtype=nl.float32, buffer=nl.psum)
             for dt in range(D_TILES):
                 d_size = min(P_MAX, D - dt * P_MAX)
@@ -144,14 +132,17 @@ def gqa_attention_core(q_sb, k_sb, v_sb, T):
         # activation bias (Nx1): -scale * max. exp(scale*data + bias) = exp(scale*(s-max)).
         neg_bias = nl.ndarray((T, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_scalar(dst=neg_bias, data=row_max, op0=nl.multiply, operand0=-scale)
+
         probs = nl.ndarray((T, L), dtype=nl.float32, buffer=nl.sbuf)
         nisa.activation(
             dst=probs, op=nl.exp, data=scores[0:T, 0:L], scale=scale, bias=neg_bias
         )
+
         row_sum = nl.ndarray((T, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_reduce(
             dst=row_sum, op=nl.add, data=probs[0:T, 0:L], axis=[1], keepdims=True
         )
+
         row_recip = nl.ndarray((T, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.reciprocal(dst=row_recip, data=row_sum)
         # Normalize and cast to bf16 (matmul-ready) in one op.
@@ -167,6 +158,7 @@ def gqa_attention_core(q_sb, k_sb, v_sb, T):
         for c in range(L_TILES):
             c0 = c * P_MAX
             cp = min(P_MAX, L - c0)
+
             pt_psum = nl.ndarray((cp, T), dtype=dtype, buffer=nl.psum)
             nisa.nc_transpose(dst=pt_psum, data=probs_bf16[0:T, c0 : c0 + cp])
             nisa.tensor_copy(dst=p_t[0:cp, c, 0:T], src=pt_psum[0:cp, 0:T])
@@ -177,6 +169,7 @@ def gqa_attention_core(q_sb, k_sb, v_sb, T):
         # over the KV-length 128-chunks. One PSUM half [d_size, T] per head_dim tile.
         for dt in range(D_TILES):
             d_size = min(P_MAX, D - dt * P_MAX)
+
             out_psum = nl.ndarray((d_size, T), dtype=nl.float32, buffer=nl.psum)
             for c in range(L_TILES):
                 c0 = c * P_MAX

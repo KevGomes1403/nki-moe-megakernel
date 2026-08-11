@@ -3,19 +3,17 @@
 
 """Post-attention RMSNorm for the Qwen3.6-A3B MoE decoder layer (token generation).
 
-The MoE block's ``post_attention_layernorm``, run so its output PERSISTS in SBUF as the [H0, T, H1]
-tile that the router and routed/shared experts consume with zero HBM round-trip. This is the MoE-layer
-input norm -- ``normed_sb`` is shared by ALL downstream composables (router, routed experts, and the
-next slice's shared expert).
+The MoE block's post_attention_layernorm, run so its output persists in SBUF as the [H0, T, H1] tile
+the router and the routed/shared experts consume with no HBM round-trip. normed_sb is shared by every
+downstream composable.
 
-``single_core_forced`` keys ``rmsnorm_tkg``'s num_H_shards, which selects the emitted [H0,T,H1]
-H-permutation:
-  * num_H_shards = n_prgs (single_core_forced=False, what the MoE consumers use): "tp2013" -- free index
-    f = s*H2 + h2 <-> H-column s*(H0*H2) + h0*H2 + h2, H2 = H1 // n_prgs. This is the layout the attention
-    kernels emit, so a megakernel can share ONE SBUF residual. At n_prgs=1 it degenerates to tp102.
-  * num_H_shards = 1 (single_core_forced=True): "tp102" (H = h0*H1 + f) on every core.
-Note num_H_shards is keyed off the LNC count only -- it is independent of whether rmsnorm itself shards
-the BxS work (it does not below SHARDING_THRESHOLD, so at T<=2 both cores compute the full norm).
+single_core_forced keys rmsnorm_tkg's num_H_shards, which selects the emitted H-permutation:
+  False  num_H_shards = n_prgs -- tp2013, the layout the attention kernels emit, so a megakernel can
+         share one SBUF residual. This is what the MoE consumers use. At n_prgs=1 it becomes tp102.
+  True   num_H_shards = 1 -- tp102 on every core.
+
+num_H_shards is keyed off the LNC count only. It is independent of whether rmsnorm shards the BxS
+work, which it does not below SHARDING_THRESHOLD -- so at T<=2 both cores compute the full norm.
 """
 
 from ...common import H0, rmsnorm_to_sbuf

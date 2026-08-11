@@ -3,13 +3,13 @@
 
 """Fused DeltaNet input RMSNorm + 4-way input projection for token generation.
 
-Thin @nki.jit wrapper over the vendored qkv_tkg: norm(hidden) @ proj_w in one call. proj_w
-concatenates the in_proj_qkv|z|a|b weights on the output axis (I = conv_dim + value_dim +
-2*num_v_heads); the caller slices the BSD output back into qkv/z/a/b at offsets conv_dim,
-+value_dim, +num_v_heads.
-proj_w is [H, I] -- the transpose of the nn.Linear [I, H] weights (qkv_tkg wants contraction H first).
-Per rank (TP=4): hidden=2048, I=3088, T<=2. The SBUF-resident fusion into conv+recurrence lives in
-deltanet/decode/fused_layer.py (deltanet_in_proj_fused_tkg_fwd).
+Thin @nki.jit wrapper over the vendored qkv_tkg: norm(hidden) @ proj_w in one call.
+
+proj_w is [H, I], the transpose of the nn.Linear weights, concatenating in_proj_qkv|z|a|b on the
+output axis. The caller slices the output back into qkv/z/a/b.
+
+Per rank (TP=4): hidden 2048, I 3088, T <= 2.
+The SBUF-resident fusion into conv+recurrence lives in deltanet/decode/fused_layer.py.
 """
 
 import nki
@@ -23,8 +23,7 @@ from ..vendored.qkv_tkg import qkv_tkg
 
 
 def in_proj_compose(hidden, proj_w, gamma, eps, output_in_sbuf, name_prefix=""):
-    """Fused input RMSNorm + 4-way projection via qkv_tkg; returns [B,S,I] HBM or [B*S,I] SBUF (caller slices qkv/z/a/b).
-    """
+    """Fused input RMSNorm + 4-way projection; returns [B, S, I] HBM or [B*S, I] SBUF."""
     if hidden.buffer == nl.sbuf:
         norm_in = nl.ndarray(hidden.shape, dtype=hidden.dtype, buffer=nl.sbuf)
         nisa.tensor_copy(dst=norm_in, src=hidden)
@@ -52,5 +51,5 @@ def in_proj_compose(hidden, proj_w, gamma, eps, output_in_sbuf, name_prefix=""):
 
 @nki.jit
 def deltanet_in_proj_fwd(hidden, proj_w, gamma, eps=1e-6):
-    """Standalone HBM-output path: returns [B,S,I] = norm(hidden) @ proj_w; caller slices qkv/z/a/b. Launch [2] (or [1])."""
+    """Standalone HBM-output path: [B, S, I] = norm(hidden) @ proj_w. Launch [2] or [1]."""
     return in_proj_compose(hidden, proj_w, gamma, eps, output_in_sbuf=False)

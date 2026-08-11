@@ -1,20 +1,20 @@
 """Qwen3.6-A3B verify-trunk megakernel: all decoder layers in one LNC2 launch.
 
-The residual stays SBUF-resident across every layer (tp2013 shard-interleaved [H0, T*H1]); the
-kernel embeds the input token ids itself, so only that gather and the final store touch HBM. Each
-layer runs attention (DeltaNet or GQA) then the MoE FFN, each followed by an in-kernel TP all-reduce
-+ LNC gather of its per-rank partial back into the residual. Structure mirrors nkilib's
+The residual stays SBUF-resident across every layer in the tp2013 shard-interleaved [H0, T*H1] tile,
+and the kernel embeds the input token ids itself -- so only that gather and the final store touch
+HBM. Each layer runs attention (DeltaNet or GQA) then the MoE FFN, each followed by an in-kernel TP
+all-reduce + LNC gather of its per-rank partial back into the residual. Structure mirrors nkilib's
 transformer_tkg.
 
-Attention H-shards its o_proj output across the two LNC cores -> H-gather. MoE token-shards
-its output -> token-gather. Both reduce across the TP replica group first.
+Attention H-shards its o_proj output across the two cores, so it needs an H-gather; MoE
+token-shards its output, so it needs a token-gather. Both reduce across the TP replica group first.
 
-The finished residual then runs the final norm + vocab head + greedy argmax, so the kernel returns
-token ids directly; the residual itself is still returned pre-final-norm because the caller needs
-it as the draft's rolling-buffer seed. Taking ids in and emitting ids out keeps the whole
+The finished residual then runs the final norm, vocab head and greedy argmax, so the kernel returns
+token ids directly. The residual is still returned pre-final-norm, because the caller needs it as
+the draft's rolling-buffer seed. Taking ids in and emitting ids out keeps the whole
 id -> hidden -> id step inside one launch.
 
-Not decorated: wrap with nki.jit() at the call site (avoids a double-jit stack overflow).
+Not decorated -- wrap with nki.jit() at the call site, since a double jit overflows the stack.
 """
 
 import linecache
@@ -133,6 +133,7 @@ def verify_trunk_compose(
             conv_dim = dn_conv_weight[dn].shape[0]
             state_w = dn_conv_weight[dn].shape[1] - 1
             Hv = (conv_dim - 2 * key_dim) // H0
+
             cand_state = nl.ndarray(
                 (T, Hv, H0, H0), dtype=nl.float32, buffer=nl.shared_hbm
             )
@@ -247,17 +248,17 @@ def qwen36_verify_megakernel(
 ):
     """Run all decoder layers, SBUF-resident residual, per-rank partials reduced in-kernel.
 
-    ``layer_is_gqa[i]`` selects the attention type for layer i; DeltaNet/GQA weight lists are
-    indexed by each type's running position. Returns
-    ``(tokens [B,S] int32 HBM, hidden [B,S,H] HBM, gqa_active_kv, dn_cand)``: the greedy token ids,
-    the trunk hidden, per-GQA-layer (active_k, active_v) for the caller's KV scatter, and
-    per-DeltaNet-layer (candidate_states, conv_cand) for the accept/reject commit.
+    layer_is_gqa[i] selects the attention type for layer i; the DeltaNet and GQA weight lists are
+    indexed by each type's running position.
 
-    ``hidden`` is PRE-final-norm: the head applies its own norm, and the caller needs the un-normed
-    hidden as the draft's rolling-buffer seed.
+    embed_w is [V, H/TP] -- ParallelEmbedding shards on hidden, so H is recovered from it only after
+    tp_degree is known, and the per-rank slices are all-gathered inside embed_compose.
 
-    ``embed_w`` is [V, H/TP] -- ParallelEmbedding shards on hidden, so H is recovered from it only
-    after tp_degree is known, and the per-rank slices are all-gathered inside embed_compose.
+    Returns:
+        (tokens [B,S] int32 HBM, hidden [B,S,H] HBM, gqa_active_kv, dn_cand) -- the greedy ids, the
+        trunk hidden, per-GQA-layer (active_k, active_v) for the caller's KV scatter, and
+        per-DeltaNet-layer (candidate_states, conv_cand) for the accept/reject commit.
+        hidden is pre-final-norm; the caller needs the un-normed hidden as the draft's seed.
     """
     B, S, H = X.shape
     dtype = X.dtype

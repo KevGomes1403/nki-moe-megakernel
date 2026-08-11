@@ -3,23 +3,21 @@
 
 """Pre-RoPE q/k RMSNorm for the GQA attention block (head_dim=256, token generation).
 
-Phase 2 of the GQA TKG pipeline (qkv_proj -> qk_norm -> rope -> attention -> out_proj). Consumes the
-head-major NBSd QKV tile produced by Phase 1 and applies RMSNorm over head_dim to each Q head and each
-K head; the V heads are passed through unchanged. RoPE is applied downstream.
+Sits between the QKV projection and RoPE: norms each Q head and each K head over head_dim, and
+passes the V heads through unchanged.
 
-Layout / why this is a FREE-AXIS reduce:
-    The QKV tile is [T, N, D] in SBUF -- T = B*S tokens on the partition axis, N heads then head_dim D
-    on the free axis (head-major, order [q0..q_{Q-1} | k0..k_{K-1} | v0..v_{K-1}]). Because head_dim D
-    sits entirely on the FREE axis (D=256 <= the 512 free limit), RMSNorm over D is a single free-axis
-    reduction per token -- no partition tiling, head_dim=256 needs no splitting. This is exactly why the
-    norm is applied in this layout rather than a head_dim-on-partition RMSNorm (which would cap d at 128).
+Layout, which is what makes this a free-axis reduce:
+    x_sb [T, N, D] -- T = B*S tokens on the partition axis; N heads head-major on the free axis,
+    then head_dim D. Because D sits entirely on the free axis and 256 <= the 512 free limit, RMSNorm
+    over D is a single free-axis reduction per token. A head_dim-on-partition norm would cap d at 128.
 
-Math per normed head (standard-weight RMSNorm; gamma is the layernorm weight, NOT 1+weight):
+Math per normed head, with gamma the standard layernorm weight (not 1+weight):
     y[t, :] = x[t, :] * rsqrt(mean_D(x[t, :]^2) + eps) * gamma
-    bf16 (or fp32) IO; the square, reduction, rsqrt, and scale run in fp32.
 
-The composable is SBUF-in / SBUF-out (megakernel-ready): Phase 1's [B*S, I] SBUF result is the same
-buffer reshaped to [T, N, D] (I = N*D head-major), so the megakernel passes it here with no copy.
+bf16 or fp32 IO; the square, reduction, rsqrt and scale all run in fp32.
+
+SBUF-in / SBUF-out: the projection's [B*S, I] result is the same buffer viewed as [T, N, D], so a
+caller passes it here with no copy.
 """
 
 import nki.isa as nisa
@@ -40,21 +38,20 @@ def kernel_assert(condition, error_text):
 
 
 def rms_norm_over_free(x_head, gamma_head, eps_t, out_head):
-    """Free-axis RMSNorm of one head tile [T, D] over head_dim D (D on the free axis).
-
-    y[t, :] = x[t, :] * rsqrt(mean_D(x[t, :]^2) + eps) * gamma   (fp32 reduce/scale; out in IO dtype).
+    """Free-axis RMSNorm of one head tile [T, D] over head_dim, fp32 reduce with an IO-dtype store.
 
     Args:
-        x_head:     [T, D] SBUF. One head's tokens (T on partition, head_dim D on free).
-        gamma_head: [T, D] SBUF. Per-head_dim weight, partition-broadcast to the T token rows.
-        eps_t:      [T, 1] SBUF fp32. RMSNorm epsilon (memset once, shared across heads).
-        out_head:   [T, D] SBUF. Normalized output (written), same dtype as x_head.
+        x_head:     [T, D] SBUF, one head's tokens.
+        gamma_head: [T, D] SBUF per-head_dim weight, partition-broadcast to the T token rows.
+        eps_t:      [T, 1] SBUF fp32 epsilon, memset once and shared across heads.
+        out_head:   [T, D] SBUF, written.
     """
     T, D = x_head.shape
 
     # Sum of squares over the free axis, accumulated in fp32.
     sq = nl.ndarray((T, D), dtype=nl.float32, buffer=nl.sbuf)
     nisa.activation(dst=sq, op=nl.square, data=x_head)
+
     ss = nl.ndarray((T, 1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_reduce(dst=ss, op=nl.add, data=sq, axis=[1], keepdims=True)
 
@@ -84,23 +81,17 @@ def qk_norm_compose(
     eps=1e-6,
     out_sb=None,
 ):
-    """Pre-RoPE q/k RMSNorm over a head-major NBSd QKV tile (free-axis reduce over head_dim).
+    """Pre-RoPE q/k RMSNorm over a head-major QKV tile, a free-axis reduce over head_dim.
 
-    Norms heads [0, num_q_heads) with gamma_q and heads [num_q_heads, num_q_heads + num_kv_heads) with
-    gamma_k; the V heads [num_q_heads + num_kv_heads, N) are copied through unchanged.
+    Norms the Q heads with gamma_q and the K heads with gamma_k; the V heads are copied through.
 
     Args:
-        qkv_sb:     [T, N, D] SBUF. Head-major QKV (T tokens on partition; N heads then head_dim D on
-                    free), N = num_q_heads + 2*num_kv_heads, order [q.. | k.. | v..]. Phase 1's
-                    [B*S, I] result is this buffer reshaped to [T, N, D] (I = N*D head-major).
-        gamma_q_sb: [T, D] SBUF. Q-layernorm weight, partition-broadcast to the T token rows.
-        gamma_k_sb: [T, D] SBUF. K-layernorm weight, partition-broadcast to the T token rows.
-        num_q_heads, num_kv_heads, head_dim: head config (defaults: Qwen3.6 per-rank 4 / 1 / 256).
-        eps:        RMSNorm epsilon (config.rms_norm_eps).
-        out_sb:     optional [T, N, D] SBUF output; allocated if None.
-
-    Returns:
-        out_sb: [T, N, D] SBUF (same dtype as qkv_sb) with q/k heads RMSNorm'd, v heads passed through.
+        qkv_sb:     [T, N, D] SBUF head-major QKV, N = num_q_heads + 2*num_kv_heads.
+        gamma_q_sb: [T, D] SBUF Q-layernorm weight, partition-broadcast to the T token rows.
+        gamma_k_sb: [T, D] SBUF K-layernorm weight, same broadcast.
+        num_q_heads, num_kv_heads, head_dim: head config.
+        eps:        RMSNorm epsilon.
+        out_sb:     optional output; allocated if None.
     """
     T, N, D = qkv_sb.shape
     kernel_assert(D == head_dim, "qkv_sb last dim must equal head_dim")

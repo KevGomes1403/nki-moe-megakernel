@@ -1,48 +1,24 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""GQA token-generation attention for head_dim=256, wrapping nkilib's AWS-tuned
-``attention_tkg`` (vendored + patched for head_dim on partition tiles).
+"""GQA token-generation attention for head_dim=256, over nkilib's tuned attention_tkg.
 
-This composable is a thin shim over the vendored ``attention_tkg`` kernel
-(``..vendored.attention_tkg``). The decode QK^T / online-softmax / P.V compute
-path is byte-for-byte AWS code; only the head_dim-on-partition layout sites are
-tiled into D_TILES = ceil(d_head / 128) partition tiles so d_head=256 fits the PE
-array (contraction-K <= 128, stationary-free-M <= 128, partition <= 128). See the
-banner in ``vendored/attention_tkg.py`` for the exact patch sites.
+A thin shim over the vendored attention_tkg kernel. The QK^T / online-softmax / P.V compute path is
+byte-for-byte AWS code; only the head_dim-on-partition layout sites are tiled into
+D_TILES = ceil(d_head/128) partition tiles, so d_head=256 fits the PE array. The banner in
+vendored/attention_tkg.py marks the exact patch sites.
 
-Replaces the earlier from-scratch ``gqa_attention_core`` (preserved as
-``attention_fresh_ref.py`` for cross-checking) so the perf-critical attention
-math is AWS-authored rather than hand-written.
+Input contract (single TP shard; GQA: q_head query heads share 1 kv head):
+  * Q arrives PRE-SCALED by 1/sqrt(d_head) and already RoPE'd / qk-normed. fuse_rope is False here,
+    so the caller owns scaling, RoPE and norm. K is RoPE'd / normed but NOT scaled.
+  * The caller supplies the full attention mask (1=keep, 0=mask); use_pos_id is False, so the
+    kernel generates no causality itself.
+  * curr_sprior (== full KV length L) must be a multiple of 128, and of 256 when s_prior is sharded
+    across 2 cores. The active tokens occupy the LAST s_active slots of the L-length KV.
 
-INPUT CONTRACT (single TP shard; GQA: ``q_head`` query heads share 1 kv head):
+Precision: bf16 IO, fp32 matmul/softmax accumulate.
 
-  * Q is PRE-SCALED by 1/sqrt(d_head) and already RoPE'd / qk-normed. The vendored
-    kernel applies the 1/sqrt(d) scale internally ONLY when fuse_rope=True; here
-    fuse_rope=False, so the caller (Phase 2 qk_norm + Phase 3 rope) owns scaling,
-    RoPE and norm. K is RoPE'd / normed but NOT scaled. This composable does not
-    touch Q/K/V values.
-  * The caller supplies the full attention ``mask`` (1=keep, 0=mask). The kernel
-    does not generate causality here (use_pos_id=False).
-  * curr_sprior (== full KV length L, prior + active) MUST be a multiple of 128,
-    and a multiple of 256 when s_prior is sharded across 2 cores (L >= 256 with
-    LNC2). The active tokens occupy the LAST s_active slots of the L-length KV.
-
-LAYOUT (head_dim tiled on partition as D_TILES = ceil(d_head/128)):
-
-  q_sb       : [128, D_TILES, B*H*s_active] SBUF io_type. q_sb[d_in, dt, b*H*s_active
-               + h*s_active + s] = Q[dt*128+d_in, b, h, s].
-  k_active_sb: [128, D_TILES, B*s_active]   SBUF io_type. [d_in, dt, b*s_active + s].
-  k_prior    : [B, 1, d_head, L]            HBM io_type (already transposed; flat-KV,
-               tp_k_prior=False). Its last s_active s_prior slots are overwritten by
-               k_active inside the kernel.
-  v_prior    : [B, 1, L, d_head]            HBM io_type.
-  v_active   : [B, 1, s_active, d_head]     HBM io_type, or (v_in_sb=True, bs == 1)
-               [s_active, d_head]           SBUF io_type -- read straight into v_sb.
-  mask       : [L, B, H, s_active]          HBM uint8 (1=keep). s_prior-major (linear).
-  out_sb     : [128, D_TILES, B*H*s_active] SBUF, written in place (out_in_sb=True).
-
-Precision: io_type bf16, fp32 matmul/softmax accumulate (AWS default).
+Tensor layouts and the head_dim tiling: specs/gqa_tkg.md.
 """
 
 import nki.language as nl
@@ -77,11 +53,9 @@ def build_attention_tkg_config(
 ):
     """Build the AttnTKGConfig for the head_dim=256 GQA decode path.
 
-    Pins the flags our config takes: flat KV (no block cache), no fp8, no FA
-    s_prior tiling, no fused RoPE, no in-kernel mask gen; q/k pre-loaded in SBUF
-    and output kept in SBUF. ``v_in_sb`` additionally takes the active V from
-    SBUF. Adaptive LNC2 sharding (s_prior or none) is decided inside the kernel
-    from the SPMD grid size.
+    Pins our flags: flat KV, no fp8, no FA s_prior tiling, no fused RoPE, no in-kernel mask gen,
+    q/k pre-loaded in SBUF and output kept there. v_in_sb also takes the active V from SBUF.
+    LNC2 sharding is decided inside the kernel from the SPMD grid size.
     """
     full_sprior = curr_sprior if full_sprior is None else full_sprior
     return AttnTKGConfig(
@@ -123,28 +97,20 @@ def gqa_attention_d256(
     v_in_sb=False,
     name_prefix="",
 ):
-    """Head_dim=256 GQA decode attention via the vendored AWS ``attention_tkg``.
+    """Head_dim=256 GQA decode attention via the vendored attention_tkg.
 
-    SBUF-in (q_sb, k_active_sb) / SBUF-out (out_sb); KV cache streamed from HBM by
-    the AWS kernel's tuned DMA path. See the module docstring for the full layout
-    and input contract. Writes ``out_sb`` in place and returns it.
+    SBUF-in (q_sb, k_active_sb), SBUF-out; the KV cache is streamed from HBM by the vendored
+    kernel's tuned DMA path. Writes out_sb in place and returns it.
 
     Args:
-        q_sb, k_active_sb: head_dim-tiled SBUF query / active key (see layout).
-        k_prior, v_prior: HBM KV cache tensors (see layout).
-        v_active: HBM [B, 1, s_active, d_head], or SBUF [s_active, d_head] when
-            v_in_sb (bs == 1).
-        mask: HBM uint8 attention mask [L, B, H, s_active] (1=keep).
-        out_sb: SBUF output [128, D_TILES, B*H*s_active], written in place.
-        bs, q_head, s_active, curr_sprior, head_dim: decode dims (GQA: q_head
-            query heads share 1 kv head; curr_sprior == full KV length L).
-        full_sprior: KV buffer capacity (defaults to curr_sprior).
-        sbm: optional SbufManager (a megakernel may pass its own). Allocated here
-            in auto-alloc mode when None.
-        v_in_sb: take the active V from SBUF instead of HBM.
-
-    Returns:
-        out_sb (the same SBUF tensor passed in).
+        q_sb, k_active_sb: head_dim-tiled SBUF query / active key.
+        k_prior, v_prior:  HBM KV cache tensors.
+        v_active:          HBM [B, 1, s_active, d_head], or SBUF [s_active, d_head] when v_in_sb.
+        mask:              HBM uint8 attention mask, 1=keep.
+        out_sb:            SBUF output, written in place.
+        full_sprior:       KV buffer capacity; defaults to curr_sprior.
+        sbm:               optional SbufManager; a megakernel may pass its own.
+        v_in_sb:           take the active V from SBUF instead of HBM.
     """
     d_tiles = _d_tiles(head_dim)
     kernel_assert(head_dim % _D_HEAD_TILE == 0, "head_dim must be a multiple of 128")

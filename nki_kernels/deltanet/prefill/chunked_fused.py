@@ -1,40 +1,23 @@
 """Fused single-kernel DeltaNet chunked forward for CTE (context encoding).
 
-Status: faster than chunked_step.py but uses the split decay form
-exp(gc[i]) * exp(-gc[j]), which overflows fp32 for this checkpoint's gating
-magnitude and yields NaN logits. Gated OFF for this model — chunked_step.py is
-the default prefill path. See README "Implementation notes".
+Status: gated OFF for this checkpoint -- its split decay form exp(gc[i]) * exp(-gc[j]) overflows fp32
+at this checkpoint's gating magnitude and yields NaN logits, so chunked_step.py is the default.
 
-SSD-style architecture: processes ALL chunks for one (batch, head) pair in
-a single NKI kernel call.  State (128x128) persists in SBUF across chunks —
-no HBM round-trips for inter-chunk state propagation.
-
-Key optimizations over the per-chunk-step kernel (chunked_step.py):
-  1. Single kernel call per (B,H) instead of B*H*num_chunks calls
-  2. State in SBUF across all chunks (no HBM state read/write per chunk)
-  3. In-kernel cumsum via tensor_tensor_scan (no PyTorch cumsum)
-  4. Masks and constants loaded once, reused across chunks
-  5. Uses tensor_scalar for partition-broadcast (no explicit broadcast loops)
-  6. nc_transpose (Vector Engine) for all 128x128 transposes instead of
-     nc_matmul(moving=eye) (Tensor Engine) — frees TE for actual math
-
-NKI 0.3.0 (SDK 2.29). k_dim = v_dim = 128 = P_MAX exactly.
-Chunk size = 128 = P_MAX (one tile per chunk).
-
-Mathematical framework (same as chunked_step.py):
-  Per-chunk Neumann-series power-doubling for intra-chunk correction:
-    A = -QK_decay * lower_mask
-    N = (I+A)(I+A^2)(I+A^4)...(I+A^64)  [6 rounds]
+Processes all chunks for one (batch, head) pair in a single call, with the 128x128 state resident in
+SBUF across chunks. Chunk size = k_dim = v_dim = 128 = P_MAX, one tile per chunk. Per chunk, a
+Neumann-series power-doubling builds the intra-chunk correction:
+    A          = -QK_decay * lower_mask
+    N          = (I+A)(I+A^2)(I+A^4)...(I+A^64)     6 rounds
     value_corr = N @ v_beta
     k_cumdecay = N @ (k_beta * exp(gc))
 
-  Inter-chunk state propagation:
-    v_prime = k_cumdecay @ state
-    v_new = value_corr - v_prime
+Then the state propagates between chunks:
+    v_new      = value_corr - k_cumdecay @ state
     attn_inter = (q * exp(gc)) @ state
     attn_intra = (q @ k^T) * decay_mask * lower_mask_diag
-    output = attn_inter + attn_intra @ v_new
-    state = exp(g_last) * (state + k_raw_decay^T @ v_new)
+    output     = attn_inter + attn_intra @ v_new
+    state      = exp(g_last) * (state + k_raw_decay^T @ v_new)
+Optimizations over chunked_step.py: specs/deltanet_prefill.md.
 """
 
 import numpy as np
@@ -242,6 +225,7 @@ def deltanet_fused_chunked_fwd(
             operand0=-1.0,
             engine=nisa.vector_engine,
         )
+
         exp_neg_gc_p = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.activation(
             dst=exp_neg_gc_p[0:P_MAX, 0:1],
@@ -292,22 +276,25 @@ def deltanet_fused_chunked_fwd(
         )
 
         # ============================================================
-        # Phase 1: Build A matrix (intra-chunk correction)
+        # Build the A matrix (intra-chunk correction)
         # Transpose K and K_beta for matmul
         # ============================================================
         kb_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_transpose(dst=kb_T_psum, data=k_beta)
+
         kb_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=kb_T, src=kb_T_psum)
 
         k_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_transpose(dst=k_T_psum, data=k_c)
+
         k_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=k_T, src=k_T_psum)
 
         # QK = k_beta^T @ k  (contract over features)
         QK_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_matmul(dst=QK_psum, stationary=kb_T, moving=k_T)
+
         QK = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=QK, src=QK_psum)
 
@@ -337,6 +324,7 @@ def deltanet_fused_chunked_fwd(
         # Transpose to scale columns (now rows in transposed view)
         QK_r_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_transpose(dst=QK_r_T_psum, data=QK_row)
+
         QK_r_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=QK_r_T, src=QK_r_T_psum)
 
@@ -352,6 +340,7 @@ def deltanet_fused_chunked_fwd(
         # Transpose back
         QK_d_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_transpose(dst=QK_d_psum, data=QK_r_T_col)
+
         QK_decay = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=QK_decay, src=QK_d_psum)
 
@@ -364,6 +353,7 @@ def deltanet_fused_chunked_fwd(
             operand0=-1.0,
             engine=nisa.vector_engine,
         )
+
         A_mat = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_tensor(dst=A_mat, data1=neg_QK_decay, data2=Lmask, op=nl.multiply)
 
@@ -381,6 +371,7 @@ def deltanet_fused_chunked_fwd(
             # A_pow = A_pow^2: transpose A_pow, then matmul
             Ap_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
             nisa.nc_transpose(dst=Ap_T_psum, data=A_pow)
+
             Ap_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
             nisa.tensor_copy(dst=Ap_T, src=Ap_T_psum)
 
@@ -394,6 +385,7 @@ def deltanet_fused_chunked_fwd(
 
             IpA_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
             nisa.nc_transpose(dst=IpA_T_psum, data=IpA)
+
             IpA_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
             nisa.tensor_copy(dst=IpA_T, src=IpA_T_psum)
 
@@ -407,11 +399,13 @@ def deltanet_fused_chunked_fwd(
         # ============================================================
         N_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_transpose(dst=N_T_psum, data=P_acc)
+
         N_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=N_T, src=N_T_psum)
 
         vc_psum = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_matmul(dst=vc_psum, stationary=N_T, moving=v_beta)
+
         value_corr = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=value_corr, src=vc_psum)
 
@@ -427,20 +421,23 @@ def deltanet_fused_chunked_fwd(
 
         kcd_psum = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_matmul(dst=kcd_psum, stationary=N_T, moving=kb_exp_gc)
+
         k_cumdecay = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=k_cumdecay, src=kcd_psum)
 
         # ============================================================
-        # Phase 2: Inter-chunk state propagation
+        # Inter-chunk state propagation
         # attn_intra = (q @ k^T) * decay_mask * lower_mask_diag
         # ============================================================
         q_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_transpose(dst=q_T_psum, data=q_c)
+
         q_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=q_T, src=q_T_psum)
 
         qk_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_matmul(dst=qk_psum, stationary=q_T, moving=k_T)
+
         qk_raw = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=qk_raw, src=qk_psum)
 
@@ -462,6 +459,7 @@ def deltanet_fused_chunked_fwd(
         # Transpose, column-scale by exp(-gc), transpose back
         qk_r_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_transpose(dst=qk_r_T_psum, data=qk_row)
+
         qk_r_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=qk_r_T, src=qk_r_T_psum)
 
@@ -476,6 +474,7 @@ def deltanet_fused_chunked_fwd(
 
         qk_d_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_transpose(dst=qk_d_psum, data=qk_r_T_col)
+
         qk_decay = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=qk_decay, src=qk_d_psum)
 
@@ -489,11 +488,13 @@ def deltanet_fused_chunked_fwd(
         # ============================================================
         kcd_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_transpose(dst=kcd_T_psum, data=k_cumdecay)
+
         kcd_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=kcd_T, src=kcd_T_psum)
 
         vp_psum = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_matmul(dst=vp_psum, stationary=kcd_T, moving=state)
+
         v_prime = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=v_prime, src=vp_psum)
 
@@ -514,11 +515,13 @@ def deltanet_fused_chunked_fwd(
 
         qe_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_transpose(dst=qe_T_psum, data=q_exp)
+
         qe_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=qe_T, src=qe_T_psum)
 
         ai_psum = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_matmul(dst=ai_psum, stationary=qe_T, moving=state)
+
         attn_inter = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=attn_inter, src=ai_psum)
 
@@ -527,11 +530,13 @@ def deltanet_fused_chunked_fwd(
         # ============================================================
         ai_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_transpose(dst=ai_T_psum, data=attn_intra)
+
         ai_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=ai_T, src=ai_T_psum)
 
         intra_psum = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_matmul(dst=intra_psum, stationary=ai_T, moving=v_new)
+
         intra_out = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=intra_out, src=intra_psum)
 
@@ -579,6 +584,7 @@ def deltanet_fused_chunked_fwd(
         # Result: sum over tokens -> (dim, dim)
         kv_psum = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_matmul(dst=kv_psum, stationary=k_raw_decay, moving=v_new)
+
         kv_outer = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=kv_outer, src=kv_psum)
 

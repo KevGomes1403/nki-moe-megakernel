@@ -149,10 +149,12 @@ def deltanet_chunk_step(
         operand0=gc_p,
         engine=nisa.vector_engine,
     )
+
     gc_row_strict = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_tensor(
         dst=gc_row_strict, data1=gc_row_broadcast, data2=Lmask, op=nl.multiply
     )
+
     g_diff_strict = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_tensor(
         dst=g_diff_strict,
@@ -160,6 +162,7 @@ def deltanet_chunk_step(
         data2=gc_row_strict,
         op=nl.subtract,
     )
+
     decay_strict_raw = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
     nisa.activation(
         dst=decay_strict_raw,
@@ -168,6 +171,7 @@ def deltanet_chunk_step(
         bias=None,
         scale=1.0,
     )
+
     decay_strict = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_tensor(
         dst=decay_strict, data1=decay_strict_raw, data2=Lmask, op=nl.multiply
@@ -181,10 +185,12 @@ def deltanet_chunk_step(
         operand0=gc_p,
         engine=nisa.vector_engine,
     )
+
     gc_row_diag = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_tensor(
         dst=gc_row_diag, data1=gc_row_broadcast, data2=Lmask_d, op=nl.multiply
     )
+
     g_diff_diag = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_tensor(
         dst=g_diff_diag,
@@ -192,6 +198,7 @@ def deltanet_chunk_step(
         data2=gc_row_diag,
         op=nl.subtract,
     )
+
     decay_diag_raw = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
     nisa.activation(
         dst=decay_diag_raw,
@@ -200,27 +207,31 @@ def deltanet_chunk_step(
         bias=None,
         scale=1.0,
     )
+
     decay_diag = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_tensor(
         dst=decay_diag, data1=decay_diag_raw, data2=Lmask_d, op=nl.multiply
     )
 
     # ============================================================
-    # Phase 1: Build A matrix (intra-chunk correction)
+    # Build the A matrix (intra-chunk correction)
     # QK = k_beta @ k^T  -- contract over features
     # ============================================================
     kb_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_matmul(dst=kb_T_psum, stationary=k_beta, moving=eye)
+
     kb_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=kb_T, src=kb_T_psum)
 
     k_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_matmul(dst=k_T_psum, stationary=k_c, moving=eye)
+
     k_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=k_T, src=k_T_psum)
 
     QK_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_matmul(dst=QK_psum, stationary=kb_T, moving=k_T)
+
     QK = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=QK, src=QK_psum)
 
@@ -237,6 +248,7 @@ def deltanet_chunk_step(
         operand0=-1.0,
         engine=nisa.vector_engine,
     )
+
     A_mat = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_tensor(dst=A_mat, data1=neg_QK_decay, data2=Lmask, op=nl.multiply)
 
@@ -252,12 +264,14 @@ def deltanet_chunk_step(
 
     A_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_transpose(dst=A_T_psum, data=A_mat)
+
     A_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=A_T, src=A_T_psum)
 
     col_mask_left_row = nl.ndarray((1, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
     nisa.memset(dst=col_mask_left_row, value=0.0)
     nisa.memset(dst=col_mask_left_row[0:1, 0:64], value=1.0)
+
     col_mask_left = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
     for i_shuf in nl.static_range(P_MAX // 32):
         nisa.nc_stream_shuffle(
@@ -269,6 +283,7 @@ def deltanet_chunk_step(
     col_mask_right_row = nl.ndarray((1, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
     nisa.memset(dst=col_mask_right_row, value=0.0)
     nisa.memset(dst=col_mask_right_row[0:1, 64:P_MAX], value=1.0)
+
     col_mask_right = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
     for i_shuf in nl.static_range(P_MAX // 32):
         nisa.nc_stream_shuffle(
@@ -286,6 +301,7 @@ def deltanet_chunk_step(
     for solve_i in nl.static_range(64):
         row_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_matmul(dst=row_psum, stationary=A_T, moving=P_acc)
+
         row_prod = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=row_prod, src=row_psum)
 
@@ -305,6 +321,7 @@ def deltanet_chunk_step(
             dst=row_mask[0:P_MAX, 0:1],
             src=eye[0:P_MAX, solve_i : solve_i + 1],
         )
+
         row_update = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_scalar(
             dst=row_update,
@@ -323,6 +340,7 @@ def deltanet_chunk_step(
 
         row_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_matmul(dst=row_psum, stationary=A_T, moving=P_acc)
+
         row_prod = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=row_prod, src=row_psum)
 
@@ -342,6 +360,7 @@ def deltanet_chunk_step(
             dst=row_mask[0:P_MAX, 0:1],
             src=eye[0:P_MAX, row_idx : row_idx + 1],
         )
+
         row_update = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_scalar(
             dst=row_update,
@@ -357,21 +376,25 @@ def deltanet_chunk_step(
 
     N_diag_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_transpose(dst=N_diag_T_psum, data=P_acc)
+
     N_diag_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=N_diag_T, src=N_diag_T_psum)
 
     tmp_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_matmul(dst=tmp_psum, stationary=N_diag_T, moving=A_mat)
+
     tmp = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=tmp, src=tmp_psum)
 
     tmp_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_transpose(dst=tmp_T_psum, data=tmp)
+
     tmp_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=tmp_T, src=tmp_T_psum)
 
     N21_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_matmul(dst=N21_psum, stationary=tmp_T, moving=P_acc)
+
     N21 = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=N21, src=N21_psum)
 
@@ -382,6 +405,7 @@ def deltanet_chunk_step(
         data2=col_mask_left,
         op=nl.multiply,
     )
+
     N21_block = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_scalar(
         dst=N21_block,
@@ -397,11 +421,13 @@ def deltanet_chunk_step(
     # ============================================================
     N_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_transpose(dst=N_T_psum, data=P_acc)
+
     N_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=N_T, src=N_T_psum)
 
     vc_psum = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_matmul(dst=vc_psum, stationary=N_T, moving=v_beta)
+
     value_corr = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=value_corr, src=vc_psum)
 
@@ -416,20 +442,23 @@ def deltanet_chunk_step(
 
     kcd_psum = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_matmul(dst=kcd_psum, stationary=N_T, moving=kb_exp_gc)
+
     k_cumdecay = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=k_cumdecay, src=kcd_psum)
 
     # ============================================================
-    # Phase 2: Inter-chunk state propagation
+    # Inter-chunk state propagation
     # attn_intra = (q @ k^T) * decay_mask * lower_mask_diag
     # ============================================================
     q_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_matmul(dst=q_T_psum, stationary=q_c, moving=eye)
+
     q_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=q_T, src=q_T_psum)
 
     qk_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_matmul(dst=qk_psum, stationary=q_T, moving=k_T)
+
     qk_raw = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=qk_raw, src=qk_psum)
 
@@ -441,11 +470,13 @@ def deltanet_chunk_step(
     # ============================================================
     kcd_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_matmul(dst=kcd_T_psum, stationary=k_cumdecay, moving=eye)
+
     kcd_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=kcd_T, src=kcd_T_psum)
 
     vp_psum = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_matmul(dst=vp_psum, stationary=kcd_T, moving=state)
+
     v_prime = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=v_prime, src=vp_psum)
 
@@ -466,11 +497,13 @@ def deltanet_chunk_step(
 
     qe_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_matmul(dst=qe_T_psum, stationary=q_exp, moving=eye)
+
     qe_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=qe_T, src=qe_T_psum)
 
     ai_psum = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_matmul(dst=ai_psum, stationary=qe_T, moving=state)
+
     attn_inter = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=attn_inter, src=ai_psum)
 
@@ -479,11 +512,13 @@ def deltanet_chunk_step(
     # ============================================================
     ai_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_matmul(dst=ai_T_psum, stationary=attn_intra, moving=eye)
+
     ai_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=ai_T, src=ai_T_psum)
 
     intra_psum = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_matmul(dst=intra_psum, stationary=ai_T, moving=v_new)
+
     intra_out = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=intra_out, src=intra_psum)
 
@@ -506,6 +541,7 @@ def deltanet_chunk_step(
         data2=gc_p,
         op=nl.subtract,
     )
+
     exp_gl_minus_gc_p = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.activation(
         dst=exp_gl_minus_gc_p,
@@ -526,6 +562,7 @@ def deltanet_chunk_step(
 
     kv_psum = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_matmul(dst=kv_psum, stationary=k_raw_decay, moving=v_new)
+
     kv_outer = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=kv_outer, src=kv_psum)
 

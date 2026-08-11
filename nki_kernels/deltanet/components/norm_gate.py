@@ -3,10 +3,13 @@
 
 """Gated per-head RMSNorm for the DeltaNet recurrence output (matches Qwen3_5MoeRMSNormGated).
 
-Per (token, value-head): out = (x * rsqrt(mean(x^2) + eps)) * gamma * silu(z), normalized over the
-128-wide head_dim. Layout A keeps head_dim on the free axis so the per-head reduce needs no transpose.
-norm_gate_row is the composable SBUF helper used at the recurrence's per-token output seam;
-deltanet_gated_rmsnorm is a thin HBM harness exposing the same math for unit testing.
+Per (token, value-head), normalized over the 128-wide head_dim:
+    out = (x * rsqrt(mean(x^2) + eps)) * gamma * silu(z)
+
+head_dim stays on the free axis, so the per-head reduce needs no transpose.
+
+norm_gate_row is the SBUF helper used at the recurrence's per-token output seam.
+deltanet_gated_rmsnorm is a thin HBM harness over the same math, for unit testing.
 """
 
 import nki
@@ -25,14 +28,13 @@ def kernel_assert(condition, error_text):
 
 
 def fold_gamma_silu(gsz_all, gamma, T, W, d):
-    """In place, turn a block of raw z rows into the gate ``gamma*silu(z)``.
+    """In place, turn a block of raw z rows into the gate gamma*silu(z).
 
-    ``gsz_all`` [1, T*W] holds z on entry (caller-gathered, token-major) and the gate on exit;
-    ``gamma`` is the replicated [d] norm weight, free-broadcast across (token, head). Folding gamma
-    here rather than inside ``norm_gate_row`` costs one activation-table load and one multiply for
-    the whole block instead of two ops per token.
+    gsz_all [1, T*W] holds z on entry and the gate on exit. gamma is the replicated [d] norm
+    weight, free-broadcast across (token, head).
     """
     TH = T * (W // d)
+
     gamma_sb = nl.ndarray((1, d), dtype=nl.float32, buffer=nl.sbuf)
     nisa.dma_copy(dst=gamma_sb, src=gamma.ap(pattern=[[d, 1], [1, d]], offset=0))
     nisa.activation(dst=gsz_all, op=nl.silu, data=gsz_all, bias=None, scale=1.0)
@@ -46,26 +48,27 @@ def fold_gamma_silu(gsz_all, gamma, T, W, d):
 
 
 def norm_gate_row(o_row, gsz_row, eps, d):
-    """One token's gated per-head RMSNorm (Layout A).
+    """One token's gated per-head RMSNorm.
 
-    ``o_row``/``gsz_row`` are [1, W_core] SBUF rows with ``gsz_row = gamma*silu(z)`` folded by
-    ``fold_gamma_silu``; returns gated [1, W_core] = RMSNorm(o_row) * gsz_row.
+    o_row and gsz_row are [1, W_core] SBUF rows, gsz_row pre-folded by fold_gamma_silu.
+    Returns [1, W_core] = RMSNorm(o_row) * gsz_row.
     """
     W = o_row.shape[1]
     kernel_assert(W % d == 0, "W_core must be a multiple of head_dim")
     kernel_assert(d == P_MAX, "head_dim must equal P_MAX")
     Hv = W // d
 
-    # 3D head-major views of the [1, W] rows: [partition=1, head, j].
+    # 3D head-major view of the [1, W] row.
     o_3d = o_row.ap(pattern=[[W, 1], [d, Hv], [1, d]], offset=0)
 
-    # Per-head sum-of-squares: free-axis reduce over the innermost d (activation_reduce can't do sub-block reduces).
+    # Per-head sum-of-squares: free-axis reduce over the innermost d.
     sq = nl.ndarray((1, Hv, d), dtype=nl.float32, buffer=nl.sbuf)
     nisa.activation(dst=sq, op=nl.square, data=o_3d, bias=None, scale=1.0)
+
     sumsq = nl.ndarray((1, Hv, 1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_reduce(dst=sumsq, op=nl.add, data=sq, axis=(2,))
 
-    # rsqrt(sumsq * (1/d) + eps): fold mean-scale + eps into one Scalar-engine rsqrt.
+    # rsqrt(sumsq/d + eps), with the mean-scale and eps folded into one Scalar-engine op.
     inv = nl.ndarray((1, Hv, 1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.activation(dst=inv, op=nl.rsqrt, data=sumsq, bias=eps, scale=1.0 / d)
 
@@ -76,6 +79,7 @@ def norm_gate_row(o_row, gsz_row, eps, d):
 
     # Gate by the pre-folded gamma*silu(z).
     out_flat = out.ap(pattern=[[W, 1], [1, W]], offset=0)
+
     gated = nl.ndarray((1, W), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_tensor(dst=gated, data1=out_flat, data2=gsz_row, op=nl.multiply)
     return gated
@@ -83,13 +87,14 @@ def norm_gate_row(o_row, gsz_row, eps, d):
 
 @nki.jit
 def deltanet_gated_rmsnorm(attn_raw, gamma, z, eps):
-    """Standalone HBM harness for testing: attn_raw/z (T,W) head-major, gamma (d,) -> (T,W) = RMSNorm(attn_raw)*silu(z). Launch [n]."""
+    """HBM test harness: attn_raw/z (T, W) head-major, gamma (d,) -> (T, W). Launch [n]."""
     T, W_full = attn_raw.shape
     d = gamma.shape[0]
     Hv_full = W_full // d
+
     out = nl.ndarray((T, W_full), dtype=nl.float32, buffer=nl.shared_hbm)
 
-    # Value-head SPMD shard: this core owns 1/n of the heads (disjoint column slice of [T, W_full]).
+    # Value-head shard: this core owns a disjoint column slice of [T, W_full].
     n = nl.num_programs(0)
     c = nl.program_id(0)
     kernel_assert(Hv_full % n == 0, "v-heads must divide across cores")
@@ -97,7 +102,7 @@ def deltanet_gated_rmsnorm(attn_raw, gamma, z, eps):
     W = Hv * d
     col_off = c * W
 
-    # Gather this core's z columns for the whole block, then fold gamma in off the per-token path.
+    # Gather this core's z columns for the block, then fold gamma in off the per-token path.
     gsz_all = nl.ndarray((1, T * W), dtype=nl.float32, buffer=nl.sbuf)
     nisa.dma_copy(
         dst=gsz_all.ap(pattern=[[T * W, 1], [W, T], [1, W]], offset=0),

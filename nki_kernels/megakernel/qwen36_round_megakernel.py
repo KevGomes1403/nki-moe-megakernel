@@ -1,28 +1,22 @@
 """Qwen3.6-A3B fused speculation round: draft, verify and replay in one LNC2 launch.
 
-The three stages that used to be three NEFFs, traced back to back so every seam between them stays
-in SBUF:
+Three stages that used to be three NEFFs, traced back to back so every seam stays in SBUF:
 
     D1  T=1  draft_stage_compose(ids=[x_t+1], h_t)         -> x_t+2^draft, writes MTP slot t
     V   T=2  verify_trunk_compose(embed([x_t+1, x_t+2]))   -> target ids, trunk hidden, candidates
     D2  T=1  draft_stage_compose(x_t+2^draft, h_t+1)       -> writes MTP slot t+1, headless
 
-Three seams carry no HBM traffic: D1's token id feeds V's embed through a [T, 1] SBUF tile; V's
-residual feeds D2's eh_proj through one tp2013->natural transpose; and D1's mutated cache handles
-are threaded into D2, which is what makes the T=1 replay legal. D2 needs MTP slot t as attention
-prior, and only a real data dependency orders that read after D1's in-place write -- across
-separate launches there is nothing to carry the edge, which is why the three-call form has to
-replay at T=2 and rewrite slot t itself.
+Three seams carry no HBM traffic: D1's token id reaches V's embed through a [T, 1] SBUF tile, V's
+residual reaches D2's eh_proj through one tp2013->natural transpose, and D1's mutated cache handles
+thread into D2 -- that last dependency orders D2's read of MTP slot t after D1's in-place write,
+which is what makes the T=1 replay legal. Neither draft's hidden is stored.
 
-D1's hidden is never stored: at spec_len=2 the draft loop runs once, so the round's carry hidden is
-the VERIFY output and D1's is dead. D2's hidden is dead by construction.
+The accept/commit epilogue is the caller's: this kernel returns the candidate id, the target ids,
+the pre-final-norm trunk hidden and every mutated handle, and the host does the greedy compare, the
+DeltaNet state select and the KV scatter.
 
-The accept/commit epilogue is still the caller's: this kernel returns the candidate id, the target
-ids, the pre-final-norm trunk hidden and every mutated handle, and the host does the greedy compare,
-the DeltaNet state select and the KV scatter.
-
-Not decorated: ``build_round_megakernel`` wraps the generated flat signature with nki.jit() (avoids
-a double-jit stack overflow).
+Not decorated -- build_round_megakernel wraps the flat signature with nki.jit(), since a double jit
+overflows the stack. Why the three-call form must replay at T=2: specs/round_megakernel_perf.md.
 """
 
 import linecache
@@ -131,15 +125,14 @@ def qwen36_round_megakernel(
 ):
     """One greedy EAGLE round at spec_len=2.
 
-    ``input_ids`` is the single committed token x_t+1 and ``prev_hidden`` its trunk hidden h_t.
-    Rope and mask come per stage because the three read at different positions: D1 at t, the verify
-    block at [t+1, t+2], D2 at t+1. ``d2_mask`` must count MTP slot t as committed prior -- that is
-    the slot D1 wrote.
+    input_ids is the single committed token x_t+1 and prev_hidden its trunk hidden h_t. Rope and mask
+    come per stage, because the three read at different positions: D1 at t, verify at [t+1, t+2], D2
+    at t+1. d2_mask must count MTP slot t as committed prior -- the slot D1 wrote.
 
     Returns:
-        ``(cand_token [B,1], tokens [B,2], hidden [B,2,H], *gqa_active_kv, *dn_candidates,
-        mtp_k_cache, mtp_v_cache, *mtp_active_kv)``. ``hidden`` is the verify trunk's, PRE-final-norm.
-        Mutated shared_hbm handles are all returned: NCC dead-stores a write nothing consumes, and
+        (cand_token [B,1], tokens [B,2], hidden [B,2,H], *gqa_active_kv, *dn_candidates,
+        mtp_k_cache, mtp_v_cache, *mtp_active_kv). hidden is the verify trunk's, pre-final-norm.
+        Every mutated shared_hbm handle is returned: NCC dead-stores a write nothing consumes, and
         an unreturned buffer may be overlaid by the allocator.
     """
     B, S = input_ids.shape

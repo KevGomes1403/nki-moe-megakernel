@@ -3,30 +3,24 @@
 
 """Routed-experts path of the Qwen3.6-A3B fused MoE layer (token generation), SBUF-resident.
 
-Composes two validated nkilib sub-kernels with the post-attn RMSNorm, keeping the normed hidden
-SBUF-resident with ZERO HBM round-trip (norm ONCE -> router + selective experts read the same tile):
+Composes two validated nkilib sub-kernels with the post-attention RMSNorm, keeping the normed hidden
+SBUF-resident so the router and the experts read the same tile:
 
     normed_sb [H0,T,H1]
-       |-- router_topk            (fp32 softmax over E -> top-k -> L1-norm) -> index[T,K], eager[T,K] (SBUF)
-       '-- routed_experts_selective (raw-NKI top-k loop: SiLU, POST_SCALE)  -> routed_local
+       |-- router_topk               fp32 softmax over E -> top-k -> L1-norm -> index/eager
+       '-- routed_experts_selective  raw-NKI top-k loop: SiLU, POST_SCALE   -> routed_local
 
-This is the FIRST MoE slice (routed experts only). The shared expert, sigma-gate, gated sum and the
-combined TP all-reduce are the NEXT slice; ``normed_sb`` is returned/reused so that slice consumes the
-SAME tile.
+This is the routed-experts slice only. The shared expert, sigma-gate and gated sum consume the same
+normed_sb, which is returned for that purpose.
 
-TWO INDEPENDENT DECISIONS, never welded together:
-  * WORK SPLIT (``moe_token_shard`` / ``moe_h_shard``): the experts token-shard across the LNC cores
-    whenever cores>1, T>1 and the config is not the big one -- each core then owns a token slice over the
-    FULL H. When the token-shard cannot engage (T == 1) the cores H-shard instead: each owns half the
-    tp2013 free axis. Exactly one of the two is active at cores>1.
-  * SBUF H-LAYOUT: always tp2013 -- ``n_s = n_prgs`` H-shards, ``H2 = H1 // n_s``, free index
-    ``f = s*H2 + h2`` <-> H-column ``s*(H0*H2) + h0*H2 + h2`` -- so the hidden tile matches the
-    attention kernels' SBUF residual. ``rmsnorm_tkg`` keys the emitted permutation off ``lnc``, so
-    ``single_core_forced=False`` gives exactly that; at one core it degenerates to tp102.
+Work split and SBUF layout are independent decisions. The experts token-shard across cores when
+cores>1, T>1 and the config is not the big one; when the token-shard cannot engage (T == 1) they
+H-shard instead, and exactly one of the two is active at cores>1. The SBUF layout is always tp2013,
+regardless, so the hidden tile matches the attention kernels' residual.
 
-Per-rank (TP=4) A3B config: H=2048, E=256, K=8, I=128 (moe_intermediate_size=512, sharded on I; EP=1,
-all 256 experts replicated per rank). ``router_w`` is rank-replicated [H,E]. ``routed_local`` is the
-per-rank partial over H (down-proj contracts the I-shard); the cross-rank all-reduce is deferred.
+Per-rank (TP=4) A3B config: H=2048, E=256, K=8, I=128, EP=1 with all 256 experts replicated.
+routed_local is the per-rank partial over H; the cross-rank all-reduce is deferred.
+Layout and sharding rationale: specs/moe_tkg.md.
 """
 
 import nki.language as nl
@@ -86,13 +80,13 @@ def moe_token_shard(T, H, moe_intermediate, n_prgs, shard_id):
 
 
 def moe_h_shard(H1, n_prgs, shard_id, shard_on_T):
-    """Per-LNC-core H-shard geometry over the tp2013 free axis: (shard_on_H, f_offset, H1_per_shard).
+    """Per-core H-shard geometry over the tp2013 free axis.
 
-    The fallback taken whenever the token-shard cannot engage (mirrors nkilib's
-    ``shard_on_h_disabled = shard_on_T`` switch). Core p owns free indices ``[p*H2, (p+1)*H2)``, i.e. the
-    contiguous H-column block ``[p*H0*H2, (p+1)*H0*H2)``: gate/up contract only their half of H (H is the
-    CONTRACTION dim -> one cross-core reduce before the activation) while down writes disjoint output
-    columns (H is the OUTPUT dim -> no reduce).
+    The fallback taken whenever the token-shard cannot engage. Core p owns a contiguous H-column
+    block, so gate/up contract only their half of H -- H is the contraction dim, hence one cross-core
+    reduce before the activation -- while down writes disjoint output columns and needs no reduce.
+
+    Returns (shard_on_H, f_offset, H1_per_shard).
     """
     if n_prgs > 1 and not shard_on_T:
         H2 = H1 // n_prgs
@@ -117,10 +111,10 @@ def routed_experts_compose(
         expert_gate_up_w: [E, H, 2, I] HBM fused gate/up expert weights (kernel layout).
         expert_down_w:    [E, I, H] HBM down expert weights (kernel layout).
         k:                top-k experts per token (A3B: 8).
-        output_in_sbuf:   True -> routed_local SBUF [H0,T,H1] (megakernel API); False -> HBM [T,H] natural.
+        output_in_sbuf:   SBUF [H0,T,H1] when set, else HBM [T,H].
 
     Returns:
-        routed_local: SBUF [H0,T,H1] (output_in_sbuf=True) or HBM [T,H] (False) -- per-rank routed partial.
+        routed_local, the per-rank routed partial.
     """
     H0, T, H1 = normed_sb.shape
     H = H0 * H1
@@ -206,11 +200,13 @@ def moe_routed_compose(
         hidden:   [B, S, H] HBM raw post-attn residual (B=1), left untouched.
         gamma:    [1, H] HBM post_attention_layernorm.weight (standard form).
         router_w / expert_gate_up_w / expert_down_w: see ``routed_experts_compose``.
-        eps:      RMSNorm epsilon.  k: top-k experts.  hidden_actual: H for the mean if padded.
-        output_in_sbuf: routed_local buffer (SBUF [H0,T,H1] default, else HBM [T,H]).
+        eps:      RMSNorm epsilon.
+        k:        top-k experts.
+        hidden_actual: H used for the mean, when the input is padded.
+        output_in_sbuf: routed_local buffer; SBUF [H0,T,H1] by default, else HBM [T,H].
 
     Returns:
-        (routed_local, normed_sb): the routed partial and the SBUF normed tile (shared by the next slice).
+        (routed_local, normed_sb) -- the routed partial, and the normed tile for the next slice.
     """
     normed_sb = post_attn_rmsnorm_compose(
         hidden,

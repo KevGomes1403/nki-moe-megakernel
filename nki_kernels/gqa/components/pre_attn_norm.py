@@ -3,21 +3,19 @@
 
 """Pre-attention RMSNorm for the GQA (full_attention) decoder layer (token generation).
 
-The GQA layer's ``input_layernorm``, run so its output PERSISTS in SBUF as the [H0, T, H1] tile that
-``qkv_tkg`` consumes with zero HBM round-trip (the megakernel omits the isolation-test's HBM store and
-hands ``normed_sb`` straight to the two projection calls via NormType.NO_NORM).
+The layer's input_layernorm, run so its output persists in SBUF as the [H0, T, H1] tile qkv_tkg
+consumes with no HBM round-trip. Callers hand normed_sb straight to the projections via
+NormType.NO_NORM.
 
 Contract (A3B, TP=4, LNC=2, bs=1):
-    hidden: [B, T, H] HBM raw pre-norm hidden (B=1, H=2048), bf16/fp32. Left untouched (residual).
-    gamma:  [1, H] HBM = input_layernorm.weight in STANDARD form -- the (1+w) conversion is applied
-            once at checkpoint load, so gamma is fed directly with no +1 in-kernel.
-    Returns normed_sb: [H0=128, T, H1=16] SBUF (same dtype as hidden) -- the exact qkv_tkg SBUF-input
-            layout, drop-in with zero reshape.
+    hidden: [B, T, H] HBM raw pre-norm hidden, bf16/fp32. Left untouched, as the residual.
+    gamma:  [1, H] HBM input_layernorm.weight in STANDARD form -- the (1+w) conversion happens once
+            at checkpoint load, so there is no +1 in-kernel.
+    returns [H0=128, T, H1=16] SBUF, the exact qkv_tkg SBUF-input layout.
 
-Sharding: default num_H_shards = lnc (2 at LNC=2, from the launch grid). This lays the H1=16 output
-    columns out as [shard0_H2(8) | shard1_H2(8)] -- the byte-for-byte column order qkv_tkg's NO_NORM
-    path slices per shard. At T = B*S <= SHARDING_THRESHOLD(18) both cores compute the full replicated
-    norm (no BxS shard, no sendrecv), matching the unsharded runtime input_layernorm.
+Sharding: num_H_shards defaults to lnc, laying the H1 output columns out in the per-shard column
+order qkv_tkg's NO_NORM path slices. At T <= SHARDING_THRESHOLD both cores compute the full
+replicated norm, matching the unsharded runtime input_layernorm.
 """
 
 from ...common import H0, rmsnorm_to_sbuf
@@ -31,10 +29,10 @@ H1 = H // H0  # 16 free H-tiles
 def pre_attn_rmsnorm_compose(
     hidden, gamma, eps=1e-6, hidden_actual=None, normed_sb=None, name_prefix=""
 ):
-    """RMSNorm raw hidden into an SBUF-resident [H0, T, H1] tile for qkv_tkg (zero HBM round-trip).
+    """RMSNorm raw hidden into an SBUF-resident [H0, T, H1] tile for qkv_tkg.
 
-    ``gamma`` is the layer's input_layernorm.weight; see ``rmsnorm_to_sbuf`` for the full argument
-    contract. Uses rmsnorm_tkg's default sharding (num_H_shards = lnc, from the launch grid).
+    gamma is the layer's input_layernorm.weight; rmsnorm_to_sbuf documents the full contract.
+    Uses rmsnorm_tkg's default sharding.
     """
     return rmsnorm_to_sbuf(
         hidden,

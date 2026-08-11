@@ -10,14 +10,14 @@ the KV cache and the two step outputs. Structure mirrors the verify megakernel, 
     hidden    = residual                                   PRE-final-norm carry
     tokens    = all_gather_argmax(lm_head_compose(residual))    with_lm_head build only
 
-The KV write is in place at ``kv_write_idx``: the scatter runs after attention's prior read, and the
+The KV write is in place at kv_write_idx: the scatter runs after attention's prior read, and the
 mutated cache handles are returned because NCC dead-stores a mutated buffer nothing consumes.
 
-``with_lm_head`` is a compile-time build key: the replay launch's logits are dead, so its build drops
-the head and the ~127 MB/core of weight it streams.
+with_lm_head is a compile-time build key -- the replay launch's logits are dead, so its build drops
+the head and the weight stream that feeds it.
 
-Not decorated: ``build_draft_megakernel`` wraps this with nki.jit() (avoids a double-jit stack
-overflow).
+Not decorated -- build_draft_megakernel wraps this with nki.jit(), since a double jit overflows
+the stack.
 """
 
 import inspect
@@ -112,9 +112,9 @@ def draft_stage_compose(
 ):
     """The draft step as one SBUF-resident stage: ids + trunk hidden -> residual + token id.
 
-    Everything the launch shell adds around this is HBM: the residual store and the token store.
-    A fused round calls it twice with no store in between, threading the mutated cache handles from
-    the first call into the second so the ordering edge on the shared MTP KV cache is explicit.
+    Everything the launch shell adds around this is HBM. A fused round calls it twice with no store
+    in between, threading the mutated cache handles through so the ordering edge on the shared MTP
+    KV cache is explicit.
 
     Args:
         ids_sb:      [T, 1] int32 SBUF token ids.
@@ -243,19 +243,17 @@ def qwen36_draft_megakernel(
     replica_groups,
     name_prefix="",
 ):
-    """Run the draft front end, the GQA+MoE decoder layer and (optionally) the vocab head.
+    """Run the draft front end, the GQA+MoE decoder layer and optionally the vocab head.
 
-    ``final_gamma``/``lm_head_w`` None selects the headless build. ``cos``/``sin`` are indexed at
-    TOKEN positions t .. t+T-1 and ``mask`` keeps the committed prior plus the trailing active slots
-    causally -- the active tokens occupy the LAST T slots of the L-length cache tile, which is where
-    the in-place scatter writes.
+    final_gamma/lm_head_w None selects the headless build. cos/sin are indexed at token positions
+    t .. t+T-1, and mask keeps the committed prior plus the trailing active slots causally -- the
+    active tokens occupy the LAST T slots of the cache tile, where the in-place scatter writes.
 
     Returns:
-        ``(tokens [B,S] int32, hidden [B,S,H], k_cache, v_cache, active_k, active_v)`` with the
-        head, else ``(hidden, k_cache, v_cache, active_k, active_v)``. ``hidden`` is PRE-final-norm:
-        the head applies its own norm and the next draft step seeds from the un-normed hidden. The
-        cache handles are the in-place mutated ones; ``active_k``/``active_v`` are returned because
-        an unreturned shared_hbm write may be overlaid by the allocator and stomp live buffers.
+        (tokens [B,S] int32, hidden [B,S,H], k_cache, v_cache, active_k, active_v) with the head,
+        else the same without tokens. hidden is pre-final-norm, since the head applies its own norm
+        and the next draft step seeds from the un-normed hidden. active_k/active_v are returned
+        because an unreturned shared_hbm write may be overlaid by the allocator.
     """
     B, S = input_ids.shape
     dtype = embed_w.dtype

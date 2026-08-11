@@ -3,24 +3,20 @@
 
 """GQA attention output projection (o_proj) for token generation (head_dim=256).
 
-Thin composable over nkilib's output_projection_tkg. The GQA o_proj contracts the attention
-output's value_dim (q_heads * head_dim) down to hidden. output_projection_tkg folds N sub-heads,
-each at most 128 wide, and PSUM-accumulates them, so a head_dim=256 q-head is presented as two
-128-wide sub-heads. With q_heads=4 that is 4*2 = 8 sub-heads of 128 -- structurally identical to
-the DeltaNet o_proj (8 value-heads of 128); this wraps output_projection_tkg, it does not patch it.
+Thin composable over nkilib's output_projection_tkg, which folds N sub-heads of at most 128 each and
+PSUM-accumulates them. A head_dim=256 q-head is therefore presented as two 128-wide sub-heads, so
+q_heads=4 gives 8 sub-heads of 128 -- structurally the same as the DeltaNet o_proj.
 
-Input layout matches the Phase 4 attention core's output `out_sb [128, D_TILES, Tq]`: head_dim is
-already on the partition axis (split into D_TILES tiles of 128), so -- unlike the DeltaNet o_proj --
-no per-head PE transpose is needed. Each (q-head, d-tile) pair is one 128-wide sub-head already sitting
-on the partition axis; this composable only reorders the free axes into output_projection_tkg's
-`attention [d=128, B=1, N, T]` sub-head layout, gathers the other LNC core's sub-heads via sendrecv,
-then runs the H-sharded matmul. The TP all-reduce of the per-rank o_proj partial is deferred; this
-returns the per-rank partial [T, hidden].
+The attention core's output already has head_dim on the partition axis, split into D_TILES tiles of
+128, so no per-head PE transpose is needed here. Each (q-head, d-tile) pair is one 128-wide sub-head
+already on the partition axis. This composable only reorders the free axes into
+output_projection_tkg's sub-head layout, gathers the other core's sub-heads via sendrecv, and runs
+the H-sharded matmul.
 
-Sub-head ordering (q-head major, d-tile minor): global sub-head n = h_global * D_TILES + d_tile
-maps to value_dim block [n*128, (n+1)*128). The o_proj weight `out_w [value_dim, hidden]` is row-indexed
-by value_dim, so out_w[n*128:(n+1)*128] is exactly sub-head n's weight -- it already matches
-output_projection_tkg's `weight [N*D, H]` indexing [n*D + d, h] and is passed through unreshaped.
+Sub-head ordering is q-head major, d-tile minor, which already matches how out_w is row-indexed by
+value_dim -- so the weight passes through unreshaped.
+
+The TP all-reduce is deferred: this returns the per-rank partial.
 """
 
 import nki
@@ -44,27 +40,20 @@ def kernel_assert(condition, error_text):
 def out_proj_compose(attn_sb, out_w, T, gate_sb=None, sbm=None):
     """Per-rank GQA attention output projection.
 
+    Optional sigmoid gate, then reorder the free axes into sub-head order, gather the other core's
+    sub-heads via sendrecv, and run the H-sharded matmul.
+
     Args:
-        attn_sb: [P_MAX, D_TILES, Tq] SBUF, this core's query heads in the Phase 4 attention core's
-            output layout (head_dim on partition). Element [d_in, d_tile, h_local*T + t] =
-            attn_out[t, h_local, d_tile*P_MAX + d_in]. Tq = qh_local * T (head-major); the head_dim of
-            256 is split into D_TILES = 2 partition tiles of 128, so (h_local, d_tile) names a 128-wide
-            sub-head already on the partition axis.
-        out_w:  [value_dim, hidden] HBM, transpose of the o_proj nn.Linear weight (value_dim first).
-            Row-indexed by value_dim; out_w[n*P_MAX:(n+1)*P_MAX] is global sub-head n's weight.
-        T:      decode width (active tokens). qh_local = Tq // T query heads on this core.
-        gate_sb: optional [P_MAX, D_TILES, Tq] SBUF, sigmoid output gate in the SAME head_dim-on-partition
-            layout as attn_sb. When provided, the attention input is gated elementwise before the matmul:
-            gated = attn_sb * sigmoid(gate_sb). Default None (no gate), keeping the core o_proj path clean.
-        sbm:    optional BufferManager passed through to output_projection_tkg.
+        attn_sb: [P_MAX, D_TILES, Tq] SBUF, this core's query heads with head_dim on partition.
+                 Tq = qh_local * T, head-major.
+        out_w:   [value_dim, hidden] HBM, transpose of the o_proj nn.Linear weight.
+        T:       decode width; qh_local = Tq // T query heads on this core.
+        gate_sb: optional sigmoid output gate in the same layout as attn_sb. When given, the input
+                 is gated elementwise before the matmul.
+        sbm:     optional BufferManager passed through to output_projection_tkg.
 
     Returns:
-        o_out: [T, hidden] HBM -- per-rank o_proj PARTIAL. Each core writes its disjoint hidden/n shard;
-            the full [T, hidden] is complete on return. The TP all-reduce across ranks is deferred.
-
-    Steps: optional sigmoid gate -> reorder (d_tile, h_local) free axes into sub-head order [d, N_core, T]
-    -> assemble the global [d, 1, N, T] (this core's sub-heads at [c*N_core, (c+1)*N_core), other core's
-    gathered via sendrecv) -> output_projection_tkg(OUT_IN_SB=False, TRANSPOSE_OUT=False, NONE).
+        o_out [T, hidden] HBM, the per-rank partial; each core writes its disjoint hidden/n shard.
     """
     _, D_TILES, Tq = attn_sb.shape
     value_dim, hidden = out_w.shape
@@ -89,8 +78,10 @@ def out_proj_compose(attn_sb, out_w, T, gate_sb=None, sbm=None):
         kernel_assert(
             gate_sb.shape == attn_sb.shape, "gate_sb must match attn_sb shape/layout"
         )
+
         sig = nl.ndarray(attn_sb.shape, dtype=nl.float32, buffer=nl.sbuf)
         nisa.activation(dst=sig, op=nl.sigmoid, data=gate_sb)
+
         gated = nl.ndarray(attn_sb.shape, dtype=attn_sb.dtype, buffer=nl.sbuf)
         nisa.tensor_tensor(dst=gated, data1=attn_sb, data2=sig, op=nl.multiply)
         attn_src = gated

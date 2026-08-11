@@ -3,27 +3,24 @@
 
 """Fully fused MoE layer of the Qwen3.6-A3B decoder (token generation), SBUF-resident.
 
-Stitches the three validated building blocks into ONE composable and adds the last two pieces
-(sigma-gate + gated sum), all SBUF-resident with a single post-attn RMSNorm and ZERO HBM round-trip:
+One post-attention RMSNorm feeds every consumer, with no HBM round-trip:
 
-    normed_sb = post_attn_rmsnorm(hidden, gamma)               <- NORM ONCE, shared by all consumers
-       |-- routed_local  = routed_experts_compose(normed_sb)   (router_topk + selective moe_tkg)
-       |-- shared_local  = shared_expert_compose(normed_sb)    (mlp_tkg SwiGLU shared expert)
-       '-- g             = sigmoid(normed_sb .h sigma_gate_w)  (tiny H->1 matmul, rank-replicated)
+    normed_sb = post_attn_rmsnorm(hidden, gamma)
+       |-- routed_local = routed_experts_compose(normed_sb)   router_topk + selective experts
+       |-- shared_local = shared_expert_compose(normed_sb)    mlp_tkg SwiGLU shared expert
+       '-- g            = sigmoid(normed_sb .h sigma_gate_w)  tiny H->1 matmul, rank-replicated
     combined_local = routed_local + broadcast(g) * shared_local
 
-Reference (modeling_qwen36_a3b.py NeuronMoEBlock): all of router/routed/shared/sigma consume the SAME
-post-attn-normed hidden, so norm ONCE. ``combined_local`` is the per-rank partial; the model applies the
-SINGLE ``reduce_from_tensor_model_parallel_region`` -- valid because the sigma-gate is rank-replicated:
-AR(routed) + g*AR(shared) == AR(routed + g*shared). No cross-rank all-reduce here (megakernel/model
-boundary; a future megakernel could use ``nki.collectives.all_reduce`` on the SBUF tile).
+combined_local is the per-rank partial, and the model applies a single
+reduce_from_tensor_model_parallel_region to it. That is valid because the sigma-gate is
+rank-replicated: AR(routed) + g*AR(shared) == AR(routed + g*shared).
 
-Every SBUF tile here -- ``normed_sb`` in and ``combined_local`` out -- is in the tp2013 H-permutation the
-attention kernels use for their residual (n_s = n_prgs H-shards, H2 = H1 // n_s, free index f = s*H2 + h2
-<-> H-column s*(H0*H2) + h0*H2 + h2), so a megakernel can share ONE SBUF residual. At one core it
-degenerates to tp102. The HBM contract ([B,S,H] in, [1,T,H] out) is layout-independent.
+Every SBUF tile here, in and out, uses the same tp2013 H-permutation the attention kernels use for
+their residual, so a megakernel can share one SBUF residual. At one core it degenerates to tp102.
+The HBM contract ([B,S,H] in, [1,T,H] out) is layout-independent.
 
 Per-rank (TP=4) A3B config: H=2048, E=256, K=8, routed I=128, shared I_s=128.
+Layout and sharding rationale: specs/moe_tkg.md.
 """
 
 import nki
@@ -50,19 +47,13 @@ def kernel_assert(condition, error_text):
 
 
 def sigma_gate_compose(normed_sb, sigma_gate_w):
-    """Sigmoid shared-expert gate: g = sigmoid(normed .h sigma_gate_w) -> [1, T] (rank-replicated).
+    """Sigmoid shared-expert gate: g = sigmoid(normed .h sigma_gate_w), rank-replicated.
 
-    An H->1 projection contracting the full H, which lives split as the H0 partition x H1 free axes of
-    ``normed_sb``. The [H,1] weight is loaded through the same tp2013 AP -- w_sb[h0, s*H2 + h2] =
-    w[s*H0*H2 + h0*H2 + h2] -- so each free-index matmul contracts H0 with matching operands. Output is a
-    [1, T] row (M=1) ready for the partition-broadcast in the gated sum.
+    An H->1 projection contracting the full H, which lives split across normed_sb's H0 partition and
+    H1 free axes. The weight is loaded through the same tp2013 AP, so each free-index matmul
+    contracts H0 with matching operands.
 
-    Args:
-        normed_sb:    [H0=128, T, H1=H//128] SBUF post-attn-normed hidden (tp2013, n_s = n_prgs).
-        sigma_gate_w: [H, 1] HBM gate weight, rank-replicated (load-transposed from stored [1, H]).
-
-    Returns:
-        g: [1, T] SBUF fp32 -- the per-token sigmoid gate (same on every rank).
+    Returns g [1, T] SBUF fp32, ready for the partition-broadcast in the gated sum.
     """
     H0, T, H1 = normed_sb.shape
     H = H0 * H1
@@ -84,8 +75,10 @@ def sigma_gate_compose(normed_sb, sigma_gate_w):
         nisa.nc_matmul(
             dst=logit_ps, stationary=w_sb[:, f : f + 1], moving=normed_sb[:, :, f]
         )
+
     logit_sb = nl.ndarray((1, T), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=logit_sb, src=logit_ps)
+
     g = nl.ndarray((1, T), dtype=nl.float32, buffer=nl.sbuf)
     nisa.activation(dst=g, data=logit_sb, op=nl.sigmoid)
     return g
@@ -94,19 +87,15 @@ def sigma_gate_compose(normed_sb, sigma_gate_w):
 def gated_sum(routed_local, shared_local, g, f_offset=0, H1_local=None):
     """combined = routed_local + broadcast(g) * shared_local, in [H0, T, H1] SBUF.
 
-    ``g`` is [1, T] but T is the MIDDLE axis of [H0,T,H1]; broadcast it across the H0 partitions (one
-    ones-matmul: [H0,T] = ones[1,H0].T @ g[1,T]) then multiply each H1 slice (T on the free axis) and add
-    routed. Operates on this core's free-index block only -- at cores=2/T>1 routed/shared hold their token
-    slice over the full H (f_offset=0, H1_local=H1) and at cores=2/T==1 their H-shard; either way only the
-    core's own slice is valid, which the caller's per-core store selects.
+    g is [1, T] but T is the middle axis, so it is broadcast across the H0 partitions with one
+    ones-matmul before multiplying each H1 slice.
+
+    Operates on this core's free-index block only; the caller's per-core store selects the valid slice.
 
     Args:
-        routed_local / shared_local: [H0, T, H1] SBUF per-rank partials in identical per-core layout.
-        g:                           [1, T] SBUF fp32 sigmoid gate (rank- and core-replicated).
-        f_offset / H1_local:         this core's H-shard geometry (``moe_h_shard``); default = full H.
-
-    Returns:
-        combined: [H0, T, H1] SBUF per-rank partial (same dtype/layout as the inputs).
+        routed_local, shared_local: [H0, T, H1] SBUF per-rank partials in identical per-core layout.
+        g:                          [1, T] SBUF fp32 gate, rank- and core-replicated.
+        f_offset, H1_local:         this core's H-shard geometry; defaults to the full H.
     """
     H0, T, H1 = routed_local.shape
     dtype = routed_local.dtype
@@ -115,10 +104,12 @@ def gated_sum(routed_local, shared_local, g, f_offset=0, H1_local=None):
 
     ones_sb = nl.ndarray((1, H0), dtype=nl.float32, buffer=nl.sbuf)
     nisa.memset(dst=ones_sb, value=1.0)
+
     g_bc_ps = nl.ndarray((H0, T), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_matmul(
         dst=g_bc_ps, stationary=ones_sb, moving=g
     )  # [H0,T] = g broadcast on H0
+
     g_bc = nl.ndarray((H0, T), dtype=dtype, buffer=nl.sbuf)
     nisa.tensor_copy(dst=g_bc, src=g_bc_ps)
 
@@ -152,6 +143,7 @@ def _store_combined_hbm(combined, moe_intermediate, output_bsh=False):
     H2 = H1 // n_s
     _, T_offset, T_per_shard = moe_tkg_shard_decision(T, H, moe_intermediate)
     _, f_offset, H1_local = moe_h_shard_decision(T, H, H1, moe_intermediate)
+
     out_hbm = nl.ndarray(
         (1, T, H) if output_bsh else (T, H), dtype=combined.dtype, buffer=nl.shared_hbm
     )
@@ -188,7 +180,7 @@ def moe_layer_compose(
     output_bsh=False,
     name_prefix="",
 ):
-    """Fully fused MoE layer: norm ONCE -> routed + shared + sigma-gate -> gated sum (per-rank partial).
+    """Fully fused MoE layer: one norm -> routed + shared + sigma-gate -> gated sum.
 
     Args:
         hidden:           [B, S, H] HBM raw post-attn residual (B=1), left untouched.
@@ -200,12 +192,13 @@ def moe_layer_compose(
         shared_gate_w:    [H, I_s] HBM shared gate weight (contraction-first, from stored [I_s, H]).
         shared_up_w:      [H, I_s] HBM shared up weight (contraction-first, from stored [I_s, H]).
         shared_down_w:    [I_s, H] HBM shared down weight (from stored [H, I_s]).
-        eps:              RMSNorm epsilon.  k: top-k experts (A3B: 8).  hidden_actual: H for the mean.
-        output_in_sbuf:   True -> combined SBUF [H0,T,H1] (megakernel API); False -> HBM [T,H] (isolation).
+        eps:              RMSNorm epsilon.
+        k:                top-k experts (A3B: 8).
+        hidden_actual:    H used for the mean, when the input is padded.
+        output_in_sbuf:   SBUF [H0,T,H1] when set, else HBM [T,H].
 
     Returns:
-        combined_local: SBUF [H0,T,H1] (output_in_sbuf=True) or HBM [T,H] (False) -- the SINGLE per-rank
-                        MoE partial for ONE downstream reduce_from_tensor_model_parallel_region.
+        combined_local, the single per-rank MoE partial for one downstream all-reduce.
     """
     moe_intermediate = expert_gate_up_w.shape[3]
 
