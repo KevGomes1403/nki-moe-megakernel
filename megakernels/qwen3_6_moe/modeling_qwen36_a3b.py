@@ -2025,16 +2025,7 @@ class NeuronQwen36A3BAttention(NeuronAttentionBase):
         """
         bsz, q_len, _ = hidden_states.shape
 
-        # Decode/verify (cache present, not chunked prefill) through the fused GQA TKG kernel.
-        is_kernel_tkg = (
-            self.use_tkg_attention_kernel
-            and past_key_value is not None
-            and not (
-                q_len > 1
-                and getattr(self.config, "use_qwen_hybrid_chunked_prefill", False)
-            )
-        )
-        if is_kernel_tkg:
+        if self.uses_tkg_kernel(past_key_value, q_len):
             return self._forward_tkg_kernel(
                 hidden_states,
                 attention_mask,
@@ -2043,6 +2034,8 @@ class NeuronQwen36A3BAttention(NeuronAttentionBase):
                 past_key_value,
                 cos_cache,
                 sin_cache,
+                kv_write_idx=kwargs.get("kv_write_idx"),
+                gamma_in=kwargs.get("gamma_in"),
             )
 
         # Use standard 2D position_ids for prep_qkv_tensors.
@@ -2132,6 +2125,20 @@ class NeuronQwen36A3BAttention(NeuronAttentionBase):
         mask = full.permute(2, 0, 1)[:, :, None, :].expand(L, bsz, self.num_heads, T)
         return mask.to(torch.uint8).contiguous()
 
+    def uses_tkg_kernel(self, past_key_value, q_len):
+        """Whether this call takes the fused GQA kernel: cache present, not chunked prefill.
+
+        The decoder layer asks too, so it knows to leave the input RMSNorm to the kernel.
+        """
+        return (
+            self.use_tkg_attention_kernel
+            and past_key_value is not None
+            and not (
+                q_len > 1
+                and getattr(self.config, "use_qwen_hybrid_chunked_prefill", False)
+            )
+        )
+
     def _forward_tkg_kernel(
         self,
         hidden_states,
@@ -2141,12 +2148,17 @@ class NeuronQwen36A3BAttention(NeuronAttentionBase):
         past_key_value,
         cos_cache,
         sin_cache,
+        kv_write_idx=None,
+        gamma_in=None,
     ):
-        """Fused GQA decode/verify: input-normed hidden in, all-reduced [B,S,H] out.
+        """Fused GQA decode/verify: hidden in, all-reduced [B,S,H] out.
 
-        hidden_states is already input-RMSNorm'd, since the decoder applies input_layernorm.
-        Returns (output, (active_k, active_v), cos_cache, sin_cache) -- the same tuple shape the
-        standard forward returns, so NxDI scatters active_k/active_v unchanged.
+        hidden_states is raw when gamma_in [1,H] is given -- the input RMSNorm then runs in-kernel,
+        SBUF-resident -- and pre-normed otherwise. Returns (output, kv, cos_cache, sin_cache), the
+        same tuple shape the standard forward returns.
+
+        kv_write_idx [B,1] int32 scatters the active K/V into the caches in place; the mutated cache
+        handles then take the KV slot, so the caller skips update_cache.
         """
         bsz, T, _ = hidden_states.shape
         k_cache, v_cache = past_key_value  # [B,1,D,L] BHDS, [B,1,L,D] BHSD
@@ -2156,7 +2168,7 @@ class NeuronQwen36A3BAttention(NeuronAttentionBase):
         mask = self._build_kernel_mask(
             attention_mask, active_mask, bsz, T, L, hidden_states.device
         )
-        o_out, active_k, active_v = gqa_fused_tkg_fwd[2](
+        rets = gqa_fused_tkg_fwd[2](
             hidden_states,
             self.gqa_qkv_w.weight,
             self.gqa_gate_w.weight,
@@ -2169,14 +2181,18 @@ class NeuronQwen36A3BAttention(NeuronAttentionBase):
             mask,
             self.gqa_o_proj_w.weight,
             self.rms_norm_eps,
+            kv_write_idx=kv_write_idx,
+            gamma_in=gamma_in,
         )
-        # o_out is the per-rank o_proj partial; all-reduce across tensor-parallel ranks.
-        output = o_out.unsqueeze(0).to(hidden_states.dtype)
+        # In-place writes append the mutated cache handles; those are then the updated KV.
+        kv = tuple(rets[3:5]) if kv_write_idx is not None else tuple(rets[1:3])
+        # rets[0] is the per-rank o_proj partial; all-reduce across tensor-parallel ranks.
+        output = rets[0].unsqueeze(0).to(hidden_states.dtype)
         output = mappings.reduce_from_tensor_model_parallel_region(
             output,
             process_group=parallel_state.get_tensor_model_parallel_group(),
         )
-        return output, (active_k, active_v), cos_cache, sin_cache
+        return output, kv, cos_cache, sin_cache
 
 
 # ============================================================
@@ -2513,8 +2529,11 @@ class NeuronQwen36A3BDecoderLayer(nn.Module):
         # the layer runs under cpu_mode (device tracing is unaffected).
         if not cpu_mode():
             hidden_states = ModuleMarkerStartWrapper()(hidden_states)
-        # The verify linear-attention kernel fuses the input RMSNorm; norm the other paths here.
-        if not (verify_mode and self.layer_type == "linear_attention"):
+        gqa_kernel = self.layer_type != "linear_attention" and (
+            self.self_attn.uses_tkg_kernel(past_key_value, hidden_states.shape[1])
+        )
+        # The GQA and verify linear-attention kernels fuse the input RMSNorm; norm the rest here.
+        if not (gqa_kernel or (verify_mode and self.layer_type == "linear_attention")):
             hidden_states = self.input_layernorm(hidden_states)
 
         if verify_mode and self.layer_type == "linear_attention":
@@ -2560,13 +2579,22 @@ class NeuronQwen36A3BDecoderLayer(nn.Module):
                 past_key_value=past_key_value,
                 cos_cache=cos_cache,
                 sin_cache=sin_cache,
+                gamma_in=(
+                    self.input_layernorm.weight.reshape(1, self.hidden_size)
+                    if gqa_kernel
+                    else None
+                ),
                 **kwargs,
             )
             hidden_states = residual + hidden_states
 
         # Dense MLP FFN
         residual = hidden_states
-        if verify_mode and self.mlp.use_moe_layer_kernel:
+        # Fused MoE kernel is decode-only: is_prefill_stage is False only on TKG graphs.
+        if (
+            self.mlp.use_moe_layer_kernel
+            and self.config.neuron_config.is_prefill_stage is False
+        ):
             # Fused MoE kernel applies post_attention_layernorm in-kernel (norm-once, SBUF-resident);
             # pass raw hidden + gamma so residual stays the pre-norm hidden.
             hidden_states = self.mlp(
@@ -4151,6 +4179,11 @@ class Qwen36MTPDraft(NeuronBaseModel):
                 block_idx.view(1, 1, q, 1) >= block_idx.view(1, 1, 1, q)
             ).expand(bsz, 1, q, q)
 
+        # The fused GQA kernel writes the draft KV in place, so the mutated cache handles are the
+        # updated KV and the host scatter is skipped (mirrors the draft megakernel).
+        inplace_kv = not is_cte and getattr(
+            self.config, "use_tkg_attention_kernel", False
+        )
         draft_logits, present_key_value, hidden = self.mtp_head.draft_step(
             prev_hidden,
             next_embeds,
@@ -4167,15 +4200,21 @@ class Qwen36MTPDraft(NeuronBaseModel):
             update_kv_per_layer=False,
             idx=0,
             seq_len=self.n_positions,
+            kv_write_idx=(
+                position_ids[:, 0:1].to(torch.int32) if inplace_kv else None
+            ),
         )
 
-        updated_kv = self.kv_mgr.update_cache(
-            is_for_context_encoding=is_cte,
-            seq_ids=seq_ids,
-            position_ids=position_ids,
-            new_key_values=[present_key_value],
-            seq_len=self.n_positions,
-        )
+        if inplace_kv:
+            updated_kv = list(present_key_value)
+        else:
+            updated_kv = self.kv_mgr.update_cache(
+                is_for_context_encoding=is_cte,
+                seq_ids=seq_ids,
+                position_ids=position_ids,
+                new_key_values=[present_key_value],
+                seq_len=self.n_positions,
+            )
 
         sampled = _greedy_argmax(  # [B, q]
             self.mtp_head.mtp_lm_head,
