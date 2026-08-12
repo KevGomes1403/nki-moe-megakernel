@@ -80,6 +80,7 @@ def verify_trunk_compose(
     moe_shared_down_w,
     final_gamma,
     lm_head_w,
+    gqa_kv_write_idx=None,
     name_prefix="",
 ):
     """All decoder layers plus the vocab head over an already-seeded SBUF residual.
@@ -88,9 +89,14 @@ def verify_trunk_compose(
     in-kernel embed) and it stores whatever it needs. ``residual`` is updated IN PLACE and is left
     PRE-final-norm, because a fused round feeds it straight to the next draft stage.
 
+    Optional kwargs:
+        gqa_kv_write_idx  [B,1] int32 write-start slot. Every GQA layer scatters its active K/V
+                          into its caches in place, so the caller skips the KV scatter.
+
     Returns:
         ``(token_idx [T, 1] int32 SBUF, gqa_out, dn_out)`` -- the greedy ids, the flat per-GQA-layer
-        (active_k, active_v) and the flat per-DeltaNet-layer (cand_state, conv_cand).
+        (active_k, active_v) and the flat per-DeltaNet-layer (cand_state, conv_cand). With
+        gqa_kv_write_idx each GQA layer contributes (k_cache, v_cache, active_k, active_v).
     """
     H0 = nl.tile_size.pmax
     H1 = residual.shape[1] // T
@@ -109,7 +115,7 @@ def verify_trunk_compose(
         x_sb = residual.reshape((H0, T, H1))
 
         if layer_is_gqa[i]:
-            attn_partial, active_k, active_v = gqa_fused_compose(
+            out = gqa_fused_compose(
                 x_sb,
                 gqa_qkv_w[gqa],
                 gqa_gate_w[gqa],
@@ -122,12 +128,15 @@ def verify_trunk_compose(
                 gqa_mask,
                 gqa_o_proj_w[gqa],
                 eps,
+                kv_write_idx=gqa_kv_write_idx,
                 gamma_in=gqa_in_gamma[gqa],
                 out_in_sb=True,
                 name_prefix=pfx,
             )
-            gqa_out.append(active_k)
-            gqa_out.append(active_v)
+            attn_partial = out[0]
+            # Mutated caches first when writing in place; the active K/V follow either way, so the
+            # allocator cannot overlay a write nothing consumes.
+            gqa_out += list(out[3:5]) + list(out[1:3])
             gqa += 1
         else:
             conv_dim = dn_conv_weight[dn].shape[0]

@@ -12,8 +12,8 @@ thread into D2 -- that last dependency orders D2's read of MTP slot t after D1's
 which is what makes the T=1 replay legal. Neither draft's hidden is stored.
 
 The accept/commit epilogue is the caller's: this kernel returns the candidate id, the target ids,
-the pre-final-norm trunk hidden and every mutated handle, and the host does the greedy compare, the
-DeltaNet state select and the KV scatter.
+the pre-final-norm trunk hidden and every mutated handle, and the host does the greedy compare and
+the DeltaNet state select.
 
 Not decorated -- build_round_megakernel wraps the flat signature with nki.jit(), since a double jit
 overflows the stack. Why the three-call form must replay at T=2: specs/round_megakernel_perf.md.
@@ -112,6 +112,7 @@ def qwen36_round_megakernel(
     cos,
     sin,
     gqa_mask,
+    v_kv_write_idx,
     moe_gamma,
     moe_router_w,
     moe_gate_up_w,
@@ -125,12 +126,13 @@ def qwen36_round_megakernel(
 ):
     """One greedy EAGLE round at spec_len=2.
 
-    input_ids is the single committed token x_t+1 and prev_hidden its trunk hidden h_t. Rope and mask
-    come per stage, because the three read at different positions: D1 at t, verify at [t+1, t+2], D2
-    at t+1. d2_mask must count MTP slot t as committed prior -- the slot D1 wrote.
+    input_ids is the single committed token x_t+1 and prev_hidden its trunk hidden h_t. Rope, mask
+    and cache-write slot come per stage, because the three read at different positions: D1 at t,
+    verify at [t+1, t+2], D2 at t+1. d2_mask must count MTP slot t as committed prior -- the slot D1
+    wrote. Every stage writes its own KV in place, the trunk's at v_kv_write_idx.
 
     Returns:
-        (cand_token [B,1], tokens [B,2], hidden [B,2,H], *gqa_active_kv, *dn_candidates,
+        (cand_token [B,1], tokens [B,2], hidden [B,2,H], *gqa_kv, *dn_candidates,
         mtp_k_cache, mtp_v_cache, *mtp_active_kv). hidden is the verify trunk's, pre-final-norm.
         Every mutated shared_hbm handle is returned: NCC dead-stores a write nothing consumes, and
         an unreturned buffer may be overlaid by the allocator.
@@ -243,6 +245,7 @@ def qwen36_round_megakernel(
         moe_shared_down_w,
         final_gamma,
         lm_head_w,
+        gqa_kv_write_idx=v_kv_write_idx,
         name_prefix=VERIFY_PREFIX,
     )
 
@@ -334,6 +337,7 @@ def flatten_round_args(
     cos,
     sin,
     gqa_mask,
+    v_kv_write_idx,
     final_gamma,
     lm_head_w,
     key_dim,
@@ -357,7 +361,7 @@ def flatten_round_args(
         flat += list(dn[f])
     for f in GQA_FIELDS:
         flat += list(gqa[f])
-    flat += [cos, sin, gqa_mask]
+    flat += [cos, sin, gqa_mask, v_kv_write_idx]
     for f in MOE_FIELDS:
         flat += list(moe[f])
     flat += [final_gamma, lm_head_w]
@@ -366,15 +370,20 @@ def flatten_round_args(
 
 
 def split_round_returns(rets, n_gqa, n_dn):
-    """Un-flatten into (cand_token, tokens, hidden, gqa_active_kv, dn_candidates, mtp_kv)."""
-    gqa_flat = rets[3 : 3 + 2 * n_gqa]
-    dn_flat = rets[3 + 2 * n_gqa : 3 + 2 * n_gqa + 2 * n_dn]
-    mtp_kv = rets[3 + 2 * n_gqa + 2 * n_dn : 3 + 2 * n_gqa + 2 * n_dn + 2]
+    """Un-flatten into (cand_token, tokens, hidden, gqa_kv, dn_candidates, mtp_kv).
+
+    Each GQA layer contributes four handles -- the mutated caches then the active K/V, which the
+    round returns only to keep them off the allocator's overlay list. Only the caches are handed on.
+    """
+    gqa_end = 3 + 4 * n_gqa
+    gqa_flat = rets[3:gqa_end]
+    dn_flat = rets[gqa_end : gqa_end + 2 * n_dn]
+    mtp_kv = rets[gqa_end + 2 * n_dn : gqa_end + 2 * n_dn + 2]
     return (
         rets[0],
         rets[1],
         rets[2],
-        [(gqa_flat[2 * i], gqa_flat[2 * i + 1]) for i in range(n_gqa)],
+        [(gqa_flat[4 * i], gqa_flat[4 * i + 1]) for i in range(n_gqa)],
         [(dn_flat[2 * i], dn_flat[2 * i + 1]) for i in range(n_dn)],
         tuple(mtp_kv),
     )
@@ -429,6 +438,7 @@ def build_round_megakernel(layer_is_gqa):
         "cos",
         "sin",
         "gqa_mask",
+        "v_kv_write_idx",
         "final_gamma",
         "lm_head_w",
         "key_dim",
@@ -455,7 +465,7 @@ def build_round_megakernel(layer_is_gqa):
     body_args += [d2[f] for f in STAGE_FIELDS]
     body_args += [f"dn_{f}" for f in DN_FIELDS]
     body_args += [f"gqa_{f}" for f in GQA_FIELDS]
-    body_args += ["cos", "sin", "gqa_mask"]
+    body_args += ["cos", "sin", "gqa_mask", "v_kv_write_idx"]
     body_args += [f"moe_{f}" for f in MOE_FIELDS]
     body_args += ["final_gamma", "lm_head_w"]
     lines.append(

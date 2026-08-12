@@ -4786,6 +4786,7 @@ class Qwen36FusedSpecModel(NeuronFusedSpecModel):
             cos_cache[0],
             sin_cache[0],
             gqa_mask,
+            pos.to(torch.int32),
             target.norm.weight.reshape(1, H),
             target.lm_head.weight,
             key_dim,
@@ -4794,32 +4795,33 @@ class Qwen36FusedSpecModel(NeuronFusedSpecModel):
         )
         n_gqa = sum(layer_is_gqa)
         n_dn = len(layer_is_gqa) - n_gqa
-        cand_token, target_tokens, hidden, gqa_active_kv, dn_cand, mtp_kv = (
-            split_round_returns(
-                build_round_megakernel(layer_is_gqa)[2](*flat), n_gqa, n_dn
-            )
+        cand_token, target_tokens, hidden, gqa_kv, dn_cand, mtp_kv = split_round_returns(
+            build_round_megakernel(layer_is_gqa)[2](*flat), n_gqa, n_dn
         )
         hidden_state = hidden.to(dtype)
 
-        next_decoder_cache = ()
+        # The trunk wrote its own GQA K/V in place, so those cache handles ARE the update. A
+        # DeltaNet layer's kv_mgr slots are placeholders nothing reads -- its live state rides the
+        # aliased state region -- but each layer still owes the graph its two cache outputs.
+        target_cache = []
         gi = 0
         for idx, layer in enumerate(target.layers):
             if layer_is_gqa[idx]:
-                next_decoder_cache += (gqa_active_kv[gi],)
+                target_cache += list(gqa_kv[gi])
                 gi += 1
             else:
-                next_decoder_cache += (
-                    layer.linear_attn._dummy_kv(bsz, spec_len, dtype, device),
+                target_cache += list(
+                    target.kv_mgr.update_kv_by_layer_id(
+                        idx=idx,
+                        is_for_context_encoding=False,
+                        seq_ids=seq_ids,
+                        position_ids=v_position_ids,
+                        kv_per_layer=layer.linear_attn._dummy_kv(
+                            bsz, spec_len, dtype, device
+                        ),
+                        seq_len=target.n_positions,
+                    )
                 )
-        target_cache = list(
-            target.kv_mgr.update_cache(
-                is_for_context_encoding=False,
-                seq_ids=seq_ids,
-                position_ids=v_position_ids,
-                new_key_values=next_decoder_cache,
-                seq_len=target.n_positions,
-            )
-        )
         candidates = [(s.unsqueeze(0), c.unsqueeze(0)) for s, c in dn_cand]
 
         candidate_input_ids = torch.cat(
