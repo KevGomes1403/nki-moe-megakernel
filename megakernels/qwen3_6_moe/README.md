@@ -42,6 +42,20 @@ The XLA round is flat in sequence length too, so the megakernel's win is fusion 
 launch overhead and HBM traffic removed — not attention scaling. The decode ratio
 moves with per-run acceptance noise; the stable per-round latency gap is -34%.
 
+### Layerwise NKI
+
+The same GQA, DeltaNet and MoE block kernels launched separately (82 NKI calls per
+round), with NxDI holding the collectives, residual adds, KV scatter and accept/reject.
+Embedding, eh_proj and LM head stay XLA. Run with `--tkg-attention-kernel
+--use-moe-layer-kernel` and the megakernel flags off.
+
+| seq_len | round p50 | tokens/round | decode | end-to-end |
+| --- | --- | --- | --- | --- |
+| 1024 | 10.62 ms | 1.94 | 182 tok/s | 149 tok/s |
+| 2048 | 10.54 ms | 1.98 | 188 tok/s | 153 tok/s |
+
+Device-time profiles at 1024: megakernel 9.051 ms, layerwise 9.808 ms.
+
 ## What's novel here
 
 ### Speculation megakernel
