@@ -31,12 +31,15 @@ def in_proj_compose(
     name_prefix="",
     i_column_shard=None,
     i_column_shard_defer=None,
+    qkv_w_packed=None,
+    qkv_w_packed_offset=0,
 ):
     """Fused input RMSNorm + 4-way projection; returns [B, S, I] HBM or [B*S, I] SBUF.
 
     i_column_shard: (start, size) column runs this core computes, replacing the LNC H-shard.
     i_column_shard_defer: run indices whose matmuls the caller drains later; returns
         (output, pending) for qkv_tkg_i_shard_drain.
+    qkv_w_packed/qkv_w_packed_offset: pre-packed weight source for those runs, in place of proj_w.
     """
     if hidden.buffer == nl.sbuf:
         norm_in = nl.ndarray(hidden.shape, dtype=hidden.dtype, buffer=nl.sbuf)
@@ -62,6 +65,8 @@ def in_proj_compose(
         i_column_tiling=True,
         i_column_shard=i_column_shard,
         i_column_shard_defer=i_column_shard_defer,
+        qkv_w_packed=qkv_w_packed,
+        qkv_w_packed_offset=qkv_w_packed_offset,
     )
 
 

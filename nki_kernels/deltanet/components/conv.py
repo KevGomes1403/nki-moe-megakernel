@@ -338,17 +338,20 @@ def conv_qkv_sbuf(
     return q_sbuf, k_sbuf, v_sbuf, pending_cand
 
 
-def shard_segments(conv_dim, key_dim):
+def shard_segments(conv_dim, key_dim, n=None, c=None):
     """The 3 channel segments (q, k, v) this core owns under value-head sharding.
 
     Returns (segments, Hv_loc, NT_loc); each segment is (global_start_tile, n_tiles).
-    n=1 yields the full contiguous q|k|v block.
+    n=1 yields the full contiguous q|k|v block. n/c default to the launch grid; pass them to
+    evaluate another core's split, or any core's outside a kernel trace.
     """
     Hk = key_dim // P_MAX  # q-heads = k-heads
     Hv = (conv_dim - 2 * key_dim) // P_MAX  # v-heads
 
-    n = nl.num_programs(0)
-    c = nl.program_id(0)
+    if n == None:
+        n = nl.num_programs(0)
+    if c == None:
+        c = nl.program_id(0)
 
     kernel_assert(conv_dim % P_MAX == 0, "conv_dim must be a multiple of 128")
     kernel_assert(key_dim % P_MAX == 0, "key_dim must be a multiple of 128")

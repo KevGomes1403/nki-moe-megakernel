@@ -28,6 +28,10 @@
 # Additive change: i_column_shard replaces the LNC H-shard with a shard on the
 # output columns -- each core contracts the full H over the column runs it owns,
 # so no partial sums cross the cores. Default is unchanged.
+#
+# Additive change: qkv_w_packed reads those column runs from a host-side repack
+# whose rows are already partition-contiguous, so a run loads as 128 contiguous
+# descriptors instead of H1_shard strided fragments each. Default is unchanged.
 # ===========================================================================
 
 """
@@ -80,6 +84,10 @@ NUM_TILES_PER_H_BLOCK = H_BLOCK_SIZE // P_MAX
 
 _DGE_MODE_NONE = 3
 
+# Packed weight loads split on H1 so the matmuls start early, but not past the DMA saturation knee.
+_PACKED_LOAD_MAX_CHUNKS = 4
+_PACKED_LOAD_MIN_RUN_BYTES = 4096
+
 logger = get_logger("qkv_tkg")
 
 
@@ -110,6 +118,8 @@ def qkv_tkg(
     i_column_tiling: bool = False,
     i_column_shard: Optional[Tuple[Tuple[int, int], ...]] = None,
     i_column_shard_defer: Optional[Tuple[int, ...]] = None,
+    qkv_w_packed: Optional[nl.ndarray] = None,
+    qkv_w_packed_offset: int = 0,
 ) -> nl.ndarray | Tuple[nl.ndarray, nl.ndarray]:
     """
     QKV Projection Kernel for Token Generation
@@ -244,6 +254,13 @@ def qkv_tkg(
             a pending list for ``qkv_tkg_i_shard_drain`` to emit later, so the caller can place them
             in a downstream Tensor-idle window. Requires ``i_column_shard`` and an auto-alloc
             ``sbm``; the deferred columns must be drained before they are read. Default: None.
+        qkv_w_packed (Optional[nl.ndarray]):
+            Flat HBM weight holding this core's ``i_column_shard`` runs already permuted to
+            ``[P_MAX, H1, size]`` per run, partition-major, so each run loads as 128 contiguous
+            descriptors. Replaces ``qkv_w`` as the weight source; ``qkv_w`` still supplies H and I.
+            Requires ``i_column_shard``. Default: None.
+        qkv_w_packed_offset (int):
+            Element offset of this core's first run inside ``qkv_w_packed``. Default: 0.
 
     Returns:
         output (nl.ndarray | Tuple[nl.ndarray, nl.ndarray]):
@@ -328,6 +345,7 @@ def qkv_tkg(
         i_column_tiling=i_column_tiling,
         i_column_shard=i_column_shard,
         i_column_shard_defer=i_column_shard_defer,
+        qkv_w_packed=qkv_w_packed,
     )
 
     io_dtype = hidden.dtype
@@ -406,6 +424,8 @@ def qkv_tkg(
             io_dtype=io_dtype,
             quantization_type=quantization_type,
             quant_config=quant_config,
+            qkv_w_packed=qkv_w_packed,
+            qkv_w_packed_offset=qkv_w_packed_offset,
         )
     else:
         output = _qkv_projection_hbm_output(
@@ -510,6 +530,7 @@ def _validate_and_create_config(
     i_column_tiling: bool = False,
     i_column_shard: Optional[Tuple[Tuple[int, int], ...]] = None,
     i_column_shard_defer: Optional[Tuple[int, ...]] = None,
+    qkv_w_packed: Optional[nl.ndarray] = None,
 ) -> QkvTkgConfig:
     """
     Validate inputs and create kernel configuration.
@@ -730,6 +751,10 @@ def _validate_and_create_config(
             input_in_sbuf or norm_type != NormType.NO_NORM,
             "i_column_shard needs the full H on every core, so an HBM input must be normed",
         )
+    kernel_assert(
+        qkv_w_packed == None or i_column_shard != None,
+        "qkv_w_packed is only defined for the i_column_shard runs",
+    )
 
     if i_column_shard_defer != None:
         kernel_assert(i_column_shard != None, "i_column_shard_defer requires i_column_shard")
@@ -1311,6 +1336,8 @@ def _qkv_projection_sbuf_output(
     io_dtype,
     quantization_type: QuantizationType = QuantizationType.NONE,
     quant_config: Optional[Union[StaticQuantConfig, RowQuantConfig]] = None,
+    qkv_w_packed: Optional[nl.ndarray] = None,
+    qkv_w_packed_offset: int = 0,
 ) -> nl.ndarray:
     """
     QKV projection with SBUF output (output_in_sbuf=True path).
@@ -1338,7 +1365,9 @@ def _qkv_projection_sbuf_output(
     qkv_out_sb = sbm.alloc_heap((BxS, I), dtype=io_dtype, buffer=nl.sbuf)
 
     if cfg.i_shard_segments != None:
-        return _qkv_projection_i_shard(hidden_sb, qkv_w, qkv_out_sb, cfg, sbm)
+        return _qkv_projection_i_shard(
+            hidden_sb, qkv_w, qkv_out_sb, cfg, sbm, qkv_w_packed, qkv_w_packed_offset
+        )
 
     # Process each I-block
     for i_block in TiledRange(I, cfg.i_block_size):
@@ -1483,12 +1512,22 @@ def _store_qkv_output_to_hbm(
             )
 
 
+def _packed_load_chunks(H1: int, run_bytes: int) -> int:
+    """H1 splits of one packed run: as many as keep each descriptor above the DMA saturation knee."""
+    n = min(_PACKED_LOAD_MAX_CHUNKS, max(1, run_bytes // _PACKED_LOAD_MIN_RUN_BYTES))
+    while H1 % n != 0:
+        n -= 1
+    return n
+
+
 def _qkv_projection_i_shard(
     hidden_sb: TensorView,
     qkv_w_hbm: TensorView,
     qkv_out_sb: nl.ndarray,
     cfg: QkvTkgConfig,
     sbm: SbufManager,
+    qkv_w_packed: Optional[nl.ndarray] = None,
+    qkv_w_packed_offset: int = 0,
 ) -> nl.ndarray:
     """Project this core's I-shard column runs, contracting the full H with no cross-core reduce.
 
@@ -1501,6 +1540,8 @@ def _qkv_projection_i_shard(
         qkv_out_sb: Full-width SBUF output. Shape: (BxS, I)
         cfg: QKV TKG config
         sbm: SbufManager for SBUF allocation
+        qkv_w_packed: Pre-permuted flat weight for these runs, in place of qkv_w_hbm
+        qkv_w_packed_offset: Element offset of this core's first run in qkv_w_packed
 
     Returns:
         qkv_out_sb, with this core's column runs written. When cfg.i_shard_defer is set, returns
@@ -1520,8 +1561,35 @@ def _qkv_projection_i_shard(
 
     # Every run's weight stays live, so the later loads stream under the earlier runs' matmuls.
     qkv_w_sb = []
+    packed_offset = qkv_w_packed_offset
     for seg in range(n_segments):
         i_start, i_size = cfg.i_shard_segments[seg]
+        if qkv_w_packed != None:
+            w_sb = TensorView(
+                sbm.alloc_stack(
+                    (cfg.H0, cfg.H1, i_size),
+                    name=f"qkv_w_sb_i_shard_{seg}",
+                    dtype=qkv_w_packed.dtype,
+                    buffer=nl.sbuf,
+                )
+            )
+            # The run is already one contiguous H0-row block, so the split is only to hand the
+            # first H1 tiles to the matmuls before the whole run has landed.
+            run = cfg.H1 * i_size
+            n_chunks = _packed_load_chunks(cfg.H1, run * sizeinbytes(qkv_w_packed.dtype))
+            h1_chunk = cfg.H1 // n_chunks
+            for chunk in range(n_chunks):
+                nisa.dma_copy(
+                    w_sb.slice(dim=1, start=chunk * h1_chunk, end=(chunk + 1) * h1_chunk).get_view(),
+                    qkv_w_packed.ap(
+                        pattern=[[run, cfg.H0], [1, h1_chunk * i_size]],
+                        offset=packed_offset + chunk * h1_chunk * i_size,
+                    ),
+                )
+            packed_offset += cfg.H0 * run
+            qkv_w_sb.append(w_sb)
+            continue
+
         w_sb = TensorView(
             sbm.alloc_stack(
                 (cfg.H0, cfg.num_shards, cfg.H1_shard, i_size),

@@ -55,6 +55,7 @@ import torch_xla.core.xla_model as xm  # noqa: E402
 from nki_kernels.deltanet.decode.fused_layer import (  # noqa: E402
     deltanet_attention_layer,
     deltanet_attention_layer_state,
+    pack_proj_w,
 )
 
 HIDDEN = 2048
@@ -104,6 +105,8 @@ def main():
     init_state_d = init_state.contiguous().to(dev)
     z_gamma_d = z_gamma.contiguous().to(dev)
     out_w_d = out_w.contiguous().to(dev)
+    packed = pack_proj_w(proj_w, CONV_DIM, KEY_DIM, 2)
+    extra = {} if packed is None else {"proj_w_packed": packed.to(dev)}
 
     if mode == "decode":
         fn = deltanet_attention_layer
@@ -126,6 +129,7 @@ def main():
             z_gamma_d,
             out_w_d,
             EPS,
+            **extra,
         )
         xm.mark_step()
     _ = [o.cpu() for o in outs]

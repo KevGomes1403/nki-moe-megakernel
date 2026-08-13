@@ -44,6 +44,7 @@ if str(_REPO_ROOT) not in sys.path:
 from nki_kernels.deltanet.decode.fused_layer import (  # noqa: E402
     deltanet_attention_layer,
     deltanet_attention_layer_state,
+    pack_proj_w,
 )
 from megakernels.qwen3_6_moe.tests.test_deltanet_conv_tkg_kernel import (  # noqa: E402
     CONV_DIM,
@@ -233,8 +234,10 @@ def run_kernel(fn, inp, cores):
     init = init_state.to(DTYPE).contiguous().to(dev)
     zg = z_gamma.to(DTYPE).contiguous().to(dev)
     ow = out_w.to(DTYPE).contiguous().to(dev)
+    packed = pack_proj_w(proj_w.to(DTYPE), CONV_DIM, KEY_DIM, cores)
+    extra = {} if packed is None else {"proj_w_packed": packed.to(dev)}
     o_out, state, conv = fn[cores](
-        h, w, g, EPS, cs, cw, KEY_DIM, al, db, init, zg, ow, EPS
+        h, w, g, EPS, cs, cw, KEY_DIM, al, db, init, zg, ow, EPS, **extra
     )
     return o_out.to(DTYPE).cpu(), state.float().cpu(), conv.float().cpu()
 

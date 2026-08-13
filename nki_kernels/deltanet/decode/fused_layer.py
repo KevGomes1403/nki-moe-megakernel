@@ -48,18 +48,22 @@ from ..vendored.qkv_tkg import qkv_tkg_i_shard_drain
 _I_COLUMN_SHARD = os.environ.get("NKI_DELTANET_IN_PROJ_I_SHARD", "0") == "1"
 # Emit the z column run's matmuls between the conv segments instead of inside the in_proj block.
 _Z_DEFER = os.environ.get("NKI_DELTANET_IN_PROJ_Z_DEFER", "0") == "1"
+# Read the projection weight from a host-side repack whose rows are partition-contiguous.
+_PROJW_PACKED = os.environ.get("NKI_DELTANET_PROJW_PACKED", "0") == "1"
 
 
-def in_proj_column_shard(conv_dim, key_dim, Hv_full, z_off, a_off):
+def in_proj_column_shard(conv_dim, key_dim, Hv_full, z_off, a_off, n=None, c=None):
     """This core's (start, size) projection column runs, or None when I-sharding is off.
 
     Its own q|k|v conv segments and z block, plus the whole 2*Hv_full-wide a|b pair -- taking
     both halves of a|b keeps that DMA one run per weight row instead of two 4-column fragments.
+    n/c default to the launch grid; pass them to get another core's runs.
     """
     if not _I_COLUMN_SHARD:
         return None
-    segments, Hv_loc, _ = shard_segments(conv_dim, key_dim)
-    c = nl.program_id(0)
+    segments, Hv_loc, _ = shard_segments(conv_dim, key_dim, n=n, c=c)
+    if c == None:
+        c = nl.program_id(0)
     W = Hv_loc * P_MAX
     runs = []
     for seg in range(len(segments)):
@@ -89,6 +93,51 @@ def in_proj_z_drain_seg(drain, seg):
     """conv_qkv_sbuf seg_hook: emit the seg-th h1 slice of the deferred in_proj column run."""
     pending, ranges = drain
     qkv_tkg_i_shard_drain(pending, ranges[seg][0], ranges[seg][1])
+
+
+def in_proj_packed_offset(H, conv_dim, key_dim, Hv_full, z_off, a_off):
+    """Element offset of this core's blocks in the packed weight."""
+    if not (_I_COLUMN_SHARD and _PROJW_PACKED):
+        return 0
+    n = nl.num_programs(0)
+    c = nl.program_id(0)
+    off = 0
+    for cc in range(c):
+        runs = in_proj_column_shard(conv_dim, key_dim, Hv_full, z_off, a_off, n=n, c=cc)
+        for run in range(len(runs)):
+            off += H * runs[run][1]
+    return off
+
+
+def pack_proj_w(proj_w, conv_dim, key_dim, num_cores):
+    """Repack [H, I] proj_w into the packed weight the kernel reads, or None when not packing.
+
+    Block (core, run) is (P_MAX, H1, width) at
+    proj_w[(h1 // H1_shard) * P_MAX * H1_shard + p * H1_shard + h1 % H1_shard, col], flattened
+    partition-major and concatenated run-then-core, so one DMA per block is 128 contiguous runs.
+    """
+    if not (_I_COLUMN_SHARD and _PROJW_PACKED):
+        return None
+    import torch
+
+    H = proj_w.shape[0]
+    H1 = H // P_MAX
+    H1_shard = H1 // num_cores
+    Hv_full = (conv_dim - 2 * key_dim) // P_MAX
+    z_off, a_off = conv_dim, conv_dim + (conv_dim - 2 * key_dim)
+
+    p = torch.arange(P_MAX).reshape(P_MAX, 1)
+    h1 = torch.arange(H1).reshape(1, H1)
+    rows = ((h1 // H1_shard) * (P_MAX * H1_shard) + p * H1_shard + h1 % H1_shard).reshape(-1)
+    gathered = proj_w[rows]  # [P_MAX * H1, I], partition-major over the shard-major H1 order
+
+    blocks = []
+    for c in range(num_cores):
+        for start, size in in_proj_column_shard(
+            conv_dim, key_dim, Hv_full, z_off, a_off, n=num_cores, c=c
+        ):
+            blocks.append(gathered[:, start : start + size].reshape(-1))
+    return torch.cat(blocks).contiguous()
 
 
 def owned_qkv_tiles(conv_dim, key_dim):
@@ -503,11 +552,13 @@ def attention_layer_compose(
     z_eps,
     out_in_sb=False,
     name_prefix="",
+    proj_w_packed=None,
 ):
     """Compose in_proj -> conv -> recurrence -> gated norm into SBUF, then project to o_out.
 
     hidden may be HBM [B, S, H] or the megakernel's SBUF residual; qkv_tkg sniffs the buffer.
     out_in_sb returns the per-core SBUF o_proj partial instead of HBM [T, hidden].
+    proj_w_packed, when given, supplies the projection weight in the packed layout.
     """
     conv_dim = conv_weight.shape[0]
     value_dim = conv_dim - 2 * key_dim
@@ -536,6 +587,10 @@ def attention_layer_compose(
         name_prefix=name_prefix,
         i_column_shard=in_proj_column_shard(conv_dim, key_dim, Hv_full, z_off, a_off),
         i_column_shard_defer=defer_runs,
+        qkv_w_packed=proj_w_packed,
+        qkv_w_packed_offset=in_proj_packed_offset(
+            proj_w.shape[0], conv_dim, key_dim, Hv_full, z_off, a_off
+        ),
     )
     if defer_runs == None:
         proj_sb = proj_out
@@ -608,11 +663,13 @@ def deltanet_attention_layer(
     z_gamma,
     out_w,
     z_eps=1e-6,
+    proj_w_packed=None,
 ):
     """Decode / commit (T=1): the whole DeltaNet layer in one launch.
 
     in_proj + conv + recurrence + gated norm + output projection. gamma/eps is the input RMSNorm,
     z_gamma/z_eps the gated per-head RMSNorm, out_w the [value_dim, hidden] o_proj weight transpose.
+    proj_w_packed, when given, replaces proj_w as the in_proj weight source.
     Returns (o_out per-rank partial, final_state, new_conv_state).
     """
     conv_dim = conv_weight.shape[0]
@@ -643,6 +700,7 @@ def deltanet_attention_layer(
         cand_is_3d=False,
         z_gamma=z_gamma,
         z_eps=z_eps,
+        proj_w_packed=proj_w_packed,
     )
     return o_out, final_state, new_conv_state
 
@@ -662,6 +720,7 @@ def deltanet_attention_layer_state(
     z_gamma,
     out_w,
     z_eps=1e-6,
+    proj_w_packed=None,
 ):
     """Speculative verify (T>=2): like the decode path, but emits per-token candidate states."""
     conv_dim = conv_weight.shape[0]
@@ -693,5 +752,6 @@ def deltanet_attention_layer_state(
         cand_is_3d=True,
         z_gamma=z_gamma,
         z_eps=z_eps,
+        proj_w_packed=proj_w_packed,
     )
     return o_out, candidate_states, conv_cand
