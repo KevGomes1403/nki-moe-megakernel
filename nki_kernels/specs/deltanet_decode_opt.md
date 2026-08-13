@@ -420,3 +420,74 @@ already-sliced `w_sb`, so the drained z run picks up the packed layout automatic
 (confirmed by `[[8192, 1]]` descriptors in the D profile). Both derive their runs from
 the single `in_proj_column_shard`, keeping host-side pack order and kernel-side offset
 consistent regardless of which flags are on.
+
+---
+
+## Round 3 — probe of the stacked build (`929217c`, all three flags on)
+
+**81.73 µs median**, 210.6 GB/s. Wall decomposes into five windows:
+
+| window | span | ANY-busy | idle | binding | what |
+|---|---|---|---|---|---|
+| `[0.0, 12.6]` | 12.60 | 4.72 | **7.88** | — | NEFF/runtime preamble, all `?`-sourced. **Not kernel-addressable.** |
+| `[12.6, 19.6]` | 7.00 | — | — | serial chain | interleave load → RMSNorm → first in_proj matmul |
+| `[19.6, 33.6]` | 14.04 | 13.86 | 0.18 | **Tensor 79.7%** | 64 in_proj matmuls. At its floor. |
+| `[33.6, 50.4]` | 16.76 | 14.43 | 2.33 | **Scalar 82.1%** | conv MAC/SiLU + q/k l2norm. 7.70 µs is `ACT_TABLE_LOAD`. |
+| `[50.4, 69.7]` | 19.25 | 19.16 | **0.09** | **Vector 77.4% / Tensor 69.6%** | recurrence token loop. Fully packed. |
+| `[69.7, 78.3]` | 8.69 | 7.67 | 1.02 | Tensor 65% | o_proj, 16 serial matmuls |
+| `[78.3, 81.7]` | 3.39 | 1.42 | 2.04 | — | epilogue / cross-core barrier |
+
+**~16 µs of prologue+epilogue is a hard floor** — all `?`-sourced `DRAIN`/`EVENT_SEMAPHORE`/
+`TENSOR_LOAD`/`SET_ORDERING_MODE`, constant across every arm, not reachable from kernel source.
+
+Three round-2 beliefs died here: (1) the `proj_w` stream **no longer paces** — it ends at
+23.02 µs vs the last in_proj matmul at 33.64, so 10.6 µs of slack, not 2.6; `PROJW_PACKED`
+already ate that lever. (2) "the SIGMOID load costs 0 ns of critical path" is false on this
+build — it is followed immediately by the largest in-body idle hole, `[40.15, 42.33]` = 2.18 µs.
+(3) The bottleneck is no longer in_proj at all.
+
+**Core imbalance (new):** core 1 lags throughout and sets the wall clock — its in_proj matmuls
+end at 36.24 vs core 0's 33.64, its o_proj runs 9.08 µs vs 6.60, and it takes 20.5 µs of
+`activity_1` throttle in `[58.98, 79.46]` vs core 0's 13.65. Total-activity reductions help
+core 1 more than core-0 numbers suggest.
+
+**`ACT_TABLE_LOAD` is exactly 1283 ns whether throttled or not** — table-load removals are
+throttle-immune and convert un-discounted. Tensor/matmul removals in throttled windows need
+~1.69× discounting when reasoning about work (not about window occupancy).
+
+### Why `ATTN_LOC` cannot be recovered cheaply (resolved)
+`out_proj_compose` transposes `attn_sb[0:T, h*d:(h+1)*d]` — **batched over T**. Per-token you
+cannot batch over T, so the count is `Hv_core × T` = 8 instead of `Hv_core` = 4. Those 8
+transposes cost ~3.7 µs of Tensor in a window with **0.09 µs of idle**, pushing Tensor 69.6%
+→ ~89%. The transposes must follow the gated row, and the only window with Tensor slack
+(`[33.6, 50.4]`) is before the gated rows exist. **Prerequisite for a retry is Tensor headroom
+inside the token loop.**
+
+### Round 3, plan 1 — de-thrash the Scalar activation table: NEGATIVE
+
+| arm | items | median | GB/s |
+|---|---|---|---|
+| ctl1 / ctl2 | none | **81.65 / 82.15** | 210.8 / 209.6 |
+| a|b-first + z-index + reorder + tap-engine | 1,2,4,5 | 87.35 | 197.1 |
+| a|b-first + z-index | 1,2 | 85.33 | 201.7 |
+| reorder + tap-engine | 4,5 | 88.71 | 194.2 |
+
+Controls bracket the treatments; no drift. Bit-identical on all six tensors in every arm.
+
+**The premise held and the plan still failed.** a|b-first genuinely moved the `a_sb`/`b_sb`
+DMAs from 35.98–37.31 → **24.60–28.20 µs** — but **the gating chain did not hoist with it**:
+SOFTPLUS's table load still fires at ~35.0 µs. Availability was never what pinned the chain.
+
+Whole-run `ACT_TABLE_LOAD` on Scalar pcore0 is **10 in both arms** — the reorder *relocated*
+loads out of the window rather than eliminating them. In-window Scalar busy fell 14.26 → 7.31 µs
+but in-window Tensor rose 8.48 → 15.25 µs and whole-run ANY-busy 69.33 → 73.61: the cost moved
+onto the larger engine.
+
+**Conclusion for anyone resuming this line:** the 7.70 µs of in-window `ACT_TABLE_LOAD` is NOT
+reachable by making `a`/`b` available earlier. The loads are pinned by something downstream of
+availability; establish what before spending another reorder.
+
+### New NKI constraint
+`nisa.tensor_copy(..., engine=nisa.engine.gpsimd)` **does not compile when the source is PSUM**:
+`tensor_copy src must be in [sbuf], got psum`. Both conv tap transposes evict from PSUM, so
+GpSimd is not a legal target regardless of its 0.00% occupancy.
