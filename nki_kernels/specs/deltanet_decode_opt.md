@@ -238,3 +238,66 @@ that ceiling. Plans 1 and 3 also conflict structurally in `_qkv_projection_i_sha
 **Measurement caveat:** a hardware 0.5-utilization throttle covered 44.4 µs of the
 round-2 capture and inflates durations 1.69× (identical matmuls: 592 ns outside,
 1,001 ns inside). Cross-session A/B is void; every arm needs a same-session control.
+
+---
+
+## Round 2 results
+
+| plan | outcome |
+|---|---|
+| **defer `z` column run into the conv windows — WIN** | **−4.11 µs (−4.4%)**, control 93.83 → 89.72 (10 reps pooled per arm, non-overlapping distributions, throttle coverage 47.7% vs 47.3%). Bit-identical. Shipped as `NKI_DELTANET_IN_PROJ_Z_DEFER=1`. |
+| h1-outer `LDWEIGHTS` elision — negative | Elision **works** (160 → 34/core) but costs more than it saves: **+3.33 µs**. |
+
+### CORRECTION: `in_proj` is DMA-bound, not PE-bound — the earlier model was a throttle artifact
+
+The round-2 planner measured PE ending 75,238 ns vs `proj_w` DMA 63,031 ns and
+concluded PE was binding, so PE cycles would pay ~1:1. **That capture read 135.4 µs
+wall with ~44 µs of 0.5-utilization throttle coverage, which inflates matmuls 1.69×**
+(identical matmul: 592 ns unthrottled, 1,001 ns throttled). Two agents independently
+re-measured unthrottled controls and found the opposite sign:
+
+| | last in_proj MATMUL end | last INPUT DMA end | DMA − PE |
+|---|---|---|---|
+| agent A, ctrl-a/b/c (15 captures) | 44,756 / 45,543 / 44,444 ns | 50,083 / 50,269 / 50,032 ns | **+5.2 to +5.5 µs** |
+| agent C control | 45,259 ns | 49,418 ns | **+4.2 µs** |
+
+PE merged-busy is only 57–65% of span, and PE is idle 43–52% before the conv.
+**There is no 1:1 PE→wall conversion.** Any plan justified by removing PE cycles
+from in_proj should be re-derived. Always check the `Throttle` table before
+trusting a phase-ordering claim.
+
+### The `LDWEIGHTS` elision: it works, and it is a trap
+
+The backend **does** elide repeated `LDWEIGHTS` when consecutive `nc_matmul`s
+present a byte-identical stationary at a fixed `tile_position`:
+**160 → 34 per core** (34 = 2 fp32 LOW/HIGH × 16 h1 + 2 — the ideal), LDWEIGHTS
+instruction time 15.6 → 3.4 µs.
+
+But pinning all tiles to `tile_position=(0,0)` collapses the **4 rotating PE column
+groups** onto one and costs moving-stream throughput:
+**1.38 → 1.08 columns/cycle (−28%)**, in_proj MATMUL window **24.7 → 31.4 µs (+6.6)**
+despite issuing 126 fewer LDWEIGHTS. Net **+3.33 µs**.
+
+**The two goals are structurally in tension: elision requires a fixed
+`tile_position`; a fixed `tile_position` forfeits column-group rotation.**
+
+Secondary effect (the briefed risk, confirmed): h1-outer defers all PSUM evictions,
+pushing the q/k/v hand-off 25.5 → 53.7 µs so the conv can no longer overlap in_proj.
+Grouping h1-outer over `{q,k,v}` only fixes the hand-off (`conv.py:195` starts 7 µs
+*earlier* than control) but cannot overcome the throughput loss — lands at +0.17 µs,
+a wash inside the 1.56 µs control drift.
+
+### Mechanism of the `z`-deferral win (not the one predicted)
+The plan assumed 14.0 µs of z PE work draining into a Tensor-bound conv stall.
+Measured: z is **~3.8 µs** of PE, the compiler **already interleaves** in_proj
+matmuls with conv transposes, and the conv-window stall is **Scalar/Vector-bound**
+(five `ACT_TABLE_LOAD`s at 1,283 ns). The real mechanism: z's matmuls were stalling
+the head of the Tensor queue on the tail of z's own 2 MiB weight DMA (a 1.87 µs
+mid-run gap plus 2.9 µs before its first matmul). Removing them lets the conv's
+transposes proceed while z streams. In-place block 25.1–26.5 → 16.8–18.5 µs;
+recurrence's first Tensor instruction 58.4 → 51.4 µs.
+
+### Two NKI frontend constraints (both agents hit these on first compile)
+- **List comprehensions are rejected**: `error: unsupported expression`.
+- **Inner `def`s are rejected**: `NKI does not support inner function definitions`.
+  Pass `(module_level_fn, data)` tuples instead of closures.
