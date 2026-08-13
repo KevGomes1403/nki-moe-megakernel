@@ -352,3 +352,71 @@ consumed by the PyTorch fallback** `_project_inputs` (`modeling_qwen36_a3b.py:46
 It must not be mutated in place. Either carry the packed tensor as a second buffer
 (+6.36 MB/core bf16 per layer at TP=4 — in_proj weight residency doubles) or port the
 fallback to the packed layout and drop the `[H, I]` copy. That decision is open.
+
+---
+
+## Integration: the wins stack, and one does not
+
+Merged commit `f6b8b16`. All arms measured on logical core 0, fully interleaved,
+15 captures each for the headline / 10 each for the ladder.
+
+### Headline — base vs stack
+
+| arm | flags on top of `I_SHARD=1` | median | min-max | Δ vs A |
+|---|---|---|---|---|
+| A | — | 94.89 µs | 93.67–96.79 | — |
+| **D** | `Z_DEFER` + `PROJW_PACKED` | **82.67 µs** | 81.24–84.07 | **−12.22 µs (−12.9%)** |
+| F | + `ATTN_LOC` | 85.58 µs | 82.68–88.76 | −9.31 µs |
+
+**Every D capture beat every A capture** (D max 84.07 < A min 93.67).
+
+### Composition ladder
+
+| arm | flags | median | Δ vs A |
+|---|---|---|---|
+| A | control | 94.50 | — |
+| B | `Z_DEFER` | 91.40 | −3.11 |
+| C | `PROJW_PACKED` | 91.12 | −3.38 |
+| D | both | **82.73** | **−11.77** |
+
+**D is superadditive.** Sum of parts −6.49 µs; measured −11.77 µs — an extra ~5.3 µs.
+Achieved HBM bandwidth **181 → 208 GB/s**. Reproduced independently in the headline
+ladder (−12.22). Mechanism: the repack shortens the weight stream, and the z-deferral
+removes the matmuls that were stalling the Tensor queue on the tail of that same
+stream — each makes the other's bottleneck cheaper to clear.
+
+### `ATTN_LOC` wins alone and loses in the stack — DO NOT DEPLOY IT
+
+Alone: −4.81 µs (95.57 → 90.75), reproducing its author's −3.77.
+On top of D: **+2.13 µs** (D 83.19 → F 85.32), confirmed again at +2.91 in the
+headline ladder. Profile deltas when adding it to D: `out_proj.py` union-busy drops
+1.26 → 0.20 µs exactly as designed, but `recurrence.py`+`norm_gate.py` busy rises
+~5.8 µs and all-engines-idle rises 5.20 → 7.47 µs. Its per-token transposes are free
+in the unstacked schedule and exposed in the stacked one.
+
+**Not a throttle artifact**: F has the LOWEST throttle coverage of any arm
+(39.9/39.4% vs A's 46.9/53.7%) and is still 2.9 µs slower than D.
+
+**Deploy `I_SHARD` + `Z_DEFER` + `PROJW_PACKED`. Leave `ATTN_LOC` off.**
+
+### Correctness of the stack
+All six tensors (`o_out`, `final_state`, `new_conv_state` at T=1; `o_out`,
+`candidate_states`, `conv_cand` at T=2) dumped fp32 and compared with `torch.equal`:
+**B, C, D and FULL are all `True`, max_abs_diff 0.0 vs A.** The bf16 error fingerprint
+is byte-identical across all seven arms, so bit-identity holds in the deployment dtype.
+
+### Flag effect verified from the profile, not the gate
+- `PROJW_PACKED` off → `read_shape [[8 128]]`, `read_steps [[6176, 49408]]`.
+  On → `[[128 1]]` with `[[16384, 1]]`/`[[8192, 1]]`; the strided pattern is gone.
+- `Z_DEFER` off → last `qkv_tkg.py` MATMUL at conv+32.2k ns.
+  On → conv+50.7k (unpacked) / conv+42.1k (packed), MATMUL count unchanged at 160.
+
+### The merge interaction that had to be resolved
+Both features edit `_qkv_projection_i_shard`. Resolution: the packed branch goes in
+the **weight-load loop**, which runs unconditionally for every segment including
+deferred ones, and both paths end at the same `(H0, H1, i_size)` view — packed
+directly, unpacked via `flatten_dims(1, 2)`. The deferred `pending` tuple carries the
+already-sliced `w_sb`, so the drained z run picks up the packed layout automatically
+(confirmed by `[[8192, 1]]` descriptors in the D profile). Both derive their runs from
+the single `in_proj_column_shard`, keeping host-side pack order and kernel-side offset
+consistent regardless of which flags are on.
