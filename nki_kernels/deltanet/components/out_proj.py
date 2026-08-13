@@ -49,19 +49,9 @@ def out_proj_compose(attn_sb, out_w, sbm=None, out_in_sb=False):
         The per-rank o_proj partial; each core writes its disjoint hidden/n shard.
     """
     T, W_core = attn_sb.shape
-    value_dim, hidden = out_w.shape
     d = P_MAX
     kernel_assert(W_core % d == 0, "W_core must be a multiple of head_dim")
-
-    n = nl.num_programs(0)
-    c = nl.program_id(0)
     Hv_core = W_core // d
-    Hv = Hv_core * n
-    kernel_assert(
-        Hv * d == value_dim, "value_dim must equal Hv * head_dim (all cores' heads)"
-    )
-    kernel_assert(T <= P_MAX, "B*S = T must not exceed P_MAX")
-    kernel_assert(hidden % n == 0, "hidden must be divisible by the LNC core count")
 
     # This core's heads, transposed to head_dim-on-partition.
     attn_loc = nl.ndarray((d, Hv_core, T), dtype=attn_sb.dtype, buffer=nl.sbuf)
@@ -73,8 +63,35 @@ def out_proj_compose(attn_sb, out_w, sbm=None, out_in_sb=False):
         )
         nisa.tensor_copy(dst=attn_loc[0:d, h_local, 0:T], src=head_t[0:d, 0:T])
 
+    return out_proj_from_loc(attn_loc, out_w, sbm=sbm, out_in_sb=out_in_sb)
+
+
+def out_proj_from_loc(attn_loc, out_w, sbm=None, out_in_sb=False):
+    """Per-rank DeltaNet output projection from an already-transposed attention tile.
+
+    Args:
+        attn_loc:  [head_dim, Hv_core, T] SBUF, this core's value heads head_dim-on-partition.
+        out_w:     [value_dim, hidden] HBM, transpose of the o_proj nn.Linear weight.
+        sbm:       optional BufferManager passed through to output_projection_tkg.
+        out_in_sb: return the per-core H-shard as an SBUF tile instead of HBM [T, hidden].
+
+    Returns:
+        The per-rank o_proj partial; each core writes its disjoint hidden/n shard.
+    """
+    d, Hv_core, T = attn_loc.shape
+    value_dim, hidden = out_w.shape
+
+    n = nl.num_programs(0)
+    c = nl.program_id(0)
+    Hv = Hv_core * n
+    kernel_assert(
+        Hv * d == value_dim, "value_dim must equal Hv * head_dim (all cores' heads)"
+    )
+    kernel_assert(T <= P_MAX, "B*S = T must not exceed P_MAX")
+    kernel_assert(hidden % n == 0, "hidden must be divisible by the LNC core count")
+
     # Assemble all Hv heads at their global head positions.
-    attn_full = nl.ndarray((d, 1, Hv, T), dtype=attn_sb.dtype, buffer=nl.sbuf)
+    attn_full = nl.ndarray((d, 1, Hv, T), dtype=attn_loc.dtype, buffer=nl.sbuf)
     nisa.tensor_copy(
         dst=attn_full[0:d, 0, c * Hv_core : (c + 1) * Hv_core, 0:T],
         src=attn_loc[0:d, 0:Hv_core, 0:T],

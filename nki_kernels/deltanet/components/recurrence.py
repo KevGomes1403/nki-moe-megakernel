@@ -164,10 +164,12 @@ def gated_delta_rule_tkg(
         proj_sb + a_off/b_off/z_off in_proj output in SBUF, source for a/b/z
         z/gamma/eps                 gated per-head RMSNorm at the output seam
         attn_sb_out                 collect gated rows in SBUF, skip the attn_out write
+                                    [T, W] head-major, or [dim, Hv, T] head_dim-on-partition
     """
     from_sbuf = q_sbuf != None
     gate_from_proj = proj_sb != None
     collect_sbuf = attn_sb_out != None
+    collect_loc = collect_sbuf and len(attn_sb_out.shape) == 3
     if from_sbuf:
         T = attn_out.shape[0]
         dim = attn_out.shape[1] // Hv_full
@@ -430,7 +432,18 @@ def gated_delta_rule_tkg(
             out_row = O_row
 
         # ---- Store the token's output ----
-        if collect_sbuf:
+        if collect_loc:
+            # Transpose each head onto the partitions for o_proj; both operands stay partition-0 based.
+            head_p = nl.ndarray((dim, Hv), dtype=nl.float32, buffer=nl.psum)
+            for h in nl.static_range(Hv):
+                nisa.nc_transpose(
+                    dst=head_p[0:dim, h : h + 1],
+                    data=out_row[0:1, h * dim : (h + 1) * dim],
+                )
+            nisa.tensor_copy(
+                dst=attn_sb_out[0:dim, 0:Hv, t : t + 1], src=head_p[0:dim, 0:Hv]
+            )
+        elif collect_sbuf:
             # Keep the row SBUF-resident for the output projection (the DMA places it on partition t).
             nisa.dma_copy(dst=attn_sb_out[t : t + 1, 0:W], src=out_row[0:1, 0:W])
         else:

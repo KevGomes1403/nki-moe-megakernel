@@ -40,7 +40,7 @@ from ..components.conv import (
     shard_segments,
 )
 from ..components.in_proj import in_proj_compose
-from ..components.out_proj import out_proj_compose
+from ..components.out_proj import out_proj_compose, out_proj_from_loc
 from ..components.recurrence import gated_delta_rule_tkg
 from ..vendored.qkv_tkg import qkv_tkg_i_shard_drain
 
@@ -50,6 +50,8 @@ _I_COLUMN_SHARD = os.environ.get("NKI_DELTANET_IN_PROJ_I_SHARD", "0") == "1"
 _Z_DEFER = os.environ.get("NKI_DELTANET_IN_PROJ_Z_DEFER", "0") == "1"
 # Read the projection weight from a host-side repack whose rows are partition-contiguous.
 _PROJW_PACKED = os.environ.get("NKI_DELTANET_PROJW_PACKED", "0") == "1"
+# Hand the recurrence's gated rows to o_proj head_dim-on-partition, dropping o_proj's transposes.
+_ATTN_LOC = os.environ.get("NKI_DELTANET_ATTN_LOC", "0") == "1"
 
 
 def in_proj_column_shard(conv_dim, key_dim, Hv_full, z_off, a_off, n=None, c=None):
@@ -529,6 +531,8 @@ def out_proj_from_recurrence(attn_sb, out_w, T, W_core, out_in_sb=False):
 
     Returns HBM [T, hidden], or the per-core SBUF H-shard when out_in_sb is set.
     """
+    if _ATTN_LOC:
+        return out_proj_from_loc(attn_sb, out_w, out_in_sb=out_in_sb)
     return out_proj_compose(attn_sb[0:T, 0:W_core], out_w, out_in_sb=out_in_sb)
 
 
@@ -601,7 +605,10 @@ def attention_layer_compose(
     T = proj_sb.shape[0]
 
     attn_shape = nl.ndarray((T, W_full), dtype=nl.float32, buffer=nl.sbuf)
-    attn_sb = nl.ndarray((T, W_core), dtype=out_w.dtype, buffer=nl.sbuf)
+    if _ATTN_LOC:
+        attn_sb = nl.ndarray((P_MAX, Hv_core, T), dtype=out_w.dtype, buffer=nl.sbuf)
+    else:
+        attn_sb = nl.ndarray((T, W_core), dtype=out_w.dtype, buffer=nl.sbuf)
 
     qkv_cp = qkv_to_channel_partition(
         proj_sb, conv_dim, T, tiles=owned_qkv_tiles(conv_dim, key_dim)
