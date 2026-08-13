@@ -301,3 +301,54 @@ recurrence's first Tensor instruction 58.4 → 51.4 µs.
 - **List comprehensions are rejected**: `error: unsupported expression`.
 - **Inner `def`s are rejected**: `NKI does not support inner function definitions`.
   Pass `(module_level_fn, data)` tuples instead of closures.
+
+### Round 2, remaining results
+
+| plan | outcome | flag |
+|---|---|---|
+| **partition-contiguous `proj_w` repack — WIN** | **−3.43 µs (−3.6%)**, 94.52 → 91.09 pooled, disjoint distributions, **bit-identical on device** (`torch.equal` True) | `NKI_DELTANET_PROJW_PACKED=1` |
+| **`attn_loc` tail restructure — WIN** | **−3.76 µs (−3.9%)**, 95.29 → 91.53, bit-identical. Dead hand-off **1262 → 54 ns** | `NKI_DELTANET_ATTN_LOC=1` |
+
+### FINAL bottleneck model for `in_proj` (supersedes both earlier claims)
+
+The weight stream **paces** in_proj but does not bound it. Measured on an
+unthrottled control: in_proj's own `proj_w` stream ends at 41,573 ns, its last
+matmul at 44,449 ns — **the phase tail is PE, +2.6 µs behind the stream**, and the
+gap is *constant* (treatment: +2,733 ns). So:
+
+- Stream-span reduction converts to phase-end reduction **~1:1**
+  (`w_end` 41,573 → 39,449, `mm_end` 44,449 → 42,182).
+- And to wall at **1.39×** (−2.47 µs of span → −3.43 µs of wall), because
+  `out_w` also finishes earlier once it stops contending with an inefficient
+  `proj_w` stream (full INPUT end 49,778 → 47,736 ns).
+
+The earlier "in_proj is DMA-bound" reading mis-attributed the 49,418 ns INPUT tail:
+that is **`out_w`** (o_proj weight, 2.10 MB/core, streaming from ~36.6 µs and
+outliving the phase), not `proj_w`. Both earlier models were wrong in opposite
+directions; this one is measured on both arms.
+
+### The repack, quantified
+`read_shape [[8 128]]` / `read_steps [[6176, 49408]]` → `[[128 1]]` / `[[8192, 1]]`.
+**Descriptors per core 10,240 → 1,664 (6.2×)**; run bytes 512–1,024 → 4,096.
+Stream span 26.3 → 23.9 µs, rate 240 → 267 GB/s.
+Packet **count** is invariant (1,728 → 1,760): packets are byte-quantized at ~3.6 KB
+against a fixed 6.36 MB transfer, so count ≈ bytes/3.6 KB regardless of layout.
+**Descriptors are the metric, not packets.**
+
+### Gate blind spots found the hard way
+- **The fp32 gate cannot catch bf16-only backend failures.** Transposing z into a
+  bf16 PSUM tile compiles at T=2 but fails the verifier at T=1
+  (`checkMatmultOutputs`, 2-byte sub-word PSUM write) — only in the deployment dtype.
+  Stage through an fp32 tile.
+- **A feature wired into `deltanet_attention_layer` but not
+  `deltanet_attention_layer_state` silently falls back and still passes the gate
+  bit-identically.** The harness profiles the `_state` entrypoint. Verify a flag took
+  effect from the profile's `read_steps`/`read_shape`, never from the gate.
+
+### Production follow-up required for the repack (NOT done)
+`build_deltanet_in_proj_fused` (`modeling_qwen36_a3b.py:3489`) must emit the packed
+layout, and `self.in_proj_fused.weight` is a `RowParallelLinear` parameter **also
+consumed by the PyTorch fallback** `_project_inputs` (`modeling_qwen36_a3b.py:461-462`).
+It must not be mutated in place. Either carry the packed tensor as a second buffer
+(+6.36 MB/core bf16 per layer at TP=4 — in_proj weight residency doubles) or port the
+fallback to the packed layout and drop the `[H, I]` copy. That decision is open.
