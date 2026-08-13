@@ -225,16 +225,19 @@ def conv_state_store_pending(pending_cand):
         conv_state_store(win, conv_cand, NT, T, state_w, ch0, cand_is_3d)
 
 
-def qkv_to_channel_partition(proj_sb, conv_dim, T):
+def qkv_to_channel_partition(proj_sb, conv_dim, T, tiles=None):
     """Transpose the projection's qkv sub-block to channel-on-partition [128, NT*T].
 
-    One nc_transpose per 128-channel tile, feeding the conv's SBUF path.
+    One nc_transpose per 128-channel tile, feeding the conv's SBUF path. tiles restricts the
+    transposes to those global tile indices, leaving the rest of the buffer unwritten.
     """
     NT = conv_dim // P_MAX
+    if tiles == None:
+        tiles = range(NT)
     # gen3 nc_transpose requires dst dtype == input dtype.
     qkv_cp = nl.ndarray((P_MAX, NT * T), dtype=proj_sb.dtype, buffer=nl.sbuf)
     tp = nl.ndarray((P_MAX, T), dtype=proj_sb.dtype, buffer=nl.psum)
-    for gt in range(NT):
+    for gt in tiles:
         nisa.nc_transpose(
             dst=tp[0:P_MAX, 0:T],
             data=proj_sb.ap(

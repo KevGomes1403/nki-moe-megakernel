@@ -23,6 +23,8 @@ head-major output and the caller applies the norm/gate.
 Input contract and rationale: specs/deltanet_tkg.md.
 """
 
+import os
+
 import nki
 import nki.language as nl
 
@@ -33,10 +35,47 @@ from ..components.conv import (
     conv_state_store_pending,
     kernel_assert,
     qkv_to_channel_partition,
+    shard_segments,
 )
 from ..components.in_proj import in_proj_compose
 from ..components.out_proj import out_proj_compose
 from ..components.recurrence import gated_delta_rule_tkg
+
+# Shard in_proj on its output columns instead of on the hidden dim, dropping the cross-core reduce.
+_I_COLUMN_SHARD = os.environ.get("NKI_DELTANET_IN_PROJ_I_SHARD", "0") == "1"
+
+
+def in_proj_column_shard(conv_dim, key_dim, Hv_full, z_off, a_off):
+    """This core's (start, size) projection column runs, or None when I-sharding is off.
+
+    Its own q|k|v conv segments and z block, plus the whole 2*Hv_full-wide a|b pair -- taking
+    both halves of a|b keeps that DMA one run per weight row instead of two 4-column fragments.
+    """
+    if not _I_COLUMN_SHARD:
+        return None
+    segments, Hv_loc, _ = shard_segments(conv_dim, key_dim)
+    c = nl.program_id(0)
+    W = Hv_loc * P_MAX
+    runs = []
+    for seg in range(len(segments)):
+        t0, n_tiles = segments[seg]
+        runs.append((t0 * P_MAX, n_tiles * P_MAX))
+    runs.append((z_off + c * W, W))
+    runs.append((a_off, 2 * Hv_full))
+    return runs
+
+
+def owned_qkv_tiles(conv_dim, key_dim):
+    """Global 128-channel tile indices of this core's q|k|v conv segments, or None when unsharded."""
+    if not _I_COLUMN_SHARD:
+        return None
+    segments, _, _ = shard_segments(conv_dim, key_dim)
+    tiles = []
+    for seg in range(len(segments)):
+        t0, n_tiles = segments[seg]
+        for i in range(n_tiles):
+            tiles.append(t0 + i)
+    return tiles
 
 
 def fused_compose(
@@ -246,11 +285,20 @@ def in_proj_fused_compose(
     conv_taps = conv_preload_taps(conv_state, conv_weight, key_dim)
 
     # Fused input RMSNorm + 4-way projection, kept in SBUF.
-    proj_sb = in_proj_compose(hidden, proj_w, gamma, eps, output_in_sbuf=True)
+    proj_sb = in_proj_compose(
+        hidden,
+        proj_w,
+        gamma,
+        eps,
+        output_in_sbuf=True,
+        i_column_shard=in_proj_column_shard(conv_dim, key_dim, Hv_full, z_off, a_off),
+    )
     T = proj_sb.shape[0]
 
     # Transpose the qkv sub-block to channel-on-partition, then run the conv off SBUF.
-    qkv_cp = qkv_to_channel_partition(proj_sb, conv_dim, T)
+    qkv_cp = qkv_to_channel_partition(
+        proj_sb, conv_dim, T, tiles=owned_qkv_tiles(conv_dim, key_dim)
+    )
     q_sbuf, k_sbuf, v_sbuf, pending_cand = conv_qkv_sbuf(
         None,
         conv_state,
@@ -453,14 +501,22 @@ def attention_layer_compose(
     conv_taps = conv_preload_taps(conv_state, conv_weight, key_dim)
 
     proj_sb = in_proj_compose(
-        hidden, proj_w, gamma, eps, output_in_sbuf=True, name_prefix=name_prefix
+        hidden,
+        proj_w,
+        gamma,
+        eps,
+        output_in_sbuf=True,
+        name_prefix=name_prefix,
+        i_column_shard=in_proj_column_shard(conv_dim, key_dim, Hv_full, z_off, a_off),
     )
     T = proj_sb.shape[0]
 
     attn_shape = nl.ndarray((T, W_full), dtype=nl.float32, buffer=nl.sbuf)
     attn_sb = nl.ndarray((T, W_core), dtype=out_w.dtype, buffer=nl.sbuf)
 
-    qkv_cp = qkv_to_channel_partition(proj_sb, conv_dim, T)
+    qkv_cp = qkv_to_channel_partition(
+        proj_sb, conv_dim, T, tiles=owned_qkv_tiles(conv_dim, key_dim)
+    )
     q_sbuf, k_sbuf, v_sbuf, pending_cand = conv_qkv_sbuf(
         None,
         conv_state,

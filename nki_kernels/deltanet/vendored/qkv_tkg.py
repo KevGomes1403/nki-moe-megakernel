@@ -24,6 +24,10 @@
 # tile instead of array_tiling_factor B*S-wide adds) can be requested by the
 # caller via i_column_tiling=True, instead of only being reachable at the
 # hardcoded H == 3072 config. Default is unchanged.
+#
+# Additive change: i_column_shard replaces the LNC H-shard with a shard on the
+# output columns -- each core contracts the full H over the column runs it owns,
+# so no partial sums cross the cores. Default is unchanged.
 # ===========================================================================
 
 """
@@ -104,6 +108,7 @@ def qkv_tkg(
     transposed_in: bool = False,
     dtype_mode: DtypeMode = DtypeMode.NON_OCP,
     i_column_tiling: bool = False,
+    i_column_shard: Optional[Tuple[Tuple[int, int], ...]] = None,
 ) -> nl.ndarray | Tuple[nl.ndarray, nl.ndarray]:
     """
     QKV Projection Kernel for Token Generation
@@ -228,6 +233,11 @@ def qkv_tkg(
             Pack output columns rather than hidden chunks into the PE array column tiles, so the
             per-tile results are disjoint output slices and PSUM eviction is one copy per column
             tile instead of ``array_tiling_factor`` B*S-wide adds. Default: False.
+        i_column_shard (Optional[Tuple[Tuple[int, int], ...]]):
+            ``(start, size)`` output-column runs this core computes, sharding I instead of H: the
+            full H is contracted over just those columns, the rest of the [B*S, I] SBUF output is
+            left untouched and the cross-core reduce is dropped. Requires ``output_in_sbuf`` and
+            an SBUF-resident or normed input, no bias and no quantization. Default: None.
 
     Returns:
         output (nl.ndarray | Tuple[nl.ndarray, nl.ndarray]):
@@ -308,6 +318,7 @@ def qkv_tkg(
         num_kv_heads=num_kv_heads,
         transposed_in=transposed_in,
         i_column_tiling=i_column_tiling,
+        i_column_shard=i_column_shard,
     )
 
     io_dtype = hidden.dtype
@@ -359,12 +370,21 @@ def qkv_tkg(
         transposed_in=transposed_in,
     )
 
-    # Shard on H for qkv_w: (H0, H1_sharded, I)
-    qkv_w_hbm = (
-        TensorView(qkv_w)
-        .reshape_dim(dim=0, shape=(cfg.num_shards, cfg.H0, cfg.H1_shard))
-        .select(dim=0, index=cfg.shard_id)
-    )
+    if cfg.i_shard_segments != None:
+        # Full H per core as (H0, num_shards, H1_shard, I): the middle dims walk the H1 tiles in
+        # the shard-major order the normed hidden's free axis uses.
+        qkv_w_hbm = (
+            TensorView(qkv_w)
+            .reshape_dim(dim=0, shape=(cfg.num_shards, cfg.H0, cfg.H1_shard))
+            .permute(dims=(1, 0, 2, 3))
+        )
+    else:
+        # Shard on H for qkv_w: (H0, H1_sharded, I)
+        qkv_w_hbm = (
+            TensorView(qkv_w)
+            .reshape_dim(dim=0, shape=(cfg.num_shards, cfg.H0, cfg.H1_shard))
+            .select(dim=0, index=cfg.shard_id)
+        )
 
     # Dispatch to appropriate projection path based output buffer
     if output_in_sbuf:
@@ -453,6 +473,8 @@ class QkvTkgConfig(nl.NKIObject):
     i_block_size: int
     # Column tiling strategy
     use_I_column_tiling: bool
+    # (start, size) output-column runs owned by this core, or None when sharding on H
+    i_shard_segments: Optional[Tuple[Tuple[int, int], ...]]
 
 
 def _validate_and_create_config(
@@ -475,6 +497,7 @@ def _validate_and_create_config(
     num_kv_heads: Optional[int],
     transposed_in: bool = False,
     i_column_tiling: bool = False,
+    i_column_shard: Optional[Tuple[Tuple[int, int], ...]] = None,
 ) -> QkvTkgConfig:
     """
     Validate inputs and create kernel configuration.
@@ -685,6 +708,17 @@ def _validate_and_create_config(
     if H == 3072 or i_column_tiling:
         use_I_column_tiling = True
 
+    if i_column_shard != None:
+        kernel_assert(output_in_sbuf, "i_column_shard requires output_in_sbuf")
+        kernel_assert(
+            quantization_type == QuantizationType.NONE and qkv_bias == None,
+            "i_column_shard does not support quantization or bias",
+        )
+        kernel_assert(
+            input_in_sbuf or norm_type != NormType.NO_NORM,
+            "i_column_shard needs the full H on every core, so an HBM input must be normed",
+        )
+
     # Only used in case of H-column-tiling.
     array_tiled_H1 = NUM_TILES_PER_H_BLOCK // array_tiling_factor
     # If H is not multiple of H_BLOCK_SIZE and num_128_tiles_per_remainder_H_block is not multiple of array_tiling_factor,
@@ -730,6 +764,7 @@ def _validate_and_create_config(
         i_tile_size=i_tile_size,
         i_block_size=i_block_size,
         use_I_column_tiling=use_I_column_tiling,
+        i_shard_segments=i_column_shard,
     )
 
 
@@ -871,6 +906,10 @@ def _fused_norm_and_load(
     num_shards, shard_id = cfg.num_shards, cfg.shard_id
     H1_sharded = cfg.H1_shard
 
+    # An I-shard leaves the full H on every core; only an H-shard slices the normed hidden.
+    h1_start = 0 if cfg.i_shard_segments != None else shard_id * H1_sharded
+    h1_end = H1 if cfg.i_shard_segments != None else (shard_id + 1) * H1_sharded
+
     hidden_in_sbuf = hidden.buffer == nl.sbuf
 
     hidden_sb = None
@@ -918,7 +957,7 @@ def _fused_norm_and_load(
         hidden_sb = TensorView(x_shard_sb)
     elif norm_type == NormType.NO_NORM:
         if hidden_in_sbuf:
-            hidden_sb = TensorView(hidden).slice(dim=2, start=shard_id * H1_sharded, end=(shard_id + 1) * H1_sharded)
+            hidden_sb = TensorView(hidden).slice(dim=2, start=h1_start, end=h1_end)
         else:
             if quantization_type != QuantizationType.NONE:
                 hidden_sb = sbm.alloc_heap(hidden_sharded_shape, dtype=hidden.dtype, buffer=nl.sbuf)
@@ -958,7 +997,7 @@ def _fused_norm_and_load(
                 eps=eps,
                 sbm=sbm,
             )
-        hidden_sb = TensorView(hidden_sb).slice(dim=2, start=shard_id * H1_sharded, end=(shard_id + 1) * H1_sharded)
+        hidden_sb = TensorView(hidden_sb).slice(dim=2, start=h1_start, end=h1_end)
 
     # optionally quantize the inputs
     if quantization_type == QuantizationType.STATIC:
@@ -1281,6 +1320,9 @@ def _qkv_projection_sbuf_output(
     # Allocate full (BxS, I) output on heap — persists for caller
     qkv_out_sb = sbm.alloc_heap((BxS, I), dtype=io_dtype, buffer=nl.sbuf)
 
+    if cfg.i_shard_segments != None:
+        return _qkv_projection_i_shard(hidden_sb, qkv_w, qkv_out_sb, cfg, sbm)
+
     # Process each I-block
     for i_block in TiledRange(I, cfg.i_block_size):
         sbm.open_scope(name=f"qkv_sbuf_output_i_block_{i_block.index}")
@@ -1422,6 +1464,106 @@ def _store_qkv_output_to_hbm(
                 output_hbm.ap(pattern=output_pattern, offset=output_offset),
                 output_sb.ap(pattern=output_sb_pattern, offset=output_sb_offset),
             )
+
+
+def _qkv_projection_i_shard(
+    hidden_sb: TensorView,
+    qkv_w_hbm: TensorView,
+    qkv_out_sb: nl.ndarray,
+    cfg: QkvTkgConfig,
+    sbm: SbufManager,
+) -> nl.ndarray:
+    """Project this core's I-shard column runs, contracting the full H with no cross-core reduce.
+
+    Each run is one PE array column tile, taken in the caller's order so that the runs downstream
+    needs first land first; only the run's columns are touched in the [B*S, I] output.
+
+    Args:
+        hidden_sb: Normed hidden in SBUF (TensorView). Shape: (H0, BxS, H1)
+        qkv_w_hbm: QKV weights (TensorView). Shape: (H0, num_shards, H1_shard, I)
+        qkv_out_sb: Full-width SBUF output. Shape: (BxS, I)
+        cfg: QKV TKG config
+        sbm: SbufManager for SBUF allocation
+
+    Returns:
+        qkv_out_sb, with this core's column runs written.
+    """
+    col_tiling_dim = cfg.array_tiling_dim
+    col_tiling_factor = cfg.array_tiling_factor
+    n_segments = len(cfg.i_shard_segments)
+    prefix = sbm.get_name_prefix()
+
+    sbm.open_scope(name="qkv_projection_i_shard")
+
+    # Every run's weight stays live, so the later loads stream under the earlier runs' matmuls.
+    qkv_w_sb = []
+    for seg in range(n_segments):
+        i_start, i_size = cfg.i_shard_segments[seg]
+        w_sb = TensorView(
+            sbm.alloc_stack(
+                (cfg.H0, cfg.num_shards, cfg.H1_shard, i_size),
+                name=f"qkv_w_sb_i_shard_{seg}",
+                dtype=qkv_w_hbm.dtype,
+                buffer=nl.sbuf,
+            )
+        )
+        w_hbm = qkv_w_hbm.slice(dim=3, start=i_start, end=i_start + i_size)
+        # One load per H shard: each is the (H0, H1_shard, i_size) pattern of the H-sharded path.
+        for shard in range(cfg.num_shards):
+            nisa.dma_copy(
+                w_sb.select(dim=1, index=shard).get_view(),
+                w_hbm.select(dim=1, index=shard).get_view(),
+            )
+        qkv_w_sb.append(w_sb.flatten_dims(start_dim=1, end_dim=2))
+
+    # Column tiles: (weight, output offset, width, PE array column, PSUM), one per <=F_MAX run.
+    col_tiles = []
+    for seg in range(n_segments):
+        i_start, i_size = cfg.i_shard_segments[seg]
+        for i_tile in TiledRange(i_size, F_MAX):
+            col_idx = len(col_tiles) % col_tiling_factor
+            result_psum = nl.ndarray(
+                (min(P_MAX, col_tiling_dim * col_tiling_factor), i_tile.size),
+                dtype=nl.float32,
+                name=f"{prefix}i_shard_result_psum_{len(col_tiles)}",
+                buffer=nl.psum,
+                address=None
+                if sbm.is_auto_alloc()
+                else (0, (len(col_tiles) % NUM_PSUM_BANKS) * (F_MAX * sizeinbytes(nl.float32))),
+            )
+            col_tiles.append(
+                (
+                    qkv_w_sb[seg].slice(dim=2, start=i_tile.start_offset, end=i_tile.end_offset),
+                    i_start + i_tile.start_offset,
+                    i_tile.size,
+                    col_idx,
+                    result_psum,
+                )
+            )
+
+    # Run-at-a-time, so an early run is evicted while the later runs' weights are still loading.
+    for t in range(len(col_tiles)):
+        w_sb, i_start, i_size, col_idx, result_psum = col_tiles[t]
+        psum_slice = result_psum[nl.ds(col_tiling_dim * col_idx, cfg.BxS), 0:i_size]
+
+        for h1_tile_idx in range(cfg.H1):
+            nisa.nc_matmul(
+                psum_slice,
+                hidden_sb.select(dim=2, index=h1_tile_idx).get_view(),
+                w_sb.select(dim=1, index=h1_tile_idx).get_view(),
+                tile_position=(0, col_tiling_dim * col_idx),
+                tile_size=(cfg.H0, col_tiling_dim),
+            )
+
+        # Evict: one copy per column tile (no reduction)
+        out_slice = qkv_out_sb[0 : cfg.BxS, nl.ds(i_start, i_size)]
+        if t % 2 == 0:
+            nisa.tensor_copy(out_slice, psum_slice, engine=nisa.engine.vector)
+        else:
+            nisa.tensor_copy(out_slice, psum_slice, engine=nisa.engine.scalar)
+
+    sbm.close_scope()
+    return qkv_out_sb
 
 
 def _qkv_projection(

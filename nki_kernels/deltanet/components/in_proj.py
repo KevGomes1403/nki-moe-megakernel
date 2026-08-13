@@ -22,8 +22,13 @@ from nkilib.core.utils.common_types import NormType, QKVOutputLayout, Quantizati
 from ..vendored.qkv_tkg import qkv_tkg
 
 
-def in_proj_compose(hidden, proj_w, gamma, eps, output_in_sbuf, name_prefix=""):
-    """Fused input RMSNorm + 4-way projection; returns [B, S, I] HBM or [B*S, I] SBUF."""
+def in_proj_compose(
+    hidden, proj_w, gamma, eps, output_in_sbuf, name_prefix="", i_column_shard=None
+):
+    """Fused input RMSNorm + 4-way projection; returns [B, S, I] HBM or [B*S, I] SBUF.
+
+    i_column_shard: (start, size) column runs this core computes, replacing the LNC H-shard.
+    """
     if hidden.buffer == nl.sbuf:
         norm_in = nl.ndarray(hidden.shape, dtype=hidden.dtype, buffer=nl.sbuf)
         nisa.tensor_copy(dst=norm_in, src=hidden)
@@ -46,6 +51,7 @@ def in_proj_compose(hidden, proj_w, gamma, eps, output_in_sbuf, name_prefix=""):
         output_in_sbuf=output_in_sbuf,
         sbm=sbm,
         i_column_tiling=True,
+        i_column_shard=i_column_shard,
     )
 
 
