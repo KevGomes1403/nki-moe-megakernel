@@ -491,3 +491,56 @@ availability; establish what before spending another reorder.
 `nisa.tensor_copy(..., engine=nisa.engine.gpsimd)` **does not compile when the source is PSUM**:
 `tensor_copy src must be in [sbuf], got psum`. Both conv tap transposes evict from PSUM, so
 GpSimd is not a legal target regardless of its 0.00% occupancy.
+
+### Round 3, plan 2 — evacuate foreign work from the token loop: NEGATIVE
+
+| arm | knobs | median | Δ vs control |
+|---|---|---|---|
+| base0 / base1 (controls, 1st and 4th) | — | **81.27 / 81.74** | — |
+| evac_b | (b) transpose dedup | 86.87 | **+5.13** |
+| evac_bc | (b)+(c) | 84.68 | +2.94 |
+| evac_abc | (a)+(b)+(c) | 91.39 | **+9.65** |
+
+**The evacuation worked and the kernel got slower.** In-loop Tensor fell 13.59 → 8.78 µs
+(below the 9.0 µs kill threshold), knob (a)'s own criterion passed (`qkv_tkg.py:1707` max end
+55,953 → 43,631), and every arm was bit-identical. But **the loop starts 13.5 µs later** — the
+work did not disappear, it moved onto the pre-loop serial path. The named guard is exactly what
+broke: last `conv.py:176` SiLU `ACTIVATE` end went 48.80 → 51.69 (b) → 60.87 (abc).
+
+### TWO METHODOLOGICAL FINDINGS THAT INVALIDATE PART OF THIS SESSION'S PLANNING
+
+**1. "Which engine is idle in window W" does not predict where the static scheduler puts work.**
+Knob (b) only touches `conv_state_store` — drained *after* the recurrence in program order —
+and it *removes* 6 Tensor ops. It still delayed the conv by +2.5 µs. There is no added
+dependency edge; this is the scheduler reacting to a changed instruction stream. Engine-slack
+reasoning is a hypothesis generator, not a predictor. Measure, never extrapolate.
+
+**2. `activity_N` throttle behaves like a di/dt limiter: denser packing buys MORE throttle.**
+Throttle coverage rose monotonically with the regression:
+
+| arm | c0 activity_1 | c1 activity_1 |
+|---|---|---|
+| base0 | 37.55 | 34.13 |
+| evac_b | 39.61 | 37.81 |
+| evac_abc | **43.15** | **40.96** |
+
+In-loop all-engine idle was already 0.09 µs; packing the same work more densely raised
+instantaneous activity and drew more throttle, not less. Run-to-run spread also grew
+0.92 → 5.10 µs, so the denser schedule is less repeatable. **This bounds the whole
+"fill the idle gaps" strategy** — it paid while the schedule was loose (the z-defer and repack
+wins) and reverses once a window is saturated.
+
+### `ATTN_LOC` retry: closed
+In-loop Tensor headroom *is* obtainable (61.9% → 46.7%) but costs +9.65 µs to get — more on the
+pre-loop path than the loop returns. Any future lever must **shorten the pre-loop conv→l2norm
+chain itself**, not relocate work into it. Do not retry `ATTN_LOC` on this basis.
+
+### More NKI constraints (measured)
+- `nisa.tensor_tensor(..., engine=nisa.engine.gpsimd)` does not compile:
+  `[NCC_IBIR766] Instruction TensorTensor cannot run on engine Pool` — for both a stride-0
+  broadcast operand and a plain contiguous multiply. GpSimd dispatch is restricted to
+  `nl.power` and int32 operands.
+- `nisa.tensor_reduce` has **no `engine=` parameter** in this NKI build.
+- (with the round-3 plan-1 finding) `nisa.tensor_copy(..., engine=gpsimd)` rejects PSUM sources.
+  Between these three, GpSimd is effectively unusable as an overflow engine here despite
+  frequently being 0% busy.
