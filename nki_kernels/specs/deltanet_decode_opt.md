@@ -159,3 +159,82 @@ with slack. Achieved BW unaffected (181.4 vs 173.8 GB/s).
 
 Vendored files (`qkv_tkg.py`, `output_projection_tkg.py`) are shared with GQA —
 extensions must be **additive and env-gated off by default**.
+
+---
+
+## Round 2 — profile of the plan-1 base, and where the time actually is
+
+Fresh capture of the I-column-shard build. **in_proj is the kernel.**
+
+| phase | len | Tensor busy | DMA busy |
+|---|---|---|---|
+| instruction-stream head (no input DMA in flight) | 13.1 µs | 12% | 54% |
+| RMSNorm prologue + wait for first `proj_w` chunk | 10.0 µs | 26% | 92% |
+| **in_proj matmuls** | **52.1 µs** | **91.8%** | 100% |
+| conv + recurrence + gated norm | 37.5 µs | 41% | 18% |
+| **o_proj tail (zero non-o_proj compute in it)** | **21.4 µs** | 80% | 14% |
+
+### The in_proj PE cost model (validated to 0.3%)
+`2 (fp32 LOW_HIGH pair) × 16 (h1) × Σ(128 + i_size)` over runs `{256,256,512,512,16}`
+= **70,144 cycles = 48.0 µs @1.46 GHz**, vs 47.87 µs measured.
+
+`proj_w` streams to 63,031 ns; PE finishes at 75,238 ns. **PE is the binding
+resource for the phase end, so PE cycles removed pay ~1:1 up to ~12.2 µs**, after
+which the phase floors on the DMA end. Every round-2 saving is derived from this.
+
+**`LDWEIGHTS` is 14.0 µs of that 48.0 µs** — `2 × 16 h1 × 5 tiles × 128 rows` —
+and it is pure overhead for a rank-2 GEMV: the stationary is `[128, BxS=2]`, so
+each load streams 128 rows to serve 2 useful columns.
+
+### Two round-1 leads killed by measurement
+- **Hoisting the `out_w` load**: already fully prefetched. Lands at 77,687; first
+  o_proj MATMUL at 114,802. **37.1 µs of slack, 0 ns attributable stall.**
+- **`out_proj.py:86` sendrecv as "the biggest remaining seam"**: lowers to a
+  4,096 B transfer, **354 ns**, consumer `EVENT_SEMAPHORE` blocks 243/197 ns.
+  Not a seam.
+
+### Also rejected, with the measured reason
+- **Operand swap** (weight stationary, hidden moving): cycles 70,144 → 54,080
+  (−11.0 µs) but Tensor instruction count 320 → 832/core. At the measured
+  per-instruction floor (~140 ns) the added 512 instructions cost 25–38 µs. Net loss.
+- **Per-token split of the o_proj matmul**: cost is (128 + 512) cycles per
+  (head, f_tile) whether `BxS` is 1 or 2 — splitting doubles o_proj PE to 28.0 µs
+  to hide at most 14. Net loss.
+- **bf16/tf32 for in_proj or o_proj**: would halve PE (profile confirms fp32 lowers
+  to paired MATMULs, `fp32_mode = LOW_HIGH`). Blocked by the fp32 atol=1e-5 gate.
+- **`dge_mode.none`/`hwdge` on weight DMAs**: `DMA_DIRECT2D` costs 21,750 ns of
+  GpSimd, but GpSimd has a contiguous 60,165 ns idle window and all `proj_w`
+  triggers retire by 25,151 while the stream runs to 63,031. Descriptor generation
+  is not the limiter.
+- **Folding the recurrence decay into the read matmul**: algebraically valid but
+  chain length is identical (`decay→mm→delta` vs `mm→eg⊙pair→delta`), and Vector
+  cost is per-column and partition-count-independent, so shrinking `[128,512]` to
+  `[2,512]` buys nothing.
+- **The 13.1 µs instruction-stream head**: real (9.7%), 236,856 B over 97 packets
+  with no input DMA yet — but it is a per-NEFF startup cost that amortizes in the
+  multi-layer megakernel.
+
+### Round-2 plans dispatched
+1. **h1-outer loop to elide repeated `LDWEIGHTS`** (stationary is identical across
+   all 5 column tiles at a given h1) — up to −11.2 µs; grouped-safe variant −8.4 µs;
+   packing fallback −2.8 µs. Kill: LDWEIGHTS/core 160 → must reach ≤64.
+2. **Host-side `proj_w` repack to partition-contiguous** — 128 descriptors instead
+   of 1,024 runs/DMA; 269 GB/s currently = 62% of the 435 GB/s peak. −5–7 µs, and
+   it lowers the DMA floor that caps plans 1 and 3 by ~14 µs. Kill: stream span
+   47,232 ns → must reach <38,000.
+3. **Defer the `z` column tile's 14.0 µs of matmuls into the conv's Tensor-idle
+   windows** (8.6 µs measured across two stretches; nothing before the gated norm
+   consumes z). Must interleave per conv segment — each engine runs its queue in
+   order, so one block emitted after the conv cannot back-fill an earlier wait.
+   −6.8 µs. Kill: conv-window Tensor-idle 8,608 ns → must reach <3,000.
+4. **Transpose the gated row inside the recurrence, deleting the `attn_sb`
+   round-trip** — 1,518 ns with all four compute engines idle on both cores.
+   −2.0–2.5 µs. Kill: that gap must fall below 400 ns.
+
+**Composition:** plans 1 and 3 are NOT additive (both remove in_proj PE; together
+they overshoot the ~12.2 µs realizable before the DMA floor). Plan 2 is what raises
+that ceiling. Plans 1 and 3 also conflict structurally in `_qkv_projection_i_shard`.
+
+**Measurement caveat:** a hardware 0.5-utilization throttle covered 44.4 µs of the
+round-2 capture and inflates durations 1.69× (identical matmuls: 592 ns outside,
+1,001 ns inside). Cross-session A/B is void; every arm needs a same-session control.
