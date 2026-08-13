@@ -109,6 +109,7 @@ def qkv_tkg(
     dtype_mode: DtypeMode = DtypeMode.NON_OCP,
     i_column_tiling: bool = False,
     i_column_shard: Optional[Tuple[Tuple[int, int], ...]] = None,
+    i_column_shard_defer: Optional[Tuple[int, ...]] = None,
 ) -> nl.ndarray | Tuple[nl.ndarray, nl.ndarray]:
     """
     QKV Projection Kernel for Token Generation
@@ -238,6 +239,11 @@ def qkv_tkg(
             full H is contracted over just those columns, the rest of the [B*S, I] SBUF output is
             left untouched and the cross-core reduce is dropped. Requires ``output_in_sbuf`` and
             an SBUF-resident or normed input, no bias and no quantization. Default: None.
+        i_column_shard_defer (Optional[Tuple[int, ...]]):
+            ``i_column_shard`` run indices whose matmuls are not emitted here. They are returned as
+            a pending list for ``qkv_tkg_i_shard_drain`` to emit later, so the caller can place them
+            in a downstream Tensor-idle window. Requires ``i_column_shard`` and an auto-alloc
+            ``sbm``; the deferred columns must be drained before they are read. Default: None.
 
     Returns:
         output (nl.ndarray | Tuple[nl.ndarray, nl.ndarray]):
@@ -245,6 +251,8 @@ def qkv_tkg(
             Shape:    [B, S, I] for BSD layout, [N, B, S, D] for NBSd layout.
             When fused_add is True, returns tuple (output, fused_hidden) where
             fused_hidden is the result of the fused residual addition.
+            When i_column_shard_defer is set, returns tuple (output, pending) where pending is
+            the deferred column tiles for qkv_tkg_i_shard_drain.
 
     Notes:
         - H must be divisible by 128 (nl.tile_size.pmax).
@@ -319,6 +327,7 @@ def qkv_tkg(
         transposed_in=transposed_in,
         i_column_tiling=i_column_tiling,
         i_column_shard=i_column_shard,
+        i_column_shard_defer=i_column_shard_defer,
     )
 
     io_dtype = hidden.dtype
@@ -475,6 +484,8 @@ class QkvTkgConfig(nl.NKIObject):
     use_I_column_tiling: bool
     # (start, size) output-column runs owned by this core, or None when sharding on H
     i_shard_segments: Optional[Tuple[Tuple[int, int], ...]]
+    # i_shard_segments indices whose matmuls the caller drains later, or None
+    i_shard_defer: Optional[Tuple[int, ...]]
 
 
 def _validate_and_create_config(
@@ -498,6 +509,7 @@ def _validate_and_create_config(
     transposed_in: bool = False,
     i_column_tiling: bool = False,
     i_column_shard: Optional[Tuple[Tuple[int, int], ...]] = None,
+    i_column_shard_defer: Optional[Tuple[int, ...]] = None,
 ) -> QkvTkgConfig:
     """
     Validate inputs and create kernel configuration.
@@ -719,6 +731,10 @@ def _validate_and_create_config(
             "i_column_shard needs the full H on every core, so an HBM input must be normed",
         )
 
+    if i_column_shard_defer != None:
+        kernel_assert(i_column_shard != None, "i_column_shard_defer requires i_column_shard")
+        kernel_assert(not fused_add, "i_column_shard_defer does not support fused_add")
+
     # Only used in case of H-column-tiling.
     array_tiled_H1 = NUM_TILES_PER_H_BLOCK // array_tiling_factor
     # If H is not multiple of H_BLOCK_SIZE and num_128_tiles_per_remainder_H_block is not multiple of array_tiling_factor,
@@ -765,6 +781,7 @@ def _validate_and_create_config(
         i_block_size=i_block_size,
         use_I_column_tiling=use_I_column_tiling,
         i_shard_segments=i_column_shard,
+        i_shard_defer=i_column_shard_defer,
     )
 
 
@@ -1486,12 +1503,18 @@ def _qkv_projection_i_shard(
         sbm: SbufManager for SBUF allocation
 
     Returns:
-        qkv_out_sb, with this core's column runs written.
+        qkv_out_sb, with this core's column runs written. When cfg.i_shard_defer is set, returns
+        (qkv_out_sb, pending) and the deferred runs' columns are only written by the drain.
     """
     col_tiling_dim = cfg.array_tiling_dim
     col_tiling_factor = cfg.array_tiling_factor
     n_segments = len(cfg.i_shard_segments)
+    defer = cfg.i_shard_defer
     prefix = sbm.get_name_prefix()
+
+    if defer != None:
+        # Auto-alloc extends the deferred tile's weight/PSUM liveness past the scope close below.
+        kernel_assert(sbm.is_auto_alloc(), "i_column_shard_defer requires an auto-alloc sbm")
 
     sbm.open_scope(name="qkv_projection_i_shard")
 
@@ -1516,7 +1539,7 @@ def _qkv_projection_i_shard(
             )
         qkv_w_sb.append(w_sb.flatten_dims(start_dim=1, end_dim=2))
 
-    # Column tiles: (weight, output offset, width, PE array column, PSUM), one per <=F_MAX run.
+    # Column tiles: (weight, output offset, width, PE array column, PSUM, run), one per <=F_MAX run.
     col_tiles = []
     for seg in range(n_segments):
         i_start, i_size = cfg.i_shard_segments[seg]
@@ -1538,13 +1561,34 @@ def _qkv_projection_i_shard(
                     i_tile.size,
                     col_idx,
                     result_psum,
+                    seg,
                 )
             )
 
     # Run-at-a-time, so an early run is evicted while the later runs' weights are still loading.
+    pending = []
     for t in range(len(col_tiles)):
-        w_sb, i_start, i_size, col_idx, result_psum = col_tiles[t]
+        w_sb, i_start, i_size, col_idx, result_psum, seg = col_tiles[t]
         psum_slice = result_psum[nl.ds(col_tiling_dim * col_idx, cfg.BxS), 0:i_size]
+
+        if defer != None and seg in defer:
+            pending.append(
+                (
+                    hidden_sb,
+                    w_sb,
+                    qkv_out_sb,
+                    result_psum,
+                    i_start,
+                    i_size,
+                    col_idx,
+                    col_tiling_dim,
+                    cfg.BxS,
+                    cfg.H0,
+                    cfg.H1,
+                    t % 2,
+                )
+            )
+            continue
 
         for h1_tile_idx in range(cfg.H1):
             nisa.nc_matmul(
@@ -1563,7 +1607,50 @@ def _qkv_projection_i_shard(
             nisa.tensor_copy(out_slice, psum_slice, engine=nisa.engine.scalar)
 
     sbm.close_scope()
+    if defer != None:
+        return qkv_out_sb, pending
     return qkv_out_sb
+
+
+def qkv_tkg_i_shard_drain(pending, h1_lo, h1_hi):
+    """Emit h1 tiles [h1_lo, h1_hi) of the deferred i-shard column tiles, evicting on the last one.
+
+    pending is the second element of the qkv_tkg return when i_column_shard_defer is set. The
+    slices must walk [0, H1) in order and complete before the deferred columns are read.
+    """
+    for p in range(len(pending)):
+        (
+            hidden_sb,
+            w_sb,
+            qkv_out_sb,
+            result_psum,
+            i_start,
+            i_size,
+            col_idx,
+            col_tiling_dim,
+            BxS,
+            H0,
+            H1,
+            evict_parity,
+        ) = pending[p]
+        psum_slice = result_psum[nl.ds(col_tiling_dim * col_idx, BxS), 0:i_size]
+
+        for h1_tile_idx in range(h1_lo, min(h1_hi, H1)):
+            nisa.nc_matmul(
+                psum_slice,
+                hidden_sb.select(dim=2, index=h1_tile_idx).get_view(),
+                w_sb.select(dim=1, index=h1_tile_idx).get_view(),
+                tile_position=(0, col_tiling_dim * col_idx),
+                tile_size=(H0, col_tiling_dim),
+                accumulate=h1_tile_idx > 0,
+            )
+
+        if h1_hi >= H1:
+            out_slice = qkv_out_sb[0:BxS, nl.ds(i_start, i_size)]
+            if evict_parity == 0:
+                nisa.tensor_copy(out_slice, psum_slice, engine=nisa.engine.vector)
+            else:
+                nisa.tensor_copy(out_slice, psum_slice, engine=nisa.engine.scalar)
 
 
 def _qkv_projection(

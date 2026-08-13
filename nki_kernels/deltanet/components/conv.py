@@ -259,6 +259,7 @@ def conv_qkv_sbuf(
     cand_is_3d,
     qkv_cp_sbuf=None,
     preloaded=None,
+    seg_hook=None,
 ):
     """Head-sharded conv into three separate q/k/v SBUF tiles, plus the pending state stores.
 
@@ -272,6 +273,8 @@ def conv_qkv_sbuf(
         qkv_cp_sbuf  channel-on-partition qkv tile; the conv reads it instead of the HBM load,
                      and qkv then carries only its shape
         preloaded    per-segment (w_blk, cs_blk) from conv_preload_taps; loaded here if omitted
+        seg_hook     (fn, arg) invoked as fn(arg, seg) after each segment's MAC, so the caller can
+                     place unrelated work in the Tensor-idle stretches between segments
 
     Returns (q_sbuf, k_sbuf, v_sbuf, pending_cand); the tiles are [H_loc*T, 128].
     """
@@ -326,6 +329,9 @@ def conv_qkv_sbuf(
             qkv_cp_sbuf=qkv_cp_sbuf,
             t0=t0,
         )
+
+        if seg_hook != None:
+            seg_hook[0](seg_hook[1], seg)
 
         pending_cand.append((win, conv_cand, n_tiles, T, state_w, ch0, cand_is_3d))
 

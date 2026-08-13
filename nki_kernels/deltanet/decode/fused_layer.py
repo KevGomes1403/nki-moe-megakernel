@@ -28,6 +28,8 @@ import os
 import nki
 import nki.language as nl
 
+from nkilib.core.utils.kernel_helpers import div_ceil
+
 from ..components.conv import (
     P_MAX,
     conv_preload_taps,
@@ -40,9 +42,12 @@ from ..components.conv import (
 from ..components.in_proj import in_proj_compose
 from ..components.out_proj import out_proj_compose
 from ..components.recurrence import gated_delta_rule_tkg
+from ..vendored.qkv_tkg import qkv_tkg_i_shard_drain
 
 # Shard in_proj on its output columns instead of on the hidden dim, dropping the cross-core reduce.
 _I_COLUMN_SHARD = os.environ.get("NKI_DELTANET_IN_PROJ_I_SHARD", "0") == "1"
+# Emit the z column run's matmuls between the conv segments instead of inside the in_proj block.
+_Z_DEFER = os.environ.get("NKI_DELTANET_IN_PROJ_Z_DEFER", "0") == "1"
 
 
 def in_proj_column_shard(conv_dim, key_dim, Hv_full, z_off, a_off):
@@ -63,6 +68,27 @@ def in_proj_column_shard(conv_dim, key_dim, Hv_full, z_off, a_off):
     runs.append((z_off + c * W, W))
     runs.append((a_off, 2 * Hv_full))
     return runs
+
+
+def in_proj_z_defer(conv_dim, key_dim, H1):
+    """(deferred run indices, per-conv-segment h1 drain ranges), or (None, None) when off.
+
+    The z run follows this core's 3 conv segments in in_proj_column_shard, and its H1 matmuls are
+    split evenly over those segments.
+    """
+    if not (_I_COLUMN_SHARD and _Z_DEFER):
+        return None, None
+    n_seg = len(shard_segments(conv_dim, key_dim)[0])
+    ranges = []
+    for seg in range(n_seg):
+        ranges.append((div_ceil(H1 * seg, n_seg), div_ceil(H1 * (seg + 1), n_seg)))
+    return (n_seg,), ranges
+
+
+def in_proj_z_drain_seg(drain, seg):
+    """conv_qkv_sbuf seg_hook: emit the seg-th h1 slice of the deferred in_proj column run."""
+    pending, ranges = drain
+    qkv_tkg_i_shard_drain(pending, ranges[seg][0], ranges[seg][1])
 
 
 def owned_qkv_tiles(conv_dim, key_dim):
@@ -500,7 +526,8 @@ def attention_layer_compose(
     # Layer-static taps/state: issue the DMAs before in_proj so they stream under its matmuls.
     conv_taps = conv_preload_taps(conv_state, conv_weight, key_dim)
 
-    proj_sb = in_proj_compose(
+    defer_runs, drain_ranges = in_proj_z_defer(conv_dim, key_dim, proj_w.shape[0] // P_MAX)
+    proj_out = in_proj_compose(
         hidden,
         proj_w,
         gamma,
@@ -508,7 +535,14 @@ def attention_layer_compose(
         output_in_sbuf=True,
         name_prefix=name_prefix,
         i_column_shard=in_proj_column_shard(conv_dim, key_dim, Hv_full, z_off, a_off),
+        i_column_shard_defer=defer_runs,
     )
+    if defer_runs == None:
+        proj_sb = proj_out
+        seg_hook = None
+    else:
+        proj_sb = proj_out[0]
+        seg_hook = (in_proj_z_drain_seg, (proj_out[1], drain_ranges))
     T = proj_sb.shape[0]
 
     attn_shape = nl.ndarray((T, W_full), dtype=nl.float32, buffer=nl.sbuf)
@@ -526,6 +560,7 @@ def attention_layer_compose(
         cand_is_3d,
         qkv_cp_sbuf=qkv_cp,
         preloaded=conv_taps,
+        seg_hook=seg_hook,
     )
     gated_delta_rule_tkg(
         None,
