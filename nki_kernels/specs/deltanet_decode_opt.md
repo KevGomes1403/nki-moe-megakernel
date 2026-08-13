@@ -544,3 +544,55 @@ chain itself**, not relocate work into it. Do not retry `ATTN_LOC` on this basis
 - (with the round-3 plan-1 finding) `nisa.tensor_copy(..., engine=gpsimd)` rejects PSUM sources.
   Between these three, GpSimd is effectively unusable as an overflow engine here despite
   frequently being 0% busy.
+
+### Round 3, plan 3 — fold RMSNorm into the weight, off the critical path: NEGATIVE
+
+| arm | median | min–max |
+|---|---|---|
+| base_a / base_b (interleaved controls) | **79.98 / 80.44** | 79.54–82.29 |
+| fold_a / fold_b | **84.16 / 84.28** | 82.71–85.50 |
+
+**+4.0 µs (+5.0%)**, ranges disjoint (base max 82.29 < fold min 82.71), control drift 0.46 µs.
+
+Kill criterion fired: first in_proj matmul `start_ts` **19,037 → 18,913 ns** (needed < 18,000).
+
+**The feature worked; the premise was wrong.** `rmsnorm_tkg.py` vanished from the union-busy
+table (`NO_NORM` took), and the `inv_rms` chain ran at 11.7–15.8 µs, well before its consumer.
+But **the first matmul was never gated by the norm — it is gated by the packed-weight DMA.**
+`qkv_tkg.py:1582` (`DMA_DIRECT2D`, GpSimd) spans 12,354→21,888 ns at baseline; the first column
+tile's 16 matmuls run 19,037→22,610. With the norm gone the DMA spans 12,344→20,950 and the
+matmuls run 18,913→22,489 — **the first column tile completes at the same instant in both arms.**
+The whole rmsnorm chain was already hidden behind that DMA.
+
+Regression source: the i-shard PSUM eviction schedule shifted (2nd eviction slips 4.0 µs,
+`evt_wait_time_ns` 11,196 on the first `TENSOR_SCALAR`); the main-path matmul phase stretched
++2.6 µs with per-matmul duration unchanged. Mechanism not established — consistent with the
+plan-2 finding that the scheduler's placement is not predictable from engine slack.
+
+**Numerics were a non-issue**, contrary to the risk assessment. The reassociation
+(`gamma·W` host-side, then accumulate, then `·inv_rms`) left every `max_abs_err` at the
+baseline's 2e-5–5e-5 level and `max_ulp` equal or one *better* than baseline (3 / 39470). The
+thin `rtol` margins on `o_out` and `candidate_states` slightly improved.
+
+**Next lead from this result:** any further attack on the in_proj prologue should target
+`qkv_tkg.py:1582`'s packed-weight DMA — its start time or descriptor shape, 8.2 µs of GpSimd
+DMA spanning 12.35→21.9 µs — not the norm.
+
+---
+
+## Round 3 summary: 0 for 3
+
+All three plans were implemented, measured against interleaved same-session controls, killed by
+their own criteria, and reverted. Each refuted its own premise:
+
+| plan | premise | what the measurement showed |
+|---|---|---|
+| ACT-table de-thrash | table loads pinned by `a`/`b` availability | a/b landed 9 µs earlier; the chain did not hoist. Loads were *relocated*, not eliminated (whole-run count unchanged at 10). |
+| loop evacuation | foreign work contends inside a packed loop | evacuation succeeded (Tensor 13.59→8.78 µs) and the loop started 13.5 µs later. |
+| RMSNorm fold | norm gates the first in_proj matmul | the packed-weight DMA gates it; the norm was already hidden. |
+
+**The deployed stack is unchanged at `I_SHARD + Z_DEFER + PROJW_PACKED`.** Round 3 produced no
+regression risk and three well-evidenced dead ends, which is a legitimate outcome — but it also
+suggests this kernel is near the practical floor for schedule-level optimization: ~16 µs of the
+~81 µs is un-addressable prologue/epilogue, the in_proj matmul phase is at its Tensor floor
+(79.7%), the token loop has 0.09 µs of idle, and the o_proj tail is at its matmul floor.
