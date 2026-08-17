@@ -11,3 +11,4 @@ output/
 *.neff
 *.ntff
 *.pb
+megakernels/qwen3_6_moe/*.html

@@ -1,0 +1,4 @@
+[submodule "nki_kernels/nki-library"]
+	path = nki_kernels/nki-library
+	url = git@github.com:KevGomes1403/nki-library.git
+	branch = 2.30_release

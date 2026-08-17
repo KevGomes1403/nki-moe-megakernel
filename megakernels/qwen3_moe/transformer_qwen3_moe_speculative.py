@@ -70,8 +70,8 @@ import nki.collectives as nccl
 import nki.isa as nisa
 import nki.language as nl
 
-from nki_kernels.attention import attention_block_tkg
-from nki_kernels.moe import (
+from nki_kernels._legacy.attention import attention_block_tkg
+from nki_kernels._legacy.moe import (
     XHBMLayout_T_H__1,
     XSBLayout_tp102__0,
     XSBLayout_tp2013__1,
